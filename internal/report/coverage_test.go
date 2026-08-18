@@ -188,3 +188,53 @@ func TestTableSuccessAndAllWriterFailureSites(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTableSeparatesQualifiedAndProvisionalResults(t *testing.T) {
+	provisional := reportTarget("1", catalog.UDP, 5, false)
+	recommended := reportTarget("2", catalog.UDP, benchmark.MinimumRecommendedSamples, true)
+	recommended.Stats.ScoreMS = 4
+	provisional.Stats.ScoreMS = 1
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 5, Queries: 5, QueryTypes: []uint16{1},
+		Targets: []benchmark.TargetResult{provisional, recommended},
+		Rankings: []benchmark.Ranking{
+			{Protocol: catalog.UDP, TargetID: provisional.Target.ID(), Rank: 1},
+			{Protocol: catalog.UDP, TargetID: recommended.Target.ID(), Rank: 2},
+		},
+	}
+
+	var output bytes.Buffer
+	if err := WriteTable(&output, run, false); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(text, "Recommendations\n  udp  Resolver 2") {
+		t.Fatalf("qualified result missing from recommendations: %s", text)
+	}
+	if strings.Contains(text, "Provisional winners") {
+		t.Fatalf("provisional section should be absent when a qualified result exists: %s", text)
+	}
+
+	provisional.Stats.ScoreMS = 1
+	provisional.Stats.Scored = 5
+	run.Targets = []benchmark.TargetResult{provisional}
+	run.Rankings = []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: provisional.Target.ID(), Rank: 1}}
+	output.Reset()
+	if err := WriteTable(&output, run, false); err != nil {
+		t.Fatal(err)
+	}
+	text = output.String()
+	for _, expected := range []string{"No qualified recommendation available", "Provisional winners", "udp  Resolver 1"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("provisional output missing %q: %s", expected, text)
+		}
+	}
+	if strings.Contains(text, "*recommended*") {
+		t.Fatalf("unqualified result was marked recommended: %s", text)
+	}
+	for _, failAt := range []int{3, 4, 5} {
+		if err := WriteTable(&failingWriter{failAt: failAt}, run, false); err == nil {
+			t.Fatalf("provisional writer failure at write %d was not returned", failAt)
+		}
+	}
+}

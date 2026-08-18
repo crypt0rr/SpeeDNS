@@ -130,6 +130,31 @@ func rankFor(report benchmark.Report, targetID string) int {
 
 func formatFloat(value float64) string { return strconv.FormatFloat(value, 'f', 3, 64) }
 
+func rankedResult(report benchmark.Report, protocol catalog.Protocol, rank int) (benchmark.TargetResult, bool) {
+	for _, ranking := range report.Rankings {
+		if ranking.Protocol != protocol || ranking.Rank != rank {
+			continue
+		}
+		if result, ok := report.ResultFor(ranking.TargetID); ok {
+			return result, true
+		}
+	}
+	return benchmark.TargetResult{}, false
+}
+
+func recommendedResult(report benchmark.Report, protocol catalog.Protocol) (benchmark.TargetResult, bool) {
+	for _, ranking := range report.Rankings {
+		if ranking.Protocol != protocol {
+			continue
+		}
+		result, ok := report.ResultFor(ranking.TargetID)
+		if ok && result.Stats.Recommended {
+			return result, true
+		}
+	}
+	return benchmark.TargetResult{}, false
+}
+
 func WriteTable(writer io.Writer, report benchmark.Report, details bool) error {
 	if _, err := fmt.Fprintf(writer, "SpeeDNS benchmark\nSeed: %d | sample: %d domains | query types: %s\n\n", report.Seed, report.SampleSize, queryTypes(report.QueryTypes)); err != nil {
 		return err
@@ -146,23 +171,38 @@ func WriteTable(writer io.Writer, report benchmark.Report, details bool) error {
 		}
 	}
 	sort.Slice(protocols, func(i, j int) bool { return protocols[i] < protocols[j] })
+	recommendationCount := 0
 	for _, protocol := range protocols {
-		var winner benchmark.TargetResult
-		found := false
-		for _, ranking := range report.Rankings {
-			if ranking.Protocol == protocol && ranking.Rank == 1 {
-				winner, found = report.ResultFor(ranking.TargetID)
-				break
-			}
-		}
+		winner, found := recommendedResult(report, protocol)
 		if !found {
 			continue
 		}
-		marker := ""
-		if winner.Stats.Recommended {
-			marker = " *recommended*"
+		recommendationCount++
+		if _, err := fmt.Fprintf(writer, "  %-4s %-20s %-15s %-22s median %7.2f ms  p95 %7.2f ms  success %6.2f%% *recommended*\n", protocol, winner.Target.DisplayName(), winner.Target.Address, winner.Target.Resolver.Policy, winner.Stats.MedianMS, winner.Stats.P95MS, winner.Stats.SuccessRate*100); err != nil {
+			return err
 		}
-		if _, err := fmt.Fprintf(writer, "  %-4s %-20s %-15s %-22s median %7.2f ms  p95 %7.2f ms  success %6.2f%%%s\n", protocol, winner.Target.DisplayName(), winner.Target.Address, winner.Target.Resolver.Policy, winner.Stats.MedianMS, winner.Stats.P95MS, winner.Stats.SuccessRate*100, marker); err != nil {
+	}
+	if recommendationCount == 0 {
+		if _, err := fmt.Fprintf(writer, "  No qualified recommendation available (minimum %d comparable samples and %.0f%% success).\n", benchmark.MinimumRecommendedSamples, benchmark.MinimumRecommendedSuccessRate*100); err != nil {
+			return err
+		}
+	}
+	provisionalCount := 0
+	for _, protocol := range protocols {
+		if _, found := recommendedResult(report, protocol); found {
+			continue
+		}
+		winner, found := rankedResult(report, protocol, 1)
+		if !found {
+			continue
+		}
+		if provisionalCount == 0 {
+			if _, err := io.WriteString(writer, "\nProvisional winners\n"); err != nil {
+				return err
+			}
+		}
+		provisionalCount++
+		if _, err := fmt.Fprintf(writer, "  %-4s %-20s %-15s %-22s median %7.2f ms  p95 %7.2f ms  success %6.2f%%\n", protocol, winner.Target.DisplayName(), winner.Target.Address, winner.Target.Resolver.Policy, winner.Stats.MedianMS, winner.Stats.P95MS, winner.Stats.SuccessRate*100); err != nil {
 			return err
 		}
 	}
