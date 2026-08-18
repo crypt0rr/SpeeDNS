@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,9 +51,112 @@ var discoverSystemResolvers = systemdns.Discover
 
 var loadProfilesFunc = loadProfiles
 
-var writeTableReport = report.WriteTable
+var writeTableReport = report.WriteTableWithOptions
 var writeJSONReport = report.WriteJSON
 var writeCSVReport = report.WriteCSV
+
+var terminalDetector = fileIsTerminal
+
+type progressRenderer struct {
+	writer        io.Writer
+	interactive   bool
+	protocols     []catalog.Protocol
+	totals        map[catalog.Protocol]int
+	completed     map[catalog.Protocol]int
+	printed       map[catalog.Protocol]bool
+	lastLineWidth int
+	rendered      bool
+	mu            sync.Mutex
+}
+
+func fileIsTerminal(file *os.File) bool {
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
+	seen := make(map[catalog.Protocol]bool, len(selected))
+	for _, protocol := range selected {
+		seen[protocol] = true
+	}
+	protocols := make([]catalog.Protocol, 0, len(selected))
+	for _, protocol := range catalog.AllProtocols {
+		if seen[protocol] {
+			protocols = append(protocols, protocol)
+		}
+	}
+	return protocols
+}
+
+func newProgressRenderer(writer io.Writer, interactive bool, selected []catalog.Protocol, targets []catalog.Target) *progressRenderer {
+	progress := &progressRenderer{
+		writer:      writer,
+		interactive: interactive,
+		protocols:   canonicalProtocols(selected),
+		totals:      make(map[catalog.Protocol]int),
+		completed:   make(map[catalog.Protocol]int),
+		printed:     make(map[catalog.Protocol]bool),
+	}
+	for _, target := range targets {
+		progress.totals[target.Protocol]++
+	}
+	return progress
+}
+
+func (p *progressRenderer) Update(update benchmark.Progress) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if update.Completed > p.completed[update.Protocol] {
+		p.completed[update.Protocol] = update.Completed
+	}
+	if update.Total > p.totals[update.Protocol] {
+		p.totals[update.Protocol] = update.Total
+	}
+	if p.interactive {
+		line := p.progressLine()
+		padding := ""
+		if p.lastLineWidth > len(line) {
+			padding = strings.Repeat(" ", p.lastLineWidth-len(line))
+		}
+		_, _ = fmt.Fprintf(p.writer, "\r%s%s", line, padding)
+		p.lastLineWidth = len(line)
+		p.rendered = true
+		return
+	}
+	if update.Completed >= p.totals[update.Protocol] && !p.printed[update.Protocol] {
+		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", update.Protocol, update.Completed, update.Total)
+		p.printed[update.Protocol] = true
+	}
+}
+
+func (p *progressRenderer) progressLine() string {
+	parts := []string{"testing"}
+	for _, protocol := range p.protocols {
+		total := p.totals[protocol]
+		if total == 0 {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s %d/%d", protocol, p.completed[protocol], total))
+	}
+	return strings.Join(parts, " | ")
+}
+
+func (p *progressRenderer) Finish() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.interactive && p.rendered {
+		_, _ = fmt.Fprintln(p.writer)
+		p.rendered = false
+	}
+}
+
+func tableColorEnabled(config *cliConfig) bool {
+	if config.noColor || (strings.TrimSpace(config.output) != "" && config.output != "-") {
+		return false
+	}
+	return terminalDetector(os.Stdout)
+}
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -164,18 +268,22 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	progress := func(progress benchmark.Progress) {
-		if config.format == "table" {
-			fmt.Fprintf(os.Stderr, "tested %-4s target %d/%d (%s)\n", progress.Protocol, progress.Completed, progress.Total, progress.Target.Address)
-		}
+	var progressView *progressRenderer
+	var onProgress func(benchmark.Progress)
+	if strings.EqualFold(config.format, "table") {
+		progressView = newProgressRenderer(os.Stderr, terminalDetector(os.Stderr), selected, targets)
+		onProgress = progressView.Update
 	}
 	runContext, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
 		Domains: domainList, QueryTypes: queryTypes, Sample: config.sample, Full: config.full,
 		Seed: seed, Timeout: config.timeout, Concurrency: config.concurrency, Protocols: selected,
-		OnProgress: progress,
+		OnProgress: onProgress,
 	})
+	if progressView != nil {
+		progressView.Finish()
+	}
 	if runErr != nil && result.FinishedAt.IsZero() {
 		return runErr
 	}
@@ -192,7 +300,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	switch strings.ToLower(config.format) {
 	case "table":
-		err = writeTableReport(writer, result, config.details)
+		err = writeTableReport(writer, result, report.TableOptions{Details: config.details, Color: tableColorEnabled(config)})
 	case "json":
 		err = writeJSONReport(writer, result, config.raw)
 	case "csv":

@@ -100,6 +100,8 @@ Short runs can still show a provisional fastest result, but SpeeDNS labels it se
 
 `—` means that a resolver does not advertise that transport. `FAIL` means it was configured for the transport but the connection or DNS exchange failed. SpeeDNS never silently falls back from one protocol to another.
 
+The terminal report groups comparisons by protocol. In an interactive terminal, progress is rendered as one updating status line; when output is redirected, SpeeDNS prints one completion line per protocol. Blocked transports are summarized together, while `--details` includes the underlying endpoint errors and counters. Use `--no-color` for plain terminal output.
+
 ## Default resolver profiles
 
 | Address | Owner | Policy | Encrypted names |

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/crypt0rr/dns-speedtest/internal/benchmark"
 	"github.com/crypt0rr/dns-speedtest/internal/catalog"
@@ -130,6 +131,18 @@ func rankFor(report benchmark.Report, targetID string) int {
 
 func formatFloat(value float64) string { return strconv.FormatFloat(value, 'f', 3, 64) }
 
+type TableOptions struct {
+	Details bool
+	Color   bool
+}
+
+const (
+	ansiGreen  = "\x1b[32m"
+	ansiYellow = "\x1b[33m"
+	ansiRed    = "\x1b[31m"
+	ansiReset  = "\x1b[0m"
+)
+
 func rankedResult(report benchmark.Report, protocol catalog.Protocol, rank int) (benchmark.TargetResult, bool) {
 	for _, ranking := range report.Rankings {
 		if ranking.Protocol != protocol || ranking.Rank != rank {
@@ -155,88 +168,319 @@ func recommendedResult(report benchmark.Report, protocol catalog.Protocol) (benc
 	return benchmark.TargetResult{}, false
 }
 
+func reportProtocols(report benchmark.Report) []catalog.Protocol {
+	seen := make(map[catalog.Protocol]bool)
+	for _, result := range report.Targets {
+		seen[result.Target.Protocol] = true
+	}
+	for _, ranking := range report.Rankings {
+		seen[ranking.Protocol] = true
+	}
+	protocols := make([]catalog.Protocol, 0, len(seen))
+	for _, protocol := range catalog.AllProtocols {
+		if seen[protocol] {
+			protocols = append(protocols, protocol)
+			delete(seen, protocol)
+		}
+	}
+	remaining := make([]catalog.Protocol, 0, len(seen))
+	for protocol := range seen {
+		remaining = append(remaining, protocol)
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
+	return append(protocols, remaining...)
+}
+
+func resultStatus(result benchmark.TargetResult) string {
+	if result.Stats.Scored == 0 {
+		return "FAILED"
+	}
+	if result.Stats.Recommended {
+		return "QUALIFIED"
+	}
+	return "INELIGIBLE"
+}
+
+func styledStatus(status string, color bool) string {
+	if !color {
+		return status
+	}
+	colorCode := ""
+	switch status {
+	case "RECOMMENDED", "QUALIFIED":
+		colorCode = ansiGreen
+	case "PROVISIONAL", "INELIGIBLE":
+		colorCode = ansiYellow
+	case "FAILED":
+		colorCode = ansiRed
+	default:
+		return status
+	}
+	return colorCode + status + ansiReset
+}
+
+func latencyText(value float64) string {
+	if value == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.2f ms", value)
+}
+
+func percentText(value float64) string { return fmt.Sprintf("%.2f%%", value*100) }
+
+func scoreText(result benchmark.TargetResult) string {
+	if result.Stats.Scored == 0 {
+		return "—"
+	}
+	return latencyText(result.Stats.ScoreMS)
+}
+
+func rankText(report benchmark.Report, targetID string) string {
+	rank := rankFor(report, targetID)
+	if rank == 0 {
+		return "—"
+	}
+	return strconv.Itoa(rank)
+}
+
+func summaryRow(protocol catalog.Protocol, result benchmark.TargetResult, status string, color bool) []string {
+	return []string{
+		string(protocol), result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy,
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate),
+		scoreText(result), styledStatus(status, color),
+	}
+}
+
+func comparisonRow(report benchmark.Report, result benchmark.TargetResult, details bool, color bool) []string {
+	row := []string{
+		rankText(report, result.Target.ID()), result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy,
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate),
+		scoreText(result),
+	}
+	if details {
+		row = append(row,
+			latencyText(result.Stats.ColdMedianMS), latencyText(result.Stats.MADMS),
+			strconv.Itoa(result.Stats.Scored), strconv.Itoa(result.Stats.Failures),
+			strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated),
+		)
+	}
+	return append(row, styledStatus(resultStatus(result), color))
+}
+
+func sortComparisonResults(report benchmark.Report, results []benchmark.TargetResult) {
+	sort.SliceStable(results, func(i, j int) bool {
+		leftRank := rankFor(report, results[i].Target.ID())
+		rightRank := rankFor(report, results[j].Target.ID())
+		if leftRank == 0 && rightRank != 0 {
+			return false
+		}
+		if leftRank != 0 && rightRank == 0 {
+			return true
+		}
+		if leftRank != 0 && rightRank != 0 && leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		if results[i].Target.Resolver.Owner != results[j].Target.Resolver.Owner {
+			return results[i].Target.Resolver.Owner < results[j].Target.Resolver.Owner
+		}
+		return results[i].Target.Address < results[j].Target.Address
+	})
+}
+
+func comparisonRows(report benchmark.Report, protocol catalog.Protocol, details bool, color bool) [][]string {
+	results := make([]benchmark.TargetResult, 0)
+	for _, result := range report.Targets {
+		if result.Target.Protocol == protocol {
+			results = append(results, result)
+		}
+	}
+	sortComparisonResults(report, results)
+	rows := make([][]string, 0, len(results))
+	for _, result := range results {
+		rows = append(rows, comparisonRow(report, result, details, color))
+	}
+	return rows
+}
+
+func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
+	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
+	indent := func(values []string) string {
+		copyValues := append([]string(nil), values...)
+		copyValues[0] = "  " + copyValues[0]
+		return strings.Join(copyValues, "\t")
+	}
+	if _, err := fmt.Fprintln(table, indent(headers)); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if _, err := fmt.Fprintln(table, indent(row)); err != nil {
+			return err
+		}
+	}
+	return table.Flush()
+}
+
+func summaryHeaders() []string {
+	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Score", "Status"}
+}
+
+func comparisonHeaders(details bool) []string {
+	headers := []string{"Rank", "Owner", "Address", "Policy", "Median", "P95", "Success", "Score"}
+	if details {
+		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "Divergent", "Truncated")
+	}
+	return append(headers, "Status")
+}
+
+func targetWarningLabel(result benchmark.TargetResult) string {
+	return fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol)
+}
+
+func isTargetWarning(warning string, results []benchmark.TargetResult) bool {
+	for _, result := range results {
+		if strings.HasPrefix(warning, targetWarningLabel(result)) {
+			return true
+		}
+	}
+	return false
+}
+
+func compactWarnings(report benchmark.Report) []string {
+	warnings := make([]string, 0)
+	handled := make(map[string]bool)
+	for _, protocol := range reportProtocols(report) {
+		targets := make([]benchmark.TargetResult, 0)
+		for _, result := range report.Targets {
+			if result.Target.Protocol == protocol {
+				targets = append(targets, result)
+			}
+		}
+		if len(targets) == 0 {
+			continue
+		}
+		allUnavailable := true
+		failedQueries := 0
+		totalQueries := 0
+		for _, result := range targets {
+			totalQueries += result.Stats.Total
+			failedQueries += result.Stats.Failures
+			if result.Stats.Total == 0 || result.Stats.Scored != 0 || result.Stats.Failures != result.Stats.Total {
+				allUnavailable = false
+			}
+		}
+		if allUnavailable {
+			warnings = append(warnings, fmt.Sprintf("%s: %d/%d endpoints unavailable; %d/%d measured queries failed", protocol, len(targets), len(targets), failedQueries, totalQueries))
+			for _, result := range targets {
+				handled[result.Target.ID()] = true
+			}
+		}
+	}
+	for _, result := range report.Targets {
+		if handled[result.Target.ID()] {
+			continue
+		}
+		parts := make([]string, 0, 4)
+		if result.OpenError != "" && result.Stats.Scored == 0 {
+			parts = append(parts, "unavailable")
+		}
+		if result.Stats.Failures > 0 {
+			parts = append(parts, fmt.Sprintf("%d/%d queries failed", result.Stats.Failures, result.Stats.Total))
+		}
+		if result.Stats.Divergent > 0 {
+			parts = append(parts, fmt.Sprintf("%d divergent responses", result.Stats.Divergent))
+		}
+		if result.Stats.Truncated > 0 {
+			parts = append(parts, fmt.Sprintf("%d truncated responses", result.Stats.Truncated))
+		}
+		if len(parts) > 0 {
+			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabel(result), strings.Join(parts, "; ")))
+		}
+	}
+	for _, warning := range report.Warnings {
+		if !isTargetWarning(warning, report.Targets) {
+			warnings = append(warnings, warning)
+		}
+	}
+	return warnings
+}
+
+func writeWarnings(writer io.Writer, report benchmark.Report, details bool) error {
+	warnings := report.Warnings
+	if !details {
+		warnings = compactWarnings(report)
+	}
+	if len(warnings) == 0 {
+		return nil
+	}
+	if _, err := io.WriteString(writer, "\nWarnings\n"); err != nil {
+		return err
+	}
+	for _, warning := range warnings {
+		if _, err := fmt.Fprintf(writer, "  - %s\n", warning); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func WriteTable(writer io.Writer, report benchmark.Report, details bool) error {
+	return WriteTableWithOptions(writer, report, TableOptions{Details: details})
+}
+
+func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options TableOptions) error {
 	if _, err := fmt.Fprintf(writer, "SpeeDNS benchmark\nSeed: %d | sample: %d domains | query types: %s\n\n", report.Seed, report.SampleSize, queryTypes(report.QueryTypes)); err != nil {
 		return err
 	}
 	if _, err := io.WriteString(writer, "Recommendations\n"); err != nil {
 		return err
 	}
-	protocols := make([]catalog.Protocol, 0)
-	seen := map[catalog.Protocol]bool{}
-	for _, ranking := range report.Rankings {
-		if !seen[ranking.Protocol] {
-			seen[ranking.Protocol] = true
-			protocols = append(protocols, ranking.Protocol)
-		}
-	}
-	sort.Slice(protocols, func(i, j int) bool { return protocols[i] < protocols[j] })
-	recommendationCount := 0
+	protocols := reportProtocols(report)
+	recommendations := make([][]string, 0, len(protocols))
+	provisionals := make([][]string, 0, len(protocols))
 	for _, protocol := range protocols {
-		winner, found := recommendedResult(report, protocol)
-		if !found {
+		if winner, found := recommendedResult(report, protocol); found {
+			recommendations = append(recommendations, summaryRow(protocol, winner, "RECOMMENDED", options.Color))
 			continue
 		}
-		recommendationCount++
-		if _, err := fmt.Fprintf(writer, "  %-4s %-20s %-15s %-22s median %7.2f ms  p95 %7.2f ms  success %6.2f%% *recommended*\n", protocol, winner.Target.DisplayName(), winner.Target.Address, winner.Target.Resolver.Policy, winner.Stats.MedianMS, winner.Stats.P95MS, winner.Stats.SuccessRate*100); err != nil {
-			return err
+		if winner, found := rankedResult(report, protocol, 1); found {
+			provisionals = append(provisionals, summaryRow(protocol, winner, "PROVISIONAL", options.Color))
 		}
 	}
-	if recommendationCount == 0 {
-		if _, err := fmt.Fprintf(writer, "  No qualified recommendation available (minimum %d comparable samples and %.0f%% success).\n", benchmark.MinimumRecommendedSamples, benchmark.MinimumRecommendedSuccessRate*100); err != nil {
+	if len(recommendations) == 0 {
+		if _, err := fmt.Fprintf(writer, "  none qualified (minimum %d comparable samples and %.0f%% success)\n", benchmark.MinimumRecommendedSamples, benchmark.MinimumRecommendedSuccessRate*100); err != nil {
 			return err
 		}
-	}
-	provisionalCount := 0
-	for _, protocol := range protocols {
-		if _, found := recommendedResult(report, protocol); found {
-			continue
-		}
-		winner, found := rankedResult(report, protocol, 1)
-		if !found {
-			continue
-		}
-		if provisionalCount == 0 {
-			if _, err := io.WriteString(writer, "\nProvisional winners\n"); err != nil {
-				return err
-			}
-		}
-		provisionalCount++
-		if _, err := fmt.Fprintf(writer, "  %-4s %-20s %-15s %-22s median %7.2f ms  p95 %7.2f ms  success %6.2f%%\n", protocol, winner.Target.DisplayName(), winner.Target.Address, winner.Target.Resolver.Policy, winner.Stats.MedianMS, winner.Stats.P95MS, winner.Stats.SuccessRate*100); err != nil {
-			return err
-		}
-	}
-	if _, err := io.WriteString(writer, "\nComparison\n"); err != nil {
+	} else if err := writeAlignedTable(writer, summaryHeaders(), recommendations); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(writer, "  Owner                 Address          Policy                         Protocol  Median       P95       Success  Score"); err != nil {
+	if len(provisionals) > 0 {
+		if _, err := io.WriteString(writer, "\nProvisional winners\n"); err != nil {
+			return err
+		}
+		if err := writeAlignedTable(writer, summaryHeaders(), provisionals); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(writer, "\nComparisons\n"); err != nil {
 		return err
 	}
-	for _, result := range report.Targets {
-		stats := result.Stats
-		if stats.Scored == 0 {
-			if _, err := fmt.Fprintf(writer, "  %-20s %-15s %-30s %-8s FAIL\n", result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy, result.Target.Protocol); err != nil {
+	for _, protocol := range protocols {
+		if _, err := fmt.Fprintf(writer, "\nProtocol %s\n", strings.ToUpper(string(protocol))); err != nil {
+			return err
+		}
+		rows := comparisonRows(report, protocol, options.Details, options.Color)
+		if len(rows) == 0 {
+			if _, err := io.WriteString(writer, "  no targets\n"); err != nil {
 				return err
 			}
 			continue
 		}
-		if details {
-			if _, err := fmt.Fprintf(writer, "  %-20s %-15s %-30s %-8s %7.2f ms %7.2f ms %7.2f%% %7.2f ms cold %7.2f mad %7.2f\n", result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy, result.Target.Protocol, stats.MedianMS, stats.P95MS, stats.SuccessRate*100, stats.ScoreMS, stats.ColdMedianMS, stats.MADMS); err != nil {
-				return err
-			}
-		} else if _, err := fmt.Fprintf(writer, "  %-20s %-15s %-30s %-8s %7.2f ms %7.2f ms %7.2f%% %7.2f\n", result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy, result.Target.Protocol, stats.MedianMS, stats.P95MS, stats.SuccessRate*100, stats.ScoreMS); err != nil {
+		if err := writeAlignedTable(writer, comparisonHeaders(options.Details), rows); err != nil {
 			return err
 		}
 	}
-	if len(report.Warnings) > 0 {
-		if _, err := io.WriteString(writer, "\nWarnings\n"); err != nil {
-			return err
-		}
-		for _, warning := range report.Warnings {
-			if _, err := fmt.Fprintf(writer, "  - %s\n", warning); err != nil {
-				return err
-			}
-		}
+	if err := writeWarnings(writer, report, options.Details); err != nil {
+		return err
 	}
 	return nil
 }

@@ -132,6 +132,63 @@ func TestCLIParsersAndOutputHelpers(t *testing.T) {
 	sortStrings(values)
 }
 
+func TestProgressRendererHandlesConcurrentCompletionStyles(t *testing.T) {
+	targets := []catalog.Target{
+		{Protocol: catalog.UDP, Address: "192.0.2.1"},
+		{Protocol: catalog.TCP, Address: "192.0.2.2"},
+		{Protocol: catalog.DoQ, Address: "192.0.2.3"},
+	}
+	selected := []catalog.Protocol{catalog.DoQ, catalog.UDP, catalog.TCP, catalog.DoH}
+
+	var logOutput bytes.Buffer
+	logProgress := newProgressRenderer(&logOutput, false, selected, targets)
+	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Completed: 1, Total: 1, Target: targets[2]})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Completed: 1, Total: 1, Target: targets[0]})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Completed: 1, Total: 1, Target: targets[2]})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Completed: 1, Total: 1, Target: targets[1]})
+	if got, want := logOutput.String(), "tested doq 1/1 targets\ntested udp 1/1 targets\ntested tcp 1/1 targets\n"; got != want {
+		t.Fatalf("non-TTY progress = %q, want %q", got, want)
+	}
+	if strings.Contains(logOutput.String(), "192.0.2.") {
+		t.Fatalf("non-TTY progress leaked target addresses: %q", logOutput.String())
+	}
+
+	var ttyOutput bytes.Buffer
+	ttyProgress := newProgressRenderer(&ttyOutput, true, selected, targets)
+	ttyProgress.lastLineWidth = 200
+	ttyProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Completed: 1, Total: 1, Target: targets[2]})
+	ttyProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Completed: 1, Total: 1, Target: targets[0]})
+	ttyProgress.Finish()
+	if !strings.Contains(ttyOutput.String(), "testing | udp 1/1 | tcp 0/1 | doq 1/1") {
+		t.Fatalf("TTY progress did not use canonical order: %q", ttyOutput.String())
+	}
+	if !strings.HasSuffix(ttyOutput.String(), "\n") {
+		t.Fatalf("TTY progress was not terminated before the report: %q", ttyOutput.String())
+	}
+
+	var fallbackOutput bytes.Buffer
+	fallbackProgress := newProgressRenderer(&fallbackOutput, false, []catalog.Protocol{catalog.UDP}, nil)
+	fallbackProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Completed: 1, Total: 1})
+	if fallbackOutput.String() != "tested udp 1/1 targets\n" {
+		t.Fatalf("fallback progress = %q", fallbackOutput.String())
+	}
+}
+
+func TestTableColorDetectionHonorsTTYAndOverrides(t *testing.T) {
+	oldDetector := terminalDetector
+	t.Cleanup(func() { terminalDetector = oldDetector })
+	terminalDetector = func(*os.File) bool { return true }
+	if !tableColorEnabled(&cliConfig{}) {
+		t.Fatal("expected color for an interactive default table")
+	}
+	if tableColorEnabled(&cliConfig{noColor: true}) {
+		t.Fatal("--no-color did not disable color")
+	}
+	if tableColorEnabled(&cliConfig{output: "result.txt"}) {
+		t.Fatal("file output should not receive terminal color")
+	}
+}
+
 func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 	defaultProfiles, err := loadProfiles(context.Background(), &cliConfig{})
 	if err != nil || len(defaultProfiles) != 10 {
