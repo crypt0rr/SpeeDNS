@@ -1,0 +1,23 @@
+version: 1
+resolvers:
+  - id: example
+    name: Example DNS
+    owner: Example Corp
+    policy: unfiltered
+    addresses:
+      - 192.0.2.53
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      dot:
+        server_name: dns.example
+        port: 853
+      doh:
+        url: https://dns.example/dns-query
+        bootstrap_addresses:
+          - 192.0.2.53
+      doq:
+        server_name: dns.example
+        port: 853

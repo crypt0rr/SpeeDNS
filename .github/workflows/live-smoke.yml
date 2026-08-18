@@ -1,0 +1,117 @@
+name: Live DNS smoke
+
+on:
+  schedule:
+    - cron: '17 03 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: live-dns-smoke
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.25.x'
+
+jobs:
+  smoke:
+    name: Public endpoint smoke tests
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build smoke-test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -trimpath -o "${RUNNER_TEMP}/speedns" ./cmd/speedns
+
+      - name: Test one official endpoint per transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="${RUNNER_TEMP}/speedns-smoke"
+          mkdir -p "${smoke_dir}"
+          : > "${smoke_dir}/failures.txt"
+
+          run_smoke() {
+            local name="$1"
+            local protocol="$2"
+            local resolver="$3"
+            local output="${smoke_dir}/${name}.json"
+            local stdout_file="${smoke_dir}/${name}.stdout"
+            local stderr_file="${smoke_dir}/${name}.stderr"
+
+            echo "::group::${name} (${protocol})"
+            set +e
+            "${RUNNER_TEMP}/speedns" \
+              --no-defaults \
+              --protocol "${protocol}" \
+              --resolver "${resolver}" \
+              --sample 1 \
+              --type A \
+              --seed 42 \
+              --timeout 5s \
+              --concurrency 1 \
+              --format json \
+              --output "${output}" \
+              >"${stdout_file}" \
+              2>"${stderr_file}"
+            local status=$?
+            set -e
+
+            if [[ "${status}" -ne 0 ]]; then
+              printf '%s (%s): exit %s\n' "${name}" "${protocol}" "${status}" >> "${smoke_dir}/failures.txt"
+              echo "${name} failed with exit code ${status}"
+            else
+              echo "${name} passed"
+            fi
+            cat "${stderr_file}"
+            cat "${stdout_file}"
+            echo "::endgroup::"
+          }
+
+          run_smoke udp udp 'google=udp://8.8.8.8:53'
+          run_smoke tcp tcp 'google=tcp://8.8.8.8:53'
+          run_smoke doh doh 'google=https://dns.google/dns-query'
+          run_smoke dot dot 'google=tls://dns.google:853'
+          run_smoke doq doq 'quad9=quic://dns.quad9.net:853'
+
+          if [[ -s "${smoke_dir}/failures.txt" ]]; then
+            {
+              echo '## Live DNS smoke failures'
+              echo
+              cat "${smoke_dir}/failures.txt"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo '## Live DNS smoke passed' >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload smoke-test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedns-live-smoke
+          path: ${{ runner.temp }}/speedns-smoke/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Report smoke status
+        if: always()
+        shell: bash
+        run: |
+          if [[ -s "${RUNNER_TEMP}/speedns-smoke/failures.txt" ]]; then
+            cat "${RUNNER_TEMP}/speedns-smoke/failures.txt" >&2
+            exit 1
+          fi
