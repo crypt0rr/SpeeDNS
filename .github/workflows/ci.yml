@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.25.x'
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t go_files < <(rg --files -g '*.go')
+          if ((${#go_files[@]} == 0)); then
+            echo 'no Go files found'
+            exit 1
+          fi
+          unformatted="$(gofmt -l "${go_files[@]}")"
+          if [[ -n "${unformatted}" ]]; then
+            echo 'The following Go files are not gofmt-formatted:'
+            printf '%s\n' "${unformatted}"
+            exit 1
+          fi
+
+      - name: Verify module metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          go mod verify
+
+      - name: Run unit and integration tests
+        run: go test -count=1 ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run race detector
+        run: go test -count=1 -race ./...
+
+      - name: Enforce 100% statement coverage
+        env:
+          COVERAGE_OUTPUT: ${{ runner.temp }}/speedns.coverprofile
+        run: bash scripts/coverage.sh
+
+      - name: Upload coverage profile
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.os }}
+          path: ${{ runner.temp }}/speedns.coverprofile
+          if-no-files-found: error
+          retention-days: 14
+
+  cross-build:
+    name: Cross-build release targets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build release targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            IFS=/ read -r goos goarch <<< "${target}"
+            output="dist/speedns-${goos}-${goarch}"
+            echo "building ${goos}/${goarch}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -trimpath -o "${output}" ./cmd/speedns
+          done
+          ./dist/speedns-linux-amd64 version
+          ls -lh dist
+
+      - name: Upload cross-build binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedns-cross-builds
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release-check:
+    name: Validate GoReleaser snapshot
+    needs:
+      - test
+      - cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Build GoReleaser snapshot
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean --skip=sign
+
+      - name: Upload GoReleaser snapshot
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedns-goreleaser-snapshot
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

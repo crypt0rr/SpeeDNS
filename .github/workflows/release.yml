@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to release
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+  id-token: write
+
+env:
+  GO_VERSION: '1.25.x'
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RELEASE_TAG}" in
+            v[0-9]*) ;;
+            *)
+              echo "release ref must be a v* tag, got ${RELEASE_TAG}" >&2
+              exit 1
+              ;;
+          esac
+          checked_out_tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          if [[ "${checked_out_tag}" != "${RELEASE_TAG}" ]]; then
+            echo "${RELEASE_TAG} does not resolve to the checked-out commit" >&2
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify module metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          go mod verify
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t go_files < <(rg --files -g '*.go')
+          unformatted="$(gofmt -l "${go_files[@]}")"
+          test -z "${unformatted}" || {
+            echo "unformatted Go files:" >&2
+            printf '%s\n' "${unformatted}" >&2
+            exit 1
+          }
+
+      - name: Run release preflight tests
+        run: go test -count=1 ./...
+
+      - name: Run release preflight vet
+        run: go vet ./...
+
+      - name: Run release preflight race tests
+        run: go test -count=1 -race ./...
+
+      - name: Enforce 100% statement coverage
+        run: bash scripts/coverage.sh
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4
+
+      - name: Build and publish GitHub release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          COSIGN_YES: 'true'

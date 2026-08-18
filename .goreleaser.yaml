@@ -1,0 +1,80 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: speedns
+    main: ./cmd/speedns
+    binary: speedns
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/crypt0rr/dns-speedtest/internal/version.Version={{.Version}}
+      - -X github.com/crypt0rr/dns-speedtest/internal/version.Commit={{.Commit}}
+      - -X github.com/crypt0rr/dns-speedtest/internal/version.Date={{.Date}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+nfpms:
+  - id: deb
+    package_name: speedns
+    vendor: SpeeDNS contributors
+    homepage: https://github.com/crypt0rr/dns-speedtest
+    maintainer: SpeeDNS contributors
+    description: Cross-platform DNS transport speed test CLI
+    license: MIT
+    formats: [deb]
+    bindir: /usr/bin
+
+homebrew_casks:
+  - repository:
+      owner: crypt0rr
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://github.com/crypt0rr/dns-speedtest
+    description: Cross-platform DNS transport speed test CLI
+    license: MIT
+    binaries:
+      - speedns
+    url:
+      verified: github.com/crypt0rr/dns-speedtest/releases/download
+
+checksum:
+  name_template: checksums.txt
+
+signs:
+  - artifacts: checksum
+    cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - --yes
+      - --bundle=${signature}
+      - ${artifact}
+
+sboms:
+  - artifacts: archive
+    documents:
+      - "{{ .ArtifactName }}.sbom.json"
+
+release:
+  draft: true
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
