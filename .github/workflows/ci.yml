@@ -41,12 +41,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t go_files < <(rg --files -g '*.go')
-          if ((${#go_files[@]} == 0)); then
-            echo 'no Go files found'
-            exit 1
-          fi
-          unformatted="$(gofmt -l "${go_files[@]}")"
+          unformatted="$(find . -type f -name '*.go' -exec gofmt -l {} +)"
           if [[ -n "${unformatted}" ]]; then
             echo 'The following Go files are not gofmt-formatted:'
             printf '%s\n' "${unformatted}"

@@ -70,8 +70,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t go_files < <(rg --files -g '*.go')
-          unformatted="$(gofmt -l "${go_files[@]}")"
+          unformatted="$(find . -type f -name '*.go' -exec gofmt -l {} +)"
           test -z "${unformatted}" || {
             echo "unformatted Go files:" >&2
             printf '%s\n' "${unformatted}" >&2
