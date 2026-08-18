@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	DefaultSample       = 100
-	DefaultTimeout      = 2 * time.Second
-	DefaultConcurrency  = 4
-	BootstrapIterations = 1000
+	DefaultSample                 = 100
+	DefaultTimeout                = 2 * time.Second
+	DefaultConcurrency            = 4
+	BootstrapIterations           = 1000
+	MinimumRecommendedSamples     = 20
+	MinimumRecommendedSuccessRate = 0.99
 )
 
 var warmupNames = []string{"example.com", "example.org", "example.net"}
@@ -457,7 +459,7 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		sort.Float64s(cold)
 		stats.ColdMedianMS = percentile(cold, 0.5)
 	}
-	stats.Recommended = stats.Scored >= 20 && stats.SuccessRate >= 0.99
+	stats.Recommended = stats.Scored >= MinimumRecommendedSamples && stats.SuccessRate >= MinimumRecommendedSuccessRate
 	return stats
 }
 
@@ -555,7 +557,7 @@ func collectWarnings(results []TargetResult) []string {
 			warnings = append(warnings, fmt.Sprintf("%s returned %d truncated responses; SpeeDNS did not fall back to another transport", label, result.Stats.Truncated))
 		}
 		if result.Stats.Scored > 0 && !result.Stats.Recommended {
-			warnings = append(warnings, fmt.Sprintf("%s is not recommended: needs at least 20 comparable samples and 99%% success", label))
+			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% success", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
 		}
 	}
 	return warnings

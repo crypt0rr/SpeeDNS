@@ -96,6 +96,8 @@ The primary comparison is the warm query latency. Cold latency tells you what a 
 
 Lower is better. A result is marked recommended only when it has at least 20 comparable samples and at least 99% successful responses. Divergent response classes—such as one filtered/NXDOMAIN response and one normal answer—are reported and excluded from latency scoring for that query.
 
+Short runs can still show a provisional fastest result, but SpeeDNS labels it separately and does not present it as a recommendation until the evidence threshold is met.
+
 `—` means that a resolver does not advertise that transport. `FAIL` means it was configured for the transport but the connection or DNS exchange failed. SpeeDNS never silently falls back from one protocol to another.
 
 ## Default resolver profiles
