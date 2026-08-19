@@ -12,6 +12,34 @@ Prebuilt macOS and Debian/Linux binaries and packages are published with each re
 - Linux `amd64` and `arm64` archives;
 - Debian packages for Linux `amd64` and `arm64`.
 
+### Homebrew
+
+Install the macOS cask from the SpeeDNS tap:
+
+```sh
+brew tap crypt0rr/speedns
+brew install --cask speedns
+```
+
+After installation, verify the command and run a benchmark:
+
+```sh
+speedns version
+speedns
+```
+
+Upgrade or uninstall it with Homebrew:
+
+```sh
+brew upgrade --cask speedns
+brew uninstall --cask speedns
+```
+
+The current prerelease macOS binaries are not Apple-signed or notarized. On
+first use, macOS may show a Gatekeeper warning. If you trust the release,
+open **System Settings → Privacy & Security**, select **Open Anyway**, and
+then run `speedns` again. Do not disable Gatekeeper globally.
+
 To build from source, install [Go 1.25 or newer](https://go.dev/dl/):
 
 ```sh
