@@ -40,7 +40,7 @@ nfpms:
 homebrew_casks:
   - repository:
       owner: crypt0rr
-      name: homebrew-tap
+      name: homebrew-speedns
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: https://github.com/crypt0rr/dns-speedtest
     description: Cross-platform DNS transport speed test CLI
