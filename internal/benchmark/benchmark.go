@@ -267,6 +267,7 @@ func normalizeDomains(domains []string) []string {
 
 func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
 	results := make([]TargetResult, len(targets))
+	dispatched := make([]bool, len(targets))
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	var completed atomic.Int32
@@ -292,15 +293,26 @@ func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query,
 		}
 		select {
 		case jobs <- index:
+			dispatched[index] = true
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
-			return results
+			return dispatchedResults(results, dispatched)
 		}
 	}
 	close(jobs)
 	wg.Wait()
-	return results
+	return dispatchedResults(results, dispatched)
+}
+
+func dispatchedResults(results []TargetResult, dispatched []bool) []TargetResult {
+	compacted := make([]TargetResult, 0, len(results))
+	for index, wasDispatched := range dispatched {
+		if wasDispatched {
+			compacted = append(compacted, results[index])
+		}
+	}
+	return compacted
 }
 
 func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts Options) TargetResult {

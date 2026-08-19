@@ -162,16 +162,24 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	resultCh := make(chan []TargetResult, 1)
+	var cancelledProgress []Progress
 	go func() {
-		resultCh <- runProtocol(ctx, targets, []Query{{Name: "x", QType: dns.TypeA}}, Options{Concurrency: 1})
+		resultCh <- runProtocol(ctx, targets, []Query{{Name: "x", QType: dns.TypeA}}, Options{
+			Concurrency: 1,
+			OnProgress: func(progress Progress) {
+				cancelledProgress = append(cancelledProgress, progress)
+			},
+		})
 	}()
 	<-started
 	time.Sleep(10 * time.Millisecond)
 	cancel()
-	time.Sleep(10 * time.Millisecond)
 	close(release)
-	if got := <-resultCh; len(got) != 2 {
-		t.Fatalf("cancelled scheduler result count = %d, want 2", len(got))
+	if got := <-resultCh; len(got) != 1 || got[0].Target.ID() != targets[0].ID() {
+		t.Fatalf("cancelled scheduler results = %#v, want only dispatched target %#v", got, targets[0])
+	}
+	if len(cancelledProgress) != 1 || cancelledProgress[0].Completed != 1 || cancelledProgress[0].Total != len(targets) {
+		t.Fatalf("cancelled scheduler progress = %#v, want one completed dispatched target", cancelledProgress)
 	}
 
 	ctx, cancel = context.WithCancel(context.Background())
@@ -180,8 +188,13 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 		cancel()
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1}}}
 	}
-	if _, err := Run(ctx, []catalog.Target{testTarget(catalog.UDP, "cancel")}, opts); !errors.Is(err, context.Canceled) {
+	cancelledTargets := []catalog.Target{testTarget(catalog.TCP, "cancel-first"), testTarget(catalog.UDP, "not-dispatched")}
+	cancelledReport, err := Run(ctx, cancelledTargets, opts)
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
+	}
+	if len(cancelledReport.Targets) != 1 || cancelledReport.Targets[0].Target.ID() == "@/" || cancelledReport.Targets[0].Target.ID() != cancelledTargets[0].ID() {
+		t.Fatalf("cancelled Run targets = %#v, want only the first dispatched target", cancelledReport.Targets)
 	}
 
 	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
@@ -254,7 +267,7 @@ func TestRunProtocolCancellationBeforeDispatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	results := runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "one")}, nil, Options{Concurrency: 5})
-	if len(results) != 1 || results[0].Target.ID() != "@/" {
+	if len(results) != 0 {
 		t.Fatalf("pre-cancelled scheduler results = %#v", results)
 	}
 }
