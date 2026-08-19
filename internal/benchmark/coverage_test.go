@@ -3,6 +3,8 @@ package benchmark
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -243,6 +245,229 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	}
 	if _, err := Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "none")}, opts); err == nil || !strings.Contains(err.Error(), "no comparable") {
 		t.Fatalf("unscored Run error = %v", err)
+	}
+}
+
+func TestFairProtocolSchedulingIsOrderIndependent(t *testing.T) {
+	oldTarget := runTargetFunc
+	oldFactory := newFactory
+	t.Cleanup(func() {
+		runTargetFunc = oldTarget
+		newFactory = oldFactory
+	})
+	runTargetFunc = runTarget
+
+	targets := []catalog.Target{
+		testTarget(catalog.UDP, "one"),
+		testTarget(catalog.UDP, "two"),
+		testTarget(catalog.UDP, "three"),
+	}
+	opts := validBenchmarkOptions()
+	opts.Domains = []string{"one.example", "two.example", "three.example"}
+	opts.QueryTypes = []uint16{dns.TypeA}
+	opts.Sample = 3
+	opts.Concurrency = 2
+	opts.OnProgress = func(Progress) {}
+
+	type event struct {
+		target string
+		round  int
+		seq    int
+	}
+	run := func(order []catalog.Target) (Report, []event, int) {
+		var mu sync.Mutex
+		events := make([]event, 0, len(order)*opts.Sample)
+		active := 0
+		maxActive := 0
+		sequence := 0
+		factories := make(map[string]transport.Factory, len(order))
+		for _, target := range order {
+			target := target
+			delay := map[string]time.Duration{"one": 5 * time.Millisecond, "two": 30 * time.Millisecond, "three": 60 * time.Millisecond}[target.Address]
+			measured := 0
+			session := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+				if strings.HasSuffix(name, ".example") {
+					mu.Lock()
+					round := measured
+					measured++
+					active++
+					if active > maxActive {
+						maxActive = active
+					}
+					sequence++
+					events = append(events, event{target: target.Address, round: round, seq: sequence})
+					mu.Unlock()
+					time.Sleep(delay)
+					mu.Lock()
+					active--
+					mu.Unlock()
+				}
+				return replyFor(name, qtype), nil
+			}}
+			factories[target.Address] = &fakeFactory{opens: []fakeOpen{
+				{session: &fakeSession{}},
+				{session: &fakeSession{}},
+				{session: &fakeSession{}},
+				{session: session},
+			}}
+		}
+		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+			return factories[target.Address], nil
+		}
+		report, err := Run(context.Background(), order, opts)
+		if err != nil {
+			t.Fatalf("fair run failed: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return report, append([]event(nil), events...), maxActive
+	}
+
+	first, firstEvents, firstMax := run(targets)
+	reversed := append([]catalog.Target(nil), targets...)
+	sort.Slice(reversed, func(i, j int) bool { return reversed[i].Address > reversed[j].Address })
+	second, secondEvents, secondMax := run(reversed)
+	if firstMax > opts.Concurrency || secondMax > opts.Concurrency {
+		t.Fatalf("measured concurrency exceeded limit: %d/%d > %d", firstMax, secondMax, opts.Concurrency)
+	}
+	if len(firstEvents) != opts.Sample*len(targets) || len(secondEvents) != len(firstEvents) {
+		t.Fatalf("measured event counts = %d/%d", len(firstEvents), len(secondEvents))
+	}
+	for _, events := range [][]event{firstEvents, secondEvents} {
+		for round := 1; round < opts.Sample; round++ {
+			previousLast := 0
+			currentFirst := 0
+			for _, item := range events {
+				if item.round == round-1 && item.seq > previousLast {
+					previousLast = item.seq
+				}
+				if item.round == round && (currentFirst == 0 || item.seq < currentFirst) {
+					currentFirst = item.seq
+				}
+			}
+			if previousLast == 0 || currentFirst <= previousLast {
+				t.Fatalf("round %d was not fully completed before the next round: %#v", round, events)
+			}
+		}
+	}
+	normalizeRankings := func(rankings []Ranking) []Ranking {
+		normalized := append([]Ranking(nil), rankings...)
+		for index := range normalized {
+			normalized[index].Tie = false
+		}
+		return normalized
+	}
+	if !reflect.DeepEqual(normalizeRankings(first.Rankings), normalizeRankings(second.Rankings)) {
+		t.Fatalf("ranking order changed with target input order: %#v != %#v", first.Rankings, second.Rankings)
+	}
+	sequenceFor := func(events []event) map[string][]int {
+		got := make(map[string][]int)
+		for _, item := range events {
+			got[item.target] = append(got[item.target], item.round)
+		}
+		return got
+	}
+	if !reflect.DeepEqual(sequenceFor(firstEvents), sequenceFor(secondEvents)) {
+		t.Fatalf("per-target query rounds changed with target input order: %#v != %#v", firstEvents, secondEvents)
+	}
+}
+
+func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
+	oldTarget := runTargetFunc
+	oldFactory := newFactory
+	t.Cleanup(func() {
+		runTargetFunc = oldTarget
+		newFactory = oldFactory
+	})
+	target := testTarget(catalog.UDP, "edge")
+	query := Query{Name: "edge.example", QType: dns.TypeA}
+	opts := Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1}
+
+	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1, ResponseClass: "answer"}}}
+	}
+	runProtocol(context.Background(), []catalog.Target{target}, []Query{query}, Options{Concurrency: 5})
+	runTargetFunc = runTarget
+
+	runQueryRound(context.Background(), nil, query, 1)
+	readyRunner := &targetRunner{
+		target:  target,
+		opts:    opts,
+		ready:   true,
+		session: minimalSession{},
+		result:  TargetResult{Target: target},
+	}
+	cancelledRoundCtx, cancelRound := context.WithCancel(context.Background())
+	cancelRound()
+	runQueryRound(cancelledRoundCtx, []*targetRunner{readyRunner}, query, 1)
+	readyRunner.finished = false
+	readyRunner.ready = true
+	runQueryRound(context.Background(), []*targetRunner{readyRunner}, query, 0)
+	runQueryRound(context.Background(), []*targetRunner{readyRunner}, query, 5)
+	if readyRunner.measure(context.Background(), query) == false {
+		t.Fatal("ready runner did not measure a query")
+	}
+	readyRunner.finished = true
+	if readyRunner.measure(context.Background(), query) {
+		t.Fatal("finished runner measured a query")
+	}
+	readyRunner.finished = false
+	readyRunner.ready = false
+	if readyRunner.measure(context.Background(), query) {
+		t.Fatal("unready runner measured a query")
+	}
+	readyRunner.close()
+	readyRunner.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+			if index == 0 {
+				cancel()
+			}
+			return minimalSession{}, nil
+		}}, nil
+	}
+	results := runProtocol(ctx, []catalog.Target{target}, []Query{query}, opts)
+	if len(results) != 1 || !results[0].Incomplete {
+		t.Fatalf("fair prepare cancellation results = %#v", results)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	release := make(chan struct{})
+	blocking := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		if strings.HasSuffix(name, ".example") {
+			startedOnce.Do(func() { close(started) })
+			<-release
+		}
+		return replyFor(name, qtype), nil
+	}}
+	newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+		session := &fakeSession{}
+		if target.Address == "one" {
+			session = blocking
+		}
+		return &fakeFactory{opens: []fakeOpen{
+			{session: &fakeSession{}},
+			{session: &fakeSession{}},
+			{session: &fakeSession{}},
+			{session: session},
+		}}, nil
+	}
+	resultCh := make(chan []TargetResult, 1)
+	go func() {
+		resultCh <- runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "one"), testTarget(catalog.UDP, "two")}, []Query{query}, opts)
+	}()
+	<-started
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+	close(release)
+	results = <-resultCh
+	if len(results) != 2 || !results[0].Incomplete || !results[1].Incomplete {
+		t.Fatalf("fair measured cancellation results = %#v", results)
 	}
 }
 

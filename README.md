@@ -324,7 +324,7 @@ Useful flags include:
 --seed N            reproduce a domain order
 --type A,AAAA       record types to query
 --timeout 2s        per-endpoint timeout
---concurrency 4    maximum concurrent endpoint workers
+--concurrency 4    maximum measured DNS exchanges in flight per protocol
 --format table|json|csv
 --output PATH       write output to a file
 --no-color          disable terminal colors

@@ -14,10 +14,16 @@ sampling, and the same shuffled matrix is given to every resolver eligible for
 the same protocol.
 
 Protocols are benchmarked separately in the order `udp`, `tcp`, `doh`, `dot`,
-and `doq`. Up to the configured concurrency limit of resolver targets run in
-parallel within one protocol group. A target has one worker, so its queries
-remain ordered and its reusable connection is not shared with another target.
-There is no transport fallback.
+and `doq`. Targets are ordered by their complete target identity rather than
+catalog input order. Each dispatched target is prepared once and keeps one
+reusable measured session. The measured phase advances in synchronized query
+rounds: every eligible target receives query `i` before any target receives
+query `i+1`. At most the configured `--concurrency` number of measured DNS
+exchanges are in flight at once, and a target's session is never used
+concurrently. This preserves bounded active work while preventing early
+catalog entries from receiving a different sequence of measurement rounds.
+Preparation (cold probes and warmups) is kept separate from the measured
+rounds. There is no transport fallback.
 
 Three excluded warm-up queries are sent before the measured phase. Encrypted
 and stream transports reuse their connections during measured queries. UDP

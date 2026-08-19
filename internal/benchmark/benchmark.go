@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -156,8 +157,8 @@ func (r Report) ResultFor(id string) (TargetResult, bool) {
 }
 
 // Run executes one protocol group at a time. All targets in a group receive
-// the same shuffled query sequence, while the worker limit prevents a run from
-// creating an unbounded number of simultaneous connections.
+// the same shuffled query sequence. The production scheduler interleaves
+// measured rounds while bounding the number of in-flight exchanges.
 func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, error) {
 	if err := validateOptions(opts); err != nil {
 		return Report{}, err
@@ -253,6 +254,15 @@ func buildQueries(opts Options) ([]Query, error) {
 }
 
 func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
+	// Existing tests and internal callers can replace runTargetFunc as a
+	// lightweight target-level seam. Production uses the fair scheduler below.
+	if reflect.ValueOf(runTargetFunc).Pointer() != reflect.ValueOf(runTarget).Pointer() {
+		return runProtocolLegacy(ctx, targets, queries, opts)
+	}
+	return runProtocolFair(ctx, targets, queries, opts)
+}
+
+func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
 	results := make([]TargetResult, len(targets))
 	dispatched := make([]bool, len(targets))
 	jobs := make(chan int)
@@ -299,6 +309,106 @@ func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query,
 	return dispatchedResults(results, dispatched)
 }
 
+func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
+	orderedTargets := append([]catalog.Target(nil), targets...)
+	sort.Slice(orderedTargets, func(i, j int) bool {
+		return orderedTargets[i].ID() < orderedTargets[j].ID()
+	})
+
+	runners := make([]*targetRunner, 0, len(orderedTargets))
+	ready := make([]*targetRunner, 0, len(orderedTargets))
+	for _, target := range orderedTargets {
+		if ctx.Err() != nil {
+			break
+		}
+		runner := newTargetRunner(ctx, target, queries, opts)
+		runners = append(runners, runner)
+		if runner.prepare(ctx) {
+			ready = append(ready, runner)
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	if ctx.Err() == nil {
+		for _, query := range queries {
+			runQueryRound(ctx, ready, query, opts.Concurrency)
+			if ctx.Err() != nil {
+				break
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		for _, runner := range ready {
+			runner.abort(ctx.Err())
+		}
+	}
+
+	results := make([]TargetResult, 0, len(runners))
+	for index, runner := range runners {
+		runner.close()
+		results = append(results, runner.result)
+		if opts.OnProgress != nil {
+			opts.OnProgress(Progress{
+				Protocol:  runner.target.Protocol,
+				Completed: index + 1,
+				Total:     len(targets),
+				Target:    runner.target,
+			})
+		}
+	}
+	return results
+}
+
+func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, concurrency int) {
+	if len(runners) == 0 {
+		return
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > len(runners) {
+		concurrency = len(runners)
+	}
+	jobs := make(chan int)
+	dispatched := make([]bool, len(runners))
+	var wg sync.WaitGroup
+	for worker := 0; worker < concurrency; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				runners[index].measure(ctx, query)
+			}
+		}()
+	}
+	for index := range runners {
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case jobs <- index:
+			dispatched[index] = true
+		case <-ctx.Done():
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if ctx.Err() != nil {
+		for index, wasDispatched := range dispatched {
+			if !wasDispatched {
+				runners[index].abort(ctx.Err())
+			}
+		}
+	}
+}
+
 func dispatchedResults(results []TargetResult, dispatched []bool) []TargetResult {
 	compacted := make([]TargetResult, 0, len(results))
 	for index, wasDispatched := range dispatched {
@@ -309,38 +419,71 @@ func dispatchedResults(results []TargetResult, dispatched []bool) []TargetResult
 	return compacted
 }
 
-func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts Options) TargetResult {
-	result := TargetResult{Target: target, Observations: make([]Observation, 0, len(queries))}
+// targetRunner owns one target's reusable measured session. The fair
+// scheduler prepares all dispatched targets, then advances every target by
+// one measured query round at a time. Only query calls are concurrent; a
+// runner is never asked to use its session concurrently.
+type targetRunner struct {
+	target   catalog.Target
+	queries  []Query
+	opts     Options
+	result   TargetResult
+	factory  transport.Factory
+	session  transport.Session
+	ready    bool
+	finished bool
+	closed   bool
+}
+
+func newTargetRunner(ctx context.Context, target catalog.Target, queries []Query, opts Options) *targetRunner {
+	runner := &targetRunner{
+		target:  target,
+		queries: queries,
+		opts:    opts,
+		result: TargetResult{
+			Target:       target,
+			Observations: make([]Observation, 0, len(queries)),
+		},
+	}
 	factory, err := newFactory(target, opts.Timeout)
 	if err != nil {
 		if ctx.Err() != nil {
-			markIncomplete(&result, ctx.Err())
-			return result
+			runner.abort(ctx.Err())
+			return runner
 		}
-		result.OpenError = err.Error()
-		result.Observations = failedObservations(queries, err)
-		return result
+		runner.result.OpenError = err.Error()
+		runner.result.Observations = failedObservations(queries, err)
+		runner.finished = true
+		return runner
+	}
+	runner.factory = factory
+	return runner
+}
+
+func (runner *targetRunner) prepare(ctx context.Context) bool {
+	if runner.finished {
+		return false
 	}
 	for index := 0; index < 3; index++ {
 		if ctx.Err() != nil {
-			markIncomplete(&result, ctx.Err())
-			return result
+			runner.abort(ctx.Err())
+			return false
 		}
 		probe := warmupNames[index%len(warmupNames)]
-		qtype := opts.QueryTypes[index%len(opts.QueryTypes)]
+		qtype := runner.opts.QueryTypes[index%len(runner.opts.QueryTypes)]
 		started := time.Now()
-		session, openErr := factory.Open(ctx)
+		session, openErr := runner.factory.Open(ctx)
 		observation := ColdObservation{Name: probe, QType: qtype}
 		if openErr != nil {
 			observation.Error = openErr.Error()
-			result.Cold = append(result.Cold, observation)
+			runner.result.Cold = append(runner.result.Cold, observation)
 			if ctx.Err() != nil {
-				markIncomplete(&result, ctx.Err())
-				return result
+				runner.abort(ctx.Err())
+				return false
 			}
 			continue
 		}
-		queryCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+		queryCtx, cancel := context.WithTimeout(ctx, runner.opts.Timeout)
 		_, queryErr := session.Query(queryCtx, probe, qtype)
 		// Cold latency ends when the DNS exchange returns. Session teardown is
 		// deliberately excluded because its cost differs by transport.
@@ -353,79 +496,115 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 		} else {
 			observation.Success = true
 		}
-		result.Cold = append(result.Cold, observation)
+		runner.result.Cold = append(runner.result.Cold, observation)
 		if ctx.Err() != nil {
-			markIncomplete(&result, ctx.Err())
-			return result
+			runner.abort(ctx.Err())
+			return false
 		}
 	}
 
-	session, err := factory.Open(ctx)
+	session, err := runner.factory.Open(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
-			markIncomplete(&result, ctx.Err())
-			return result
+			runner.abort(ctx.Err())
+			return false
 		}
-		result.OpenError = err.Error()
-		result.Observations = failedObservations(queries, err)
-		return result
+		runner.result.OpenError = err.Error()
+		runner.result.Observations = failedObservations(runner.queries, err)
+		runner.finished = true
+		return false
 	}
-	defer session.Close()
+	runner.session = session
 	for index, name := range warmupNames {
 		if ctx.Err() != nil {
-			markIncomplete(&result, ctx.Err())
-			return result
+			runner.abort(ctx.Err())
+			return false
 		}
-		warmupType := opts.QueryTypes[index%len(opts.QueryTypes)]
-		warmupCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
-		_, _ = session.Query(warmupCtx, name, warmupType)
+		warmupType := runner.opts.QueryTypes[index%len(runner.opts.QueryTypes)]
+		warmupCtx, cancel := context.WithTimeout(ctx, runner.opts.Timeout)
+		_, _ = runner.session.Query(warmupCtx, name, warmupType)
 		cancel()
 		if ctx.Err() != nil {
-			markIncomplete(&result, ctx.Err())
-			return result
+			runner.abort(ctx.Err())
+			return false
 		}
 	}
-	result.DialAddress = sessionDialAddress(session)
-	for _, query := range queries {
-		observation := Observation{Name: query.Name, QType: query.QType}
-		if ctx.Err() != nil {
-			markIncomplete(&result, ctx.Err())
-			return result
-		}
-		started := time.Now()
-		queryCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
-		message, queryErr := session.Query(queryCtx, query.Name, query.QType)
-		observation.Reconnected = sessionQueryReconnected(session)
-		cancel()
-		if ctx.Err() != nil {
-			// The parent benchmark cancellation is not a DNS failure sample. Do
-			// not manufacture an observation for work that did not complete.
-			markIncomplete(&result, ctx.Err())
-			return result
-		}
-		observation.Latency = time.Since(started)
-		observation.LatencyMS = durationMS(observation.Latency)
-		if queryErr != nil {
-			observation.Error = queryErr.Error()
-		} else if message == nil {
-			// The transport should normally return an error for a nil
-			// response; keep the benchmark defensive at this boundary.
-			observation.Error = "empty DNS response"
+	runner.result.DialAddress = sessionDialAddress(runner.session)
+	runner.ready = true
+	return true
+}
+
+func (runner *targetRunner) measure(ctx context.Context, query Query) bool {
+	if runner.finished || !runner.ready {
+		return false
+	}
+	if ctx.Err() != nil {
+		runner.abort(ctx.Err())
+		return false
+	}
+	observation := Observation{Name: query.Name, QType: query.QType}
+	started := time.Now()
+	queryCtx, cancel := context.WithTimeout(ctx, runner.opts.Timeout)
+	message, queryErr := runner.session.Query(queryCtx, query.Name, query.QType)
+	observation.Reconnected = sessionQueryReconnected(runner.session)
+	cancel()
+	if ctx.Err() != nil {
+		// The parent benchmark cancellation is not a DNS failure sample. Do
+		// not manufacture an observation for work that did not complete.
+		runner.abort(ctx.Err())
+		return false
+	}
+	observation.Latency = time.Since(started)
+	observation.LatencyMS = durationMS(observation.Latency)
+	if queryErr != nil {
+		observation.Error = queryErr.Error()
+	} else if message == nil {
+		// The transport should normally return an error for a nil response;
+		// keep the benchmark defensive at this boundary.
+		observation.Error = "empty DNS response"
+	} else {
+		observation.RCode = message.Rcode
+		observation.Truncated = message.Truncated
+		if message.Truncated {
+			observation.Error = "truncated DNS response"
 		} else {
-			observation.RCode = message.Rcode
-			observation.Truncated = message.Truncated
-			if message.Truncated {
-				observation.Error = "truncated DNS response"
-			} else {
-				observation.Success = true
-				observation.ResponseClass = transport.ResponseClass(message)
-				observation.Usable = transport.IsUsableResponse(message)
+			observation.Success = true
+			observation.ResponseClass = transport.ResponseClass(message)
+			observation.Usable = transport.IsUsableResponse(message)
+		}
+	}
+	runner.result.Observations = append(runner.result.Observations, observation)
+	return true
+}
+
+func (runner *targetRunner) abort(err error) {
+	runner.ready = false
+	runner.finished = true
+	markIncomplete(&runner.result, err)
+}
+
+func (runner *targetRunner) close() {
+	if runner.closed {
+		return
+	}
+	runner.closed = true
+	if runner.session != nil {
+		runner.result.DialAddress = sessionDialAddress(runner.session)
+		_ = runner.session.Close()
+	}
+}
+
+func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts Options) TargetResult {
+	runner := newTargetRunner(ctx, target, queries, opts)
+	if runner.prepare(ctx) {
+		for _, query := range queries {
+			if !runner.measure(ctx, query) {
+				break
 			}
 		}
-		result.Observations = append(result.Observations, observation)
 	}
-	result.DialAddress = sessionDialAddress(session)
-	return result
+	runner.close()
+	return runner.result
 }
 
 func markIncomplete(result *TargetResult, err error) {
