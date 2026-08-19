@@ -7,11 +7,14 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
@@ -22,6 +25,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/internal/version"
 	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
+	"golang.org/x/text/width"
 )
 
 type cliConfig struct {
@@ -61,6 +65,7 @@ var verifyCorpusFunc = data.VerifyCorpus
 var writeTableReport = report.WriteTableWithOptions
 var writeJSONReport = report.WriteJSON
 var writeCSVReport = report.WriteCSV
+var outputWriterFunc = outputWriter
 
 var terminalDetector = fileIsTerminal
 
@@ -138,11 +143,12 @@ func (p *progressRenderer) Update(update benchmark.Progress) {
 	if p.interactive {
 		line := p.progressLine()
 		padding := ""
-		if p.lastLineWidth > len(line) {
-			padding = strings.Repeat(" ", p.lastLineWidth-len(line))
+		lineWidth := displayWidth(line)
+		if p.lastLineWidth > lineWidth {
+			padding = strings.Repeat(" ", p.lastLineWidth-lineWidth)
 		}
 		_, _ = fmt.Fprintf(p.writer, "\r%s%s", line, padding)
-		p.lastLineWidth = len(line)
+		p.lastLineWidth = lineWidth
 		p.rendered = true
 		return
 	}
@@ -162,6 +168,26 @@ func (p *progressRenderer) progressLine() string {
 		parts = append(parts, fmt.Sprintf("%s %d/%d", protocol, p.completed[protocol], total))
 	}
 	return strings.Join(parts, " | ")
+}
+
+// displayWidth returns the number of terminal cells used by a progress line.
+// Resolver metadata can contain Unicode, so byte length is not a safe measure
+// when erasing the previous line. Combining marks occupy no cells and common
+// wide/full-width characters occupy two.
+func displayWidth(value string) int {
+	result := 0
+	for _, character := range value {
+		if unicode.Is(unicode.Mn, character) || unicode.Is(unicode.Me, character) {
+			continue
+		}
+		switch width.LookupRune(character).Kind() {
+		case width.EastAsianWide, width.EastAsianFullwidth:
+			result += 2
+		default:
+			result++
+		}
+	}
+	return result
 }
 
 func (p *progressRenderer) Finish() {
@@ -248,7 +274,7 @@ func newResolversCommand() *cobra.Command {
 				for protocol := range resolver.Transports {
 					protocols = append(protocols, protocol.String())
 				}
-				sortStrings(protocols)
+				sort.Strings(protocols)
 				fmt.Fprintf(cmd.OutOrStdout(), "%-16s %-22s %-24s %-34s %s\n", resolver.ID, resolver.Owner, strings.Join(resolver.Addresses, ","), resolver.Policy, strings.Join(protocols, ","))
 			}
 			return nil
@@ -379,34 +405,40 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if concurrencyCapped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
 	}
-	writer, closeWriter, err := outputWriter(config.output)
+	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {
 		return err
 	}
-	defer closeWriter()
 	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
 		result.Warnings = append(result.Warnings, "benchmark interrupted before all targets completed")
 	}
+	var reportErr error
 	switch strings.ToLower(config.format) {
 	case "table":
-		err = writeTableReport(writer, result, report.TableOptions{
+		reportErr = writeTableReport(writer, result, report.TableOptions{
 			Details: config.details, Color: tableColorEnabled(config), ProfileView: config.profileView, RedactSystem: config.redactSystem, Profiles: profiles, Protocols: selected,
 		})
 	case "json":
 		if config.redactSystem || config.profileView {
-			err = report.WriteJSONWithOptions(writer, result, config.raw, report.JSONOptions{RedactSystem: config.redactSystem, ProfileView: config.profileView})
+			reportErr = report.WriteJSONWithOptions(writer, result, config.raw, report.JSONOptions{RedactSystem: config.redactSystem, ProfileView: config.profileView})
 		} else {
-			err = writeJSONReport(writer, result, config.raw)
+			reportErr = writeJSONReport(writer, result, config.raw)
 		}
 	case "csv":
 		if config.redactSystem {
-			err = report.WriteCSVWithOptions(writer, result, report.CSVOptions{RedactSystem: true})
+			reportErr = report.WriteCSVWithOptions(writer, result, report.CSVOptions{RedactSystem: true})
 		} else {
-			err = writeCSVReport(writer, result)
+			reportErr = writeCSVReport(writer, result)
 		}
 	}
-	if err != nil {
+	if err := finalizeOutput(reportErr == nil); err != nil {
+		if reportErr != nil {
+			return fmt.Errorf("write report: %v; finalize output: %w", reportErr, err)
+		}
 		return err
+	}
+	if reportErr != nil {
+		return reportErr
 	}
 	if runErr != nil {
 		return runErr
@@ -496,23 +528,64 @@ func parseQueryTypes(value string) ([]uint16, error) {
 	return types, nil
 }
 
-func outputWriter(path string) (io.Writer, func(), error) {
-	if strings.TrimSpace(path) == "" || path == "-" {
-		return os.Stdout, func() {}, nil
-	}
-	file, err := os.Create(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create output file: %w", err)
-	}
-	return file, func() { _ = file.Close() }, nil
+type outputFinalizer func(commit bool) error
+
+type outputFileHandle interface {
+	io.Writer
+	Sync() error
+	Close() error
+	Name() string
 }
 
-func sortStrings(values []string) {
-	for i := 0; i < len(values); i++ {
-		for j := i + 1; j < len(values); j++ {
-			if values[j] < values[i] {
-				values[i], values[j] = values[j], values[i]
-			}
-		}
+var statOutputPath = os.Stat
+var createTempOutputFile = func(directory, pattern string) (outputFileHandle, error) {
+	return os.CreateTemp(directory, pattern)
+}
+var removeOutputFile = os.Remove
+var renameOutputFile = os.Rename
+
+func outputWriter(path string) (io.Writer, outputFinalizer, error) {
+	if strings.TrimSpace(path) == "" || path == "-" {
+		return os.Stdout, func(bool) error { return nil }, nil
 	}
+	if info, err := statOutputPath(path); err == nil && info.IsDir() {
+		return nil, nil, fmt.Errorf("output path is a directory: %s", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("inspect output path: %w", err)
+	}
+	directory := filepath.Dir(path)
+	base := filepath.Base(path)
+	file, err := createTempOutputFile(directory, "."+base+".speedns-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create temporary output file: %w", err)
+	}
+	temporaryPath := file.Name()
+	finalize := func(commit bool) error {
+		if !commit {
+			closeErr := file.Close()
+			removeErr := removeOutputFile(temporaryPath)
+			if closeErr != nil {
+				return fmt.Errorf("discard output file: %w", closeErr)
+			}
+			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return fmt.Errorf("remove temporary output file: %w", removeErr)
+			}
+			return nil
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			_ = removeOutputFile(temporaryPath)
+			return fmt.Errorf("flush output file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			_ = removeOutputFile(temporaryPath)
+			return fmt.Errorf("close output file: %w", err)
+		}
+		if err := renameOutputFile(temporaryPath, path); err != nil {
+			_ = removeOutputFile(temporaryPath)
+			return fmt.Errorf("replace output file: %w", err)
+		}
+		return nil
+	}
+	return file, finalize, nil
 }

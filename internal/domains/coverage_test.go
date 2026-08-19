@@ -43,15 +43,15 @@ func TestLoadReaderReportsScannerFailures(t *testing.T) {
 	}
 }
 
-func TestValidateIgnoresEmptyInputsAndRequiresAName(t *testing.T) {
-	got, err := validate([]string{" ", "# comment", "Example.COM.", "example.com", "example.org."})
+func TestNormalizeIgnoresEmptyInputsAndRequiresAName(t *testing.T) {
+	got, err := Normalize([]string{" ", "# comment", "Example.COM.", "example.com", "example.org."})
 	if err != nil || len(got) != 2 || got[0] != "example.com" || got[1] != "example.org" {
 		t.Fatalf("validated names = %#v/%v", got, err)
 	}
-	if _, err := validate(nil); err == nil {
+	if _, err := Normalize(nil); err == nil {
 		t.Fatal("expected nil validation input to fail")
 	}
-	if _, err := validate([]string{"example..com"}); err == nil {
+	if _, err := Normalize([]string{"example..com"}); err == nil {
 		t.Fatal("expected invalid name to fail")
 	}
 }

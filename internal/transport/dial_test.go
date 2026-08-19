@@ -338,6 +338,9 @@ func TestDoHFactoryUsesBootstrapCandidates(t *testing.T) {
 	}
 	defer session.Close()
 	transport := session.(*doHSession).client.Transport.(*http.Transport)
+	if transport.MaxResponseHeaderBytes != doHMaxResponseHeaderBytes {
+		t.Fatalf("DoH response header limit = %d, want %d", transport.MaxResponseHeaderBytes, doHMaxResponseHeaderBytes)
+	}
 	conn, err := transport.DialContext(context.Background(), "", "ignored")
 	if err != nil {
 		t.Fatal(err)

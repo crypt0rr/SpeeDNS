@@ -75,10 +75,6 @@ func loadReader(reader io.Reader) ([]string, error) {
 	return validateInputs(lines)
 }
 
-func validate(lines []string) ([]string, error) {
-	return Normalize(lines)
-}
-
 // Normalize validates and canonicalizes a list of domain names. It is shared
 // by embedded data, custom files, and benchmark callers that provide names
 // directly instead of going through Load.

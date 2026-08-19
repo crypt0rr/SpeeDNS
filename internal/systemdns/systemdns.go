@@ -95,21 +95,6 @@ func discoverMacOSSources(ctx context.Context) ([]resolverSource, error) {
 	return plainSources(addresses), nil
 }
 
-// discoverMacOS retains the address-only helper for callers that only need a
-// flattened view. Discover uses discoverMacOSSources so it does not lose scope
-// and interface metadata.
-func discoverMacOS(ctx context.Context) ([]string, error) {
-	sources, err := discoverMacOSSources(ctx)
-	if err != nil {
-		return nil, err
-	}
-	addresses := make([]string, 0, len(sources))
-	for _, source := range sources {
-		addresses = append(addresses, source.Address)
-	}
-	return addresses, nil
-}
-
 func parseMacOSSources(output []byte) []resolverSource {
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	var sources []resolverSource

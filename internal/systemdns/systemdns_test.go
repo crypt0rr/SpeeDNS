@@ -111,10 +111,6 @@ resolver #4
 	if profiles[4].Scope != "global" || !strings.Contains(profiles[4].Name, "scope: global") {
 		t.Fatalf("global scope metadata = %#v", profiles[4])
 	}
-	addresses, err := discoverMacOS(context.Background())
-	if err != nil || len(addresses) != 5 || addresses[0] != "192.0.2.1" || addresses[1] != "2001:db8::1" || addresses[2] != "192.0.2.1" {
-		t.Fatalf("flattened macOS addresses = %#v/%v", addresses, err)
-	}
 }
 
 func TestDiscoverMacOSFallbacks(t *testing.T) {
@@ -133,16 +129,16 @@ func TestDiscoverMacOSFallbacks(t *testing.T) {
 		return &testReadCloser{Reader: strings.NewReader("nameserver 192.0.2.9\n")}, nil
 	}
 	runScutil = func(context.Context) ([]byte, error) { return []byte("no resolver records\n"), nil }
-	addresses, err := discoverMacOS(context.Background())
-	if err != nil || len(addresses) != 1 || addresses[0] != "192.0.2.9" {
-		t.Fatalf("no-match fallback = %#v/%v", addresses, err)
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 1 || profiles[0].Addresses[0] != "192.0.2.9" {
+		t.Fatalf("no-match fallback = %#v/%v", profiles, err)
 	}
 	runScutil = func(context.Context) ([]byte, error) { return nil, errors.New("scutil failed") }
-	if addresses, err = discoverMacOS(context.Background()); err != nil || len(addresses) != 1 {
-		t.Fatalf("command-error fallback = %#v/%v", addresses, err)
+	if profiles, err = Discover(context.Background()); err != nil || len(profiles) != 1 {
+		t.Fatalf("command-error fallback = %#v/%v", profiles, err)
 	}
 	openResolvConf = func() (io.ReadCloser, error) { return nil, errors.New("fallback failed") }
-	if _, err := discoverMacOS(context.Background()); err == nil || !strings.Contains(err.Error(), "fallback failed") {
+	if _, err := Discover(context.Background()); err == nil || !strings.Contains(err.Error(), "fallback failed") {
 		t.Fatalf("fallback error = %v", err)
 	}
 }

@@ -422,6 +422,11 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
 }
 
+// DNS-over-HTTPS responses are small DNS messages. Keep response headers
+// bounded independently from the already bounded response body so a hostile
+// endpoint cannot force an unnecessarily large header allocation per query.
+const doHMaxResponseHeaderBytes = 64 << 10
+
 func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -460,8 +465,9 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 	}
 	transport := &http.Transport{
-		ForceAttemptHTTP2: true,
-		TLSClientConfig:   tlsConfig,
+		ForceAttemptHTTP2:      true,
+		TLSClientConfig:        tlsConfig,
+		MaxResponseHeaderBytes: doHMaxResponseHeaderBytes,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return plan.dialTCP(ctx, network, session.setDialAddress)
 		},
