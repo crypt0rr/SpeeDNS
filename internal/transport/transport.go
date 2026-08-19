@@ -46,6 +46,115 @@ type doqConn interface {
 	CloseWithError(quic.ApplicationErrorCode, string) error
 }
 
+// dialPlan contains the ordered network addresses used to open one logical
+// endpoint. Bootstrap addresses are connection candidates, not separately
+// ranked resolver targets. Once one candidate succeeds, the resulting session
+// is reused by the benchmark worker.
+type dialPlan struct {
+	addresses []string
+	timeout   time.Duration
+}
+
+func newDialPlan(targetAddress string, bootstrapAddresses []string, port int, timeout time.Duration) dialPlan {
+	candidates := bootstrapAddresses
+	if len(candidates) == 0 {
+		candidates = []string{targetAddress}
+	}
+	addresses := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		addresses = append(addresses, joinAddress(candidate, port))
+	}
+	return dialPlan{addresses: addresses, timeout: timeout}
+}
+
+func singleDialPlan(address string, timeout time.Duration) dialPlan {
+	if strings.TrimSpace(address) == "" {
+		return dialPlan{timeout: timeout}
+	}
+	return dialPlan{addresses: []string{address}, timeout: timeout}
+}
+
+func (p dialPlan) openContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if p.timeout <= 0 {
+		return ctx, func() {}
+	}
+	deadline := time.Now().Add(p.timeout)
+	if existing, hasDeadline := ctx.Deadline(); hasDeadline && existing.Before(deadline) {
+		return ctx, func() {}
+	}
+	return context.WithDeadline(ctx, deadline)
+}
+
+func (p dialPlan) failed(errs []error) error {
+	if len(errs) == 0 {
+		return errors.New("no connection candidates configured")
+	}
+	parts := make([]string, 0, len(errs))
+	for _, err := range errs {
+		parts = append(parts, err.Error())
+	}
+	return fmt.Errorf("all connection candidates failed: %s", strings.Join(parts, "; "))
+}
+
+func (p dialPlan) dialTCP(ctx context.Context, network string, onConnected func(string)) (net.Conn, error) {
+	openCtx, cancel := p.openContext(ctx)
+	defer cancel()
+	if network == "" {
+		network = "tcp"
+	}
+	dialer := &net.Dialer{Timeout: p.timeout}
+	errs := make([]error, 0, len(p.addresses))
+	for _, address := range p.addresses {
+		conn, err := dialer.DialContext(openCtx, network, address)
+		if err == nil {
+			if onConnected != nil {
+				onConnected(address)
+			}
+			return conn, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", address, err))
+		if openCtx.Err() != nil {
+			break
+		}
+	}
+	return nil, p.failed(errs)
+}
+
+func (p dialPlan) openStream(ctx context.Context, tlsConfig *tls.Config) (net.Conn, string, error) {
+	openCtx, cancel := p.openContext(ctx)
+	defer cancel()
+	dialer := &net.Dialer{Timeout: p.timeout}
+	errs := make([]error, 0, len(p.addresses))
+	for _, address := range p.addresses {
+		conn, err := dialer.DialContext(openCtx, "tcp", address)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", address, err))
+			if openCtx.Err() != nil {
+				break
+			}
+			continue
+		}
+		if tlsConfig != nil {
+			tlsConn := tls.Client(conn, tlsConfig.Clone())
+			if err := tlsConn.HandshakeContext(openCtx); err != nil {
+				_ = conn.Close()
+				errs = append(errs, fmt.Errorf("%s: TLS handshake: %w", address, err))
+				if openCtx.Err() != nil {
+					break
+				}
+				continue
+			}
+			conn = tlsConn
+		}
+		return conn, address, nil
+	}
+	return nil, "", p.failed(errs)
+}
+
 type quicConnAdapter struct{ conn *quic.Conn }
 
 func (c quicConnAdapter) OpenStreamSync(ctx context.Context) (doqStream, error) {
@@ -70,20 +179,22 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	if timeout <= 0 {
 		return nil, errors.New("transport timeout must be positive")
 	}
-	address := joinAddress(target.Address, target.Spec.Port)
+	connectionPlan := newDialPlan(target.Address, target.Spec.BootstrapAddresses, target.Spec.Port, timeout)
+	address := firstAddress(connectionPlan)
 	switch target.Protocol {
 	case catalog.UDP:
-		return &udpFactory{address: address, timeout: timeout}, nil
+		return &udpFactory{address: joinAddress(target.Address, target.Spec.Port), timeout: timeout}, nil
 	case catalog.TCP:
-		return &streamFactory{address: address, timeout: timeout}, nil
+		return &streamFactory{address: address, connectionPlan: connectionPlan, timeout: timeout}, nil
 	case catalog.DoT:
 		serverName := target.Spec.ServerName
 		if serverName == "" {
 			serverName = target.Address
 		}
 		return &streamFactory{
-			address: address,
-			timeout: timeout,
+			address:        address,
+			connectionPlan: connectionPlan,
+			timeout:        timeout,
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				ServerName: serverName,
@@ -97,8 +208,9 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			serverName = target.Address
 		}
 		return &doqFactory{
-			address: address,
-			timeout: timeout,
+			address:        address,
+			connectionPlan: connectionPlan,
+			timeout:        timeout,
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS13,
 				ServerName: serverName,
@@ -120,26 +232,22 @@ func (f *udpFactory) Open(context.Context) (Session, error) {
 }
 
 type streamFactory struct {
-	address   string
-	timeout   time.Duration
-	tlsConfig *tls.Config
+	address        string
+	connectionPlan dialPlan
+	timeout        time.Duration
+	tlsConfig      *tls.Config
 }
 
 func (f *streamFactory) Open(ctx context.Context) (Session, error) {
-	dialer := net.Dialer{Timeout: f.timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", f.address)
+	plan := f.connectionPlan
+	if len(plan.addresses) == 0 {
+		plan = singleDialPlan(f.address, f.timeout)
+	}
+	conn, dialAddress, err := plan.openStream(ctx, f.tlsConfig)
 	if err != nil {
 		return nil, err
 	}
-	if f.tlsConfig != nil {
-		tlsConn := tls.Client(conn, f.tlsConfig.Clone())
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-		conn = tlsConn
-	}
-	return &streamSession{conn: conn, timeout: f.timeout, secure: f.tlsConfig != nil}, nil
+	return &streamSession{conn: conn, timeout: f.timeout, secure: f.tlsConfig != nil, dialAddress: dialAddress}, nil
 }
 
 type udpSession struct {
@@ -163,11 +271,14 @@ func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 func (s *udpSession) Close() error { return nil }
 
 type streamSession struct {
-	conn    net.Conn
-	mu      sync.Mutex
-	timeout time.Duration
-	secure  bool
+	conn        net.Conn
+	mu          sync.Mutex
+	timeout     time.Duration
+	secure      bool
+	dialAddress string
 }
+
+func (s *streamSession) DialAddress() string { return s.dialAddress }
 
 func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	s.mu.Lock()
@@ -215,10 +326,15 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 func (s *streamSession) Close() error { return s.conn.Close() }
 
 type doHFactory struct {
-	url        string
-	dialAddr   string
-	serverName string
-	timeout    time.Duration
+	url            string
+	dialAddr       string
+	connectionPlan dialPlan
+	serverName     string
+	timeout        time.Duration
+}
+
+var newDoHTLSConfig = func(serverName string) *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
 }
 
 func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
@@ -238,40 +354,77 @@ func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error
 	if dialAddress == "" {
 		dialAddress = u.Hostname()
 	}
+	connectionPlan := newDialPlan(dialAddress, target.Spec.BootstrapAddresses, port, timeout)
 	return &doHFactory{
-		url:        target.Spec.URL,
-		dialAddr:   joinAddress(dialAddress, port),
-		serverName: serverName,
-		timeout:    timeout,
+		url:            target.Spec.URL,
+		dialAddr:       joinAddress(dialAddress, port),
+		connectionPlan: connectionPlan,
+		serverName:     serverName,
+		timeout:        timeout,
 	}, nil
 }
 
 func (f *doHFactory) Open(context.Context) (Session, error) {
-	dialer := &net.Dialer{Timeout: f.timeout}
+	plan := f.connectionPlan
+	if len(plan.addresses) == 0 {
+		plan = singleDialPlan(f.dialAddr, f.timeout)
+	}
+	session := &doHSession{endpoint: f.url}
+	tlsConfig := newDoHTLSConfig(f.serverName)
+	if len(tlsConfig.NextProtos) == 0 {
+		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
+	}
 	transport := &http.Transport{
 		ForceAttemptHTTP2: true,
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			ServerName: f.serverName,
-		},
+		TLSClientConfig:   tlsConfig,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, f.dialAddr)
+			return plan.dialTCP(ctx, network, session.setDialAddress)
+		},
+		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			conn, address, err := plan.openStream(ctx, tlsConfig)
+			if err == nil {
+				session.setDialAddress(address)
+			}
+			return conn, err
 		},
 	}
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   f.timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) > 0 && !sameHost(via[0].URL, req.URL) {
-				return errors.New("DoH redirect changed host")
+			if len(via) > 0 && !sameHTTPSOrigin(via[0].URL, req.URL) {
+				return errors.New("DoH redirect changed HTTPS origin")
 			}
 			return nil
 		},
 	}
-	return &doHSession{client: client, transport: transport, endpoint: f.url}, nil
+	session.client = client
+	session.transport = transport
+	return session, nil
 }
 
 func sameHost(a, b *url.URL) bool { return strings.EqualFold(a.Hostname(), b.Hostname()) }
+
+func sameHTTPSOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || !strings.EqualFold(a.Scheme, "https") || !strings.EqualFold(b.Scheme, "https") {
+		return false
+	}
+	return sameHost(a, b) && effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	return "443"
+}
+
+func firstAddress(plan dialPlan) string {
+	if len(plan.addresses) == 0 {
+		return ""
+	}
+	return plan.addresses[0]
+}
 
 func joinAddress(host string, port int) string {
 	host = strings.TrimSpace(host)
@@ -285,6 +438,20 @@ type doHSession struct {
 	client    *http.Client
 	transport *http.Transport
 	endpoint  string
+	mu        sync.RWMutex
+	dialAddr  string
+}
+
+func (s *doHSession) setDialAddress(address string) {
+	s.mu.Lock()
+	s.dialAddr = address
+	s.mu.Unlock()
+}
+
+func (s *doHSession) DialAddress() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dialAddr
 }
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
@@ -330,26 +497,43 @@ func (s *doHSession) Close() error {
 }
 
 type doqFactory struct {
-	address   string
-	timeout   time.Duration
-	tlsConfig *tls.Config
+	address        string
+	connectionPlan dialPlan
+	timeout        time.Duration
+	tlsConfig      *tls.Config
 }
 
 func (f *doqFactory) Open(ctx context.Context) (Session, error) {
-	conn, err := dialDoQ(ctx, f.address, f.tlsConfig.Clone(), &quic.Config{
-		HandshakeIdleTimeout: f.timeout,
-		MaxIdleTimeout:       f.timeout * 2,
-	})
-	if err != nil {
-		return nil, err
+	plan := f.connectionPlan
+	if len(plan.addresses) == 0 {
+		plan = singleDialPlan(f.address, f.timeout)
 	}
-	return &doqSession{conn: conn, timeout: f.timeout}, nil
+	openCtx, cancel := plan.openContext(ctx)
+	defer cancel()
+	errs := make([]error, 0, len(plan.addresses))
+	for _, address := range plan.addresses {
+		conn, err := dialDoQ(openCtx, address, f.tlsConfig.Clone(), &quic.Config{
+			HandshakeIdleTimeout: f.timeout,
+			MaxIdleTimeout:       f.timeout * 2,
+		})
+		if err == nil {
+			return &doqSession{conn: conn, timeout: f.timeout, dialAddress: address}, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", address, err))
+		if openCtx.Err() != nil {
+			break
+		}
+	}
+	return nil, plan.failed(errs)
 }
 
 type doqSession struct {
-	conn    doqConn
-	timeout time.Duration
+	conn        doqConn
+	timeout     time.Duration
+	dialAddress string
 }
+
+func (s *doqSession) DialAddress() string { return s.dialAddress }
 
 func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	query := newQuery(name, qtype, 0, true)

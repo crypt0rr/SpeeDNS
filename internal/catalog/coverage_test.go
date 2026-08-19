@@ -41,6 +41,7 @@ resolvers:
       tcp: {}
       doh:
         url: https://dns.example/dns-query
+        bootstrap_addresses: [" 127.0.0.1 ", "[2001:db8::53]", "127.0.0.1"]
       dot:
         server_name: dns.example
       doq:
@@ -52,6 +53,10 @@ resolvers:
 	}
 	if profiles[0].Transports[UDP].Port != 53 || profiles[0].Transports[DoH].Port != 443 || profiles[0].Transports[DoT].Port != 853 || profiles[0].Transports[DoQ].Port != 853 {
 		t.Fatalf("default ports = %#v", profiles[0].Transports)
+	}
+	bootstrap := profiles[0].Transports[DoH].BootstrapAddresses
+	if len(bootstrap) != 2 || bootstrap[0] != "127.0.0.1" || bootstrap[1] != "2001:db8::53" {
+		t.Fatalf("normalized bootstrap addresses = %#v", bootstrap)
 	}
 	for _, input := range []string{"[", "version: 2\nresolvers: []\n", "version: 1\nresolvers: []\n"} {
 		if _, err := LoadYAML(strings.NewReader(input)); err == nil {
@@ -81,6 +86,9 @@ func TestValidateRejectsInvalidProfiles(t *testing.T) {
 		{"missing doh path", ResolverProfile{ID: "id", Name: "name", Addresses: []string{"1.1.1.1"}, Transports: map[Protocol]TransportSpec{DoH: {URL: "https://dns.example"}}}},
 		{"missing dot name", ResolverProfile{ID: "id", Name: "name", Addresses: []string{"1.1.1.1"}, Transports: map[Protocol]TransportSpec{DoT: {Port: 853}}}},
 		{"missing doq name", ResolverProfile{ID: "id", Name: "name", Addresses: []string{"1.1.1.1"}, Transports: map[Protocol]TransportSpec{DoQ: {Port: 853}}}},
+		{"bootstrap hostname", ResolverProfile{ID: "id", Name: "name", Addresses: []string{"1.1.1.1"}, Transports: map[Protocol]TransportSpec{DoH: {URL: "https://dns.example/dns-query", BootstrapAddresses: []string{"dns.example"}}}}},
+		{"bootstrap port", ResolverProfile{ID: "id", Name: "name", Addresses: []string{"1.1.1.1"}, Transports: map[Protocol]TransportSpec{DoT: {ServerName: "dns.example", BootstrapAddresses: []string{"192.0.2.1:853"}}}}},
+		{"plain bootstrap", ResolverProfile{ID: "id", Name: "name", Addresses: []string{"1.1.1.1"}, Transports: map[Protocol]TransportSpec{UDP: {BootstrapAddresses: []string{"192.0.2.1"}}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

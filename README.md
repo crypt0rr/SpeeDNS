@@ -1,110 +1,95 @@
 # SpeeDNS
 
-SpeeDNS (`speedns`) is a read-only CLI for comparing recursive DNS resolvers from your current network. It measures UDP, TCP, DNS-over-HTTPS, DNS-over-TLS, and dedicated DNS-over-QUIC independently, then shows which eligible resolver is fastest and reliable enough to recommend.
+SpeeDNS (`speedns`) is a read-only command-line DNS benchmark. It compares recursive DNS resolvers from your current network over UDP, TCP, DNS-over-HTTPS (DoH), DNS-over-TLS (DoT), and dedicated DNS-over-QUIC (DoQ), then shows which resolver is fastest for each transport.
 
-It never changes the machine's DNS configuration, needs no root privileges, and sends no telemetry.
+SpeeDNS does not change your system DNS settings, requires no root privileges, and sends no telemetry.
 
-## What it measures
+## Install
 
-The default run samples 100 names from the embedded, versioned 1,000-name Tranco corpus and sends A and AAAA queries. Use `--full` to test the complete corpus. Every selected resolver receives the same domain/type matrix and the same randomized ordering.
+Prebuilt macOS and Debian/Linux binaries and packages are published with each release on the [GitHub Releases page](https://github.com/crypt0rr/SpeeDNS/releases). Choose the archive for your platform and architecture. Releases include:
 
-Encrypted transports are reported in two parts:
+- macOS Intel (`amd64`) and Apple silicon (`arm64`);
+- Linux `amd64` and `arm64` archives;
+- Debian packages for Linux `amd64` and `arm64`.
 
-- cold first-query latency, including a fresh connection/handshake;
-- warm query latency over a reused connection.
-
-Resolvers are ranked separately per transport. SpeeDNS does not claim that a UDP result and a DoH result are directly interchangeable.
-
-The bundled catalog currently includes Google, Quad9, Cloudflare, and DNS4EU profiles. Filtering policy is shown beside the owner because a protective resolver is not behaviorally equivalent to an unfiltered resolver.
-
-## Build from source
-
-Requires Go 1.25 or newer. Builds are pure Go and do not require a runtime dependency.
+To build from source, install [Go 1.25 or newer](https://go.dev/dl/):
 
 ```sh
+git clone https://github.com/crypt0rr/SpeeDNS.git
+cd SpeeDNS
 go build -trimpath -ldflags "-s -w" -o speedns ./cmd/speedns
-./speedns --help
+./speedns version
 ```
 
-## Usage
+The build is pure Go and has no runtime dependencies.
 
-Run the default benchmark:
+## Quick start
+
+Run the default comparison:
 
 ```sh
 ./speedns
 ```
 
-Run a short, reproducible UDP comparison:
+Run a short, reproducible test against UDP resolvers:
 
 ```sh
 ./speedns --protocol udp --sample 25 --type A --seed 42
 ```
 
-Run all bundled protocols against the complete corpus:
+Run every configured transport against all 1,000 bundled names:
 
 ```sh
 ./speedns --full --details
 ```
 
-Include the currently configured system resolver as a baseline:
+Inspect the bundled resolver catalog without running a benchmark:
 
 ```sh
-./speedns --include-system
+./speedns resolvers
 ```
 
-The system resolver is read only. On Debian/Linux SpeeDNS reads `/etc/resolv.conf`; on macOS it uses `scutil --dns` and falls back to `/etc/resolv.conf`.
+## How the comparison works
 
-Export results for automation:
+The default run samples 100 names from an embedded, versioned 1,000-name domain list and queries both A and AAAA records. `--full` uses the complete list. Every resolver eligible for the same transport receives the same names, query types, DNS settings, and randomized order.
 
-```sh
-./speedns --format json --output result.json
-./speedns --format csv --output result.csv
-./speedns --format json --raw --output result-with-samples.json
-```
+SpeeDNS reports warm query latency over reused connections and, for encrypted transports, cold first-query latency including connection setup. Results are ranked separately for each transport; a UDP result is not treated as interchangeable with a DoH, DoT, or DoQ result.
 
-One-off custom endpoints use `NAME=URI` syntax:
-
-```sh
-./speedns --no-defaults \
-  --resolver office=udp://10.0.0.53:53 \
-  --resolver private-dot=tls://dns.example.net:853 \
-  --resolver private-doh=https://dns.example.net/dns-query \
-  --resolver private-doq=quic://dns.example.net:853
-```
-
-For a complete profile with an owner, policy, address, TLS name, and multiple transports, use YAML:
-
-```sh
-./speedns --resolver-file resolvers.yaml
-```
-
-See [`resolvers.example.yaml`](resolvers.example.yaml) for the schema.
-
-Custom domain lists are newline-delimited. Blank lines and lines beginning with `#` are ignored, names are case-normalized, and duplicates are removed:
-
-```sh
-./speedns --domains my-domains.txt --sample 200
-```
-
-## Interpreting results
-
-The primary comparison is the warm query latency. Cold latency tells you what a newly started client pays for connection setup. The ranking score is:
+The score is lower-is-better:
 
 ```text
-0.60 × median + 0.40 × p95 + failure_rate × timeout
+0.60 × median latency + 0.40 × p95 latency + failure rate × timeout
 ```
 
-Lower is better. A result is marked recommended only when it has at least 20 comparable samples and at least 99% successful responses. Divergent response classes—such as one filtered/NXDOMAIN response and one normal answer—are reported and excluded from latency scoring for that query.
+An endpoint is marked `RECOMMENDED` only when it has at least 20 comparable samples and at least 99% successful responses. Short runs can show a `PROVISIONAL` winner, but use a larger sample or `--full` for a more stable comparison.
 
-Short runs can still show a provisional fastest result, but SpeeDNS labels it separately and does not present it as a recommendation until the evidence threshold is met.
+Resolvers can have different filtering policies. SpeeDNS shows the policy beside each result and excludes materially divergent responses from comparative latency scoring, so a blocking or filtered answer does not automatically win by responding sooner.
 
-`—` means that a resolver does not advertise that transport. `FAIL` means it was configured for the transport but the connection or DNS exchange failed. SpeeDNS never silently falls back from one protocol to another.
+## Choosing protocols
 
-The terminal report groups comparisons by protocol. In an interactive terminal, progress is rendered as one updating status line; when output is redirected, SpeeDNS prints one completion line per protocol. Blocked transports are summarized together, while `--details` includes the underlying endpoint errors and counters. Use `--no-color` for plain terminal output.
+Use `--protocol` with one or more comma-separated transports:
 
-## Default resolver profiles
+```sh
+./speedns --protocol udp,tcp,doh,dot,doq
+```
 
-| Address | Owner | Policy | Encrypted names |
+The available transports are:
+
+| Name | Transport |
+| --- | --- |
+| `udp` | Traditional DNS over UDP |
+| `tcp` | Traditional DNS over TCP |
+| `doh` | DNS over HTTPS using RFC 8484 and HTTP/2 |
+| `dot` | DNS over TLS |
+| `doq` | Dedicated DNS over QUIC using RFC 9250 |
+
+SpeeDNS does not silently fall back from one protocol to another. A configured but unavailable transport is shown as `FAIL`; an unsupported transport for a resolver is shown as `—`.
+
+## Default resolvers
+
+Each address is ranked independently. The owner and filtering policy are shown in the terminal report so that unfiltered and protective services can be compared knowingly.
+
+| Address | Owner | Policy | Encrypted hostname |
 | --- | --- | --- | --- |
 | 8.8.8.8, 8.8.4.4 | Google | unfiltered | `dns.google` |
 | 9.9.9.9 | Quad9 | threat blocking + DNSSEC | `dns.quad9.net` |
@@ -116,44 +101,107 @@ The terminal report groups comparisons by protocol. In an interactive terminal, 
 | 86.54.11.13 | DNS4EU / JOINDNS4.eu | protective + ad blocking | `noads.joindns4.eu` |
 | 86.54.11.100 | DNS4EU / JOINDNS4.eu | unfiltered | `unfiltered.joindns4.eu` |
 
-Dedicated DoQ is currently configured for Quad9. DoH over HTTP/3 is a separate transport from dedicated DoQ and is not mislabeled as DoQ in v1.
+Dedicated DoQ is currently configured for Quad9. DoH over HTTP/3 is a separate transport and is not mislabeled as DoQ.
 
-## Development
+## Custom resolvers
 
-```sh
-go test ./...
-go test -race ./...
-go vet ./...
-bash scripts/coverage.sh
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./cmd/speedns
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/speedns
-```
-
-`scripts/coverage.sh` runs each package with atomic instrumentation, merges the profiles, and fails unless total statement coverage is exactly 100.0%. CI runs this gate on both Ubuntu and macOS.
-
-## GitHub automation
-
-All repository automation lives in `.github/` and runs on GitHub-hosted runners:
-
-- `CI` runs formatting, module verification, unit/integration tests, `go vet`, race detection, the 100% coverage gate, four pure-Go cross-builds, and a GoReleaser snapshot on every push and pull request.
-- `CodeQL` uploads Go code-scanning results on pushes, pull requests, and a weekly schedule.
-- `Go security` runs Go's vulnerability reachability scan on pushes, pull requests, and a weekly schedule.
-- `Live DNS smoke` checks one official endpoint for UDP, TCP, DoH, DoT, and DoQ weekly. It is deliberately non-blocking and stores its JSON/log evidence as a workflow artifact; normal CI never depends on public DNS.
-- `Dependabot` opens weekly update pull requests for Go modules and GitHub Actions.
-
-The release workflow runs for `v*` tags and can also be dispatched with an existing tag. It runs the full preflight again, then creates a draft GitHub release containing macOS and Linux archives, Debian packages, checksums, SBOMs, and keyless Sigstore signatures. Add a repository secret named `HOMEBREW_TAP_TOKEN` with write access to `crypt0rr/homebrew-tap` before using the release workflow; the automatically provided `GITHUB_TOKEN` handles the release in this repository.
-
-The recommended first public build is a prerelease such as `v0.1.0-alpha.1`. GoReleaser accepts SemVer prerelease tags and marks them as prereleases automatically; `v1.0.0` should wait until the hosted CI, release artifacts, macOS/Debian installs, and real-world DNS comparisons have been exercised by testers.
-
-To publish the first prerelease after the GitHub CI run is green:
+Add one-off endpoints with repeatable `--resolver NAME=URI` flags. Use `--no-defaults` when you want to test only your own endpoints:
 
 ```sh
-git tag -a v0.1.0-alpha.1 -m "SpeeDNS v0.1.0-alpha.1"
-git push origin v0.1.0-alpha.1
+./speedns --no-defaults \
+  --resolver office=udp://10.0.0.53:53 \
+  --resolver private-dot=tls://dns.example.net:853 \
+  --resolver private-doh=https://dns.example.net/dns-query \
+  --resolver private-doq=quic://dns.example.net:853
 ```
 
-The `workflow_dispatch` controls on CI, CodeQL, security, and live smoke are available from the repository Actions tab. The release workflow's manual input is an existing `v*` tag, so it cannot accidentally release an arbitrary branch.
+For ownership, policy, multiple addresses, or encrypted endpoints that need a specific TLS name, use a YAML profile:
+
+```sh
+./speedns --resolver-file resolvers.yaml
+```
+
+See [`resolvers.example.yaml`](resolvers.example.yaml) for the complete schema. A profile can specify ordered `bootstrap_addresses` for DoH, DoT, or DoQ:
+
+```yaml
+version: 1
+resolvers:
+  - id: private
+    name: Private DNS
+    owner: Example Network
+    policy: unfiltered
+    addresses:
+      - 192.0.2.53
+    transports:
+      doh:
+        url: https://dns.example.net/dns-query
+        bootstrap_addresses:
+          - 192.0.2.53
+```
+
+Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order. TLS certificate validation is always enabled.
+
+## Custom domain lists
+
+Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; names are normalized before testing.
+
+```sh
+./speedns --domains my-domains.txt --sample 200 --seed 42
+```
+
+A custom list replaces the embedded list for that run. SpeeDNS does not download domain names while benchmarking.
+
+## System resolver baseline
+
+Use `--include-system` to include the resolver configured by the operating system:
+
+```sh
+./speedns --include-system
+```
+
+This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver scopes with `scutil --dns` and falls back to `/etc/resolv.conf`.
+
+System resolvers are tested only over transports discoverable from the operating system configuration, normally UDP and TCP.
+
+## Output
+
+Human-readable table output is the default. Use `--details` for cold latency, jitter, scored samples, failures, divergence, truncation, and the selected connection address.
+
+For scripts and other tools, use JSON or CSV:
+
+```sh
+./speedns --format json --output result.json
+./speedns --format csv --output result.csv
+./speedns --format json --raw --output result-with-samples.json
+```
+
+Useful flags include:
+
+```text
+--sample N          number of domains to sample
+--full              test the complete domain list
+--seed N            reproduce a domain order
+--type A,AAAA       record types to query
+--timeout 2s        per-endpoint timeout
+--concurrency 4    maximum concurrent endpoint workers
+--format table|json|csv
+--output PATH       write output to a file
+--no-color          disable terminal colors
+```
+
+In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.
+
+## Troubleshooting
+
+- If a network blocks traditional DNS, UDP and TCP may show `FAIL` while encrypted transports still work. SpeeDNS reports these failures instead of retrying through another protocol.
+- If no resolver is marked recommended, increase `--sample` or use `--full`. A short run may only qualify for a provisional winner.
+- Compare resolvers with similar policies when answer behavior matters. Protective, ad-blocking, and unfiltered services may intentionally return different response classes.
+- Use `--details` to inspect connection errors and response counters for a failing endpoint.
+
+## Privacy and platform support
+
+SpeeDNS runs locally on macOS and Debian/Linux, supports IPv4 and IPv6 resolver addresses, and does not modify DNS settings or send telemetry. The domains you test are sent to the resolvers you select, just as they would be for normal DNS lookups.
 
 ## License
 
-MIT. The embedded Tranco snapshot carries source/date metadata in `data/domains.meta.json`; retain that attribution when updating or redistributing the corpus.
+SpeeDNS is released under the [MIT License](LICENSE).

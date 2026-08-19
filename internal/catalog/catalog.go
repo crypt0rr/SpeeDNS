@@ -40,7 +40,7 @@ func ParseProtocol(value string) (Protocol, error) {
 
 // TransportSpec contains the endpoint details needed for one protocol. For
 // encrypted transports ServerName is used for TLS authentication while the
-// profile address is used as the dial target when it is an IP address.
+// profile address or BootstrapAddresses provide the dial candidates.
 type TransportSpec struct {
 	Port               int      `yaml:"port,omitempty"`
 	ServerName         string   `yaml:"server_name,omitempty"`
@@ -260,6 +260,16 @@ func Validate(profiles []ResolverProfile) error {
 			if spec.Port < 1 || spec.Port > 65535 {
 				return fmt.Errorf("resolver %q protocol %q has invalid port %d", profile.ID, protocol, spec.Port)
 			}
+			if len(spec.BootstrapAddresses) > 0 {
+				if protocol == UDP || protocol == TCP {
+					return fmt.Errorf("resolver %q protocol %q cannot use bootstrap_addresses", profile.ID, protocol)
+				}
+				normalized, err := normalizeBootstrapAddresses(spec.BootstrapAddresses)
+				if err != nil {
+					return fmt.Errorf("resolver %q protocol %q has invalid bootstrap_addresses: %w", profile.ID, protocol, err)
+				}
+				spec.BootstrapAddresses = normalized
+			}
 			if protocol == DoH {
 				u, err := url.Parse(spec.URL)
 				if err != nil || u.Scheme != "https" || u.Host == "" || u.Path == "" {
@@ -271,9 +281,30 @@ func Validate(profiles []ResolverProfile) error {
 					return fmt.Errorf("resolver %q protocol %q requires server_name", profile.ID, protocol)
 				}
 			}
+			profile.Transports[protocol] = spec
 		}
 	}
 	return nil
+}
+
+func normalizeBootstrapAddresses(addresses []string) ([]string, error) {
+	normalized := make([]string, 0, len(addresses))
+	seen := make(map[string]struct{}, len(addresses))
+	for index, address := range addresses {
+		address = strings.TrimSpace(address)
+		if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
+			address = strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
+		}
+		if net.ParseIP(address) == nil {
+			return nil, fmt.Errorf("entry %d %q is not an IPv4 or IPv6 literal", index+1, address)
+		}
+		if _, exists := seen[address]; exists {
+			continue
+		}
+		seen[address] = struct{}{}
+		normalized = append(normalized, address)
+	}
+	return normalized, nil
 }
 
 func defaultPort(protocol Protocol) int {

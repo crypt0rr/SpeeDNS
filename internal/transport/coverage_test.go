@@ -387,6 +387,12 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	if err != nil || fallback.(*doHFactory).dialAddr != "dns.example:443" || fallback.(*doHFactory).serverName != "dns.example" {
 		t.Fatalf("DoH fallback factory = %#v/%v", fallback, err)
 	}
+	legacy := &doHFactory{url: "https://dns.example/dns-query", dialAddr: "dns.example:443", timeout: time.Second}
+	legacySession, err := legacy.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = legacySession.Close()
 	session, err := dohFactory.Open(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -414,6 +420,9 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	}
 	if err := doh.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if sameHTTPSOrigin(nil, first) || sameHTTPSOrigin(first, other) {
+		t.Fatal("invalid HTTPS origin was accepted")
 	}
 }
 

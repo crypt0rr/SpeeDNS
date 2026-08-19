@@ -107,6 +107,7 @@ type TargetResult struct {
 	Cold         []ColdObservation `json:"cold,omitempty"`
 	Stats        Statistics        `json:"stats"`
 	OpenError    string            `json:"open_error,omitempty"`
+	DialAddress  string            `json:"-"`
 }
 
 type Ranking struct {
@@ -341,6 +342,7 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 		_, _ = session.Query(warmupCtx, name, warmupType)
 		cancel()
 	}
+	result.DialAddress = sessionDialAddress(session)
 	for _, query := range queries {
 		observation := Observation{Name: query.Name, QType: query.QType}
 		if ctx.Err() != nil {
@@ -368,6 +370,16 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 		result.Observations = append(result.Observations, observation)
 	}
 	return result
+}
+
+func sessionDialAddress(session transport.Session) string {
+	type dialAddressSession interface {
+		DialAddress() string
+	}
+	if session, ok := session.(dialAddressSession); ok {
+		return session.DialAddress()
+	}
+	return ""
 }
 
 func failedObservations(queries []Query, err error) []Observation {
