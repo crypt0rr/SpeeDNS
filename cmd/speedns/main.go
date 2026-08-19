@@ -25,24 +25,27 @@ import (
 )
 
 type cliConfig struct {
-	protocols     string
-	resolverFlags []string
-	resolverFile  string
-	noDefaults    bool
-	domainFile    string
-	sample        int
-	full          bool
-	seed          int64
-	queryTypes    string
-	timeout       time.Duration
-	concurrency   int
-	includeSystem bool
-	format        string
-	output        string
-	details       bool
-	raw           bool
-	noColor       bool
-	redactSystem  bool
+	protocols       string
+	resolverFlags   []string
+	resolverFile    string
+	noDefaults      bool
+	domainFile      string
+	cacheMiss       bool
+	cacheMissSample int
+	sample          int
+	full            bool
+	seed            int64
+	queryTypes      string
+	timeout         time.Duration
+	concurrency     int
+	includeSystem   bool
+	format          string
+	output          string
+	details         bool
+	profileView     bool
+	raw             bool
+	noColor         bool
+	redactSystem    bool
 }
 
 var exit = os.Exit
@@ -60,6 +63,8 @@ var writeJSONReport = report.WriteJSON
 var writeCSVReport = report.WriteCSV
 
 var terminalDetector = fileIsTerminal
+
+var newCacheMissNonceFunc = domains.NewCacheMissNonce
 
 func exitCodeForError(err error) int {
 	switch {
@@ -199,6 +204,8 @@ func newRootCommand() *cobra.Command {
 	flags.StringVar(&config.resolverFile, "resolver-file", "", "YAML resolver profile file")
 	flags.BoolVar(&config.noDefaults, "no-defaults", false, "do not include bundled public resolvers")
 	flags.StringVar(&config.domainFile, "domains", "", "newline-delimited domain list; defaults to the embedded corpus")
+	flags.BoolVar(&config.cacheMiss, "cache-miss", false, "opt in to bounded random names below the reserved example.com zone")
+	flags.IntVar(&config.cacheMissSample, "cache-miss-sample", domains.CacheMissDefaultSample, "number of unique reserved-zone names for --cache-miss (maximum 20)")
 	flags.IntVar(&config.sample, "sample", benchmark.DefaultSample, "number of domains to sample")
 	flags.BoolVar(&config.full, "full", false, "test the complete embedded or custom domain list")
 	flags.Int64Var(&config.seed, "seed", 0, "random seed (0 chooses and prints a new seed)")
@@ -209,6 +216,7 @@ func newRootCommand() *cobra.Command {
 	flags.StringVar(&config.format, "format", "table", "output format: table, json, or csv")
 	flags.StringVar(&config.output, "output", "", "write output to a file instead of stdout")
 	flags.BoolVar(&config.details, "details", false, "show cold latency, jitter, response outcomes, and expanded metrics")
+	flags.BoolVar(&config.profileView, "profile-view", false, "show same-resolver transport comparisons with score confidence intervals")
 	flags.BoolVar(&config.raw, "raw", false, "include per-query observations in JSON output")
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
 	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
@@ -284,6 +292,9 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if config.timeout <= 0 || config.concurrency <= 0 {
 		return errors.New("--timeout and --concurrency must be positive")
 	}
+	if config.profileView && strings.EqualFold(config.format, "csv") {
+		return errors.New("--profile-view requires table or json output")
+	}
 	selected, err := parseProtocols(config.protocols)
 	if err != nil {
 		return err
@@ -292,9 +303,32 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if err != nil {
 		return err
 	}
-	domainList, err := domains.Load(config.domainFile)
-	if err != nil {
-		return err
+	corpusMode := benchmark.CorpusWarmCache
+	corpusZone := ""
+	corpusNonce := ""
+	var domainList []string
+	if config.cacheMiss {
+		if strings.TrimSpace(config.domainFile) != "" {
+			return errors.New("--cache-miss cannot be combined with --domains")
+		}
+		if config.full {
+			return errors.New("--cache-miss cannot be combined with --full; use --cache-miss-sample")
+		}
+		corpusNonce, err = newCacheMissNonceFunc()
+		if err != nil {
+			return err
+		}
+		domainList, err = domains.CacheMissNames(corpusNonce, config.cacheMissSample)
+		if err != nil {
+			return err
+		}
+		corpusMode = benchmark.CorpusCacheMiss
+		corpusZone = domains.CacheMissZone
+	} else {
+		domainList, err = domains.Load(config.domainFile)
+		if err != nil {
+			return err
+		}
 	}
 	profiles, err := loadProfilesFunc(ctx, config)
 	if err != nil {
@@ -311,6 +345,12 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
+	effectiveConcurrency := config.concurrency
+	concurrencyCapped := false
+	if config.cacheMiss && effectiveConcurrency > domains.CacheMissMaxConcurrency {
+		effectiveConcurrency = domains.CacheMissMaxConcurrency
+		concurrencyCapped = true
+	}
 	var progressView *progressRenderer
 	var onProgress func(benchmark.Progress)
 	if strings.EqualFold(config.format, "table") {
@@ -321,7 +361,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	defer stop()
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
 		Domains: domainList, QueryTypes: queryTypes, Sample: config.sample, Full: config.full,
-		Seed: seed, Timeout: config.timeout, Concurrency: config.concurrency, Protocols: selected,
+		Seed: seed, Timeout: config.timeout, Concurrency: effectiveConcurrency, Protocols: selected,
 		OnProgress: onProgress,
 	})
 	if progressView != nil {
@@ -332,6 +372,12 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) && !errors.Is(runErr, benchmark.ErrNoComparableResults) {
 		return runErr
+	}
+	result.CorpusMode = corpusMode
+	result.CorpusZone = corpusZone
+	result.CorpusNonce = corpusNonce
+	if concurrencyCapped {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
 	}
 	writer, closeWriter, err := outputWriter(config.output)
 	if err != nil {
@@ -344,11 +390,11 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	switch strings.ToLower(config.format) {
 	case "table":
 		err = writeTableReport(writer, result, report.TableOptions{
-			Details: config.details, Color: tableColorEnabled(config), RedactSystem: config.redactSystem, Profiles: profiles, Protocols: selected,
+			Details: config.details, Color: tableColorEnabled(config), ProfileView: config.profileView, RedactSystem: config.redactSystem, Profiles: profiles, Protocols: selected,
 		})
 	case "json":
-		if config.redactSystem {
-			err = report.WriteJSONWithOptions(writer, result, config.raw, report.JSONOptions{RedactSystem: true})
+		if config.redactSystem || config.profileView {
+			err = report.WriteJSONWithOptions(writer, result, config.raw, report.JSONOptions{RedactSystem: config.redactSystem, ProfileView: config.profileView})
 		} else {
 			err = writeJSONReport(writer, result, config.raw)
 		}

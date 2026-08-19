@@ -2,6 +2,8 @@ package domains
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,9 +18,20 @@ import (
 
 const maxDomainLineSize = 64 * 1024
 
+// CacheMissZone is the IANA-reserved example zone used only by the explicit
+// cache-miss mode. SpeeDNS never sends these names unless the user opts in.
+const CacheMissZone = "example.com"
+
+const (
+	CacheMissDefaultSample  = 10
+	CacheMissMaxSample      = 20
+	CacheMissMaxConcurrency = 2
+)
+
 var lookupProfile = idna.New(idna.MapForLookup(), idna.VerifyDNSLength(true), idna.BidiRule())
 
 var verifyEmbeddedCorpus = data.VerifyCorpus
+var randomRead = rand.Read
 
 type domainInput struct {
 	value string
@@ -75,6 +88,39 @@ func Normalize(lines []string) ([]string, error) {
 		inputs = append(inputs, domainInput{value: line})
 	}
 	return validateInputs(inputs)
+}
+
+// NewCacheMissNonce returns a local random nonce used to make cache-miss names
+// unique between runs. It does not contact the network or persist state.
+func NewCacheMissNonce() (string, error) {
+	var value [8]byte
+	if _, err := randomRead(value[:]); err != nil {
+		return "", fmt.Errorf("generate cache-miss nonce: %w", err)
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+// CacheMissNames creates a bounded set of unique names below the reserved
+// example zone. The nonce must be hexadecimal so generated labels remain
+// syntactically valid and auditable in reports.
+func CacheMissNames(nonce string, count int) ([]string, error) {
+	nonce = strings.ToLower(strings.TrimSpace(nonce))
+	if nonce == "" {
+		return nil, errors.New("cache-miss nonce is empty")
+	}
+	if count <= 0 || count > CacheMissMaxSample {
+		return nil, fmt.Errorf("cache-miss sample must be between 1 and %d", CacheMissMaxSample)
+	}
+	for _, character := range nonce {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return nil, errors.New("cache-miss nonce must be hexadecimal")
+		}
+	}
+	raw := make([]string, 0, count)
+	for index := 1; index <= count; index++ {
+		raw = append(raw, fmt.Sprintf("speedns-%s-%04d.%s", nonce, index, CacheMissZone))
+	}
+	return Normalize(raw)
 }
 
 func validateInputs(inputs []domainInput) ([]string, error) {

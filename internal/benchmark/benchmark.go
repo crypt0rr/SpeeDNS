@@ -27,6 +27,8 @@ const (
 	BootstrapIterations           = 1000
 	MinimumRecommendedSamples     = 20
 	MinimumRecommendedSuccessRate = 0.99
+	CorpusWarmCache               = "warm-cache"
+	CorpusCacheMiss               = "cache-miss"
 )
 
 // ErrNoComparableResults means the benchmark completed, but no target had a
@@ -140,6 +142,9 @@ type Report struct {
 	StartedAt     time.Time          `json:"started_at"`
 	FinishedAt    time.Time          `json:"finished_at"`
 	Seed          int64              `json:"seed"`
+	CorpusMode    string             `json:"corpus_mode,omitempty"`
+	CorpusZone    string             `json:"corpus_zone,omitempty"`
+	CorpusNonce   string             `json:"corpus_nonce,omitempty"`
 	SampleSize    int                `json:"sample_size"`
 	Queries       int                `json:"queries_per_target"`
 	QueryTypes    []uint16           `json:"query_types"`

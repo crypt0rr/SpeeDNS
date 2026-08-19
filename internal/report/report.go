@@ -15,22 +15,41 @@ import (
 )
 
 type JSONReport struct {
-	SchemaVersion int                          `json:"schema_version"`
-	Run           JSONRun                      `json:"run"`
-	Results       []JSONResult                 `json:"results"`
-	Rankings      []benchmark.Ranking          `json:"rankings"`
-	PairedEffects []benchmark.PairedEffect     `json:"paired_effects,omitempty"`
-	Divergence    []benchmark.DivergenceDetail `json:"divergence,omitempty"`
-	Warnings      []string                     `json:"warnings,omitempty"`
+	SchemaVersion      int                          `json:"schema_version"`
+	Run                JSONRun                      `json:"run"`
+	Results            []JSONResult                 `json:"results"`
+	Rankings           []benchmark.Ranking          `json:"rankings"`
+	PairedEffects      []benchmark.PairedEffect     `json:"paired_effects,omitempty"`
+	ProfileComparisons []JSONProfileComparison      `json:"profile_comparisons,omitempty"`
+	Divergence         []benchmark.DivergenceDetail `json:"divergence,omitempty"`
+	Warnings           []string                     `json:"warnings,omitempty"`
 }
 
 type JSONRun struct {
-	StartedAt  string   `json:"started_at"`
-	FinishedAt string   `json:"finished_at"`
-	Seed       int64    `json:"seed"`
-	SampleSize int      `json:"sample_size"`
-	Queries    int      `json:"queries_per_target"`
-	QueryTypes []uint16 `json:"query_types"`
+	StartedAt   string   `json:"started_at"`
+	FinishedAt  string   `json:"finished_at"`
+	Seed        int64    `json:"seed"`
+	CorpusMode  string   `json:"corpus_mode,omitempty"`
+	CorpusZone  string   `json:"corpus_zone,omitempty"`
+	CorpusNonce string   `json:"corpus_nonce,omitempty"`
+	SampleSize  int      `json:"sample_size"`
+	Queries     int      `json:"queries_per_target"`
+	QueryTypes  []uint16 `json:"query_types"`
+}
+
+type JSONProfileComparison struct {
+	ID         string                 `json:"id"`
+	Name       string                 `json:"name"`
+	Owner      string                 `json:"owner"`
+	Address    string                 `json:"address"`
+	Transports []JSONProfileTransport `json:"transports"`
+}
+
+type JSONProfileTransport struct {
+	Protocol catalog.Protocol     `json:"protocol"`
+	TargetID string               `json:"target_id"`
+	Stats    benchmark.Statistics `json:"stats"`
+	Status   string               `json:"status"`
 }
 
 type JSONResult struct {
@@ -59,6 +78,7 @@ type JSONTarget struct {
 
 type JSONOptions struct {
 	RedactSystem bool
+	ProfileView  bool
 }
 
 type CSVOptions struct {
@@ -111,14 +131,19 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 	if options.RedactSystem {
 		warnings = redactWarnings(report, redactedIDs)
 	}
+	var profileComparisons []JSONProfileComparison
+	if options.ProfileView {
+		profileComparisons = profileComparisonsForJSON(report, redactedIDs)
+	}
 	return JSONReport{
 		SchemaVersion: 1,
 		Run: JSONRun{
-			StartedAt:  report.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-			FinishedAt: report.FinishedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-			Seed:       report.Seed, SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes,
+			StartedAt: report.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"), FinishedAt: report.FinishedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+			Seed: report.Seed, CorpusMode: report.CorpusMode, CorpusZone: report.CorpusZone, CorpusNonce: report.CorpusNonce,
+			SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes,
 		},
-		Results: results, Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
+		Results: results, Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), ProfileComparisons: profileComparisons,
+		Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
 	}
 }
 
@@ -143,6 +168,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate", "rcode_counts", "median_ms", "p95_ms",
 		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error", "reconnects", "incomplete",
 		"endpoint_url", "tls_server_name", "tls_identity_source", "bootstrap_mode", "bootstrap_addresses", "dial_address",
+		"corpus_mode", "corpus_zone", "corpus_nonce",
 	}); err != nil {
 		return err
 	}
@@ -165,6 +191,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 			formatFloat(stats.P95MS), formatFloat(stats.MinMS), formatFloat(stats.MaxMS), formatFloat(stats.MADMS),
 			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), csvCell(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), strconv.Itoa(stats.Reconnects), strconv.FormatBool(result.Incomplete),
 			csvCell(metadata.EndpointURL), csvCell(metadata.TLSServerName), csvCell(metadata.TLSIdentitySource), csvCell(metadata.BootstrapMode), csvCell(bootstrapAddressesCSV(metadata.BootstrapAddresses)), csvCell(dialAddress),
+			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -184,6 +211,13 @@ func rankFor(report benchmark.Report, targetID string) int {
 }
 
 func formatFloat(value float64) string { return strconv.FormatFloat(value, 'f', 3, 64) }
+
+func placeholderText(value string) string {
+	if value == "" {
+		return "—"
+	}
+	return value
+}
 
 // csvCell prefixes values that spreadsheet applications may interpret as a
 // formula. The leading apostrophe is part of the exported cell value and is
@@ -369,6 +403,73 @@ func pairedEffectsForJSON(report benchmark.Report, redactedIDs map[string]string
 	return effects
 }
 
+type profileGroup struct {
+	Target  catalog.Target
+	Results map[catalog.Protocol]benchmark.TargetResult
+}
+
+func profileGroupKey(target catalog.Target) string {
+	return target.Resolver.ID + "\x00" + target.Address
+}
+
+func profileGroups(report benchmark.Report) map[string]profileGroup {
+	groups := make(map[string]profileGroup)
+	for _, result := range report.Targets {
+		key := profileGroupKey(result.Target)
+		group, ok := groups[key]
+		if !ok {
+			group = profileGroup{Target: result.Target, Results: make(map[catalog.Protocol]benchmark.TargetResult)}
+		}
+		group.Results[result.Target.Protocol] = result
+		groups[key] = group
+	}
+	return groups
+}
+
+func sortedProfileGroupKeys(groups map[string]profileGroup) []string {
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := groups[keys[i]].Target, groups[keys[j]].Target
+		if left.Resolver.ID != right.Resolver.ID {
+			return left.Resolver.ID < right.Resolver.ID
+		}
+		return left.Address < right.Address
+	})
+	return keys
+}
+
+func profileComparisonsForJSON(report benchmark.Report, redactedIDs map[string]string) []JSONProfileComparison {
+	groups := profileGroups(report)
+	comparisons := make([]JSONProfileComparison, 0, len(groups))
+	for _, key := range sortedProfileGroupKeys(groups) {
+		group := groups[key]
+		view := targetViewFor(group.Target, len(redactedIDs) > 0, redactedIDs[group.Target.ID()])
+		profileID := group.Target.Resolver.ID
+		if len(redactedIDs) > 0 && isSystemTarget(group.Target) {
+			profileID = "system-redacted"
+		}
+		comparison := JSONProfileComparison{ID: profileID, Name: view.Name, Owner: view.Owner, Address: view.Address}
+		for _, protocol := range catalog.AllProtocols {
+			result, ok := group.Results[protocol]
+			if !ok {
+				continue
+			}
+			targetID := result.Target.ID()
+			if replacement, exists := redactedIDs[targetID]; exists {
+				targetID = replacement
+			}
+			comparison.Transports = append(comparison.Transports, JSONProfileTransport{
+				Protocol: protocol, TargetID: targetID, Stats: result.Stats, Status: resultStatus(result),
+			})
+		}
+		comparisons = append(comparisons, comparison)
+	}
+	return comparisons
+}
+
 func cloneIntMap(values map[string]int) map[string]int {
 	if len(values) == 0 {
 		return nil
@@ -383,6 +484,7 @@ func cloneIntMap(values map[string]int) map[string]int {
 type TableOptions struct {
 	Details      bool
 	Color        bool
+	ProfileView  bool
 	RedactSystem bool
 	Profiles     []catalog.ResolverProfile
 	Protocols    []catalog.Protocol
@@ -489,7 +591,7 @@ func styledStatus(status string, color bool) string {
 	switch status {
 	case "RECOMMENDED", "QUALIFIED", "REFERENCE":
 		colorCode = ansiGreen
-	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE":
+	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED":
 		colorCode = ansiYellow
 	case "FAILED":
 		colorCode = ansiRed
@@ -755,6 +857,75 @@ func writePairedEffects(writer io.Writer, report benchmark.Report, options Table
 	return writeAlignedTable(writer, []string{"Protocol", "Policy", "Target", "Reference", "Samples", "Median Δ", "95% CI", "Interpretation"}, pairedEffectRows(report, options))
 }
 
+func profileGroupsForTable(report benchmark.Report, options TableOptions) map[string]profileGroup {
+	groups := profileGroups(report)
+	for _, profile := range options.Profiles {
+		for _, address := range profile.Addresses {
+			target := catalog.Target{Resolver: profile, Address: address}
+			key := profileGroupKey(target)
+			if _, exists := groups[key]; !exists {
+				groups[key] = profileGroup{Target: target, Results: make(map[catalog.Protocol]benchmark.TargetResult)}
+			}
+		}
+	}
+	return groups
+}
+
+func profileViewProtocols(report benchmark.Report, options TableOptions) []catalog.Protocol {
+	if len(options.Protocols) > 0 {
+		return tableProtocols(report, options)
+	}
+	return reportProtocols(report)
+}
+
+func profileScoreCIText(stats benchmark.Statistics) string {
+	if stats.Scored == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("[%.2f, %.2f] ms", stats.CILowMS, stats.CIHighMS)
+}
+
+func profileViewRow(group profileGroup, protocol catalog.Protocol, options TableOptions) []string {
+	view := targetViewFor(group.Target, options.RedactSystem, redactedValue)
+	result, ok := group.Results[protocol]
+	if !ok {
+		status := "—"
+		if _, supported := group.Target.Resolver.Transports[protocol]; supported {
+			status = styledStatus("NOT MEASURED", options.Color)
+		}
+		return []string{view.Name, view.Owner, view.Address, string(protocol), "—", "—", "—", "—", "—", "—", status}
+	}
+	return []string{
+		view.Name, view.Owner, view.Address, string(protocol), latencyText(result.Stats.MedianMS),
+		latencyText(result.Stats.P95MS), latencyText(result.Stats.ColdMedianMS), scoreText(result),
+		profileScoreCIText(result.Stats), percentText(result.Stats.SuccessRate), styledStatus(resultStatus(result), options.Color),
+	}
+}
+
+func profileViewRows(report benchmark.Report, options TableOptions) [][]string {
+	groups := profileGroupsForTable(report, options)
+	protocols := profileViewProtocols(report, options)
+	rows := make([][]string, 0, len(groups)*len(protocols))
+	for _, key := range sortedProfileGroupKeys(groups) {
+		for _, protocol := range protocols {
+			rows = append(rows, profileViewRow(groups[key], protocol, options))
+		}
+	}
+	return rows
+}
+
+func writeProfileView(writer io.Writer, report benchmark.Report, options TableOptions) error {
+	if _, err := io.WriteString(writer, "\nProfile-level transport view (same resolver/address; score 95% CI)\n"); err != nil {
+		return err
+	}
+	rows := profileViewRows(report, options)
+	if len(rows) == 0 {
+		_, err := io.WriteString(writer, "  no profile results\n")
+		return err
+	}
+	return writeAlignedTable(writer, []string{"Profile", "Owner", "Address", "Protocol", "Median", "P95", "Cold", "Score", "Score 95% CI", "Success", "Status"}, rows)
+}
+
 func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	indent := func(values []string) string {
@@ -988,6 +1159,11 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 	if _, err := fmt.Fprintf(writer, "SpeeDNS benchmark\nSeed: %d | sample: %d domains | query types: %s\n\n", report.Seed, report.SampleSize, queryTypes(report.QueryTypes)); err != nil {
 		return err
 	}
+	if report.CorpusMode != "" {
+		if _, err := fmt.Fprintf(writer, "Corpus: %s | zone: %s | nonce: %s\n\n", report.CorpusMode, placeholderText(report.CorpusZone), placeholderText(report.CorpusNonce)); err != nil {
+			return err
+		}
+	}
 	if _, err := io.WriteString(writer, "Recommendations\n"); err != nil {
 		return err
 	}
@@ -1038,6 +1214,11 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 	}
 	if err := writePairedEffects(writer, report, options); err != nil {
 		return err
+	}
+	if options.ProfileView {
+		if err := writeProfileView(writer, report, options); err != nil {
+			return err
+		}
 	}
 	if options.Details {
 		if err := writeDivergenceDetails(writer, report, options.RedactSystem); err != nil {

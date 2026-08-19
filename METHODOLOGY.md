@@ -162,3 +162,22 @@ when interpreting a winner.
 The embedded corpus is pinned and never downloaded at runtime. Its source,
 Tranco list ID, retrieval date, entry count, and SHA-256 checksum are stored in
 `data/domains.meta.json`.
+
+## Cache-miss mode and profile view
+
+The normal run uses the embedded corpus and is treated as the warm-cache
+population. The opt-in `--cache-miss` mode instead generates a bounded set of
+unique labels below the IANA-reserved `example.com` zone. It allows at most 20
+names and two measured exchanges in flight, records a per-run random nonce,
+and rejects custom domain files and `--full`. The generated population is
+never appended to the normal corpus, and its results must not be interpreted
+as a warm-cache ranking. The ownership, traffic limits, and intended use are
+documented in [`CACHE_MISS.md`](CACHE_MISS.md).
+
+`--profile-view` groups the measured target rows by resolver profile and
+address, then lists each available selected transport side by side in a
+stable order. It reuses each transport's existing median, p95, cold median,
+score, and deterministic score confidence interval. Missing transport
+combinations are shown as unavailable in the table; profile view is a view of
+the same run, not a new cross-transport ranking and not a replacement for the
+per-protocol score.

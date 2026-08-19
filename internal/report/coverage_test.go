@@ -871,3 +871,90 @@ func TestPairedEffectsAreRenderedExportedAndRedacted(t *testing.T) {
 		t.Fatal("top-level paired effect writer failure was not returned")
 	}
 }
+
+func TestProfileViewShowsTransportCostsConfidenceAndCorpusMetadata(t *testing.T) {
+	profile := catalog.ResolverProfile{
+		ID: "profile-a", Name: "Profile A", Owner: "Owner A", Policy: "unfiltered",
+		Addresses: []string{"192.0.2.1"}, Transports: map[catalog.Protocol]catalog.TransportSpec{
+			catalog.UDP: {Port: 53}, catalog.TCP: {Port: 53}, catalog.DoT: {Port: 853, ServerName: "dns.example"},
+		},
+	}
+	other := catalog.ResolverProfile{ID: "profile-b", Name: "Profile B", Owner: "Owner B", Policy: "unfiltered", Addresses: []string{"192.0.2.2"}, Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.DoH: {URL: "https://dns.example/dns-query"}}}
+	udp := reportTarget("profile-a", catalog.UDP, 2, true)
+	udp.Target.Resolver = profile
+	udp.Target.Address = "192.0.2.1"
+	udp.Stats = benchmark.Statistics{Total: 2, Successes: 2, Scored: 2, SuccessRate: 1, MedianMS: 3, P95MS: 4, ColdMedianMS: 5, ScoreMS: 3.4, CILowMS: 2, CIHighMS: 5, Recommended: true}
+	dot := udp
+	dot.Target.Protocol = catalog.DoT
+	dot.Stats = benchmark.Statistics{Total: 2, Successes: 2, Scored: 2, SuccessRate: 1, MedianMS: 8, P95MS: 9, ColdMedianMS: 12, ScoreMS: 8.4, CILowMS: 7, CIHighMS: 10}
+	system := udp
+	system.Target.Resolver = catalog.ResolverProfile{ID: "system-profile", Name: "System DNS (scope: corp)", Owner: "local forwarding (interface: utun0)", Policy: "local", Addresses: []string{"127.0.0.53"}, Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}}}
+	system.Target.Address = "127.0.0.53"
+	system.Target.Protocol = catalog.UDP
+	run := benchmark.Report{
+		Seed: 42, CorpusMode: benchmark.CorpusCacheMiss, CorpusZone: "example.com", CorpusNonce: "0123456789abcdef",
+		SampleSize: 2, Queries: 2, QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{udp, dot, system},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: udp.Target.ID(), Rank: 1}, {Protocol: catalog.DoT, TargetID: dot.Target.ID(), Rank: 1}},
+	}
+	options := TableOptions{Color: true, ProfileView: true, RedactSystem: true, Profiles: []catalog.ResolverProfile{profile, other, system.Target.Resolver}, Protocols: []catalog.Protocol{catalog.UDP, catalog.TCP, catalog.DoT}}
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, options); err != nil {
+		t.Fatal(err)
+	}
+	tableText := table.String()
+	for _, expected := range []string{"Corpus: cache-miss", "0123456789abcdef", "Profile-level transport view", "Score 95% CI", "Profile A", "NOT MEASURED", "System DNS (redacted)", ansiYellow} {
+		if !strings.Contains(tableText, expected) {
+			t.Fatalf("profile table missing %q: %s", expected, tableText)
+		}
+	}
+	if strings.Contains(tableText, "127.0.0.53") || strings.Contains(tableText, "system-profile") {
+		t.Fatalf("profile table leaked system identity: %s", tableText)
+	}
+	if placeholderText("") != "—" || placeholderText("zone") != "zone" || profileScoreCIText(benchmark.Statistics{}) != "—" || profileScoreCIText(benchmark.Statistics{Scored: 1, CILowMS: 1, CIHighMS: 2}) != "[1.00, 2.00] ms" {
+		t.Fatal("profile placeholder/CI formatting mismatch")
+	}
+
+	var jsonOutput bytes.Buffer
+	if err := WriteJSONWithOptions(&jsonOutput, run, false, JSONOptions{ProfileView: true, RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	jsonText := jsonOutput.String()
+	for _, expected := range []string{"\"corpus_mode\": \"cache-miss\"", "\"corpus_zone\": \"example.com\"", "\"corpus_nonce\": \"0123456789abcdef\"", "\"profile_comparisons\"", "\"transports\"", "\"score_ms\": 3.4", "system-redacted-1@redacted/udp"} {
+		if !strings.Contains(jsonText, expected) {
+			t.Fatalf("profile JSON missing %q: %s", expected, jsonText)
+		}
+	}
+	if strings.Contains(jsonText, "127.0.0.53") || strings.Contains(jsonText, "system-profile") {
+		t.Fatalf("profile JSON leaked system identity: %s", jsonText)
+	}
+	if len(profileComparisonsForJSON(benchmark.Report{}, nil)) != 0 || len(profileViewRows(benchmark.Report{}, TableOptions{})) != 0 {
+		t.Fatal("empty profile views were not empty")
+	}
+	if plain := profileComparisonsForJSON(run, nil); len(plain) != 2 || plain[0].ID == "system-redacted" {
+		t.Fatalf("plain profile comparisons = %#v", plain)
+	}
+	sameProfileOtherAddress := udp.Target
+	sameProfileOtherAddress.Address = "192.0.2.9"
+	keys := sortedProfileGroupKeys(map[string]profileGroup{
+		"one": {Target: udp.Target}, "two": {Target: sameProfileOtherAddress},
+	})
+	if len(keys) != 2 {
+		t.Fatalf("same-profile address sort = %#v", keys)
+	}
+
+	if err := writeProfileView(contentFailWriter{needle: "Profile-level transport view"}, run, options); err == nil {
+		t.Fatal("profile view heading writer failure was not returned")
+	}
+	if err := writeProfileView(contentFailWriter{needle: "Profile"}, run, options); err == nil {
+		t.Fatal("profile view table writer failure was not returned")
+	}
+	if err := writeProfileView(&bytes.Buffer{}, benchmark.Report{}, TableOptions{}); err != nil {
+		t.Fatalf("empty profile view = %v", err)
+	}
+	if err := WriteTableWithOptions(contentFailWriter{needle: "Profile-level transport view"}, run, options); err == nil {
+		t.Fatal("top-level profile view writer failure was not returned")
+	}
+	if err := WriteTableWithOptions(contentFailWriter{needle: "Corpus: cache-miss"}, run, options); err == nil {
+		t.Fatal("corpus metadata writer failure was not returned")
+	}
+}

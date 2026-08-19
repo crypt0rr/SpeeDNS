@@ -113,6 +113,15 @@ Inspect the bundled resolver catalog without running a benchmark:
 ./speedns resolvers
 ```
 
+Show a profile-level transport view for the same resolver/address. This is
+useful when comparing the cost of enabling encrypted transports; it includes
+the existing score confidence interval and does not replace per-protocol
+rankings:
+
+```sh
+./speedns --profile-view --protocol udp,tcp,doh,dot,doq --sample 25 --type A
+```
+
 ## How the comparison works
 
 The complete ranking methodology, scoring denominators, confidence intervals,
@@ -291,6 +300,23 @@ Provide one domain per line with `--domains`. Blank lines, comments beginning wi
 
 A custom list replaces the embedded list for that run. SpeeDNS does not download domain names while benchmarking.
 
+### Opt-in cache-miss mode
+
+For a bounded cache-miss experiment, use the separately documented reserved
+zone mode:
+
+```sh
+./speedns --cache-miss --cache-miss-sample 10 --no-defaults \
+  --resolver lab=udp://192.0.2.53:53 --type A
+```
+
+This generates 1–20 unique labels below the IANA-reserved `example.com` zone,
+caps measured concurrency at two, and records a random nonce in the report.
+It cannot be combined with `--domains` or `--full`. Cache-miss results are
+kept in their own run and ranking population; they are never mixed with the
+normal embedded warm-cache corpus. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
+using the mode, especially for ownership, traffic, and abuse limits.
+
 ## System resolver baseline
 
 Use `--include-system` to include the resolver configured by the operating system:
@@ -338,6 +364,8 @@ Useful flags include:
 ```text
 --sample N          number of domains to sample
 --full              test the complete domain list
+--cache-miss        opt in to bounded reserved-zone cache-miss names
+--cache-miss-sample N  number of unique cache-miss names (maximum 20)
 --seed N            reproduce a domain order
 --type A,AAAA       record types to query
 --timeout 2s        per-endpoint timeout
@@ -346,9 +374,15 @@ Useful flags include:
 --output PATH       write output to a file
 --no-color          disable terminal colors
 --redact-system     hide local system resolver details in reports
+--profile-view      show same-resolver transport costs and score confidence
 ```
 
 In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.
+
+Cache-miss JSON and CSV reports carry the corpus mode, reserved zone, and
+per-run nonce. JSON with `--profile-view` additionally includes
+`profile_comparisons`; the table view renders the same transport metrics and
+confidence intervals below the normal comparisons.
 
 When a benchmark finishes without a comparable result, SpeeDNS still writes the
 diagnostic report so you can inspect endpoint failures, resolver errors, and

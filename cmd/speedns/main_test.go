@@ -282,6 +282,7 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 		apply func(*cliConfig)
 	}{
 		{"format", func(c *cliConfig) { c.format = "xml" }},
+		{"profile csv", func(c *cliConfig) { c.format = "csv"; c.profileView = true }},
 		{"sample", func(c *cliConfig) { c.sample = 0 }},
 		{"timeout", func(c *cliConfig) { c.timeout = 0 }},
 		{"concurrency", func(c *cliConfig) { c.concurrency = 0 }},
@@ -322,6 +323,56 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 	full.sample = 0
 	if err := runBenchmark(context.Background(), full); err != nil {
 		t.Fatalf("full mode should pass sample validation: %v", err)
+	}
+}
+
+func TestRunBenchmarkCacheMissSafetyAndMetadata(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldNonce := newCacheMissNonceFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		newCacheMissNonceFunc = oldNonce
+	})
+	var captured benchmark.Options
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		captured = options
+		return fakeCLIReport(), nil
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+	config := &cliConfig{
+		protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true,
+		cacheMiss: true, cacheMissSample: 2, sample: 100, seed: 7, queryTypes: "A", timeout: time.Second,
+		concurrency: 4, format: "json", profileView: true, output: filepath.Join(t.TempDir(), "cache.json"),
+	}
+	if err := runBenchmark(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured.Domains) != 2 || !strings.HasPrefix(captured.Domains[0], "speedns-0123456789abcdef-") || captured.Concurrency != 2 {
+		t.Fatalf("cache-miss engine options = %#v", captured)
+	}
+	content, err := os.ReadFile(config.output)
+	if err != nil || !strings.Contains(string(content), "\"corpus_mode\": \"cache-miss\"") || !strings.Contains(string(content), "cache-miss mode capped concurrency at 2") || !strings.Contains(string(content), "\"profile_comparisons\"") {
+		t.Fatalf("cache-miss report = %q/%v", content, err)
+	}
+
+	config.domainFile = cliDomainFile(t)
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "cannot be combined with --domains") {
+		t.Fatalf("cache-miss domain combination error = %v", err)
+	}
+	config.domainFile = ""
+	config.full = true
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "cannot be combined with --full") {
+		t.Fatalf("cache-miss full combination error = %v", err)
+	}
+	config.full = false
+	config.cacheMissSample = 0
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "cache-miss sample") {
+		t.Fatalf("cache-miss sample error = %v", err)
+	}
+	config.cacheMissSample = 2
+	newCacheMissNonceFunc = func() (string, error) { return "", errors.New("nonce fixture failed") }
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "nonce fixture failed") {
+		t.Fatalf("cache-miss nonce error = %v", err)
 	}
 }
 
