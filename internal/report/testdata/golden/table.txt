@@ -1,0 +1,20 @@
+SpeeDNS benchmark
+Seed: 42 | sample: 1 domains | query types: A
+
+Recommendations
+  Protocol  Owner     Address     Policy      Median   P95      Success  Usable   Score    Status
+  udp       Owner 10  192.0.2.10  unfiltered  2.00 ms  3.00 ms  100.00%  100.00%  2.40 ms  RECOMMENDED
+
+Comparisons
+
+Protocol UDP
+  Rank  Owner     Address     Policy      Median   P95      Success  Usable   Score    Status
+  1     Owner 10  192.0.2.10  unfiltered  2.00 ms  3.00 ms  100.00%  100.00%  2.40 ms  QUALIFIED
+
+Protocol TCP
+  Rank  Owner     Address     Policy      Median  P95  Success  Usable  Score  Status
+  —     Owner 11  192.0.2.11  unfiltered  —       —    0.00%    0.00%   —      FAILED
+
+Warnings
+  - tcp: 1/1 endpoints unavailable; 2/2 measured queries failed
+  - fixture warning
