@@ -61,6 +61,9 @@ func TestDeterministicResolverFixtureCoversBenchmarkOutcomes(t *testing.T) {
 	if len(report.Targets) != len(targets) || len(report.Rankings) == 0 {
 		t.Fatalf("fixture report targets/rankings = %d/%d", len(report.Targets), len(report.Rankings))
 	}
+	if len(report.PairedEffects) < 3 {
+		t.Fatalf("fixture paired effects = %d, want at least 3", len(report.PairedEffects))
+	}
 
 	flaky, ok := report.ResultFor(targets[1].ID())
 	if !ok {

@@ -137,16 +137,38 @@ type Ranking struct {
 }
 
 type Report struct {
-	StartedAt  time.Time          `json:"started_at"`
-	FinishedAt time.Time          `json:"finished_at"`
-	Seed       int64              `json:"seed"`
-	SampleSize int                `json:"sample_size"`
-	Queries    int                `json:"queries_per_target"`
-	QueryTypes []uint16           `json:"query_types"`
-	Targets    []TargetResult     `json:"results"`
-	Rankings   []Ranking          `json:"rankings"`
-	Divergence []DivergenceDetail `json:"divergence,omitempty"`
-	Warnings   []string           `json:"warnings,omitempty"`
+	StartedAt     time.Time          `json:"started_at"`
+	FinishedAt    time.Time          `json:"finished_at"`
+	Seed          int64              `json:"seed"`
+	SampleSize    int                `json:"sample_size"`
+	Queries       int                `json:"queries_per_target"`
+	QueryTypes    []uint16           `json:"query_types"`
+	Targets       []TargetResult     `json:"results"`
+	Rankings      []Ranking          `json:"rankings"`
+	PairedEffects []PairedEffect     `json:"paired_effects,omitempty"`
+	Divergence    []DivergenceDetail `json:"divergence,omitempty"`
+	Warnings      []string           `json:"warnings,omitempty"`
+}
+
+// PairedEffect describes the latency difference between a target and the
+// deterministic reference for its protocol and declared policy group. A
+// positive delta means that the target was slower than the reference.
+//
+// Only observations that are usable, non-divergent, non-reconnect samples are
+// paired. The existing composite score remains the ranking authority; these
+// values explain whether a ranked difference is distinguishable from noise.
+type PairedEffect struct {
+	Protocol          catalog.Protocol `json:"protocol"`
+	Policy            string           `json:"policy"`
+	TargetID          string           `json:"target_id"`
+	ReferenceTargetID string           `json:"reference_target_id"`
+	Samples           int              `json:"samples"`
+	MedianDeltaMS     float64          `json:"median_delta_ms"`
+	CILowMS           float64          `json:"ci_low_ms"`
+	CIHighMS          float64          `json:"ci_high_ms"`
+	Indistinguishable bool             `json:"indistinguishable"`
+	Reference         bool             `json:"reference,omitempty"`
+	Reason            string           `json:"reason,omitempty"`
 }
 
 // DivergenceExclusion identifies a successful response that differed from the
@@ -228,6 +250,7 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 		return report.Targets[i].Target.ID() < report.Targets[j].Target.ID()
 	})
 	report.Rankings = makeRankings(report.Targets)
+	report.PairedEffects = calculatePairedEffects(report.Targets, report.Rankings, report.Seed)
 	report.Warnings = collectWarnings(report.Targets)
 	if ctx.Err() != nil {
 		return report, ctx.Err()
@@ -1016,6 +1039,166 @@ func bootstrapCI(samples []scoreSample, timeout time.Duration, seed int64) (floa
 			resample[index] = samples[rng.Intn(len(samples))]
 		}
 		scores[iteration] = scoreFromSamples(resample, durationMS(timeout))
+	}
+	sort.Float64s(scores)
+	return percentile(scores, 0.025), percentile(scores, 0.975)
+}
+
+type pairedGroupKey struct {
+	protocol catalog.Protocol
+	policy   string
+}
+
+// calculatePairedEffects builds policy-local comparisons against the best
+// ranked target in each protocol/policy group. It deliberately runs after
+// makeRankings so the existing score remains the only ranking authority.
+func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int64) []PairedEffect {
+	ranks := make(map[string]int, len(rankings))
+	for _, ranking := range rankings {
+		ranks[ranking.TargetID] = ranking.Rank
+	}
+	groups := make(map[pairedGroupKey][]int)
+	for index, result := range results {
+		if result.Incomplete || result.Stats.Scored == 0 {
+			continue
+		}
+		key := pairedGroupKey{protocol: result.Target.Protocol, policy: divergencePolicy(result.Target.Resolver.Policy)}
+		groups[key] = append(groups[key], index)
+	}
+	keys := make([]pairedGroupKey, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].protocol != keys[j].protocol {
+			return keys[i].protocol < keys[j].protocol
+		}
+		return keys[i].policy < keys[j].policy
+	})
+
+	effects := make([]PairedEffect, 0)
+	for _, key := range keys {
+		indexes := groups[key]
+		sort.Slice(indexes, func(i, j int) bool {
+			left, right := results[indexes[i]], results[indexes[j]]
+			leftRank, rightRank := ranks[left.Target.ID()], ranks[right.Target.ID()]
+			if leftRank == 0 {
+				leftRank = len(results) + 1
+			}
+			if rightRank == 0 {
+				rightRank = len(results) + 1
+			}
+			if leftRank != rightRank {
+				return leftRank < rightRank
+			}
+			if left.Stats.ScoreMS != right.Stats.ScoreMS {
+				return left.Stats.ScoreMS < right.Stats.ScoreMS
+			}
+			return left.Target.ID() < right.Target.ID()
+		})
+		reference := results[indexes[0]]
+		for _, index := range indexes {
+			target := results[index]
+			effect := PairedEffect{
+				Protocol:          key.protocol,
+				Policy:            key.policy,
+				TargetID:          target.Target.ID(),
+				ReferenceTargetID: reference.Target.ID(),
+				Reference:         target.Target.ID() == reference.Target.ID(),
+			}
+			deltas := pairedLatencyDeltas(target, reference)
+			effect.Samples = len(deltas)
+			if effect.Reference {
+				if effect.Samples == 0 {
+					effect.Reason = "no scored samples"
+				}
+				effects = append(effects, effect)
+				continue
+			}
+			if len(deltas) == 0 {
+				effect.Reason = "no shared scored samples"
+				effects = append(effects, effect)
+				continue
+			}
+			sort.Float64s(deltas)
+			effect.MedianDeltaMS = percentile(deltas, 0.5)
+			effect.CILowMS, effect.CIHighMS = bootstrapPairedCI(deltas, pairedBootstrapSeed(seed, key.protocol, key.policy, reference.Target.ID(), target.Target.ID()))
+			effect.Indistinguishable = effect.CILowMS <= 0 && effect.CIHighMS >= 0
+			effects = append(effects, effect)
+		}
+	}
+	sort.Slice(effects, func(i, j int) bool {
+		if effects[i].Protocol != effects[j].Protocol {
+			return effects[i].Protocol < effects[j].Protocol
+		}
+		if effects[i].Policy != effects[j].Policy {
+			return effects[i].Policy < effects[j].Policy
+		}
+		return effects[i].TargetID < effects[j].TargetID
+	})
+	return effects
+}
+
+func pairedLatencyDeltas(target, reference TargetResult) []float64 {
+	targetLatencies := pairedObservationLatencies(target)
+	referenceLatencies := pairedObservationLatencies(reference)
+	keys := make([]string, 0, len(targetLatencies))
+	for key := range targetLatencies {
+		if _, ok := referenceLatencies[key]; ok {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	deltas := make([]float64, 0, len(keys))
+	for _, key := range keys {
+		deltas = append(deltas, targetLatencies[key]-referenceLatencies[key])
+	}
+	return deltas
+}
+
+func pairedObservationLatencies(result TargetResult) map[string]float64 {
+	latencies := make(map[string]float64)
+	for _, observation := range result.Observations {
+		if !observationUsable(observation) || observation.Divergent || observation.Reconnected ||
+			math.IsNaN(observation.LatencyMS) || math.IsInf(observation.LatencyMS, 0) || observation.LatencyMS < 0 {
+			continue
+		}
+		key := queryKey(observation.Name, observation.QType)
+		if _, exists := latencies[key]; !exists {
+			latencies[key] = observation.LatencyMS
+		}
+	}
+	return latencies
+}
+
+func pairedBootstrapSeed(seed int64, protocol catalog.Protocol, policy, referenceID, targetID string) int64 {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(string(protocol)))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(policy))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(referenceID))
+	_, _ = hasher.Write([]byte{0})
+	_, _ = hasher.Write([]byte(targetID))
+	return seed ^ int64(hasher.Sum64())
+}
+
+func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
+	if len(deltas) == 0 {
+		return 0, 0
+	}
+	if len(deltas) == 1 {
+		return deltas[0], deltas[0]
+	}
+	rng := rand.New(rand.NewSource(seed))
+	scores := make([]float64, BootstrapIterations)
+	resample := make([]float64, len(deltas))
+	for iteration := range scores {
+		for index := range resample {
+			resample[index] = deltas[rng.Intn(len(deltas))]
+		}
+		sort.Float64s(resample)
+		scores[iteration] = percentile(resample, 0.5)
 	}
 	sort.Float64s(scores)
 	return percentile(scores, 0.025), percentile(scores, 0.975)

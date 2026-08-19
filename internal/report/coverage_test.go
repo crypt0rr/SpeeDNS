@@ -787,3 +787,87 @@ func TestReportFormattingBranchesAndWriteErrors(t *testing.T) {
 		t.Fatal("warning row propagation was not returned")
 	}
 }
+
+func TestPairedEffectsAreRenderedExportedAndRedacted(t *testing.T) {
+	first := reportTarget("first", catalog.UDP, 2, true)
+	second := reportTarget("second", catalog.UDP, 2, false)
+	system := reportTarget("system-paired", catalog.UDP, 2, false)
+	system.Target.Resolver.Name = "System DNS (scope: corp)"
+	system.Target.Resolver.Owner = "local forwarding (interface: utun0)"
+	system.Target.Address = "127.0.0.53"
+	effects := []benchmark.PairedEffect{
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: second.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 2, MedianDeltaMS: 0, CILowMS: -1, CIHighMS: 1, Indistinguishable: true},
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: first.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 2, Reference: true},
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: system.Target.ID(), ReferenceTargetID: system.Target.ID(), Samples: 2, MedianDeltaMS: 2, CILowMS: 1, CIHighMS: 3},
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: "missing-target", ReferenceTargetID: first.Target.ID(), Reason: "no shared scored samples"},
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: second.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 1, MedianDeltaMS: -2, CILowMS: -2, CIHighMS: -2},
+		{Protocol: catalog.TCP, Policy: "z-policy", TargetID: second.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 1, MedianDeltaMS: 1, CILowMS: 1, CIHighMS: 1},
+		{Protocol: catalog.TCP, Policy: "a-policy", TargetID: first.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 1, Reference: true},
+	}
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 2, Queries: 2, QueryTypes: []uint16{1},
+		Targets:       []benchmark.TargetResult{first, second, system},
+		Rankings:      []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: first.Target.ID(), Rank: 1}, {Protocol: catalog.UDP, TargetID: second.Target.ID(), Rank: 2}},
+		PairedEffects: effects,
+	}
+
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{Color: true, RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	tableText := table.String()
+	for _, expected := range []string{"Paired latency effects", "Median Δ", "NO CLEAR DIFFERENCE", "REFERENCE", "NOT COMPARABLE", "FASTER", "SLOWER", ansiYellow} {
+		if !strings.Contains(tableText, expected) {
+			t.Fatalf("paired table missing %q: %s", expected, tableText)
+		}
+	}
+	if strings.Contains(tableText, system.Target.ID()) || !strings.Contains(tableText, "redacted") {
+		t.Fatalf("paired table leaked system identity: %s", tableText)
+	}
+	if pairedEffectTargetText(run, "missing-target", true) != "—" {
+		t.Fatalf("missing paired target label = %q", pairedEffectTargetText(run, "missing-target", true))
+	}
+
+	var jsonOutput bytes.Buffer
+	if err := WriteJSONWithOptions(&jsonOutput, run, false, JSONOptions{RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	jsonText := jsonOutput.String()
+	for _, expected := range []string{"\"paired_effects\"", "\"reference_target_id\"", "\"indistinguishable\": true", "system-redacted-1@redacted/udp"} {
+		if !strings.Contains(jsonText, expected) {
+			t.Fatalf("paired JSON missing %q: %s", expected, jsonText)
+		}
+	}
+	if strings.Contains(jsonText, system.Target.ID()) || strings.Contains(jsonText, "127.0.0.53") {
+		t.Fatalf("paired JSON leaked system identity: %s", jsonText)
+	}
+
+	if pairedDeltaText(benchmark.PairedEffect{}) != "—" || pairedCIText(benchmark.PairedEffect{}) != "—" {
+		t.Fatal("empty paired effect formatting did not use placeholders")
+	}
+	if got := pairedInterpretation(benchmark.PairedEffect{Reference: true}, false); got != "REFERENCE" {
+		t.Fatalf("reference interpretation = %q", got)
+	}
+	if got := pairedInterpretation(benchmark.PairedEffect{}, false); got != "NOT COMPARABLE" {
+		t.Fatalf("unavailable interpretation = %q", got)
+	}
+	if got := pairedInterpretation(benchmark.PairedEffect{Samples: 1, MedianDeltaMS: 0}, false); got != "NO CLEAR DIFFERENCE" {
+		t.Fatalf("zero interpretation = %q", got)
+	}
+	if got := pairedInterpretation(benchmark.PairedEffect{Samples: 1, MedianDeltaMS: -1}, false); got != "FASTER" {
+		t.Fatalf("faster interpretation = %q", got)
+	}
+	if got := pairedInterpretation(benchmark.PairedEffect{Samples: 1, MedianDeltaMS: 1}, false); got != "SLOWER" {
+		t.Fatalf("slower interpretation = %q", got)
+	}
+
+	if err := writePairedEffects(contentFailWriter{needle: "Paired latency effects"}, run, TableOptions{}); err == nil {
+		t.Fatal("paired heading writer failure was not returned")
+	}
+	if err := writePairedEffects(contentFailWriter{needle: "Protocol"}, run, TableOptions{}); err == nil {
+		t.Fatal("paired table writer failure was not returned")
+	}
+	if err := WriteTableWithOptions(contentFailWriter{needle: "Paired latency effects"}, run, TableOptions{}); err == nil {
+		t.Fatal("top-level paired effect writer failure was not returned")
+	}
+}

@@ -116,6 +116,20 @@ leader's tie group when its 95% bootstrap interval overlaps the leader's
 interval. The leader is marked as tied too, so the tie is visible from either
 row.
 
+The report also includes paired latency effects. For each protocol and
+normalized declared policy, the best-ranked target in that group is the local
+reference. Each other target is paired with that reference by normalized query
+name and record type. Only usable, non-divergent observations that were not
+recorded immediately after a reconnect are included. The reported delta is the
+median of `target latency - reference latency`, so a positive value means the
+target was slower. A deterministic bootstrap of those paired deltas provides
+the 95% confidence interval. When the interval contains zero, the report says
+`NO CLEAR DIFFERENCE`: the observed ranking difference is not distinguishable
+from noise in this run. These effects explain the existing score and never
+change ranking order. JSON exposes them in the additive `paired_effects`
+section; the human table shows them below the protocol comparisons, while CSV
+retains its aggregate one-row-per-target schema.
+
 ## Interruption and diagnostics
 
 Cancellation never creates synthetic observations for queries that were not

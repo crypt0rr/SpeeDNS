@@ -19,6 +19,7 @@ type JSONReport struct {
 	Run           JSONRun                      `json:"run"`
 	Results       []JSONResult                 `json:"results"`
 	Rankings      []benchmark.Ranking          `json:"rankings"`
+	PairedEffects []benchmark.PairedEffect     `json:"paired_effects,omitempty"`
 	Divergence    []benchmark.DivergenceDetail `json:"divergence,omitempty"`
 	Warnings      []string                     `json:"warnings,omitempty"`
 }
@@ -117,7 +118,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 			FinishedAt: report.FinishedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			Seed:       report.Seed, SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes,
 		},
-		Results: results, Rankings: rankings, Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
+		Results: results, Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
 	}
 }
 
@@ -352,6 +353,22 @@ func divergenceForJSON(report benchmark.Report, redactedIDs map[string]string) [
 	return details
 }
 
+func pairedEffectsForJSON(report benchmark.Report, redactedIDs map[string]string) []benchmark.PairedEffect {
+	if len(report.PairedEffects) == 0 {
+		return nil
+	}
+	effects := append([]benchmark.PairedEffect(nil), report.PairedEffects...)
+	for index := range effects {
+		if replacement, ok := redactedIDs[effects[index].TargetID]; ok {
+			effects[index].TargetID = replacement
+		}
+		if replacement, ok := redactedIDs[effects[index].ReferenceTargetID]; ok {
+			effects[index].ReferenceTargetID = replacement
+		}
+	}
+	return effects
+}
+
 func cloneIntMap(values map[string]int) map[string]int {
 	if len(values) == 0 {
 		return nil
@@ -470,9 +487,9 @@ func styledStatus(status string, color bool) string {
 	}
 	colorCode := ""
 	switch status {
-	case "RECOMMENDED", "QUALIFIED":
+	case "RECOMMENDED", "QUALIFIED", "REFERENCE":
 		colorCode = ansiGreen
-	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE":
+	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE":
 		colorCode = ansiYellow
 	case "FAILED":
 		colorCode = ansiRed
@@ -663,6 +680,79 @@ func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, 
 		}
 	}
 	return rows
+}
+
+func pairedEffectTargetText(report benchmark.Report, targetID string, redactSystem bool) string {
+	result, ok := report.ResultFor(targetID)
+	if !ok {
+		return "—"
+	}
+	view := targetViewFor(result.Target, redactSystem, redactedValue)
+	return strings.TrimSpace(view.Owner + " " + view.Address)
+}
+
+func pairedDeltaText(effect benchmark.PairedEffect) string {
+	if effect.Samples == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%+.2f ms", effect.MedianDeltaMS)
+}
+
+func pairedCIText(effect benchmark.PairedEffect) string {
+	if effect.Samples == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("[%+.2f, %+.2f] ms", effect.CILowMS, effect.CIHighMS)
+}
+
+func pairedInterpretation(effect benchmark.PairedEffect, color bool) string {
+	if effect.Reference {
+		return styledStatus("REFERENCE", color)
+	}
+	if effect.Samples == 0 {
+		return styledStatus("NOT COMPARABLE", color)
+	}
+	if effect.Indistinguishable || effect.MedianDeltaMS == 0 {
+		return styledStatus("NO CLEAR DIFFERENCE", color)
+	}
+	if effect.MedianDeltaMS < 0 {
+		return "FASTER"
+	}
+	return "SLOWER"
+}
+
+func pairedEffectRows(report benchmark.Report, options TableOptions) [][]string {
+	effects := append([]benchmark.PairedEffect(nil), report.PairedEffects...)
+	sort.SliceStable(effects, func(i, j int) bool {
+		if effects[i].Protocol != effects[j].Protocol {
+			return effects[i].Protocol < effects[j].Protocol
+		}
+		if effects[i].Policy != effects[j].Policy {
+			return effects[i].Policy < effects[j].Policy
+		}
+		return effects[i].TargetID < effects[j].TargetID
+	})
+	rows := make([][]string, 0, len(effects))
+	for _, effect := range effects {
+		rows = append(rows, []string{
+			string(effect.Protocol), effect.Policy,
+			pairedEffectTargetText(report, effect.TargetID, options.RedactSystem),
+			pairedEffectTargetText(report, effect.ReferenceTargetID, options.RedactSystem),
+			strconv.Itoa(effect.Samples), pairedDeltaText(effect), pairedCIText(effect),
+			pairedInterpretation(effect, options.Color),
+		})
+	}
+	return rows
+}
+
+func writePairedEffects(writer io.Writer, report benchmark.Report, options TableOptions) error {
+	if len(report.PairedEffects) == 0 {
+		return nil
+	}
+	if _, err := io.WriteString(writer, "\nPaired latency effects (target - reference; policy-local reference)\n"); err != nil {
+		return err
+	}
+	return writeAlignedTable(writer, []string{"Protocol", "Policy", "Target", "Reference", "Samples", "Median Δ", "95% CI", "Interpretation"}, pairedEffectRows(report, options))
 }
 
 func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
@@ -945,6 +1035,9 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 		if err := writeAlignedTable(writer, comparisonHeaders(options.Details), rows); err != nil {
 			return err
 		}
+	}
+	if err := writePairedEffects(writer, report, options); err != nil {
+		return err
 	}
 	if options.Details {
 		if err := writeDivergenceDetails(writer, report, options.RedactSystem); err != nil {
