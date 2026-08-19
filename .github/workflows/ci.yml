@@ -56,6 +56,10 @@ jobs:
           git diff --exit-code -- go.mod go.sum
           go mod verify
 
+      - name: Test domain corpus updater fixture
+        shell: bash
+        run: bash scripts/update-domains-fixture.sh
+
       - name: Run unit and integration tests
         run: go test -count=1 ./...
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand"
 	"sort"
@@ -74,6 +75,7 @@ type Observation struct {
 	Truncated     bool          `json:"truncated,omitempty"`
 	ResponseClass string        `json:"response_class,omitempty"`
 	Divergent     bool          `json:"divergent,omitempty"`
+	Reconnected   bool          `json:"reconnected,omitempty"`
 	Error         string        `json:"error,omitempty"`
 }
 
@@ -95,6 +97,7 @@ type Statistics struct {
 	Scored              int            `json:"scored"`
 	Divergent           int            `json:"divergent"`
 	Truncated           int            `json:"truncated"`
+	Reconnects          int            `json:"reconnects"`
 	SuccessRate         float64        `json:"success_rate"`
 	FailureRate         float64        `json:"failure_rate"`
 	UsableRate          float64        `json:"usable_rate"`
@@ -120,6 +123,7 @@ type TargetResult struct {
 	Cold         []ColdObservation `json:"cold,omitempty"`
 	Stats        Statistics        `json:"stats"`
 	OpenError    string            `json:"open_error,omitempty"`
+	Incomplete   bool              `json:"incomplete,omitempty"`
 	DialAddress  string            `json:"-"`
 }
 
@@ -263,7 +267,14 @@ func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query,
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
-				results[index] = runTargetFunc(ctx, targets[index], queries, opts)
+				result := runTargetFunc(ctx, targets[index], queries, opts)
+				if ctx.Err() != nil {
+					// A worker may return just after cancellation, including when a
+					// test fixture ignores its context. Keep that target diagnostic
+					// but never let a partial result enter rankings.
+					markIncomplete(&result, ctx.Err())
+				}
+				results[index] = result
 				if opts.OnProgress != nil {
 					opts.OnProgress(Progress{Protocol: targets[index].Protocol, Completed: int(completed.Add(1)), Total: len(targets), Target: targets[index]})
 				}
@@ -302,11 +313,19 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 	result := TargetResult{Target: target, Observations: make([]Observation, 0, len(queries))}
 	factory, err := newFactory(target, opts.Timeout)
 	if err != nil {
+		if ctx.Err() != nil {
+			markIncomplete(&result, ctx.Err())
+			return result
+		}
 		result.OpenError = err.Error()
 		result.Observations = failedObservations(queries, err)
 		return result
 	}
 	for index := 0; index < 3; index++ {
+		if ctx.Err() != nil {
+			markIncomplete(&result, ctx.Err())
+			return result
+		}
 		probe := warmupNames[index%len(warmupNames)]
 		qtype := opts.QueryTypes[index%len(opts.QueryTypes)]
 		started := time.Now()
@@ -315,24 +334,38 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 		if openErr != nil {
 			observation.Error = openErr.Error()
 			result.Cold = append(result.Cold, observation)
+			if ctx.Err() != nil {
+				markIncomplete(&result, ctx.Err())
+				return result
+			}
 			continue
 		}
 		queryCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 		_, queryErr := session.Query(queryCtx, probe, qtype)
-		cancel()
-		_ = session.Close()
+		// Cold latency ends when the DNS exchange returns. Session teardown is
+		// deliberately excluded because its cost differs by transport.
 		observation.Latency = time.Since(started)
 		observation.LatencyMS = durationMS(observation.Latency)
+		cancel()
+		_ = session.Close()
 		if queryErr != nil {
 			observation.Error = queryErr.Error()
 		} else {
 			observation.Success = true
 		}
 		result.Cold = append(result.Cold, observation)
+		if ctx.Err() != nil {
+			markIncomplete(&result, ctx.Err())
+			return result
+		}
 	}
 
 	session, err := factory.Open(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			markIncomplete(&result, ctx.Err())
+			return result
+		}
 		result.OpenError = err.Error()
 		result.Observations = failedObservations(queries, err)
 		return result
@@ -340,27 +373,36 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 	defer session.Close()
 	for index, name := range warmupNames {
 		if ctx.Err() != nil {
-			result.OpenError = ctx.Err().Error()
-			result.Observations = failedObservations(queries, ctx.Err())
+			markIncomplete(&result, ctx.Err())
 			return result
 		}
 		warmupType := opts.QueryTypes[index%len(opts.QueryTypes)]
 		warmupCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 		_, _ = session.Query(warmupCtx, name, warmupType)
 		cancel()
+		if ctx.Err() != nil {
+			markIncomplete(&result, ctx.Err())
+			return result
+		}
 	}
 	result.DialAddress = sessionDialAddress(session)
 	for _, query := range queries {
 		observation := Observation{Name: query.Name, QType: query.QType}
 		if ctx.Err() != nil {
-			observation.Error = ctx.Err().Error()
-			result.Observations = append(result.Observations, observation)
-			continue
+			markIncomplete(&result, ctx.Err())
+			return result
 		}
 		started := time.Now()
 		queryCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 		message, queryErr := session.Query(queryCtx, query.Name, query.QType)
+		observation.Reconnected = sessionQueryReconnected(session)
 		cancel()
+		if ctx.Err() != nil {
+			// The parent benchmark cancellation is not a DNS failure sample. Do
+			// not manufacture an observation for work that did not complete.
+			markIncomplete(&result, ctx.Err())
+			return result
+		}
 		observation.Latency = time.Since(started)
 		observation.LatencyMS = durationMS(observation.Latency)
 		if queryErr != nil {
@@ -382,7 +424,15 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 		}
 		result.Observations = append(result.Observations, observation)
 	}
+	result.DialAddress = sessionDialAddress(session)
 	return result
+}
+
+func markIncomplete(result *TargetResult, err error) {
+	result.Incomplete = true
+	if err != nil {
+		result.OpenError = err.Error()
+	}
 }
 
 func sessionDialAddress(session transport.Session) string {
@@ -393,6 +443,16 @@ func sessionDialAddress(session transport.Session) string {
 		return session.DialAddress()
 	}
 	return ""
+}
+
+func sessionQueryReconnected(session transport.Session) bool {
+	type queryDiagnostics interface {
+		LastQueryReconnected() bool
+	}
+	if session, ok := session.(queryDiagnostics); ok {
+		return session.LastQueryReconnected()
+	}
+	return false
 }
 
 func failedObservations(queries []Query, err error) []Observation {
@@ -432,9 +492,15 @@ func queryKey(name string, qtype uint16) string {
 	return fmt.Sprintf("%s/%d", strings.ToLower(name), qtype)
 }
 
+type scoreSample struct {
+	latencyMS float64
+	success   bool
+}
+
 func calculateStatistics(result TargetResult, timeout time.Duration, seed int64) Statistics {
 	stats := Statistics{Total: len(result.Observations), RCodeCounts: make(map[string]int)}
 	latencies := make([]float64, 0, len(result.Observations))
+	scoreSamples := make([]scoreSample, 0, len(result.Observations))
 	scoringFailures := 0
 	for _, observation := range result.Observations {
 		if observation.Success {
@@ -446,6 +512,9 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		if observation.Truncated {
 			stats.Truncated++
 		}
+		if observation.Reconnected {
+			stats.Reconnects++
+		}
 		usable := observationUsable(observation)
 		if observation.Success && !observation.Truncated && usable {
 			stats.UsableResponses++
@@ -456,16 +525,27 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		if observation.Success && !observation.Truncated && (observation.ResponseClass != "" || observation.RCode != 0 || observation.Usable) {
 			stats.RCodeCounts[transport.ResponseCodeName(observation.RCode)]++
 		}
+
 		if observation.Divergent {
 			stats.Divergent++
-			continue
 		}
 		if observation.Success && !observation.Truncated && usable {
+			if observation.Divergent || observation.Reconnected {
+				// Valid divergent responses and responses obtained immediately
+				// after a reconnect are not ordinary warm-latency samples.
+				continue
+			}
 			stats.Scored++
 			latencies = append(latencies, observation.LatencyMS)
-		} else {
-			scoringFailures++
+			scoreSamples = append(scoreSamples, scoreSample{latencyMS: observation.LatencyMS, success: true})
+			continue
 		}
+
+		// Unusable transport-valid responses remain scoring failures even
+		// when their response class is divergent. This prevents a fast
+		// SERVFAIL/REFUSED response from escaping the failure penalty.
+		scoringFailures++
+		scoreSamples = append(scoreSamples, scoreSample{success: false})
 	}
 	if len(stats.RCodeCounts) == 0 {
 		stats.RCodeCounts = nil
@@ -475,7 +555,9 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		stats.FailureRate = float64(stats.Failures) / float64(stats.Total)
 		stats.UsableRate = float64(stats.UsableResponses) / float64(stats.Total)
 		stats.ResolverFailureRate = float64(stats.ResolverFailures) / float64(stats.Total)
-		stats.ScoringFailureRate = float64(scoringFailures) / float64(stats.Total)
+	}
+	if len(scoreSamples) > 0 {
+		stats.ScoringFailureRate = float64(scoringFailures) / float64(len(scoreSamples))
 	}
 	if len(latencies) > 0 {
 		sort.Float64s(latencies)
@@ -484,14 +566,8 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		stats.MinMS = latencies[0]
 		stats.MaxMS = latencies[len(latencies)-1]
 		stats.MADMS = mad(latencies, stats.MedianMS)
-		stats.ScoreMS = 0.60*stats.MedianMS + 0.40*stats.P95MS + stats.ScoringFailureRate*durationMS(timeout)
-		stats.CILowMS, stats.CIHighMS = bootstrapCI(latencies, stats.ScoringFailureRate, timeout, seed+int64(len(result.Target.ID())))
-	}
-	for _, observation := range result.Cold {
-		if observation.Success {
-			// Cold probes are kept separate from warm scores. The median is
-			// populated after sorting to avoid changing the warm ranking.
-		}
+		stats.ScoreMS = scoreFromLatencies(latencies, stats.ScoringFailureRate, durationMS(timeout))
+		stats.CILowMS, stats.CIHighMS = bootstrapCI(scoreSamples, timeout, bootstrapSeed(seed, result.Target.ID()))
 	}
 	cold := make([]float64, 0, len(result.Cold))
 	for _, observation := range result.Cold {
@@ -503,7 +579,7 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		sort.Float64s(cold)
 		stats.ColdMedianMS = percentile(cold, 0.5)
 	}
-	stats.Recommended = stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
+	stats.Recommended = !result.Incomplete && stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
 	return stats
 }
 
@@ -554,20 +630,52 @@ func mad(sorted []float64, median float64) float64 {
 	return percentile(deviations, 0.5)
 }
 
-func bootstrapCI(latencies []float64, failureRate float64, timeout time.Duration, seed int64) (float64, float64) {
-	if len(latencies) < 2 {
-		score := 0.60*percentile(latencies, 0.5) + 0.40*percentile(latencies, 0.95) + failureRate*durationMS(timeout)
+func scoreFromLatencies(latencies []float64, failureRate, timeoutMS float64) float64 {
+	return 0.60*percentile(latencies, 0.50) + 0.40*percentile(latencies, 0.95) + failureRate*timeoutMS
+}
+
+func scoreFromSamples(samples []scoreSample, timeoutMS float64) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	latencies := make([]float64, 0, len(samples))
+	failures := 0
+	for _, sample := range samples {
+		if sample.success {
+			latencies = append(latencies, sample.latencyMS)
+		} else {
+			failures++
+		}
+	}
+	failureRate := float64(failures) / float64(len(samples))
+	if len(latencies) == 0 {
+		// This value is used only for confidence intervals because targets
+		// without scored samples are never ranked.
+		return 2 * timeoutMS
+	}
+	sort.Float64s(latencies)
+	return scoreFromLatencies(latencies, failureRate, timeoutMS)
+}
+
+func bootstrapSeed(seed int64, targetID string) int64 {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(targetID))
+	return seed ^ int64(hasher.Sum64())
+}
+
+func bootstrapCI(samples []scoreSample, timeout time.Duration, seed int64) (float64, float64) {
+	if len(samples) < 2 {
+		score := scoreFromSamples(samples, durationMS(timeout))
 		return score, score
 	}
 	rng := rand.New(rand.NewSource(seed))
 	scores := make([]float64, BootstrapIterations)
-	resample := make([]float64, len(latencies))
+	resample := make([]scoreSample, len(samples))
 	for iteration := range scores {
 		for index := range resample {
-			resample[index] = latencies[rng.Intn(len(latencies))]
+			resample[index] = samples[rng.Intn(len(samples))]
 		}
-		sort.Float64s(resample)
-		scores[iteration] = 0.60*percentile(resample, 0.5) + 0.40*percentile(resample, 0.95) + failureRate*durationMS(timeout)
+		scores[iteration] = scoreFromSamples(resample, durationMS(timeout))
 	}
 	sort.Float64s(scores)
 	return percentile(scores, 0.025), percentile(scores, 0.975)
@@ -576,25 +684,33 @@ func bootstrapCI(latencies []float64, failureRate float64, timeout time.Duration
 func makeRankings(results []TargetResult) []Ranking {
 	byProtocol := make(map[catalog.Protocol][]int)
 	for index, result := range results {
-		if result.Stats.Scored > 0 {
+		if result.Stats.Scored > 0 && !result.Incomplete {
 			byProtocol[result.Target.Protocol] = append(byProtocol[result.Target.Protocol], index)
 		}
 	}
 	var rankings []Ranking
 	for protocol, indexes := range byProtocol {
 		sort.Slice(indexes, func(i, j int) bool {
-			return results[indexes[i]].Stats.ScoreMS < results[indexes[j]].Stats.ScoreMS
+			left, right := results[indexes[i]], results[indexes[j]]
+			if left.Stats.ScoreMS != right.Stats.ScoreMS {
+				return left.Stats.ScoreMS < right.Stats.ScoreMS
+			}
+			return left.Target.ID() < right.Target.ID()
 		})
+		leader := results[indexes[0]].Stats
+		leaderTie := false
+		protocolRankingStart := len(rankings)
 		for rank, index := range indexes {
 			tie := false
-			if rank > 0 {
-				previous := results[indexes[rank-1]].Stats
-				current := results[index].Stats
-				tie = current.CILowMS <= previous.CIHighMS && previous.CILowMS <= current.CIHighMS
+			if rank > 0 && confidenceIntervalsOverlap(leader, results[index].Stats) {
+				tie = true
+				leaderTie = true
 			}
 			results[index].Stats.Tie = tie
 			rankings = append(rankings, Ranking{Protocol: protocol, TargetID: results[index].Target.ID(), Rank: rank + 1, Tie: tie})
 		}
+		results[indexes[0]].Stats.Tie = leaderTie
+		rankings[protocolRankingStart].Tie = leaderTie
 	}
 	sort.Slice(rankings, func(i, j int) bool {
 		if rankings[i].Protocol != rankings[j].Protocol {
@@ -605,10 +721,25 @@ func makeRankings(results []TargetResult) []Ranking {
 	return rankings
 }
 
+func confidenceIntervalsOverlap(left, right Statistics) bool {
+	leftLow, leftHigh := left.CILowMS, left.CIHighMS
+	rightLow, rightHigh := right.CILowMS, right.CIHighMS
+	if leftLow == 0 && leftHigh == 0 && left.ScoreMS != 0 {
+		leftLow, leftHigh = left.ScoreMS, left.ScoreMS
+	}
+	if rightLow == 0 && rightHigh == 0 && right.ScoreMS != 0 {
+		rightLow, rightHigh = right.ScoreMS, right.ScoreMS
+	}
+	return leftLow <= rightHigh && rightLow <= leftHigh
+}
+
 func collectWarnings(results []TargetResult) []string {
 	warnings := make([]string, 0)
 	for _, result := range results {
 		label := fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol)
+		if result.Incomplete {
+			warnings = append(warnings, fmt.Sprintf("%s was incomplete and excluded from ranking", label))
+		}
 		if result.OpenError != "" {
 			warnings = append(warnings, fmt.Sprintf("%s could not open a session: %s", label, result.OpenError))
 		}
@@ -628,7 +759,7 @@ func collectWarnings(results []TargetResult) []string {
 			}
 			warnings = append(warnings, warning)
 		}
-		if result.Stats.Scored > 0 && !result.Stats.Recommended {
+		if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
 			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
 		}
 	}

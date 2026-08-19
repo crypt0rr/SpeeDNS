@@ -36,10 +36,23 @@ func (f *fakeFactory) Open(context.Context) (transport.Session, error) {
 	return f.opens[index].session, f.opens[index].err
 }
 
+type scriptedFactory struct {
+	open  func(int, context.Context) (transport.Session, error)
+	count int
+}
+
+func (f *scriptedFactory) Open(ctx context.Context) (transport.Session, error) {
+	index := f.count
+	f.count++
+	return f.open(index, ctx)
+}
+
 type fakeSession struct {
-	query    func(context.Context, string, uint16) (*dns.Msg, error)
-	closeErr error
-	closes   int
+	query       func(context.Context, string, uint16) (*dns.Msg, error)
+	closeErr    error
+	closeDelay  time.Duration
+	reconnected bool
+	closes      int
 }
 
 func (s *fakeSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
@@ -50,8 +63,31 @@ func (s *fakeSession) Query(ctx context.Context, name string, qtype uint16) (*dn
 }
 
 func (s *fakeSession) Close() error {
+	if s.closeDelay > 0 {
+		time.Sleep(s.closeDelay)
+	}
 	s.closes++
 	return s.closeErr
+}
+
+func (s *fakeSession) LastQueryReconnected() bool { return s.reconnected }
+
+type minimalSession struct{}
+
+func (minimalSession) Query(context.Context, string, uint16) (*dns.Msg, error) {
+	return replyFor("example.com", dns.TypeA), nil
+}
+
+func (minimalSession) Close() error { return nil }
+
+type cancelDialSession struct {
+	*fakeSession
+	cancel context.CancelFunc
+}
+
+func (s *cancelDialSession) DialAddress() string {
+	s.cancel()
+	return ""
 }
 
 func replyFor(name string, qtype uint16) *dns.Msg {
@@ -198,7 +234,7 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
 	}
-	if len(cancelledReport.Targets) != 1 || cancelledReport.Targets[0].Target.ID() == "@/" || cancelledReport.Targets[0].Target.ID() != cancelledTargets[0].ID() {
+	if len(cancelledReport.Targets) != 1 || len(cancelledReport.Rankings) != 0 || !cancelledReport.Targets[0].Incomplete || cancelledReport.Targets[0].Target.ID() == "@/" || cancelledReport.Targets[0].Target.ID() != cancelledTargets[0].ID() {
 		t.Fatalf("cancelled Run targets = %#v, want only the first dispatched target", cancelledReport.Targets)
 	}
 
@@ -376,7 +412,7 @@ func TestRunTargetStopsWhenContextCancelsDuringWarmup(t *testing.T) {
 	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
 	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
 	result := runTarget(ctx, testTarget(catalog.UDP, "cancel-warmup"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
-	if result.OpenError != context.Canceled.Error() || result.Observations[0].Error != context.Canceled.Error() {
+	if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
 		t.Fatalf("cancelled warmup result = %#v", result)
 	}
 
@@ -390,7 +426,7 @@ func TestRunTargetStopsWhenContextCancelsDuringWarmup(t *testing.T) {
 	factory = &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
 	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
 	result = runTarget(ctx, testTarget(catalog.UDP, "cancel-query"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
-	if result.OpenError != "" || result.Observations[0].Error != context.Canceled.Error() {
+	if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
 		t.Fatalf("cancelled measured query result = %#v", result)
 	}
 }
@@ -415,11 +451,17 @@ func TestStatisticsRankingAndWarnings(t *testing.T) {
 	second := TargetResult{Target: testTarget(catalog.UDP, "slow"), Stats: Statistics{Scored: 2, ScoreMS: 2, CILowMS: 0.5, CIHighMS: 3}}
 	other := TargetResult{Target: testTarget(catalog.TCP, "other"), Stats: Statistics{Scored: 2, ScoreMS: 5, CILowMS: 5, CIHighMS: 5}}
 	rankings := makeRankings([]TargetResult{second, other, first})
-	if len(rankings) != 3 || rankings[0].Protocol != catalog.TCP || rankings[0].Rank != 1 || !rankings[2].Tie {
+	if len(rankings) != 3 || rankings[0].Protocol != catalog.TCP || rankings[0].Rank != 1 || !rankings[1].Tie || !rankings[2].Tie {
 		t.Fatalf("rankings = %#v", rankings)
 	}
 	if len(makeRankings(nil)) != 0 || len(makeRankings([]TargetResult{{Target: target}})) != 0 {
 		t.Fatal("unscored results should not be ranked")
+	}
+	equalA := TargetResult{Target: testTarget(catalog.UDP, "equal-a"), Stats: Statistics{Scored: 1, ScoreMS: 5}}
+	equalB := TargetResult{Target: testTarget(catalog.UDP, "equal-b"), Stats: Statistics{Scored: 1, ScoreMS: 5}}
+	equalRankings := makeRankings([]TargetResult{equalB, equalA})
+	if len(equalRankings) != 2 || equalRankings[0].TargetID != equalA.Target.ID() || !equalRankings[0].Tie || !equalRankings[1].Tie {
+		t.Fatalf("equal-score rankings = %#v", equalRankings)
 	}
 
 	warningResult := TargetResult{Target: target, OpenError: "open failed", Stats: Statistics{Total: 4, Failures: 1, Divergent: 1, Truncated: 1, Scored: 1, Recommended: false}}
@@ -430,6 +472,222 @@ func TestStatisticsRankingAndWarnings(t *testing.T) {
 	if got := failedObservations([]Query{{Name: "x", QType: dns.TypeA}}, errors.New("failed")); got[0].Error != "failed" {
 		t.Fatalf("failed observation = %#v", got)
 	}
+}
+
+func TestDivergentUnusableResponsesRemainScoringFailures(t *testing.T) {
+	badTarget := testTarget(catalog.UDP, "fast-errors")
+	goodTarget := testTarget(catalog.UDP, "steady")
+	badObservations := make([]Observation, 0, 20)
+	goodObservations := make([]Observation, 0, 20)
+	for index := 0; index < 12; index++ {
+		badObservations = append(badObservations, Observation{Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 1})
+		goodObservations = append(goodObservations, Observation{Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 10})
+	}
+	for index := 0; index < 8; index++ {
+		badObservations = append(badObservations, Observation{Success: true, RCode: dns.RcodeServerFailure, ResponseClass: "rcode-2", Divergent: true, LatencyMS: 1})
+		goodObservations = append(goodObservations, Observation{Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 10})
+	}
+	bad := calculateStatistics(TargetResult{Target: badTarget, Observations: badObservations}, 2*time.Second, 42)
+	good := calculateStatistics(TargetResult{Target: goodTarget, Observations: goodObservations}, 2*time.Second, 42)
+	if bad.ResolverFailures != 8 || bad.Divergent != 8 || bad.ScoringFailureRate != .4 {
+		t.Fatalf("divergent unusable metrics = %#v", bad)
+	}
+	if bad.ScoreMS <= good.ScoreMS {
+		t.Fatalf("fast resolver errors outranked usable peer: bad=%#v good=%#v", bad, good)
+	}
+}
+
+func TestBootstrapUsesCompleteOutcomesAndTargetIdentity(t *testing.T) {
+	samples := []scoreSample{{latencyMS: 10, success: true}, {latencyMS: 20, success: true}, {success: false}}
+	low, high := bootstrapCI(samples, 2*time.Second, bootstrapSeed(42, "one@192.0.2.1/udp"))
+	if high <= low {
+		t.Fatalf("bootstrap interval omitted outcome uncertainty: %v/%v", low, high)
+	}
+	if bootstrapSeed(42, "one@192.0.2.1/udp") == bootstrapSeed(42, "two@192.0.2.2/udp") {
+		t.Fatal("distinct target identities reused a bootstrap seed")
+	}
+	if got := scoreFromSamples([]scoreSample{{success: false}}, 2000); got != 4000 {
+		t.Fatalf("all-failure bootstrap score = %v, want 4000", got)
+	}
+}
+
+func TestIncompleteTargetsAreExcludedFromRankings(t *testing.T) {
+	target := testTarget(catalog.UDP, "partial")
+	result := TargetResult{Target: target, Incomplete: true, Stats: Statistics{Scored: 20, ScoreMS: 1}}
+	if rankings := makeRankings([]TargetResult{result}); len(rankings) != 0 {
+		t.Fatalf("incomplete target was ranked: %#v", rankings)
+	}
+	if warnings := collectWarnings([]TargetResult{result}); len(warnings) != 1 || !strings.Contains(warnings[0], "excluded from ranking") {
+		t.Fatalf("incomplete target warnings = %#v", warnings)
+	}
+}
+
+func TestColdLatencyExcludesSessionTeardown(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	factory := &fakeFactory{opens: []fakeOpen{
+		{session: &fakeSession{closeDelay: 100 * time.Millisecond}},
+		{session: &fakeSession{closeDelay: 100 * time.Millisecond}},
+		{session: &fakeSession{closeDelay: 100 * time.Millisecond}},
+		{session: &fakeSession{}},
+	}}
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	result := runTarget(context.Background(), testTarget(catalog.UDP, "cold-timing"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(result.Cold) != 3 || result.Cold[0].Latency >= 80*time.Millisecond {
+		t.Fatalf("cold latency included teardown: %#v", result.Cold)
+	}
+}
+
+func TestRunTargetRecordsReconnectDiagnostics(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	warm := &fakeSession{reconnected: true}
+	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	result := runTarget(context.Background(), testTarget(catalog.TCP, "reconnect-metric"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(result.Observations) != 1 || !result.Observations[0].Reconnected {
+		t.Fatalf("reconnect observation = %#v", result.Observations)
+	}
+	stats := calculateStatistics(result, time.Second, 42)
+	if stats.Reconnects != 1 || stats.Scored != 0 {
+		t.Fatalf("reconnect statistics = %#v", stats)
+	}
+}
+
+func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	target := testTarget(catalog.UDP, "cancel-branches")
+	queries := []Query{{Name: "x", QType: dns.TypeA}}
+	options := Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second}
+
+	t.Run("factory creation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return nil, errors.New("factory failed")
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("factory cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("before cold probe", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) { return minimalSession{}, nil }}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Cold) != 0 {
+			t.Fatalf("pre-cold cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("cold open", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index == 0 {
+					cancel()
+					return nil, errors.New("cold open canceled")
+				}
+				return minimalSession{}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Cold) != 1 || len(result.Observations) != 0 {
+			t.Fatalf("cold-open cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("cold query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
+				return &fakeSession{query: func(context.Context, string, uint16) (*dns.Msg, error) {
+					cancel()
+					return replyFor("example.com", dns.TypeA), nil
+				}}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Cold) != 1 || len(result.Observations) != 0 {
+			t.Fatalf("cold-query cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("warm open", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				cancel()
+				return nil, errors.New("warm open canceled")
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
+			t.Fatalf("warm-open cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("before warmup", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				cancel()
+				return minimalSession{}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("pre-warmup cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("before measured query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				return &cancelDialSession{fakeSession: &fakeSession{}, cancel: cancel}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("pre-measured cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("during measured query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				return &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+					if name == "x" {
+						cancel()
+					}
+					return replyFor(name, qtype), nil
+				}}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("measured cancellation result = %#v", result)
+		}
+	})
 }
 
 func TestDivergenceAndStatisticsHelpers(t *testing.T) {
@@ -454,10 +712,10 @@ func TestDivergenceAndStatisticsHelpers(t *testing.T) {
 	if got := percentile([]float64{1, 3, 7, 9}, .25); got != 2.5 {
 		t.Fatalf("interpolated percentile = %v", got)
 	}
-	if low, high := bootstrapCI(nil, .25, 2*time.Second, 1); low != 500 || high != 500 {
+	if low, high := bootstrapCI(nil, 2*time.Second, 1); low != 0 || high != 0 {
 		t.Fatalf("empty bootstrap CI = %v/%v", low, high)
 	}
-	if low, high := bootstrapCI([]float64{10}, .5, 2*time.Second, 1); low != high || low != 1010 {
+	if low, high := bootstrapCI([]scoreSample{{latencyMS: 10, success: true}}, 2*time.Second, 1); low != high || low != 10 {
 		t.Fatalf("single bootstrap CI = %v/%v", low, high)
 	}
 	if got := QueryTypeName(dns.TypeAAAA); got != "AAAA" {
@@ -471,6 +729,18 @@ func TestDivergenceAndStatisticsHelpers(t *testing.T) {
 	}
 	if got := sessionDialAddress(&reportedSession{address: "192.0.2.1:853"}); got != "192.0.2.1:853" {
 		t.Fatalf("reported session dial metadata = %q", got)
+	}
+	if sessionQueryReconnected(minimalSession{}) {
+		t.Fatal("session without reconnect metadata reported a reconnect")
+	}
+	if !confidenceIntervalsOverlap(Statistics{ScoreMS: 1.5}, Statistics{ScoreMS: 1.5}) {
+		t.Fatal("equal fallback score intervals should overlap")
+	}
+	if confidenceIntervalsOverlap(Statistics{ScoreMS: 1}, Statistics{ScoreMS: 3}) {
+		t.Fatal("separated fallback score intervals should not overlap")
+	}
+	if confidenceIntervalsOverlap(Statistics{CILowMS: 1, CIHighMS: 2}, Statistics{CILowMS: 3, CIHighMS: 4}) {
+		t.Fatal("separated confidence intervals should not overlap")
 	}
 }
 

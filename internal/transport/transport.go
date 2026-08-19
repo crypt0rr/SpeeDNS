@@ -277,13 +277,14 @@ func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 func (s *udpSession) Close() error { return nil }
 
 type streamSession struct {
-	conn        net.Conn
-	reopen      func(context.Context) (net.Conn, string, error)
-	mu          sync.Mutex
-	timeout     time.Duration
-	secure      bool
-	dialAddress string
-	closed      bool
+	conn            net.Conn
+	reopen          func(context.Context) (net.Conn, string, error)
+	mu              sync.Mutex
+	timeout         time.Duration
+	secure          bool
+	dialAddress     string
+	lastReconnected bool
+	closed          bool
 }
 
 func (s *streamSession) DialAddress() string {
@@ -292,9 +293,18 @@ func (s *streamSession) DialAddress() string {
 	return s.dialAddress
 }
 
+// LastQueryReconnected reports whether the most recent Query had to open a
+// fresh connection after the previous one was invalidated.
+func (s *streamSession) LastQueryReconnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastReconnected
+}
+
 func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastReconnected = false
 	if s.closed {
 		return nil, errors.New("stream session is closed")
 	}
@@ -306,9 +316,12 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 	if len(packed) > 65535 {
 		return nil, errors.New("DNS query exceeds TCP message limit")
 	}
+	reconnecting := s.conn == nil
 	if err := s.ensureConn(ctx); err != nil {
+		s.lastReconnected = reconnecting
 		return nil, err
 	}
+	s.lastReconnected = reconnecting
 	if err := setConnDeadline(s.conn, ctx, s.timeout); err != nil {
 		return nil, s.fatal(err)
 	}

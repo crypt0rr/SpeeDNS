@@ -35,6 +35,7 @@ type JSONResult struct {
 	Target       JSONTarget                  `json:"target"`
 	Stats        benchmark.Statistics        `json:"stats"`
 	OpenError    string                      `json:"open_error,omitempty"`
+	Incomplete   bool                        `json:"incomplete,omitempty"`
 	Observations []benchmark.Observation     `json:"samples,omitempty"`
 	Cold         []benchmark.ColdObservation `json:"cold,omitempty"`
 }
@@ -67,7 +68,7 @@ func toJSON(report benchmark.Report, raw bool) JSONReport {
 				Owner: result.Target.Resolver.Owner, Policy: result.Target.Resolver.Policy,
 				Address: result.Target.Address, Protocol: result.Target.Protocol,
 			},
-			Stats: result.Stats, OpenError: result.OpenError,
+			Stats: result.Stats, OpenError: result.OpenError, Incomplete: result.Incomplete,
 		}
 		if raw {
 			jsonResult.Observations = result.Observations
@@ -97,7 +98,7 @@ func WriteCSV(writer io.Writer, report benchmark.Report) error {
 	if err := writerCSV.Write([]string{
 		"target_id", "name", "owner", "policy", "address", "protocol", "rank", "recommended", "tie",
 		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate", "rcode_counts", "median_ms", "p95_ms",
-		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error",
+		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error", "reconnects", "incomplete",
 	}); err != nil {
 		return err
 	}
@@ -105,13 +106,13 @@ func WriteCSV(writer io.Writer, report benchmark.Report) error {
 		rank := rankFor(report, result.Target.ID())
 		stats := result.Stats
 		row := []string{
-			result.Target.ID(), result.Target.DisplayName(), result.Target.Resolver.Owner, result.Target.Resolver.Policy,
-			result.Target.Address, result.Target.Protocol.String(), strconv.Itoa(rank), strconv.FormatBool(stats.Recommended),
+			csvCell(result.Target.ID()), csvCell(result.Target.DisplayName()), csvCell(result.Target.Resolver.Owner), csvCell(result.Target.Resolver.Policy),
+			csvCell(result.Target.Address), csvCell(result.Target.Protocol.String()), strconv.Itoa(rank), strconv.FormatBool(stats.Recommended),
 			strconv.FormatBool(stats.Tie), strconv.Itoa(stats.Total), strconv.Itoa(stats.Successes), strconv.Itoa(stats.Failures),
 			strconv.Itoa(stats.UsableResponses), strconv.Itoa(stats.ResolverFailures), strconv.Itoa(stats.Scored), strconv.Itoa(stats.Divergent), strconv.Itoa(stats.Truncated),
 			formatFloat(stats.SuccessRate), formatFloat(stats.UsableRate), formatFloat(stats.ResolverFailureRate), formatFloat(stats.ScoringFailureRate), rcodeCountsCSV(stats.RCodeCounts), formatFloat(stats.MedianMS),
 			formatFloat(stats.P95MS), formatFloat(stats.MinMS), formatFloat(stats.MaxMS), formatFloat(stats.MADMS),
-			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), result.OpenError,
+			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), csvCell(result.OpenError), strconv.Itoa(stats.Reconnects), strconv.FormatBool(result.Incomplete),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -131,6 +132,21 @@ func rankFor(report benchmark.Report, targetID string) int {
 }
 
 func formatFloat(value float64) string { return strconv.FormatFloat(value, 'f', 3, 64) }
+
+// csvCell prefixes values that spreadsheet applications may interpret as a
+// formula. The leading apostrophe is part of the exported cell value and is
+// understood by spreadsheet programs as text protection.
+func csvCell(value string) string {
+	if value == "" {
+		return value
+	}
+	switch value[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + value
+	default:
+		return value
+	}
+}
 
 func rcodeCountsText(counts map[string]int) string {
 	if len(counts) == 0 {
@@ -175,7 +191,9 @@ func rankedResult(report benchmark.Report, protocol catalog.Protocol, rank int) 
 			continue
 		}
 		if result, ok := report.ResultFor(ranking.TargetID); ok {
-			return result, true
+			if !result.Incomplete {
+				return result, true
+			}
 		}
 	}
 	return benchmark.TargetResult{}, false
@@ -187,7 +205,7 @@ func recommendedResult(report benchmark.Report, protocol catalog.Protocol) (benc
 			continue
 		}
 		result, ok := report.ResultFor(ranking.TargetID)
-		if ok && result.Stats.Recommended {
+		if ok && !result.Incomplete && result.Stats.Recommended {
 			return result, true
 		}
 	}
@@ -241,6 +259,9 @@ func tableProtocols(report benchmark.Report, options TableOptions) []catalog.Pro
 }
 
 func resultStatus(result benchmark.TargetResult) string {
+	if result.Incomplete {
+		return "INCOMPLETE"
+	}
 	if result.Stats.Successes == 0 {
 		return "FAILED"
 	}
@@ -258,7 +279,7 @@ func styledStatus(status string, color bool) string {
 	switch status {
 	case "RECOMMENDED", "QUALIFIED":
 		colorCode = ansiGreen
-	case "PROVISIONAL", "INELIGIBLE":
+	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE":
 		colorCode = ansiYellow
 	case "FAILED":
 		colorCode = ansiRed
@@ -322,7 +343,7 @@ func comparisonRow(report benchmark.Report, result benchmark.TargetResult, detai
 		row = append(row,
 			latencyText(result.Stats.ColdMedianMS), latencyText(result.Stats.MADMS),
 			strconv.Itoa(result.Stats.Scored), strconv.Itoa(result.Stats.Failures),
-			strconv.Itoa(result.Stats.ResolverFailures), strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated),
+			strconv.Itoa(result.Stats.ResolverFailures), strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated), strconv.Itoa(result.Stats.Reconnects),
 			rcodeCountsText(result.Stats.RCodeCounts), dialAddressText(result),
 		)
 	}
@@ -374,7 +395,9 @@ func comparisonRows(report benchmark.Report, protocol catalog.Protocol, details 
 func unsupportedComparisonRow(target catalog.Target, details bool) []string {
 	row := []string{"—", target.Resolver.Owner, target.Address, target.Resolver.Policy, "—", "—", "—", "—", "—"}
 	if details {
-		row = append(row, "—", "—", "—", "—", "—", "—", "—", "—", "—", "—")
+		for range comparisonHeaders(true)[len(comparisonHeaders(false))-1 : len(comparisonHeaders(true))-1] {
+			row = append(row, "—")
+		}
 	}
 	return append(row, "—")
 }
@@ -428,7 +451,7 @@ func summaryHeaders() []string {
 func comparisonHeaders(details bool) []string {
 	headers := []string{"Rank", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score"}
 	if details {
-		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "RCodes", "Dial")
+		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "Reconnects", "RCodes", "Dial")
 	}
 	return append(headers, "Status")
 }
@@ -467,7 +490,7 @@ func compactWarnings(report benchmark.Report) []string {
 		for _, result := range targets {
 			totalQueries += result.Stats.Total
 			failedQueries += result.Stats.Failures
-			if result.Stats.Total == 0 || result.Stats.Scored != 0 {
+			if result.Incomplete || result.Stats.Total == 0 || result.Stats.Scored != 0 {
 				allUnavailable = false
 			}
 			if result.Stats.Total == 0 || result.Stats.Failures != result.Stats.Total {
@@ -500,7 +523,10 @@ func compactWarnings(report benchmark.Report) []string {
 			continue
 		}
 		parts := make([]string, 0, 4)
-		if result.OpenError != "" && result.Stats.Scored == 0 {
+		if result.Incomplete {
+			parts = append(parts, "incomplete; excluded from ranking")
+		}
+		if result.OpenError != "" && !result.Incomplete && result.Stats.Scored == 0 {
 			parts = append(parts, "unavailable")
 		}
 		if result.Stats.Failures > 0 {

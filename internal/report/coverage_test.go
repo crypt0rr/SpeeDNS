@@ -2,6 +2,7 @@ package report
 
 import (
 	"bytes"
+	"encoding/csv"
 	"errors"
 	"io"
 	"strings"
@@ -137,13 +138,73 @@ func TestCSVWriterErrorPathsAndMetadata(t *testing.T) {
 	if err := WriteCSV(&output, run); err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"target_id", "open_error", "open failed", "Owner 1"} {
+	for _, expected := range []string{"target_id", "open_error", "reconnects", "incomplete", "open failed", "Owner 1"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("CSV output missing %q: %s", expected, output.String())
 		}
 	}
 	if got := rankFor(run, "missing"); got != 0 {
 		t.Fatalf("missing rank = %d", got)
+	}
+}
+
+func TestCSVFormulaLeadingCellsAreProtected(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  string
+	}{
+		{value: "=formula", want: "'=formula"},
+		{value: "+formula", want: "'+formula"},
+		{value: "-formula", want: "'-formula"},
+		{value: "@formula", want: "'@formula"},
+		{value: "\tformula", want: "'\tformula"},
+		{value: "\rformula", want: "'\rformula"},
+		{value: "normal", want: "normal"},
+		{value: "", want: ""},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			if got := csvCell(tc.value); got != tc.want {
+				t.Fatalf("csvCell(%q) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCSVFormulaProtectionCoversTargetAndErrorFields(t *testing.T) {
+	target := catalog.Target{
+		Resolver: catalog.ResolverProfile{ID: "=target", Name: "+name", Owner: "-owner", Policy: "@policy"},
+		Protocol: catalog.UDP,
+		Address:  "\taddress",
+	}
+	run := benchmark.Report{Targets: []benchmark.TargetResult{{Target: target, OpenError: "\rerror"}}}
+	var output bytes.Buffer
+	if err := WriteCSV(&output, run); err != nil {
+		t.Fatal(err)
+	}
+	reader := csv.NewReader(strings.NewReader(output.String()))
+	header, err := reader.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := reader.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[string]string, len(header))
+	for index, name := range header {
+		values[name] = row[index]
+	}
+	for name, want := range map[string]string{
+		"target_id":  "'=target@\taddress/udp",
+		"name":       "'+name",
+		"owner":      "'-owner",
+		"policy":     "'@policy",
+		"address":    "'\taddress",
+		"open_error": "'\rerror",
+	} {
+		if values[name] != want {
+			t.Fatalf("CSV %s = %q, want %q", name, values[name], want)
+		}
 	}
 }
 
@@ -163,7 +224,7 @@ func TestTableSuccessAndAllWriterFailureSites(t *testing.T) {
 	if err := WriteTable(&output, run, true); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "Cold") || !strings.Contains(output.String(), "MAD") || !strings.Contains(output.String(), "Dial") || !strings.Contains(output.String(), "192.0.2.1:53") {
+	if !strings.Contains(output.String(), "Cold") || !strings.Contains(output.String(), "MAD") || !strings.Contains(output.String(), "Reconnects") || !strings.Contains(output.String(), "Dial") || !strings.Contains(output.String(), "192.0.2.1:53") {
 		t.Fatalf("detailed table missing cold/MAD/dial: %s", output.String())
 	}
 
@@ -288,6 +349,13 @@ func TestWarningAggregationAndColoredTables(t *testing.T) {
 	if strings.Contains(joined, "could not open a session") || strings.Count(joined, "5/5 failed") != 0 {
 		t.Fatalf("compact warnings retained duplicate raw details: %s", joined)
 	}
+	incomplete := reportTarget("incomplete", catalog.UDP, 0, false)
+	incomplete.Incomplete = true
+	incomplete.OpenError = "context canceled"
+	incompleteReport := benchmark.Report{Targets: []benchmark.TargetResult{incomplete}}
+	if incompleteWarnings := strings.Join(compactWarnings(incompleteReport), "\n"); !strings.Contains(incompleteWarnings, "incomplete; excluded from ranking") {
+		t.Fatalf("compact incomplete warning missing: %s", incompleteWarnings)
+	}
 
 	var detailOutput bytes.Buffer
 	if err := writeWarnings(&detailOutput, run, true); err != nil {
@@ -373,12 +441,14 @@ func TestProtocolMatrixAndTruthfulStatuses(t *testing.T) {
 		{name: "unreachable", stats: benchmark.Statistics{Total: 2, Failures: 2}, want: "FAILED"},
 		{name: "servfail only", stats: benchmark.Statistics{Total: 2, Successes: 2, ResolverFailures: 2}, want: "INELIGIBLE"},
 		{name: "divergent only", stats: benchmark.Statistics{Total: 2, Successes: 2, Divergent: 2}, want: "INELIGIBLE"},
+		{name: "incomplete", stats: benchmark.Statistics{Total: 2, Successes: 2, Scored: 2}, want: "INCOMPLETE"},
 		{name: "provisional", stats: benchmark.Statistics{Total: 5, Successes: 5, Scored: 5}, want: "INELIGIBLE"},
 		{name: "qualified", stats: benchmark.Statistics{Total: 20, Successes: 20, Scored: 20, Recommended: true}, want: "QUALIFIED"},
 	}
 	for _, tc := range statuses {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resultStatus(benchmark.TargetResult{Stats: tc.stats}); got != tc.want {
+			result := benchmark.TargetResult{Stats: tc.stats, Incomplete: tc.name == "incomplete"}
+			if got := resultStatus(result); got != tc.want {
 				t.Fatalf("status = %q, want %q", got, tc.want)
 			}
 		})
@@ -414,7 +484,7 @@ func TestProtocolMatrixAndTruthfulStatuses(t *testing.T) {
 	}
 	presentUnsupported := run
 	presentUnsupported.Targets = append(presentUnsupported.Targets, benchmark.TargetResult{Target: catalog.Target{Resolver: profile, Protocol: catalog.DoQ, Address: "192.0.2.1"}})
-	if rows := comparisonRowsForTable(presentUnsupported, catalog.DoQ, TableOptions{Details: true, Profiles: []catalog.ResolverProfile{profile}}); len(rows) != 1 {
+	if rows := comparisonRowsForTable(presentUnsupported, catalog.DoQ, TableOptions{Details: true, Profiles: []catalog.ResolverProfile{profile}}); len(rows) != 1 || len(rows[0]) != len(comparisonHeaders(true)) {
 		t.Fatalf("present unsupported rows = %#v", rows)
 	}
 

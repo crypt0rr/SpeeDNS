@@ -79,6 +79,10 @@ Inspect the bundled resolver catalog without running a benchmark:
 
 ## How the comparison works
 
+The complete ranking methodology, scoring denominators, confidence intervals,
+interruption behavior, and reproducibility limits are documented in
+[`METHODOLOGY.md`](METHODOLOGY.md).
+
 The default run samples 100 names from an embedded, versioned 1,000-name domain list and queries both A and AAAA records. `--full` uses the complete list. Every resolver eligible for the same transport receives the same names, query types, DNS settings, and randomized order.
 
 SpeeDNS reports warm query latency over reused connections and, for encrypted transports, cold first-query latency including connection setup. Results are ranked separately for each transport; a UDP result is not treated as interchangeable with a DoH, DoT, or DoQ result.
@@ -94,11 +98,15 @@ REFUSED:
 SpeeDNS keeps three concepts separate: a transport success means that a
 validated DNS message was received, a usable response is a normal `NOERROR`
 (including NODATA) or `NXDOMAIN` result, and a scored sample is a usable result
-that is not divergent from the other resolvers in the same query group.
+that is not divergent from the other resolvers in the same query group and was
+not obtained immediately after a stream reconnect.
 Responses such as `SERVFAIL`, `REFUSED`, and other resolver errors are shown in
 the results but cannot win latency scoring. This prevents an unhealthy or
 blocked resolver from appearing fast merely because it rejects queries
-quickly.
+quickly. Valid divergent responses and samples immediately following a stream
+reconnect are excluded from the scoring denominator; unusable responses remain
+failure-penalized even if they are divergent. See
+[`METHODOLOGY.md`](METHODOLOGY.md) for the exact rules.
 
 An endpoint is marked `RECOMMENDED` only when it has at least 20 comparable
 samples and at least 99% usable responses. Short runs can show a
@@ -128,8 +136,8 @@ The available transports are:
 SpeeDNS does not silently fall back from one protocol to another. The table
 shows the complete selected resolver/protocol matrix: an unsupported transport
 is shown as `—`, an unavailable transport is `FAILED`, a transport-valid result
-that cannot qualify is `INELIGIBLE`, and a recommendation-eligible result is
-`QUALIFIED`.
+that cannot qualify is `INELIGIBLE`, an interrupted target is `INCOMPLETE`, and
+a recommendation-eligible result is `QUALIFIED`.
 
 ## Default resolvers
 
@@ -214,7 +222,8 @@ System resolvers are tested only over transports discoverable from the operating
 Human-readable table output is the default. It shows both transport success and
 usable-response rates. Use `--details` for cold latency, MAD jitter, scored
 samples, transport failures, resolver-error counts and RCODEs, divergence,
-truncation, and the selected connection address.
+truncation, reconnects, incomplete targets, and the selected connection
+address.
 
 For scripts and other tools, use JSON or CSV:
 

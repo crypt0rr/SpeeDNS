@@ -8,12 +8,16 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
 
+download_url="${SPEEDNS_TRANCO_DOWNLOAD_URL:-https://tranco-list.eu/download/${list_id}/1000}"
+output_dir="${SPEEDNS_DOMAINS_OUTPUT_DIR:-${root_dir}/data}"
+mkdir -p "${output_dir}"
+
 curl --fail --location --silent --show-error \
-  "https://tranco-list.eu/download/${list_id}/1000" \
-  -o "${temporary_dir}/tranco.csv"
+	"${download_url}" \
+	-o "${temporary_dir}/tranco.csv"
 
 LC_ALL=C awk -F, '
-function invalid(name, labels, count, index) {
+function invalid(name, labels, count, label_index) {
   if (name !~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/) {
     return "malformed label"
   }
@@ -21,8 +25,8 @@ function invalid(name, labels, count, index) {
     return "name exceeds 253 bytes"
   }
   count = split(name, labels, "\\.")
-  for (index = 1; index <= count; index++) {
-    if (length(labels[index]) > 63) {
+  for (label_index = 1; label_index <= count; label_index++) {
+    if (length(labels[label_index]) > 63) {
       return "label exceeds 63 bytes"
     }
   }
@@ -72,18 +76,18 @@ if [[ ! "${corpus_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-cp "${temporary_dir}/domains.txt" "${root_dir}/data/domains.txt"
+cp "${temporary_dir}/domains.txt" "${output_dir}/domains.txt"
 retrieved_at="$(date -u +%F)"
-cat > "${root_dir}/data/domains.meta.json" <<EOF
+cat > "${output_dir}/domains.meta.json" <<EOF
 {
   "source": "Tranco daily list",
   "list_id": "${list_id}",
   "retrieved_at": "${retrieved_at}",
-  "download_url": "https://tranco-list.eu/download/${list_id}/1000",
+  "download_url": "${download_url}",
   "entries": 1000,
   "sha256": "${corpus_sha256}",
   "license_note": "Tranco aggregates providers with their own attribution and license terms; retain this metadata when redistributing the snapshot."
 }
 EOF
 
-echo "updated data/domains.txt from Tranco list ${list_id} (sha256 ${corpus_sha256})"
+echo "updated ${output_dir}/domains.txt from Tranco list ${list_id} (sha256 ${corpus_sha256})"
