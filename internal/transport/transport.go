@@ -247,7 +247,13 @@ func (f *streamFactory) Open(ctx context.Context) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &streamSession{conn: conn, timeout: f.timeout, secure: f.tlsConfig != nil, dialAddress: dialAddress}, nil
+	return &streamSession{
+		conn:        conn,
+		reopen:      func(ctx context.Context) (net.Conn, string, error) { return plan.openStream(ctx, f.tlsConfig) },
+		timeout:     f.timeout,
+		secure:      f.tlsConfig != nil,
+		dialAddress: dialAddress,
+	}, nil
 }
 
 type udpSession struct {
@@ -272,58 +278,119 @@ func (s *udpSession) Close() error { return nil }
 
 type streamSession struct {
 	conn        net.Conn
+	reopen      func(context.Context) (net.Conn, string, error)
 	mu          sync.Mutex
 	timeout     time.Duration
 	secure      bool
 	dialAddress string
+	closed      bool
 }
 
-func (s *streamSession) DialAddress() string { return s.dialAddress }
+func (s *streamSession) DialAddress() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dialAddress
+}
 
 func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil, errors.New("stream session is closed")
+	}
 	query := newQuery(name, qtype, dns.Id(), s.secure)
 	packed, err := packSessionQuery(query)
 	if err != nil {
 		return nil, err
 	}
-	if err := setConnDeadline(s.conn, ctx, s.timeout); err != nil {
-		return nil, err
-	}
-	var prefix [2]byte
 	if len(packed) > 65535 {
 		return nil, errors.New("DNS query exceeds TCP message limit")
 	}
+	if err := s.ensureConn(ctx); err != nil {
+		return nil, err
+	}
+	if err := setConnDeadline(s.conn, ctx, s.timeout); err != nil {
+		return nil, s.fatal(err)
+	}
+	var prefix [2]byte
 	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
 	if _, err := s.conn.Write(prefix[:]); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	if _, err := s.conn.Write(packed); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	if _, err := io.ReadFull(s.conn, prefix[:]); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	length := int(binary.BigEndian.Uint16(prefix[:]))
 	if length == 0 {
-		return nil, errors.New("empty DNS response")
+		return nil, s.fatal(errors.New("empty DNS response"))
 	}
 	responseBytes := make([]byte, length)
 	if _, err := io.ReadFull(s.conn, responseBytes); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	response := new(dns.Msg)
 	if err := response.Unpack(responseBytes); err != nil {
-		return nil, fmt.Errorf("unpack DNS response: %w", err)
+		return nil, s.fatal(fmt.Errorf("unpack DNS response: %w", err))
 	}
 	if err := validateResponse(response, name, qtype, query.Id, false); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	return response, nil
 }
 
-func (s *streamSession) Close() error { return s.conn.Close() }
+func (s *streamSession) ensureConn(ctx context.Context) error {
+	if s.conn != nil {
+		return nil
+	}
+	if s.closed {
+		return errors.New("stream session is closed")
+	}
+	if s.reopen == nil {
+		return errors.New("stream session connection is unavailable")
+	}
+	conn, dialAddress, err := s.reopen(ctx)
+	if err != nil {
+		return err
+	}
+	if conn == nil {
+		return errors.New("stream session reconnect returned nil connection")
+	}
+	s.conn = conn
+	s.dialAddress = dialAddress
+	return nil
+}
+
+func (s *streamSession) fatal(err error) error {
+	s.invalidate()
+	return err
+}
+
+func (s *streamSession) invalidate() {
+	conn := s.conn
+	s.conn = nil
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (s *streamSession) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	conn := s.conn
+	s.conn = nil
+	s.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	return conn.Close()
+}
 
 type doHFactory struct {
 	url            string

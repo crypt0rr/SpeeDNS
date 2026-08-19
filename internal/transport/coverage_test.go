@@ -31,6 +31,7 @@ type scriptedConn struct {
 	writeErrAt     int
 	setDeadlineErr error
 	closeErr       error
+	closeCalls     int
 	writeCalls     int
 	deadlines      []time.Time
 	lastWrite      []byte
@@ -58,7 +59,10 @@ func (c *scriptedConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *scriptedConn) Close() error         { return c.closeErr }
+func (c *scriptedConn) Close() error {
+	c.closeCalls++
+	return c.closeErr
+}
 func (c *scriptedConn) LocalAddr() net.Addr  { return fakeAddr("local") }
 func (c *scriptedConn) RemoteAddr() net.Addr { return fakeAddr("remote") }
 func (c *scriptedConn) SetDeadline(deadline time.Time) error {
