@@ -364,6 +364,82 @@ func TestResolverOutcomeMetricsAreVisible(t *testing.T) {
 	}
 }
 
+func TestProtocolMatrixAndTruthfulStatuses(t *testing.T) {
+	statuses := []struct {
+		name  string
+		stats benchmark.Statistics
+		want  string
+	}{
+		{name: "unreachable", stats: benchmark.Statistics{Total: 2, Failures: 2}, want: "FAILED"},
+		{name: "servfail only", stats: benchmark.Statistics{Total: 2, Successes: 2, ResolverFailures: 2}, want: "INELIGIBLE"},
+		{name: "divergent only", stats: benchmark.Statistics{Total: 2, Successes: 2, Divergent: 2}, want: "INELIGIBLE"},
+		{name: "provisional", stats: benchmark.Statistics{Total: 5, Successes: 5, Scored: 5}, want: "INELIGIBLE"},
+		{name: "qualified", stats: benchmark.Statistics{Total: 20, Successes: 20, Scored: 20, Recommended: true}, want: "QUALIFIED"},
+	}
+	for _, tc := range statuses {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resultStatus(benchmark.TargetResult{Stats: tc.stats}); got != tc.want {
+				t.Fatalf("status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	profile := catalog.ResolverProfile{
+		ID: "matrix", Name: "Matrix resolver", Owner: "Matrix owner", Policy: "unfiltered",
+		Addresses: []string{"192.0.2.1"}, Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}},
+	}
+	target := catalog.Target{Resolver: profile, Protocol: catalog.UDP, Address: "192.0.2.1", Spec: profile.Transports[catalog.UDP]}
+	result := benchmark.TargetResult{Target: target, Stats: benchmark.Statistics{Total: 5, Successes: 5, Scored: 5, SuccessRate: 1, ScoreMS: 2}}
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 5, QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{result},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: target.ID(), Rank: 1}},
+	}
+	var output bytes.Buffer
+	if err := WriteTableWithOptions(&output, run, TableOptions{Details: true, Profiles: []catalog.ResolverProfile{profile}, Protocols: []catalog.Protocol{catalog.UDP, catalog.DoQ}}); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	for _, expected := range []string{"Protocol UDP", "Protocol DOQ", "Matrix owner", "192.0.2.1", "—"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("matrix output missing %q: %s", expected, text)
+		}
+	}
+	if strings.Contains(text, "Protocol TCP") || strings.Contains(text, "Protocol DOT") {
+		t.Fatalf("matrix output included unselected protocols: %s", text)
+	}
+	custom := catalog.Protocol("custom")
+	customOther := catalog.Protocol("custom-other")
+	if got := tableProtocols(benchmark.Report{}, TableOptions{Protocols: []catalog.Protocol{customOther, custom}}); len(got) != 2 || got[0] != custom || got[1] != customOther {
+		t.Fatalf("custom table protocol ordering = %#v", got)
+	}
+	presentUnsupported := run
+	presentUnsupported.Targets = append(presentUnsupported.Targets, benchmark.TargetResult{Target: catalog.Target{Resolver: profile, Protocol: catalog.DoQ, Address: "192.0.2.1"}})
+	if rows := comparisonRowsForTable(presentUnsupported, catalog.DoQ, TableOptions{Details: true, Profiles: []catalog.ResolverProfile{profile}}); len(rows) != 1 {
+		t.Fatalf("present unsupported rows = %#v", rows)
+	}
+
+	provisional := result
+	provisional.Target = catalog.Target{Resolver: profile, Protocol: catalog.TCP, Address: "192.0.2.2", Spec: catalog.TransportSpec{Port: 53}}
+	provisional.Stats.Recommended = false
+	qualified := result
+	qualified.Target = catalog.Target{Resolver: profile, Protocol: catalog.DoH, Address: "192.0.2.3", Spec: catalog.TransportSpec{Port: 443}}
+	qualified.Stats = benchmark.Statistics{Total: 20, Successes: 20, Scored: 20, Recommended: true, SuccessRate: 1, ScoreMS: 2}
+	run = benchmark.Report{
+		Seed: 42, SampleSize: 20, QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{provisional, qualified},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.TCP, TargetID: provisional.Target.ID(), Rank: 1}, {Protocol: catalog.DoH, TargetID: qualified.Target.ID(), Rank: 1}},
+	}
+	output.Reset()
+	if err := WriteTable(&output, run, false); err != nil {
+		t.Fatal(err)
+	}
+	text = output.String()
+	for _, expected := range []string{"Provisional winners", "PROVISIONAL", "RECOMMENDED", "QUALIFIED", "INELIGIBLE"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("status output missing %q: %s", expected, text)
+		}
+	}
+}
+
 func TestReportFormattingBranchesAndWriteErrors(t *testing.T) {
 	if got := styledStatus("OTHER", true); got != "OTHER" {
 		t.Fatalf("unknown styled status = %q", got)

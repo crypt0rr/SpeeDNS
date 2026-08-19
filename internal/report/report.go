@@ -156,8 +156,10 @@ func rcodeCountsCSV(counts map[string]int) string {
 }
 
 type TableOptions struct {
-	Details bool
-	Color   bool
+	Details   bool
+	Color     bool
+	Profiles  []catalog.ResolverProfile
+	Protocols []catalog.Protocol
 }
 
 const (
@@ -215,8 +217,31 @@ func reportProtocols(report benchmark.Report) []catalog.Protocol {
 	return append(protocols, remaining...)
 }
 
+func tableProtocols(report benchmark.Report, options TableOptions) []catalog.Protocol {
+	if len(options.Protocols) == 0 {
+		return reportProtocols(report)
+	}
+	seen := make(map[catalog.Protocol]bool, len(options.Protocols))
+	for _, protocol := range options.Protocols {
+		seen[protocol] = true
+	}
+	protocols := make([]catalog.Protocol, 0, len(seen))
+	for _, protocol := range catalog.AllProtocols {
+		if seen[protocol] {
+			protocols = append(protocols, protocol)
+			delete(seen, protocol)
+		}
+	}
+	remaining := make([]catalog.Protocol, 0, len(seen))
+	for protocol := range seen {
+		remaining = append(remaining, protocol)
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
+	return append(protocols, remaining...)
+}
+
 func resultStatus(result benchmark.TargetResult) string {
-	if result.Stats.Scored == 0 {
+	if result.Stats.Successes == 0 {
 		return "FAILED"
 	}
 	if result.Stats.Recommended {
@@ -342,6 +367,38 @@ func comparisonRows(report benchmark.Report, protocol catalog.Protocol, details 
 	rows := make([][]string, 0, len(results))
 	for _, result := range results {
 		rows = append(rows, comparisonRow(report, result, details, color))
+	}
+	return rows
+}
+
+func unsupportedComparisonRow(target catalog.Target, details bool) []string {
+	row := []string{"—", target.Resolver.Owner, target.Address, target.Resolver.Policy, "—", "—", "—", "—", "—"}
+	if details {
+		row = append(row, "—", "—", "—", "—", "—", "—", "—", "—", "—", "—")
+	}
+	return append(row, "—")
+}
+
+func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, options TableOptions) [][]string {
+	rows := comparisonRows(report, protocol, options.Details, options.Color)
+	if len(options.Profiles) == 0 {
+		return rows
+	}
+	present := make(map[string]bool, len(report.Targets))
+	for _, result := range report.Targets {
+		present[result.Target.ID()] = true
+	}
+	for _, profile := range options.Profiles {
+		if _, supported := profile.Transports[protocol]; supported {
+			continue
+		}
+		for _, address := range profile.Addresses {
+			target := catalog.Target{Resolver: profile, Protocol: protocol, Address: address}
+			if present[target.ID()] {
+				continue
+			}
+			rows = append(rows, unsupportedComparisonRow(target, options.Details))
+		}
 	}
 	return rows
 }
@@ -504,7 +561,7 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 	if _, err := io.WriteString(writer, "Recommendations\n"); err != nil {
 		return err
 	}
-	protocols := reportProtocols(report)
+	protocols := tableProtocols(report, options)
 	recommendations := make([][]string, 0, len(protocols))
 	provisionals := make([][]string, 0, len(protocols))
 	for _, protocol := range protocols {
@@ -538,7 +595,7 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 		if _, err := fmt.Fprintf(writer, "\nProtocol %s\n", strings.ToUpper(string(protocol))); err != nil {
 			return err
 		}
-		rows := comparisonRows(report, protocol, options.Details, options.Color)
+		rows := comparisonRowsForTable(report, protocol, options)
 		if len(rows) == 0 {
 			if _, err := io.WriteString(writer, "  no targets\n"); err != nil {
 				return err
