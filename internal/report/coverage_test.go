@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/benchmark"
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 )
 
 type failingWriter struct {

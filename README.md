@@ -51,6 +51,42 @@ go build -trimpath -ldflags "-s -w" -o speedns ./cmd/speedns
 
 The build is pure Go and has no runtime dependencies.
 
+The canonical Go module path is `github.com/crypt0rr/SpeeDNS`. Install the
+latest published command directly with:
+
+```sh
+go install github.com/crypt0rr/SpeeDNS/cmd/speedns@latest
+```
+
+Older releases used `github.com/crypt0rr/dns-speedtest`. GitHub redirects that
+historical path, and existing users can continue to use old release tags while
+migrating imports. New source references and release metadata use the canonical
+`SpeeDNS` path.
+
+### Verify a downloaded release
+
+From the release assets directory, verify the checksums and the keyless
+Sigstore signature on the checksum file:
+
+```sh
+sha256sum -c checksums.txt
+cosign verify-blob checksums.txt \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/crypt0rr/SpeeDNS/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Release archives also carry a GitHub artifact attestation. With the GitHub CLI,
+verify an archive against this repository:
+
+```sh
+gh attestation verify speedns_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS
+```
+
+Replace the archive name with the exact asset you downloaded. The release
+workflow uses the protected `release` environment; maintainers must store
+`HOMEBREW_TAP_TOKEN` there and configure required reviewers before publishing.
+
 ## Quick start
 
 Run the default comparison:
@@ -155,7 +191,11 @@ Each address is ranked independently. The owner and filtering policy are shown i
 | 86.54.11.13 | DNS4EU / JOINDNS4.eu | protective + ad blocking | `noads.joindns4.eu` |
 | 86.54.11.100 | DNS4EU / JOINDNS4.eu | unfiltered | `unfiltered.joindns4.eu` |
 
-Dedicated DoQ is currently configured for Quad9. DoH over HTTP/3 is a separate transport and is not mislabeled as DoQ.
+Dedicated DoQ is currently configured for Quad9. SpeeDNS uses TLS 1.3 and
+ALPN `doq`, sends an explicit QUIC keepalive at the configured timeout, and
+reconnects lazily after a connection or idle-timeout failure. The failed query
+is not retried. DoH over HTTP/3 is a separate transport and is not mislabeled
+as DoQ.
 
 ## Custom resolvers
 

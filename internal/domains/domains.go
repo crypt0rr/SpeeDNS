@@ -10,7 +10,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/crypt0rr/dns-speedtest/data"
+	"github.com/crypt0rr/SpeeDNS/data"
 	"golang.org/x/net/idna"
 )
 

@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 )
@@ -154,6 +154,33 @@ func TestOpenStreamStopsAfterCanceledTLSCandidate(t *testing.T) {
 	}
 }
 
+func TestOpenStreamStopsAfterTLSContextExpires(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- conn
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	plan := dialPlan{addresses: []string{listener.Addr().String()}, timeout: time.Second}
+	if _, _, err := plan.openStream(ctx, &tls.Config{InsecureSkipVerify: true}); err == nil {
+		t.Fatal("expected TLS context expiry")
+	}
+	if conn := <-accepted; conn != nil {
+		_ = conn.Close()
+	}
+}
+
 func TestOpenStreamRetriesAfterCandidateTimeout(t *testing.T) {
 	const serverName = "dns.example"
 	certificate, roots := testServerCertificate(t, serverName)
@@ -194,7 +221,7 @@ func TestOpenStreamRetriesAfterCandidateTimeout(t *testing.T) {
 
 	plan := dialPlan{
 		addresses: []string{firstListener.Addr().String(), secondListener.Addr().String()},
-		timeout:   20 * time.Millisecond,
+		timeout:   100 * time.Millisecond,
 	}
 	conn, address, err := plan.openStream(context.Background(), &tls.Config{
 		MinVersion: tls.VersionTLS12,

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/crypt0rr/dns-speedtest/data"
+	"github.com/crypt0rr/SpeeDNS/data"
 )
 
 func TestLoadNormalizesCommentsAndDuplicates(t *testing.T) {

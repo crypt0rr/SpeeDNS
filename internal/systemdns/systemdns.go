@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 )
 
 var macOSResolverHeader = regexp.MustCompile(`^\s*resolver\s+#\s*([0-9]+)\s*$`)

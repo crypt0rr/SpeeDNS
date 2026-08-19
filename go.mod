@@ -1,4 +1,4 @@
-module github.com/crypt0rr/dns-speedtest
+module github.com/crypt0rr/SpeeDNS
 
 go 1.25.0
 

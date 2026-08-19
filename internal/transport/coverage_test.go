@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 )
@@ -530,13 +531,17 @@ func (s *fakeDoQStream) SetDeadline(deadline time.Time) error {
 }
 
 type fakeDoQConn struct {
-	stream   doqStream
-	openErr  error
-	closeErr error
+	stream     doqStream
+	openErr    error
+	closeErr   error
+	closeCalls int
 }
 
-func (c *fakeDoQConn) OpenStreamSync(context.Context) (doqStream, error)      { return c.stream, c.openErr }
-func (c *fakeDoQConn) CloseWithError(quic.ApplicationErrorCode, string) error { return c.closeErr }
+func (c *fakeDoQConn) OpenStreamSync(context.Context) (doqStream, error) { return c.stream, c.openErr }
+func (c *fakeDoQConn) CloseWithError(quic.ApplicationErrorCode, string) error {
+	c.closeCalls++
+	return c.closeErr
+}
 
 func newFakeDoQStream() (*fakeDoQStream, *fakeDoQConn) {
 	stream := &fakeDoQStream{}
@@ -563,10 +568,13 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 	}
 	fakeStream, fakeConn := newFakeDoQStream()
 	var dialedAddress string
-	dialDoQ = func(_ context.Context, address string, config *tls.Config, _ *quic.Config) (doqConn, error) {
+	dialDoQ = func(_ context.Context, address string, config *tls.Config, quicConfig *quic.Config) (doqConn, error) {
 		dialedAddress = address
 		if config.NextProtos[0] != "doq" {
 			t.Fatalf("DoQ ALPN = %#v", config.NextProtos)
+		}
+		if quicConfig.HandshakeIdleTimeout != time.Second || quicConfig.MaxIdleTimeout != 2*time.Second || quicConfig.KeepAlivePeriod != time.Second {
+			t.Fatalf("DoQ idle configuration = %#v", quicConfig)
 		}
 		return fakeConn, nil
 	}
@@ -651,6 +659,20 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 			packSessionQuery = packQuery
 			if _, err := tc.make().Query(context.Background(), "example.com", dns.TypeA); err == nil {
 				t.Fatal("expected DoQ query error")
+			}
+		})
+	}
+	for _, withDeadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline error %t", withDeadline), func(t *testing.T) {
+			ctx := context.Background()
+			if withDeadline {
+				deadlineContext, cancel := context.WithTimeout(ctx, time.Second)
+				defer cancel()
+				ctx = deadlineContext
+			}
+			stream := &fakeDoQStream{deadlineErr: errors.New("deadline failed")}
+			if _, err := (&doqSession{conn: &fakeDoQConn{stream: stream}, timeout: time.Second}).Query(ctx, "example.com", dns.TypeA); err == nil {
+				t.Fatal("expected DoQ deadline error")
 			}
 		})
 	}

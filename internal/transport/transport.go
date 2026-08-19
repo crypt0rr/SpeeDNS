@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 )
@@ -588,7 +588,17 @@ type doqFactory struct {
 	tlsConfig      *tls.Config
 }
 
-func (f *doqFactory) Open(ctx context.Context) (Session, error) {
+func (f *doqFactory) dialConfig() *quic.Config {
+	return &quic.Config{
+		HandshakeIdleTimeout: f.timeout,
+		MaxIdleTimeout:       f.timeout * 2,
+		// Keep the reusable session alive between benchmark queries. If the
+		// peer or network still closes it, the next query reconnects lazily.
+		KeepAlivePeriod: f.timeout,
+	}
+}
+
+func (f *doqFactory) open(ctx context.Context) (doqConn, string, error) {
 	plan := f.connectionPlan
 	if len(plan.addresses) == 0 {
 		plan = singleDialPlan(f.address, f.timeout)
@@ -596,31 +606,63 @@ func (f *doqFactory) Open(ctx context.Context) (Session, error) {
 	errs := make([]error, 0, len(plan.addresses))
 	for _, address := range plan.addresses {
 		openCtx, cancel := plan.openContext(ctx)
-		conn, err := dialDoQ(openCtx, address, f.tlsConfig.Clone(), &quic.Config{
-			HandshakeIdleTimeout: f.timeout,
-			MaxIdleTimeout:       f.timeout * 2,
-		})
+		conn, err := dialDoQ(openCtx, address, f.tlsConfig.Clone(), f.dialConfig())
 		cancel()
 		if err == nil {
-			return &doqSession{conn: conn, timeout: f.timeout, dialAddress: address}, nil
+			return conn, address, nil
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", address, err))
 		if ctx.Err() != nil {
 			break
 		}
 	}
-	return nil, plan.failed(errs)
+	return nil, "", plan.failed(errs)
+}
+
+func (f *doqFactory) Open(ctx context.Context) (Session, error) {
+	conn, dialAddress, err := f.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &doqSession{
+		conn:        conn,
+		reopen:      f.open,
+		timeout:     f.timeout,
+		dialAddress: dialAddress,
+	}, nil
 }
 
 type doqSession struct {
-	conn        doqConn
-	timeout     time.Duration
-	dialAddress string
+	conn            doqConn
+	reopen          func(context.Context) (doqConn, string, error)
+	mu              sync.Mutex
+	timeout         time.Duration
+	dialAddress     string
+	lastReconnected bool
+	closed          bool
 }
 
-func (s *doqSession) DialAddress() string { return s.dialAddress }
+func (s *doqSession) DialAddress() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dialAddress
+}
+
+// LastQueryReconnected reports whether the most recent Query had to open a
+// fresh QUIC connection after the previous one was invalidated.
+func (s *doqSession) LastQueryReconnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastReconnected
+}
 
 func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReconnected = false
+	if s.closed {
+		return nil, errors.New("DoQ session is closed")
+	}
 	query := newQuery(name, qtype, 0, true)
 	packed, err := packSessionQuery(query)
 	if err != nil {
@@ -629,49 +671,108 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	if len(packed) > 65535 {
 		return nil, errors.New("DNS query exceeds DoQ message limit")
 	}
+	reconnecting := s.conn == nil
+	if err := s.ensureConn(ctx); err != nil {
+		s.lastReconnected = reconnecting
+		return nil, err
+	}
+	s.lastReconnected = reconnecting
 	stream, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	defer stream.Close()
 	if deadline, ok := ctx.Deadline(); ok {
-		_ = stream.SetDeadline(deadline)
+		if err := stream.SetDeadline(deadline); err != nil {
+			return nil, s.fatal(err)
+		}
 	} else {
-		_ = stream.SetDeadline(time.Now().Add(s.timeout))
+		if err := stream.SetDeadline(time.Now().Add(s.timeout)); err != nil {
+			return nil, s.fatal(err)
+		}
 	}
 	var prefix [2]byte
 	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
 	if _, err := stream.Write(prefix[:]); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	if _, err := stream.Write(packed); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	if err := stream.Close(); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	if _, err := io.ReadFull(stream, prefix[:]); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	length := int(binary.BigEndian.Uint16(prefix[:]))
 	if length == 0 {
-		return nil, errors.New("empty DoQ response")
+		return nil, s.fatal(errors.New("empty DoQ response"))
 	}
 	responseBytes := make([]byte, length)
 	if _, err := io.ReadFull(stream, responseBytes); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	response := new(dns.Msg)
 	if err := response.Unpack(responseBytes); err != nil {
-		return nil, fmt.Errorf("unpack DoQ response: %w", err)
+		return nil, s.fatal(fmt.Errorf("unpack DoQ response: %w", err))
 	}
 	if err := validateResponse(response, name, qtype, 0, true); err != nil {
-		return nil, err
+		return nil, s.fatal(err)
 	}
 	return response, nil
 }
 
-func (s *doqSession) Close() error { return s.conn.CloseWithError(0, "") }
+func (s *doqSession) ensureConn(ctx context.Context) error {
+	if s.conn != nil {
+		return nil
+	}
+	if s.closed {
+		return errors.New("DoQ session is closed")
+	}
+	if s.reopen == nil {
+		return errors.New("DoQ session connection is unavailable")
+	}
+	conn, dialAddress, err := s.reopen(ctx)
+	if err != nil {
+		return err
+	}
+	if conn == nil {
+		return errors.New("DoQ session reconnect returned nil connection")
+	}
+	s.conn = conn
+	s.dialAddress = dialAddress
+	return nil
+}
+
+func (s *doqSession) fatal(err error) error {
+	s.invalidate()
+	return err
+}
+
+func (s *doqSession) invalidate() {
+	conn := s.conn
+	s.conn = nil
+	if conn != nil {
+		_ = conn.CloseWithError(0, "")
+	}
+}
+
+func (s *doqSession) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	conn := s.conn
+	s.conn = nil
+	s.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	return conn.CloseWithError(0, "")
+}
 
 func newQuery(name string, qtype, id uint16, padded bool) *dns.Msg {
 	query := &dns.Msg{

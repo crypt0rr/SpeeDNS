@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
-	"github.com/crypt0rr/dns-speedtest/internal/domains"
-	"github.com/crypt0rr/dns-speedtest/internal/transport"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/domains"
+	"github.com/crypt0rr/SpeeDNS/internal/transport"
 	"github.com/miekg/dns"
 )
 

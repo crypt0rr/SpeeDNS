@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/miekg/dns"
 )
 

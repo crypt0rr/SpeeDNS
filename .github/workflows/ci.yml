@@ -56,9 +56,22 @@ jobs:
           git diff --exit-code -- go.mod go.sum
           go mod verify
 
+      - name: Verify canonical Go install path
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/speedns-bin"
+          mkdir -p "${install_dir}"
+          GOBIN="${install_dir}" go install github.com/crypt0rr/SpeeDNS/cmd/speedns
+          "${install_dir}/speedns" version
+
       - name: Test domain corpus updater fixture
         shell: bash
         run: bash scripts/update-domains-fixture.sh
+
+      - name: Test live smoke retry fixture
+        shell: bash
+        run: bash scripts/live-smoke-fixture.sh
 
       - name: Run unit and integration tests
         run: go test -count=1 ./...
