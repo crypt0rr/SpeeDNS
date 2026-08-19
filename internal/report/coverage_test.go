@@ -361,6 +361,97 @@ func TestTableSuccessAndAllWriterFailureSites(t *testing.T) {
 	}
 }
 
+func TestDivergenceDetailsAreRenderedAndExported(t *testing.T) {
+	first := reportTarget("first", catalog.UDP, 2, false)
+	second := reportTarget("second", catalog.UDP, 1, false)
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 2, Queries: 2, QueryTypes: []uint16{1},
+		Targets: []benchmark.TargetResult{first, second},
+		Divergence: []benchmark.DivergenceDetail{
+			{
+				Name: "example.com", QType: 1, Policy: "unfiltered", Compared: 2,
+				Baseline: "answer", Classes: map[string]int{"answer": 1, "nxdomain": 1},
+				Excluded: []benchmark.DivergenceExclusion{{TargetID: second.Target.ID(), ResponseClass: "nxdomain"}},
+			},
+		},
+	}
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{Details: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Divergence details", "baseline=answer", "classes=answer:1,nxdomain:1", second.Target.ID() + "=nxdomain"} {
+		if !strings.Contains(table.String(), expected) {
+			t.Fatalf("detailed divergence output missing %q: %s", expected, table.String())
+		}
+	}
+
+	var jsonOutput bytes.Buffer
+	if err := WriteJSON(&jsonOutput, run, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"\"divergence\"", "\"baseline\": \"answer\"", second.Target.ID()} {
+		if !strings.Contains(jsonOutput.String(), expected) {
+			t.Fatalf("JSON divergence output missing %q: %s", expected, jsonOutput.String())
+		}
+	}
+
+	ambiguous := run
+	ambiguous.Divergence = []benchmark.DivergenceDetail{{
+		Name: "ambiguous.example", QType: 1, Policy: "unfiltered", Compared: 2,
+		Ambiguous: true, Classes: nil,
+	}}
+	var ambiguousTable bytes.Buffer
+	if err := WriteTableWithOptions(&ambiguousTable, ambiguous, TableOptions{Details: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"ambiguous (no baseline)", "classes=—", "excluded=none"} {
+		if !strings.Contains(ambiguousTable.String(), expected) {
+			t.Fatalf("ambiguous divergence output missing %q: %s", expected, ambiguousTable.String())
+		}
+	}
+	if err := WriteJSON(&bytes.Buffer{}, ambiguous, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := divergenceClassesText(nil); got != "—" {
+		t.Fatalf("empty divergence classes = %q", got)
+	}
+	if got := divergenceExcludedText(benchmark.DivergenceDetail{}, nil); got != "none" {
+		t.Fatalf("empty divergence exclusions = %q", got)
+	}
+	if err := writeDivergenceDetails(contentFailWriter{needle: "Divergence details"}, run, false); err == nil {
+		t.Fatal("divergence header writer failure was not returned")
+	}
+	if err := writeDivergenceDetails(contentFailWriter{needle: "baseline=answer"}, run, false); err == nil {
+		t.Fatal("divergence row writer failure was not returned")
+	}
+	if err := WriteTableWithOptions(contentFailWriter{needle: "Divergence details"}, run, TableOptions{Details: true}); err == nil {
+		t.Fatal("top-level divergence writer failure was not returned")
+	}
+
+	system := reportTarget("system-divergence", catalog.UDP, 1, false)
+	redacted := run
+	redacted.Targets = append(redacted.Targets, system)
+	redacted.Divergence = []benchmark.DivergenceDetail{{
+		Name: "system.example", QType: 1, Policy: "unfiltered", Compared: 2,
+		Baseline: "answer", Classes: map[string]int{"answer": 1, "nxdomain": 1},
+		Excluded: []benchmark.DivergenceExclusion{{TargetID: system.Target.ID(), ResponseClass: "nxdomain"}},
+	}}
+	var redactedJSON bytes.Buffer
+	if err := WriteJSONWithOptions(&redactedJSON, redacted, false, JSONOptions{RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(redactedJSON.String(), system.Target.ID()) || !strings.Contains(redactedJSON.String(), "system-redacted-1@redacted/udp") {
+		t.Fatalf("redacted divergence JSON = %s", redactedJSON.String())
+	}
+	var redactedTable bytes.Buffer
+	if err := WriteTableWithOptions(&redactedTable, redacted, TableOptions{Details: true, RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(redactedTable.String(), system.Target.ID()) || !strings.Contains(redactedTable.String(), "system-redacted-1@redacted/udp") {
+		t.Fatalf("redacted divergence table = %s", redactedTable.String())
+	}
+}
+
 func TestTableSeparatesQualifiedAndProvisionalResults(t *testing.T) {
 	provisional := reportTarget("1", catalog.UDP, 5, false)
 	recommended := reportTarget("2", catalog.UDP, benchmark.MinimumRecommendedSamples, true)

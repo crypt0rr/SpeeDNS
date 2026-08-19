@@ -66,18 +66,19 @@ type Query struct {
 }
 
 type Observation struct {
-	Name          string        `json:"name"`
-	QType         uint16        `json:"qtype"`
-	Latency       time.Duration `json:"-"`
-	LatencyMS     float64       `json:"latency_ms,omitempty"`
-	Success       bool          `json:"success"`
-	Usable        bool          `json:"usable"`
-	RCode         int           `json:"rcode,omitempty"`
-	Truncated     bool          `json:"truncated,omitempty"`
-	ResponseClass string        `json:"response_class,omitempty"`
-	Divergent     bool          `json:"divergent,omitempty"`
-	Reconnected   bool          `json:"reconnected,omitempty"`
-	Error         string        `json:"error,omitempty"`
+	Name               string        `json:"name"`
+	QType              uint16        `json:"qtype"`
+	Latency            time.Duration `json:"-"`
+	LatencyMS          float64       `json:"latency_ms,omitempty"`
+	Success            bool          `json:"success"`
+	Usable             bool          `json:"usable"`
+	RCode              int           `json:"rcode,omitempty"`
+	Truncated          bool          `json:"truncated,omitempty"`
+	ResponseClass      string        `json:"response_class,omitempty"`
+	Divergent          bool          `json:"divergent,omitempty"`
+	DivergenceBaseline string        `json:"divergence_baseline,omitempty"`
+	Reconnected        bool          `json:"reconnected,omitempty"`
+	Error              string        `json:"error,omitempty"`
 }
 
 type ColdObservation struct {
@@ -136,15 +137,40 @@ type Ranking struct {
 }
 
 type Report struct {
-	StartedAt  time.Time      `json:"started_at"`
-	FinishedAt time.Time      `json:"finished_at"`
-	Seed       int64          `json:"seed"`
-	SampleSize int            `json:"sample_size"`
-	Queries    int            `json:"queries_per_target"`
-	QueryTypes []uint16       `json:"query_types"`
-	Targets    []TargetResult `json:"results"`
-	Rankings   []Ranking      `json:"rankings"`
-	Warnings   []string       `json:"warnings,omitempty"`
+	StartedAt  time.Time          `json:"started_at"`
+	FinishedAt time.Time          `json:"finished_at"`
+	Seed       int64              `json:"seed"`
+	SampleSize int                `json:"sample_size"`
+	Queries    int                `json:"queries_per_target"`
+	QueryTypes []uint16           `json:"query_types"`
+	Targets    []TargetResult     `json:"results"`
+	Rankings   []Ranking          `json:"rankings"`
+	Divergence []DivergenceDetail `json:"divergence,omitempty"`
+	Warnings   []string           `json:"warnings,omitempty"`
+}
+
+// DivergenceExclusion identifies a successful response that differed from the
+// selected response-class baseline. Usable outliers are removed from the
+// latency sample; unusable outliers remain failure-penalized.
+type DivergenceExclusion struct {
+	TargetID      string `json:"target_id"`
+	ResponseClass string `json:"response_class"`
+	Treatment     string `json:"treatment"`
+}
+
+// DivergenceDetail records the deterministic baseline decision for one query
+// and policy group. A tied plurality has no safe baseline, so Ambiguous is
+// true and all successful observations in the group are excluded from
+// comparative latency scoring.
+type DivergenceDetail struct {
+	Name      string                `json:"name"`
+	QType     uint16                `json:"qtype"`
+	Policy    string                `json:"policy"`
+	Compared  int                   `json:"compared"`
+	Baseline  string                `json:"baseline,omitempty"`
+	Ambiguous bool                  `json:"ambiguous,omitempty"`
+	Classes   map[string]int        `json:"classes"`
+	Excluded  []DivergenceExclusion `json:"excluded,omitempty"`
 }
 
 func (r Report) ResultFor(id string) (TargetResult, bool) {
@@ -191,7 +217,7 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 
 	for _, protocol := range protocols {
 		groupResults := runProtocol(ctx, byProtocol[protocol], queries, opts)
-		markDivergence(groupResults)
+		report.Divergence = append(report.Divergence, markDivergence(groupResults)...)
 		for i := range groupResults {
 			groupResults[i].Stats = calculateStatistics(groupResults[i], opts.Timeout, opts.Seed)
 		}
@@ -642,33 +668,168 @@ func failedObservations(queries []Query, err error) []Observation {
 	return observations
 }
 
-func markDivergence(results []TargetResult) {
-	classes := make(map[string]map[string]struct{})
-	for _, result := range results {
-		for _, observation := range result.Observations {
+type divergenceGroupKey struct {
+	name   string
+	qtype  uint16
+	policy string
+}
+
+type divergenceObservation struct {
+	resultIndex      int
+	observationIndex int
+	targetID         string
+	responseClass    string
+}
+
+// markDivergence selects a plurality response class independently for each
+// query and declared policy. Exact policy matching prevents an unfiltered
+// resolver from being treated as equivalent to a filtering resolver. A tied
+// plurality is intentionally ambiguous: all successful observations in that
+// group are excluded from comparative latency scoring rather than receiving an
+// arbitrary advantage from a lexicographic tie-break.
+func markDivergence(results []TargetResult) []DivergenceDetail {
+	groups := make(map[divergenceGroupKey][]divergenceObservation)
+	for resultIndex := range results {
+		policy := divergencePolicy(results[resultIndex].Target.Resolver.Policy)
+		for observationIndex := range results[resultIndex].Observations {
+			observation := &results[resultIndex].Observations[observationIndex]
+			observation.Divergent = false
+			observation.DivergenceBaseline = ""
 			if !observation.Success {
 				continue
 			}
-			key := queryKey(observation.Name, observation.QType)
-			if classes[key] == nil {
-				classes[key] = make(map[string]struct{})
+			key := divergenceGroupKey{
+				name:   normalizedQueryName(observation.Name),
+				qtype:  observation.QType,
+				policy: policy,
 			}
-			classes[key][observation.ResponseClass] = struct{}{}
+			groups[key] = append(groups[key], divergenceObservation{
+				resultIndex:      resultIndex,
+				observationIndex: observationIndex,
+				targetID:         results[resultIndex].Target.ID(),
+				responseClass:    responseClassName(observation.ResponseClass),
+			})
 		}
 	}
-	for i := range results {
-		for j := range results[i].Observations {
-			observation := &results[i].Observations[j]
-			key := queryKey(observation.Name, observation.QType)
-			if observation.Success && len(classes[key]) > 1 {
-				observation.Divergent = true
+
+	keys := make([]divergenceGroupKey, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].name != keys[j].name {
+			return keys[i].name < keys[j].name
+		}
+		if keys[i].qtype != keys[j].qtype {
+			return keys[i].qtype < keys[j].qtype
+		}
+		return keys[i].policy < keys[j].policy
+	})
+
+	details := make([]DivergenceDetail, 0)
+	for _, key := range keys {
+		observations := groups[key]
+		counts := make(map[string]int)
+		for _, observation := range observations {
+			counts[observation.responseClass]++
+		}
+		if len(counts) <= 1 {
+			continue
+		}
+
+		classes := make([]string, 0, len(counts))
+		maxCount := 0
+		for class, count := range counts {
+			if count > maxCount {
+				maxCount = count
+				classes = classes[:0]
+			} else if count < maxCount {
+				continue
+			}
+			classes = append(classes, class)
+		}
+		sort.Strings(classes)
+
+		detail := DivergenceDetail{
+			Name:     key.name,
+			QType:    key.qtype,
+			Policy:   key.policy,
+			Compared: len(observations),
+			Classes:  cloneIntMap(counts),
+		}
+		if len(classes) == 1 {
+			detail.Baseline = classes[0]
+			for _, observation := range observations {
+				current := &results[observation.resultIndex].Observations[observation.observationIndex]
+				current.DivergenceBaseline = detail.Baseline
+				if observation.responseClass == detail.Baseline {
+					continue
+				}
+				current.Divergent = true
+				detail.Excluded = append(detail.Excluded, DivergenceExclusion{
+					TargetID: observation.targetID, ResponseClass: observation.responseClass,
+					Treatment: divergenceTreatment(*current),
+				})
+			}
+		} else {
+			detail.Ambiguous = true
+			for _, observation := range observations {
+				current := &results[observation.resultIndex].Observations[observation.observationIndex]
+				current.Divergent = true
+				current.DivergenceBaseline = "ambiguous"
+				detail.Excluded = append(detail.Excluded, DivergenceExclusion{
+					TargetID: observation.targetID, ResponseClass: observation.responseClass,
+					Treatment: divergenceTreatment(*current),
+				})
 			}
 		}
+		sort.Slice(detail.Excluded, func(i, j int) bool {
+			if detail.Excluded[i].TargetID != detail.Excluded[j].TargetID {
+				return detail.Excluded[i].TargetID < detail.Excluded[j].TargetID
+			}
+			return detail.Excluded[i].ResponseClass < detail.Excluded[j].ResponseClass
+		})
+		details = append(details, detail)
 	}
+	return details
+}
+
+func normalizedQueryName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+}
+
+func divergencePolicy(policy string) string {
+	policy = strings.ToLower(strings.TrimSpace(policy))
+	if policy == "" {
+		return "unspecified"
+	}
+	return policy
+}
+
+func responseClassName(class string) string {
+	if class == "" {
+		return "unknown"
+	}
+	return class
+}
+
+func divergenceTreatment(observation Observation) string {
+	if observationUsable(observation) {
+		return "latency-excluded"
+	}
+	return "failure-penalized"
+}
+
+func cloneIntMap(values map[string]int) map[string]int {
+	clone := make(map[string]int, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }
 
 func queryKey(name string, qtype uint16) string {
-	return fmt.Sprintf("%s/%d", strings.ToLower(name), qtype)
+	return fmt.Sprintf("%s/%d", normalizedQueryName(name), qtype)
 }
 
 type scoreSample struct {

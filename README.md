@@ -134,8 +134,8 @@ REFUSED:
 SpeeDNS keeps three concepts separate: a transport success means that a
 validated DNS message was received, a usable response is a normal `NOERROR`
 (including NODATA) or `NXDOMAIN` result, and a scored sample is a usable result
-that is not divergent from the other resolvers in the same query group and was
-not obtained immediately after a stream reconnect.
+that is not divergent from the other resolvers in the same policy group and
+was not obtained immediately after a stream reconnect.
 Responses such as `SERVFAIL`, `REFUSED`, and other resolver errors are shown in
 the results but cannot win latency scoring. This prevents an unhealthy or
 blocked resolver from appearing fast merely because it rejects queries
@@ -149,7 +149,14 @@ samples and at least 99% usable responses. Short runs can show a
 `PROVISIONAL` winner, but use a larger sample or `--full` for a more stable
 comparison.
 
-Resolvers can have different filtering policies. SpeeDNS shows the policy beside each result and excludes materially divergent responses from comparative latency scoring, so a blocking or filtered answer does not automatically win by responding sooner.
+Resolvers can have different filtering policies. SpeeDNS compares response
+classes only within the same declared policy. Within that group, the largest
+plurality is the baseline; an outlier is excluded from comparative latency
+scoring. Equal pluralities are reported as ambiguous and all successful
+observations in that group are excluded rather than receiving an arbitrary
+advantage. The detailed report shows the baseline, class counts, and excluded
+observations. This keeps blocking, filtered, `NXDOMAIN`, `NODATA`, `SERVFAIL`,
+and `REFUSED` behavior explicit without treating unlike policies as identical.
 
 ## Choosing protocols
 

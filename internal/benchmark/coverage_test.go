@@ -969,6 +969,118 @@ func TestDivergenceAndStatisticsHelpers(t *testing.T) {
 	}
 }
 
+func TestPolicyAwareDivergenceBaselines(t *testing.T) {
+	observation := func(class string, rcode int) Observation {
+		return Observation{
+			Name: "Example.COM.", QType: dns.TypeA, Success: true,
+			Usable: class == "answer" || class == "nxdomain", RCode: rcode,
+			ResponseClass: class, LatencyMS: 5,
+		}
+	}
+	makeResult := func(address, policy, class string, rcode int) TargetResult {
+		target := testTarget(catalog.UDP, address)
+		target.Resolver.Policy = policy
+		return TargetResult{Target: target, Observations: []Observation{observation(class, rcode)}}
+	}
+
+	t.Run("unanimous classes do not diverge", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("unanimous-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("unanimous-b", "unfiltered", "answer", dns.RcodeSuccess),
+		}
+		if details := markDivergence(results); len(details) != 0 {
+			t.Fatalf("unanimous divergence details = %#v", details)
+		}
+		for _, result := range results {
+			if result.Observations[0].Divergent {
+				t.Fatal("unanimous response was marked divergent")
+			}
+		}
+	})
+
+	t.Run("plurality excludes only the outlier", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("plurality-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("plurality-b", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("plurality-c", "unfiltered", "nxdomain", dns.RcodeNameError),
+		}
+		details := markDivergence(results)
+		if len(details) != 1 || details[0].Baseline != "answer" || details[0].Ambiguous || len(details[0].Excluded) != 1 {
+			t.Fatalf("plurality details = %#v", details)
+		}
+		if details[0].Excluded[0].TargetID != results[2].Target.ID() || details[0].Excluded[0].ResponseClass != "nxdomain" || details[0].Excluded[0].Treatment != "latency-excluded" {
+			t.Fatalf("plurality exclusion = %#v", details[0].Excluded)
+		}
+		if results[0].Observations[0].Divergent || results[1].Observations[0].Divergent || !results[2].Observations[0].Divergent {
+			t.Fatalf("plurality divergence flags = %#v", results)
+		}
+		for _, result := range results {
+			if result.Observations[0].DivergenceBaseline != "answer" {
+				t.Fatalf("plurality baseline = %#v", result.Observations[0])
+			}
+		}
+	})
+
+	t.Run("equal classes are ambiguous", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("tie-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("tie-b", "unfiltered", "nxdomain", dns.RcodeNameError),
+		}
+		details := markDivergence(results)
+		if len(details) != 1 || !details[0].Ambiguous || details[0].Baseline != "" || len(details[0].Excluded) != 2 {
+			t.Fatalf("ambiguous details = %#v", details)
+		}
+		for _, result := range results {
+			if !result.Observations[0].Divergent || result.Observations[0].DivergenceBaseline != "ambiguous" {
+				t.Fatalf("ambiguous observation = %#v", result.Observations[0])
+			}
+		}
+	})
+
+	t.Run("declared policies are not compared", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("policy-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("policy-b", "protective", "nxdomain", dns.RcodeNameError),
+		}
+		if details := markDivergence(results); len(details) != 0 {
+			t.Fatalf("policy divergence details = %#v", details)
+		}
+		for _, result := range results {
+			if result.Observations[0].Divergent {
+				t.Fatal("different declared policies were compared")
+			}
+		}
+	})
+
+	t.Run("unusable outlier remains a scoring failure", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("rcode-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("rcode-b", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("rcode-c", "unfiltered", "rcode-2", dns.RcodeServerFailure),
+		}
+		details := markDivergence(results)
+		stats := calculateStatistics(results[2], 2*time.Second, 42)
+		if len(details) != 1 || details[0].Excluded[0].Treatment != "failure-penalized" || !results[2].Observations[0].Divergent || stats.ResolverFailures != 1 || stats.ScoringFailureRate != 1 {
+			t.Fatalf("unusable divergent response = %#v / %#v", results[2].Observations[0], stats)
+		}
+	})
+
+	t.Run("sorts query types deterministically", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("qtype-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("qtype-b", "unfiltered", "nxdomain", dns.RcodeNameError),
+		}
+		results[0].Observations = append(results[0].Observations, observation("answer", dns.RcodeSuccess))
+		results[1].Observations = append(results[1].Observations, observation("nxdomain", dns.RcodeNameError))
+		results[0].Observations[1].QType = dns.TypeAAAA
+		results[1].Observations[1].QType = dns.TypeAAAA
+		details := markDivergence(results)
+		if len(details) != 2 || details[0].QType != dns.TypeA || details[1].QType != dns.TypeAAAA {
+			t.Fatalf("query-type divergence details = %#v", details)
+		}
+	})
+}
+
 type reportedSession struct {
 	fakeSession
 	address string

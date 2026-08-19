@@ -15,11 +15,12 @@ import (
 )
 
 type JSONReport struct {
-	SchemaVersion int                 `json:"schema_version"`
-	Run           JSONRun             `json:"run"`
-	Results       []JSONResult        `json:"results"`
-	Rankings      []benchmark.Ranking `json:"rankings"`
-	Warnings      []string            `json:"warnings,omitempty"`
+	SchemaVersion int                          `json:"schema_version"`
+	Run           JSONRun                      `json:"run"`
+	Results       []JSONResult                 `json:"results"`
+	Rankings      []benchmark.Ranking          `json:"rankings"`
+	Divergence    []benchmark.DivergenceDetail `json:"divergence,omitempty"`
+	Warnings      []string                     `json:"warnings,omitempty"`
 }
 
 type JSONRun struct {
@@ -116,7 +117,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 			FinishedAt: report.FinishedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			Seed:       report.Seed, SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes,
 		},
-		Results: results, Rankings: rankings, Warnings: warnings,
+		Results: results, Rankings: rankings, Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
 	}
 }
 
@@ -331,6 +332,35 @@ func redactWarnings(report benchmark.Report, redactedIDs map[string]string) []st
 		warnings[index] = redactWarningValue(report, warnings[index], redactedIDs)
 	}
 	return warnings
+}
+
+func divergenceForJSON(report benchmark.Report, redactedIDs map[string]string) []benchmark.DivergenceDetail {
+	if len(report.Divergence) == 0 {
+		return nil
+	}
+	details := make([]benchmark.DivergenceDetail, len(report.Divergence))
+	copy(details, report.Divergence)
+	for index := range details {
+		details[index].Classes = cloneIntMap(details[index].Classes)
+		details[index].Excluded = append([]benchmark.DivergenceExclusion(nil), details[index].Excluded...)
+		for exclusionIndex := range details[index].Excluded {
+			if replacement, ok := redactedIDs[details[index].Excluded[exclusionIndex].TargetID]; ok {
+				details[index].Excluded[exclusionIndex].TargetID = replacement
+			}
+		}
+	}
+	return details
+}
+
+func cloneIntMap(values map[string]int) map[string]int {
+	if len(values) == 0 {
+		return nil
+	}
+	clone := make(map[string]int, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
 }
 
 type TableOptions struct {
@@ -803,6 +833,63 @@ func writeWarningsWithOptions(writer io.Writer, report benchmark.Report, details
 	return nil
 }
 
+func divergenceClassesText(classes map[string]int) string {
+	if len(classes) == 0 {
+		return "—"
+	}
+	keys := make([]string, 0, len(classes))
+	for key := range classes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, classes[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func divergenceExcludedText(detail benchmark.DivergenceDetail, redactedIDs map[string]string) string {
+	if len(detail.Excluded) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(detail.Excluded))
+	for _, exclusion := range detail.Excluded {
+		targetID := exclusion.TargetID
+		if replacement, ok := redactedIDs[targetID]; ok {
+			targetID = replacement
+		}
+		part := targetID + "=" + exclusion.ResponseClass
+		if exclusion.Treatment != "" {
+			part += "[" + exclusion.Treatment + "]"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ",")
+}
+
+func writeDivergenceDetails(writer io.Writer, report benchmark.Report, redactSystem bool) error {
+	if len(report.Divergence) == 0 {
+		return nil
+	}
+	if _, err := io.WriteString(writer, "\nDivergence details\n"); err != nil {
+		return err
+	}
+	redactedIDs := redactedTargetIDs(report, redactSystem)
+	for _, detail := range report.Divergence {
+		baseline := detail.Baseline
+		if detail.Ambiguous {
+			baseline = "ambiguous (no baseline)"
+		}
+		if _, err := fmt.Fprintf(writer, "  - %s/%s policy=%s compared=%d baseline=%s; classes=%s; excluded=%s\n",
+			detail.Name, benchmark.QueryTypeName(detail.QType), detail.Policy, detail.Compared, baseline,
+			divergenceClassesText(detail.Classes), divergenceExcludedText(detail, redactedIDs)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func WriteTable(writer io.Writer, report benchmark.Report, details bool) error {
 	return WriteTableWithOptions(writer, report, TableOptions{Details: details})
 }
@@ -856,6 +943,11 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 			continue
 		}
 		if err := writeAlignedTable(writer, comparisonHeaders(options.Details), rows); err != nil {
+			return err
+		}
+	}
+	if options.Details {
+		if err := writeDivergenceDetails(writer, report, options.RedactSystem); err != nil {
 			return err
 		}
 	}

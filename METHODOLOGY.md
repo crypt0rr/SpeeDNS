@@ -61,14 +61,35 @@ score_ms = 0.60 × median_ms
          + scoring_failure_rate × timeout_ms
 ```
 
-Scoring uses usable responses that are neither divergent nor reconnect
-samples. A valid usable response whose response class differs from another
-resolver for the same name and type is counted as divergent and excluded from
-the latency sample. Divergent usable observations are removed from the scoring
-denominator. Unusable observations are never removed this way: even when
-marked divergent, they remain scoring failures and contribute to the failure
-penalty. This prevents a fast SERVFAIL or REFUSED response from winning by
-escaping the denominator.
+For each name/type, SpeeDNS builds separate comparison groups for each
+normalized declared resolver policy. This prevents an unfiltered resolver from
+being treated as equivalent to a filtering resolver. Within a policy group,
+the response class with the largest plurality is the deterministic baseline.
+The classes are `answer`, `nodata`, `nxdomain`, and DNS response-code classes
+such as `rcode-2` (SERVFAIL) or `rcode-5` (REFUSED). A successful observation
+whose class differs from a unique plurality baseline is divergent and is
+excluded from comparative latency scoring.
+
+If two or more classes are tied for the plurality, the group is ambiguous:
+there is no defensible baseline, so every successful observation in that group
+is marked divergent and excluded from comparative latency scoring. SpeeDNS
+does not break this tie by address, catalog order, or class name. Policy groups
+with only one observed class are not divergent, even when another declared
+policy group returns a different class; unlike policy profiles are not treated
+as having identical behavior.
+
+Divergent usable observations are removed from the scoring denominator.
+Unusable observations are never removed this way: even when marked divergent,
+they remain scoring failures and contribute to the failure penalty. This
+prevents a fast SERVFAIL or REFUSED response from winning by escaping the
+denominator.
+
+The detailed table includes a divergence section showing the policy group,
+selected baseline (or an ambiguous decision), response-class counts, and the
+excluded target observations. Each exclusion is labeled either
+`latency-excluded` for a usable outlier or `failure-penalized` for an unusable
+transport-valid response. Raw JSON observations carry the selected baseline,
+and the additive `divergence` report section carries the same decision details.
 
 `SuccessRate` describes receipt of transport-valid DNS messages. `UsableRate`
 describes semantic DNS usability over all measured observations.
