@@ -187,6 +187,12 @@ func TestDoHFactoryUsesBootstrapCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	closedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddress := closedListener.Addr().String()
+	_ = closedListener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 	factory, err := newDoHFactory(catalog.Target{
 		Address: "192.0.2.53",
@@ -204,6 +210,10 @@ func TestDoHFactoryUsesBootstrapCandidates(t *testing.T) {
 	if got := dohFactory.connectionPlan.addresses; len(got) != 2 || got[0] != net.JoinHostPort("127.0.0.2", strconv.Itoa(port)) || got[1] != listener.Addr().String() {
 		t.Fatalf("DoH bootstrap plan = %#v", got)
 	}
+	// Use a locally allocated and then closed port for the first candidate. A
+	// non-local loopback address can blackhole on some runners instead of
+	// failing promptly, which prevents the second candidate from being tried.
+	dohFactory.connectionPlan = dialPlan{addresses: []string{closedAddress, listener.Addr().String()}, timeout: time.Second}
 	session, err := dohFactory.Open(context.Background())
 	if err != nil {
 		t.Fatal(err)
