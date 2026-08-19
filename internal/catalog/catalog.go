@@ -56,6 +56,8 @@ type ResolverProfile struct {
 	Name       string                     `yaml:"name"`
 	Owner      string                     `yaml:"owner"`
 	Policy     string                     `yaml:"policy"`
+	Scope      string                     `yaml:"scope,omitempty"`
+	Interface  string                     `yaml:"interface,omitempty"`
 	Addresses  []string                   `yaml:"addresses"`
 	Transports map[Protocol]TransportSpec `yaml:"transports"`
 }
@@ -232,6 +234,8 @@ func Validate(profiles []ResolverProfile) error {
 		profile.Name = strings.TrimSpace(profile.Name)
 		profile.Owner = strings.TrimSpace(profile.Owner)
 		profile.Policy = strings.TrimSpace(profile.Policy)
+		profile.Scope = strings.TrimSpace(profile.Scope)
+		profile.Interface = strings.TrimSpace(profile.Interface)
 		if profile.ID == "" || profile.Name == "" {
 			return fmt.Errorf("resolver %d must have id and name", i+1)
 		}

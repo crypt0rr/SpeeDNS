@@ -244,10 +244,10 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 	oldDiscover := discoverSystemResolvers
 	t.Cleanup(func() { discoverSystemResolvers = oldDiscover })
 	discoverSystemResolvers = func(context.Context) ([]catalog.ResolverProfile, error) {
-		return []catalog.ResolverProfile{{ID: "system", Name: "System", Addresses: []string{"127.0.0.1"}, Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}}}}, nil
+		return []catalog.ResolverProfile{{ID: "system", Name: "System", Scope: "corp.example", Interface: "utun0", Addresses: []string{"127.0.0.1"}, Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}}}}, nil
 	}
 	profiles, err = loadProfiles(context.Background(), &cliConfig{noDefaults: true, includeSystem: true})
-	if err != nil || len(profiles) != 1 || profiles[0].ID != "system" {
+	if err != nil || len(profiles) != 1 || profiles[0].ID != "system" || profiles[0].Scope != "corp.example" || profiles[0].Interface != "utun0" {
 		t.Fatalf("system profiles = %#v/%v", profiles, err)
 	}
 	discoverSystemResolvers = func(context.Context) ([]catalog.ResolverProfile, error) {
