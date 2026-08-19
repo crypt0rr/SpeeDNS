@@ -126,6 +126,97 @@ func TestOpenStreamReportsTLSHandshakeTimeout(t *testing.T) {
 	}
 }
 
+func TestOpenStreamStopsAfterCanceledTLSCandidate(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- conn
+		cancel()
+	}()
+
+	plan := dialPlan{addresses: []string{listener.Addr().String(), "127.0.0.1:1"}, timeout: time.Second}
+	if _, _, err := plan.openStream(ctx, &tls.Config{InsecureSkipVerify: true}); err == nil {
+		t.Fatal("expected canceled TLS handshake error")
+	}
+	if conn := <-accepted; conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func TestOpenStreamRetriesAfterCandidateTimeout(t *testing.T) {
+	const serverName = "dns.example"
+	certificate, roots := testServerCertificate(t, serverName)
+
+	firstListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstListener.Close()
+	firstAccepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := firstListener.Accept()
+		if acceptErr != nil {
+			firstAccepted <- nil
+			return
+		}
+		firstAccepted <- conn
+	}()
+
+	secondListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsListener := tls.NewListener(secondListener, &tls.Config{Certificates: []tls.Certificate{certificate}})
+	defer tlsListener.Close()
+	secondResult := make(chan error, 1)
+	go func() {
+		conn, acceptErr := tlsListener.Accept()
+		if acceptErr != nil {
+			secondResult <- acceptErr
+			return
+		}
+		tlsConn := conn.(*tls.Conn)
+		handshakeErr := tlsConn.Handshake()
+		_ = conn.Close()
+		secondResult <- handshakeErr
+	}()
+
+	plan := dialPlan{
+		addresses: []string{firstListener.Addr().String(), secondListener.Addr().String()},
+		timeout:   20 * time.Millisecond,
+	}
+	conn, address, err := plan.openStream(context.Background(), &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: serverName,
+		RootCAs:    roots,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if address != secondListener.Addr().String() {
+		t.Fatalf("selected address = %q, want %q", address, secondListener.Addr().String())
+	}
+	_ = conn.Close()
+
+	if firstConn := <-firstAccepted; firstConn != nil {
+		_ = firstConn.Close()
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second candidate TLS handshake = %v", err)
+	}
+}
+
 func TestStreamFactoryFallsBackToNextCandidate(t *testing.T) {
 	closed, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -433,6 +524,37 @@ func TestDoQFactoryStopsWhenOpenContextExpires(t *testing.T) {
 	if called != 1 {
 		t.Fatalf("expired DoQ candidates attempted = %d, want 1", called)
 	}
+}
+
+func TestDoQFactoryRetriesAfterCandidateTimeout(t *testing.T) {
+	oldDial := dialDoQ
+	t.Cleanup(func() { dialDoQ = oldDial })
+	_, fakeConn := newFakeDoQStream()
+	addresses := make([]string, 0, 2)
+	dialDoQ = func(ctx context.Context, address string, _ *tls.Config, _ *quic.Config) (doqConn, error) {
+		addresses = append(addresses, address)
+		if len(addresses) == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return fakeConn, nil
+	}
+	factory := &doqFactory{
+		connectionPlan: dialPlan{addresses: []string{"192.0.2.1:853", "192.0.2.2:853"}, timeout: 20 * time.Millisecond},
+		timeout:        20 * time.Millisecond,
+		tlsConfig:      &tls.Config{NextProtos: []string{"doq"}},
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := session.(*doqSession).DialAddress(); got != "192.0.2.2:853" {
+		t.Fatalf("DoQ selected address = %q", got)
+	}
+	if strings.Join(addresses, ",") != "192.0.2.1:853,192.0.2.2:853" {
+		t.Fatalf("DoQ dial order = %#v", addresses)
+	}
+	_ = session.Close()
 }
 
 func TestDoHRedirectRequiresHTTPSOrigin(t *testing.T) {

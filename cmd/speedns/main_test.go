@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/crypt0rr/dns-speedtest/data"
 	"github.com/crypt0rr/dns-speedtest/internal/benchmark"
 	"github.com/crypt0rr/dns-speedtest/internal/catalog"
 )
@@ -72,6 +73,19 @@ func TestMainAndCommands(t *testing.T) {
 	resolversCommand.SetArgs(nil)
 	if err := resolversCommand.Execute(); err != nil || !strings.Contains(resolverOutput.String(), "Google") || !strings.Contains(resolverOutput.String(), "doq") {
 		t.Fatalf("resolvers command = %v/%q", err, resolverOutput.String())
+	}
+	corpusCommand := newCorpusCommand()
+	var corpusOutput bytes.Buffer
+	corpusCommand.SetOut(&corpusOutput)
+	corpusCommand.SetArgs(nil)
+	if err := corpusCommand.Execute(); err != nil || !strings.Contains(corpusOutput.String(), "List ID:") || !strings.Contains(corpusOutput.String(), "Entries: 1000") || !strings.Contains(corpusOutput.String(), "SHA-256:") {
+		t.Fatalf("corpus command = %v/%q", err, corpusOutput.String())
+	}
+	oldVerifyCorpus := verifyCorpusFunc
+	verifyCorpusFunc = func() (data.CorpusMetadata, error) { return data.CorpusMetadata{}, errors.New("corpus fixture failed") }
+	t.Cleanup(func() { verifyCorpusFunc = oldVerifyCorpus })
+	if err := newCorpusCommand().Execute(); err == nil || !strings.Contains(err.Error(), "corpus fixture failed") {
+		t.Fatalf("corpus command error = %v", err)
 	}
 	root := newRootCommand()
 	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Commands() == nil {

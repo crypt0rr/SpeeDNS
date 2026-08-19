@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/crypt0rr/dns-speedtest/data"
 	"github.com/crypt0rr/dns-speedtest/internal/benchmark"
 	"github.com/crypt0rr/dns-speedtest/internal/catalog"
 	"github.com/crypt0rr/dns-speedtest/internal/domains"
@@ -50,6 +51,8 @@ var runBenchmarkEngine = benchmark.Run
 var discoverSystemResolvers = systemdns.Discover
 
 var loadProfilesFunc = loadProfiles
+
+var verifyCorpusFunc = data.VerifyCorpus
 
 var writeTableReport = report.WriteTableWithOptions
 var writeJSONReport = report.WriteJSON
@@ -209,6 +212,7 @@ func newRootCommand() *cobra.Command {
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
 
 	root.AddCommand(newResolversCommand())
+	root.AddCommand(newCorpusCommand())
 	root.AddCommand(newVersionCommand())
 	return root
 }
@@ -236,6 +240,30 @@ func newResolversCommand() *cobra.Command {
 				}
 				sortStrings(protocols)
 				fmt.Fprintf(cmd.OutOrStdout(), "%-16s %-22s %-24s %-34s %s\n", resolver.ID, resolver.Owner, strings.Join(resolver.Addresses, ","), resolver.Policy, strings.Join(protocols, ","))
+			}
+			return nil
+		},
+	}
+}
+
+func newCorpusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "corpus",
+		Short: "Show the embedded domain corpus provenance and checksum",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			metadata, err := verifyCorpusFunc()
+			if err != nil {
+				return err
+			}
+			writer := cmd.OutOrStdout()
+			fmt.Fprintln(writer, "SpeeDNS domain corpus")
+			fmt.Fprintf(writer, "Source: %s\n", metadata.Source)
+			fmt.Fprintf(writer, "List ID: %s\n", metadata.ListID)
+			fmt.Fprintf(writer, "Retrieved: %s\n", metadata.RetrievedAt)
+			fmt.Fprintf(writer, "Entries: %d\n", metadata.Entries)
+			fmt.Fprintf(writer, "SHA-256: %s\n", metadata.SHA256)
+			if metadata.DownloadURL != "" {
+				fmt.Fprintf(writer, "Source URL: %s\n", metadata.DownloadURL)
 			}
 			return nil
 		},

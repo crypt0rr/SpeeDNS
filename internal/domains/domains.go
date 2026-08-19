@@ -18,6 +18,8 @@ const maxDomainLineSize = 64 * 1024
 
 var lookupProfile = idna.New(idna.MapForLookup(), idna.VerifyDNSLength(true), idna.BidiRule())
 
+var verifyEmbeddedCorpus = data.VerifyCorpus
+
 type domainInput struct {
 	value string
 	line  int
@@ -28,6 +30,9 @@ type domainInput struct {
 // consistently in both modes.
 func Load(path string) ([]string, error) {
 	if strings.TrimSpace(path) == "" {
+		if _, err := verifyEmbeddedCorpus(); err != nil {
+			return nil, fmt.Errorf("verify embedded domain corpus: %w", err)
+		}
 		return Normalize(data.Domains())
 	}
 	file, err := os.Open(path)

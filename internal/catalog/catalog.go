@@ -213,6 +213,12 @@ func LoadYAML(r io.Reader) ([]ResolverProfile, error) {
 	if err := decoder.Decode(&file); err != nil {
 		return nil, fmt.Errorf("decode resolver file: %w", err)
 	}
+	var extraDocument any
+	if err := decoder.Decode(&extraDocument); err == nil {
+		return nil, errors.New("resolver file contains multiple YAML documents; use one document")
+	} else if !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("decode resolver file: %w", err)
+	}
 	if file.Version != 1 {
 		return nil, fmt.Errorf("unsupported resolver file version %d", file.Version)
 	}

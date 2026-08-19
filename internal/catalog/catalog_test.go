@@ -41,6 +41,38 @@ func TestLoadYAMLRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestLoadYAMLRejectsMultipleDocuments(t *testing.T) {
+	valid := `version: 1
+resolvers:
+  - id: example
+    name: Example
+    owner: Example
+    policy: unfiltered
+    addresses: [192.0.2.53]
+    transports:
+      udp: {port: 53}
+`
+	for _, suffix := range []string{
+		"---\nversion: 1\nresolvers: []\n",
+		"---\n# an explicit empty second document\n",
+	} {
+		t.Run(strings.TrimSpace(suffix), func(t *testing.T) {
+			_, err := LoadYAML(strings.NewReader(valid + suffix))
+			if err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
+				t.Fatalf("multiple-document error = %v", err)
+			}
+		})
+	}
+
+	profiles, err := LoadYAML(strings.NewReader(valid + "\n# trailing comment only\n"))
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("single-document trailing comment = %#v/%v", profiles, err)
+	}
+	if _, err := LoadYAML(strings.NewReader(valid + "\n---\n: [\n")); err == nil || !strings.Contains(err.Error(), "decode resolver file") {
+		t.Fatalf("malformed second document error = %v", err)
+	}
+}
+
 func TestParseResolverFlag(t *testing.T) {
 	profile, err := ParseResolverFlag("private=https://dns.example/dns-query")
 	if err != nil {

@@ -195,6 +195,23 @@ resolvers:
 
 Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order. TLS certificate validation is always enabled.
 
+Resolver profile files must contain exactly one YAML document. SpeeDNS rejects
+additional documents instead of silently ignoring them.
+
+## Bundled domain corpus
+
+The default benchmark uses an embedded, pinned 1,000-domain corpus. SpeeDNS
+verifies its entry count, uniqueness, syntax, and SHA-256 checksum locally
+before using it. Show the source and integrity metadata with:
+
+```sh
+./speedns corpus
+```
+
+The corpus is a pinned Tranco snapshot. Its source, list ID, retrieval date,
+checksum, and attribution note are shipped with the program; benchmarking does
+not download or refresh the list.
+
 ## Custom domain lists
 
 Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line.

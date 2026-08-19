@@ -78,6 +78,9 @@ func singleDialPlan(address string, timeout time.Duration) dialPlan {
 	return dialPlan{addresses: []string{address}, timeout: timeout}
 }
 
+// openContext returns a fresh timeout budget for one ordered candidate
+// attempt. The caller context remains authoritative, so a candidate timeout
+// does not consume the budget of later candidates.
 func (p dialPlan) openContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if p.timeout <= 0 {
 		return ctx, func() {}
@@ -101,15 +104,15 @@ func (p dialPlan) failed(errs []error) error {
 }
 
 func (p dialPlan) dialTCP(ctx context.Context, network string, onConnected func(string)) (net.Conn, error) {
-	openCtx, cancel := p.openContext(ctx)
-	defer cancel()
 	if network == "" {
 		network = "tcp"
 	}
 	dialer := &net.Dialer{Timeout: p.timeout}
 	errs := make([]error, 0, len(p.addresses))
 	for _, address := range p.addresses {
+		openCtx, cancel := p.openContext(ctx)
 		conn, err := dialer.DialContext(openCtx, network, address)
+		cancel()
 		if err == nil {
 			if onConnected != nil {
 				onConnected(address)
@@ -117,7 +120,7 @@ func (p dialPlan) dialTCP(ctx context.Context, network string, onConnected func(
 			return conn, nil
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", address, err))
-		if openCtx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
 	}
@@ -125,15 +128,15 @@ func (p dialPlan) dialTCP(ctx context.Context, network string, onConnected func(
 }
 
 func (p dialPlan) openStream(ctx context.Context, tlsConfig *tls.Config) (net.Conn, string, error) {
-	openCtx, cancel := p.openContext(ctx)
-	defer cancel()
 	dialer := &net.Dialer{Timeout: p.timeout}
 	errs := make([]error, 0, len(p.addresses))
 	for _, address := range p.addresses {
+		openCtx, cancel := p.openContext(ctx)
 		conn, err := dialer.DialContext(openCtx, "tcp", address)
 		if err != nil {
+			cancel()
 			errs = append(errs, fmt.Errorf("%s: %w", address, err))
-			if openCtx.Err() != nil {
+			if ctx.Err() != nil {
 				break
 			}
 			continue
@@ -142,14 +145,16 @@ func (p dialPlan) openStream(ctx context.Context, tlsConfig *tls.Config) (net.Co
 			tlsConn := tls.Client(conn, tlsConfig.Clone())
 			if err := tlsConn.HandshakeContext(openCtx); err != nil {
 				_ = conn.Close()
+				cancel()
 				errs = append(errs, fmt.Errorf("%s: TLS handshake: %w", address, err))
-				if openCtx.Err() != nil {
+				if ctx.Err() != nil {
 					break
 				}
 				continue
 			}
 			conn = tlsConn
 		}
+		cancel()
 		return conn, address, nil
 	}
 	return nil, "", p.failed(errs)
@@ -588,19 +593,19 @@ func (f *doqFactory) Open(ctx context.Context) (Session, error) {
 	if len(plan.addresses) == 0 {
 		plan = singleDialPlan(f.address, f.timeout)
 	}
-	openCtx, cancel := plan.openContext(ctx)
-	defer cancel()
 	errs := make([]error, 0, len(plan.addresses))
 	for _, address := range plan.addresses {
+		openCtx, cancel := plan.openContext(ctx)
 		conn, err := dialDoQ(openCtx, address, f.tlsConfig.Clone(), &quic.Config{
 			HandshakeIdleTimeout: f.timeout,
 			MaxIdleTimeout:       f.timeout * 2,
 		})
+		cancel()
 		if err == nil {
 			return &doqSession{conn: conn, timeout: f.timeout, dialAddress: address}, nil
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", address, err))
-		if openCtx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
 	}
