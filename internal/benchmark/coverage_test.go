@@ -192,6 +192,62 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	}
 }
 
+func TestRunNoComparableReportsRetainUnavailableTargets(t *testing.T) {
+	oldTarget := runTargetFunc
+	t.Cleanup(func() { runTargetFunc = oldTarget })
+	runTargetFunc = func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
+		return TargetResult{
+			Target: target, OpenError: "connection refused",
+			Observations: failedObservations(queries, errors.New("connection refused")),
+		}
+	}
+	opts := validBenchmarkOptions()
+	opts.Domains = []string{"example.com"}
+	opts.QueryTypes = []uint16{dns.TypeA}
+	targets := []catalog.Target{testTarget(catalog.UDP, "unavailable-a"), testTarget(catalog.UDP, "unavailable-b")}
+	report, err := Run(context.Background(), targets, opts)
+	if !errors.Is(err, ErrNoComparableResults) {
+		t.Fatalf("Run error = %v, want no-comparable error", err)
+	}
+	if report.FinishedAt.IsZero() || len(report.Targets) != len(targets) || len(report.Rankings) != 0 {
+		t.Fatalf("unavailable report metadata/results = %#v", report)
+	}
+	joined := strings.Join(report.Warnings, "\n")
+	if !strings.Contains(joined, "connection refused") || !strings.Contains(joined, "failed queries") {
+		t.Fatalf("unavailable report warnings = %#v", report.Warnings)
+	}
+}
+
+func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
+	oldTarget := runTargetFunc
+	t.Cleanup(func() { runTargetFunc = oldTarget })
+	runTargetFunc = func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
+		observations := make([]Observation, 0, len(queries))
+		for _, query := range queries {
+			observations = append(observations, Observation{
+				Name: query.Name, QType: query.QType, Success: true, Usable: false,
+				RCode: dns.RcodeServerFailure, ResponseClass: "rcode-2", LatencyMS: 1,
+			})
+		}
+		return TargetResult{Target: target, Observations: observations}
+	}
+	opts := validBenchmarkOptions()
+	opts.Domains = []string{"example.com"}
+	opts.QueryTypes = []uint16{dns.TypeA}
+	targets := []catalog.Target{testTarget(catalog.UDP, "servfail-a"), testTarget(catalog.UDP, "servfail-b")}
+	report, err := Run(context.Background(), targets, opts)
+	if !errors.Is(err, ErrNoComparableResults) {
+		t.Fatalf("Run error = %v, want no-comparable error", err)
+	}
+	if report.FinishedAt.IsZero() || len(report.Targets) != len(targets) || len(report.Rankings) != 0 {
+		t.Fatalf("unusable-response report metadata/results = %#v", report)
+	}
+	joined := strings.Join(report.Warnings, "\n")
+	if !strings.Contains(joined, "unusable DNS responses") || !strings.Contains(joined, "SERVFAIL:1") {
+		t.Fatalf("unusable-response report warnings = %#v", report.Warnings)
+	}
+}
+
 func TestRunProtocolCancellationBeforeDispatch(t *testing.T) {
 	oldTarget := runTargetFunc
 	t.Cleanup(func() { runTargetFunc = oldTarget })

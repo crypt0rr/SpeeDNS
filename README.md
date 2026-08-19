@@ -210,6 +210,15 @@ Useful flags include:
 
 In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.
 
+When a benchmark finishes without a comparable result, SpeeDNS still writes the
+diagnostic report so you can inspect endpoint failures, resolver errors, and
+warnings. The command returns a distinct non-zero status:
+
+- `0` — comparison completed successfully;
+- `2` — invalid input or configuration;
+- `3` — no comparable DNS results were produced;
+- `130` — interrupted by the user or operating system.
+
 ## Troubleshooting
 
 - If a network blocks traditional DNS, UDP and TCP may show `FAILED` while encrypted transports still work. SpeeDNS reports these failures instead of retrying through another protocol.

@@ -26,6 +26,10 @@ const (
 	MinimumRecommendedSuccessRate = 0.99
 )
 
+// ErrNoComparableResults means the benchmark completed, but no target had a
+// comparable set of DNS observations to rank.
+var ErrNoComparableResults = errors.New("no comparable DNS results were produced")
+
 var warmupNames = []string{"example.com", "example.org", "example.net"}
 
 // newFactory is kept as a small dependency seam so the scheduler and
@@ -197,7 +201,7 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 		return report, ctx.Err()
 	}
 	if len(report.Rankings) == 0 {
-		return report, errors.New("no comparable DNS results were produced")
+		return report, ErrNoComparableResults
 	}
 	return report, nil
 }
