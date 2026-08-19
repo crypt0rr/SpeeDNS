@@ -52,6 +52,26 @@ if [[ "${entry_count}" != 1000 ]]; then
   exit 1
 fi
 
+sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${file}" | awk '{print $1}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${file}" | awk '{print $1}'
+    return
+  fi
+  echo "a SHA-256 utility (sha256sum or shasum) is required" >&2
+  exit 1
+}
+
+corpus_sha256="$(sha256_file "${temporary_dir}/domains.txt")"
+if [[ ! "${corpus_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "failed to calculate a SHA-256 checksum for the normalized corpus" >&2
+  exit 1
+fi
+
 cp "${temporary_dir}/domains.txt" "${root_dir}/data/domains.txt"
 retrieved_at="$(date -u +%F)"
 cat > "${root_dir}/data/domains.meta.json" <<EOF
@@ -61,8 +81,9 @@ cat > "${root_dir}/data/domains.meta.json" <<EOF
   "retrieved_at": "${retrieved_at}",
   "download_url": "https://tranco-list.eu/download/${list_id}/1000",
   "entries": 1000,
+  "sha256": "${corpus_sha256}",
   "license_note": "Tranco aggregates providers with their own attribution and license terms; retain this metadata when redistributing the snapshot."
 }
 EOF
 
-echo "updated data/domains.txt from Tranco list ${list_id}"
+echo "updated data/domains.txt from Tranco list ${list_id} (sha256 ${corpus_sha256})"
