@@ -70,6 +70,7 @@ func reportTarget(id string, protocol catalog.Protocol, scored int, recommended 
 
 func completeReport() benchmark.Report {
 	winner := reportTarget("1", catalog.UDP, 2, true)
+	winner.DialAddress = "192.0.2.1:53"
 	winner.Observations = []benchmark.Observation{{Name: "example.com", QType: 1, Success: true, LatencyMS: 2}}
 	winner.Cold = []benchmark.ColdObservation{{Name: "example.com", QType: 1, Success: true, LatencyMS: 5}}
 	failed := reportTarget("2", catalog.TCP, 0, false)
@@ -99,6 +100,9 @@ func TestJSONRawAndWriterErrors(t *testing.T) {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("raw JSON missing %q: %s", expected, text)
 		}
+	}
+	if strings.Contains(text, "dial_address") {
+		t.Fatalf("JSON schema unexpectedly exposed human-only dial metadata: %s", text)
 	}
 	if err := WriteJSON(&failingWriter{failAt: 1}, run, false); err == nil {
 		t.Fatal("expected JSON writer error")
@@ -159,8 +163,8 @@ func TestTableSuccessAndAllWriterFailureSites(t *testing.T) {
 	if err := WriteTable(&output, run, true); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "Cold") || !strings.Contains(output.String(), "MAD") {
-		t.Fatalf("detailed table missing cold/MAD: %s", output.String())
+	if !strings.Contains(output.String(), "Cold") || !strings.Contains(output.String(), "MAD") || !strings.Contains(output.String(), "Dial") || !strings.Contains(output.String(), "192.0.2.1:53") {
+		t.Fatalf("detailed table missing cold/MAD/dial: %s", output.String())
 	}
 
 	// Exercise every top-level write failure path. Tables buffer their output

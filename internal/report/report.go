@@ -253,7 +253,8 @@ func summaryRow(protocol catalog.Protocol, result benchmark.TargetResult, status
 
 func comparisonRow(report benchmark.Report, result benchmark.TargetResult, details bool, color bool) []string {
 	row := []string{
-		rankText(report, result.Target.ID()), result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy,
+		rankText(report, result.Target.ID()), result.Target.Resolver.Owner, result.Target.Address,
+		result.Target.Resolver.Policy,
 		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate),
 		scoreText(result),
 	}
@@ -261,10 +262,17 @@ func comparisonRow(report benchmark.Report, result benchmark.TargetResult, detai
 		row = append(row,
 			latencyText(result.Stats.ColdMedianMS), latencyText(result.Stats.MADMS),
 			strconv.Itoa(result.Stats.Scored), strconv.Itoa(result.Stats.Failures),
-			strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated),
+			strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated), dialAddressText(result),
 		)
 	}
 	return append(row, styledStatus(resultStatus(result), color))
+}
+
+func dialAddressText(result benchmark.TargetResult) string {
+	if result.DialAddress == "" {
+		return "—"
+	}
+	return result.DialAddress
 }
 
 func sortComparisonResults(report benchmark.Report, results []benchmark.TargetResult) {
@@ -327,7 +335,7 @@ func summaryHeaders() []string {
 func comparisonHeaders(details bool) []string {
 	headers := []string{"Rank", "Owner", "Address", "Policy", "Median", "P95", "Success", "Score"}
 	if details {
-		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "Divergent", "Truncated")
+		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "Divergent", "Truncated", "Dial")
 	}
 	return append(headers, "Status")
 }

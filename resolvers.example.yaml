@@ -14,6 +14,8 @@ resolvers:
       dot:
         server_name: dns.example
         port: 853
+        bootstrap_addresses:
+          - 192.0.2.53
       doh:
         url: https://dns.example/dns-query
         bootstrap_addresses:
@@ -21,3 +23,5 @@ resolvers:
       doq:
         server_name: dns.example
         port: 853
+        bootstrap_addresses:
+          - 192.0.2.53

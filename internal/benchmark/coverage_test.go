@@ -379,4 +379,17 @@ func TestDivergenceAndStatisticsHelpers(t *testing.T) {
 	if got := QueryTypeName(65000); got != "TYPE65000" {
 		t.Fatalf("unknown query type = %q", got)
 	}
+	if got := sessionDialAddress(&fakeSession{}); got != "" {
+		t.Fatalf("session without dial metadata = %q", got)
+	}
+	if got := sessionDialAddress(&reportedSession{address: "192.0.2.1:853"}); got != "192.0.2.1:853" {
+		t.Fatalf("reported session dial metadata = %q", got)
+	}
 }
+
+type reportedSession struct {
+	fakeSession
+	address string
+}
+
+func (s *reportedSession) DialAddress() string { return s.address }

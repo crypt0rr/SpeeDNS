@@ -80,6 +80,16 @@ For a complete profile with an owner, policy, address, TLS name, and multiple tr
 
 See [`resolvers.example.yaml`](resolvers.example.yaml) for the schema.
 
+For hostname-based encrypted endpoints that must be reached without resolving
+the endpoint name through the system DNS, add an ordered list of IP literals as
+`bootstrap_addresses` to the DoH, DoT, or DoQ transport. SpeeDNS tries those
+addresses in order while retaining the configured HTTPS host or TLS
+`server_name` for certificate validation. The first successful address is
+reused for the endpoint and is shown by `--details`. Bootstrap addresses are
+not separately ranked, and SpeeDNS never retries a failed query through
+another protocol. One-off `--resolver` URIs do not have bootstrap syntax; use a
+YAML profile when pinned or split-DNS dialing is required.
+
 Custom domain lists are newline-delimited. Blank lines and lines beginning with `#` are ignored, names are case-normalized, and duplicates are removed:
 
 ```sh
@@ -101,6 +111,10 @@ Short runs can still show a provisional fastest result, but SpeeDNS labels it se
 `—` means that a resolver does not advertise that transport. `FAIL` means it was configured for the transport but the connection or DNS exchange failed. SpeeDNS never silently falls back from one protocol to another.
 
 The terminal report groups comparisons by protocol. In an interactive terminal, progress is rendered as one updating status line; when output is redirected, SpeeDNS prints one completion line per protocol. Blocked transports are summarized together, while `--details` includes the underlying endpoint errors and counters. Use `--no-color` for plain terminal output.
+
+DoH follows only redirects that remain on the same HTTPS origin (hostname and
+effective port). HTTP downgrades and cross-origin redirects are recorded as
+transport failures.
 
 ## Default resolver profiles
 
