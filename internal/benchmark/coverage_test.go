@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/dns-speedtest/internal/domains"
 	"github.com/crypt0rr/dns-speedtest/internal/transport"
 	"github.com/miekg/dns"
 )
@@ -109,6 +110,9 @@ func TestRunValidationAndQueryConstruction(t *testing.T) {
 	if _, err := Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "build-error")}, Options{Domains: []string{"# ignored"}, QueryTypes: base.QueryTypes, Sample: 1, Timeout: time.Second, Concurrency: 1}); err == nil || !strings.Contains(err.Error(), "no valid names") {
 		t.Fatalf("Run build error = %v", err)
 	}
+	if _, err := buildQueries(Options{Domains: []string{"bad..name"}, QueryTypes: base.QueryTypes, Sample: 1}); err == nil || !strings.Contains(err.Error(), "empty labels") {
+		t.Fatalf("strict query construction error = %v", err)
+	}
 
 	full := base
 	full.Full = true
@@ -123,8 +127,9 @@ func TestRunValidationAndQueryConstruction(t *testing.T) {
 	if err != nil || len(queries) != 4 {
 		t.Fatalf("oversized sample construction = %d, %v; want 4, nil", len(queries), err)
 	}
-	if got := normalizeDomains([]string{" A.Example. ", "a.example", "", " # comment", "B.example"}); len(got) != 2 || got[0] != "a.example" || got[1] != "b.example" {
-		t.Fatalf("normalized domains = %#v", got)
+	got, normalizeErr := domains.Normalize([]string{" A.Example. ", "a.example", "", " # comment", "B.example"})
+	if normalizeErr != nil || len(got) != 2 || got[0] != "a.example" || got[1] != "b.example" {
+		t.Fatalf("normalized domains = %#v/%v", got, normalizeErr)
 	}
 }
 

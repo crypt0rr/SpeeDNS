@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/dns-speedtest/internal/domains"
 	"github.com/crypt0rr/dns-speedtest/internal/transport"
 	"github.com/miekg/dns"
 )
@@ -226,11 +227,11 @@ func validateOptions(opts Options) error {
 }
 
 func buildQueries(opts Options) ([]Query, error) {
-	domains := normalizeDomains(opts.Domains)
-	if len(domains) == 0 {
-		return nil, errors.New("domain corpus has no valid names")
+	names, err := domains.Normalize(opts.Domains)
+	if err != nil {
+		return nil, fmt.Errorf("domain corpus has no valid names: %w", err)
 	}
-	source := append([]string(nil), domains...)
+	source := append([]string(nil), names...)
 	rng := rand.New(rand.NewSource(opts.Seed))
 	rng.Shuffle(len(source), func(i, j int) { source[i], source[j] = source[j], source[i] })
 	count := opts.Sample
@@ -245,24 +246,6 @@ func buildQueries(opts Options) ([]Query, error) {
 	}
 	rng.Shuffle(len(queries), func(i, j int) { queries[i], queries[j] = queries[j], queries[i] })
 	return queries, nil
-}
-
-func normalizeDomains(domains []string) []string {
-	seen := make(map[string]struct{}, len(domains))
-	result := make([]string, 0, len(domains))
-	for _, domain := range domains {
-		domain = strings.TrimSpace(strings.ToLower(domain))
-		domain = strings.TrimSuffix(domain, ".")
-		if domain == "" || strings.HasPrefix(domain, "#") {
-			continue
-		}
-		if _, ok := seen[domain]; ok {
-			continue
-		}
-		seen[domain] = struct{}{}
-		result = append(result, domain)
-	}
-	return result
 }
 
 func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
