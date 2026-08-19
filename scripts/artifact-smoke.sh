@@ -2,11 +2,12 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: $0 linux|macos|macos-archives [dist-directory]" >&2
+	echo "usage: $0 linux|macos|macos-archives [dist-directory] [release-manifest]" >&2
 }
 
 mode="${1:-}"
 dist_dir="${2:-dist}"
+release_manifest="${3:-}"
 if [[ ! -d "${dist_dir}" ]]; then
 	usage
 	exit 2
@@ -33,6 +34,10 @@ require_artifact() {
 	artifact="$(find_artifact "${pattern}")"
 	if [[ -z "${artifact}" ]]; then
 		echo "missing artifact matching ${pattern} in ${dist_dir}" >&2
+		exit 1
+	fi
+	if [[ -n "${release_manifest}" ]] && ! grep -Fqx -- "${artifact}" "${release_manifest}"; then
+		echo "${artifact} is not present in the release asset manifest" >&2
 		exit 1
 	fi
 	echo "using ${artifact}" >&2

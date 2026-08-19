@@ -99,29 +99,107 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - name: Build release candidate snapshot
+      - name: Build reproducibility reference
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: release --snapshot --clean --skip=sign
+          args: release --snapshot --clean --skip=publish --skip=sign
 
-      - name: Smoke-test release candidate artifacts
+      - name: Save reproducibility reference
+        shell: bash
+        run: cp -a dist "${RUNNER_TEMP}/speedns-repro-reference"
+
+      - name: Build reproducibility candidate
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean --skip=publish --skip=sign
+
+      - name: Compare reproducibility artifacts
+        shell: bash
+        run: bash scripts/compare-release-artifacts.sh "${RUNNER_TEMP}/speedns-repro-reference" dist
+
+      - name: Test release scripts fixture
+        shell: bash
+        run: bash scripts/release-fixture.sh
+
+      - name: Build release artifacts once
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean --skip=publish
+        env:
+          COSIGN_YES: 'true'
+
+      - name: Verify and smoke-test exact release assets
         shell: bash
         run: |
-          bash scripts/artifact-smoke.sh linux dist
-          bash scripts/artifact-smoke.sh macos-archives dist
+          set -euo pipefail
+          : >dist/release-smoke.log
+          {
+            bash scripts/release-assets.sh verify dist dist/release-assets.txt
+            bash scripts/artifact-smoke.sh linux dist dist/release-assets.txt
+            bash scripts/artifact-smoke.sh macos-archives dist dist/release-assets.txt
+            bash scripts/homebrew-cask.sh "${RELEASE_TAG}" dist dist/speedns.rb
+          } 2>&1 | tee dist/release-smoke.log
 
-      - name: Build and publish GitHub release
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+      - name: Upload release verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: release --clean
+          name: speedns-release-verification
+          path: |
+            dist/artifacts.json
+            dist/checksums.txt
+            dist/release-assets.txt
+            dist/release-smoke.log
+            dist/speedns.rb
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Create GitHub release draft
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_args=(
+            --repo "${GITHUB_REPOSITORY}"
+            --verify-tag
+            --draft
+            --title "SpeeDNS ${RELEASE_TAG}"
+          )
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+          if [[ -f dist/CHANGELOG.md ]]; then
+            release_args+=(--notes-file dist/CHANGELOG.md)
+          else
+            release_args+=(--generate-notes)
+          fi
+          gh release create "${RELEASE_TAG}" "${release_args[@]}"
+
+      - name: Upload exact release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mapfile -t release_assets <dist/release-assets.txt
+          test "${#release_assets[@]}" -gt 0
+          gh release upload "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            "${release_assets[@]}"
+
+      - name: Publish Homebrew cask from exact checksums
+        shell: bash
+        env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          COSIGN_YES: 'true'
+        run: bash scripts/publish-homebrew-cask.sh dist/speedns.rb "${RELEASE_TAG}"
 
       - name: Attest published release artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
