@@ -143,6 +143,14 @@ jobs:
           version: '~> v2'
           args: release --snapshot --clean --skip=sign
 
+      - name: Smoke-test Linux archive and Debian package
+        shell: bash
+        run: bash scripts/artifact-smoke.sh linux dist
+
+      - name: Validate macOS archive contents
+        shell: bash
+        run: bash scripts/artifact-smoke.sh macos-archives dist
+
       - name: Upload GoReleaser snapshot
         uses: actions/upload-artifact@v7
         with:
@@ -150,3 +158,21 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
+  native-macos-smoke:
+    name: Native macOS artifact smoke
+    needs: release-check
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Download GoReleaser snapshot
+        uses: actions/download-artifact@v7
+        with:
+          name: speedns-goreleaser-snapshot
+          path: dist
+
+      - name: Execute native macOS artifact
+        shell: bash
+        run: bash scripts/artifact-smoke.sh macos dist
