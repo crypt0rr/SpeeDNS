@@ -408,7 +408,7 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	}
 	dialCtx, cancelDial := context.WithCancel(context.Background())
 	cancelDial()
-	if _, err := doh.client.Transport.(*http.Transport).DialContext(dialCtx, "tcp", "ignored"); err == nil {
+	if _, err := doh.client.Transport.(*http.Transport).DialTLSContext(dialCtx, "tcp", "ignored"); err == nil {
 		t.Fatal("expected cancelled DoH dial")
 	}
 	first, _ := url.Parse("https://dns.example/a")

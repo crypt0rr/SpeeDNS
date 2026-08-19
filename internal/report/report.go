@@ -610,17 +610,6 @@ func latencyText(value float64) string {
 
 func percentText(value float64) string { return fmt.Sprintf("%.2f%%", value*100) }
 
-func usableRate(stats benchmark.Statistics) float64 {
-	// Reports may be constructed by older callers that populate only the
-	// original success fields. Prefer the explicit semantic metric whenever
-	// the benchmark supplied one, including a real zero rate with resolver
-	// failures.
-	if stats.UsableResponses == 0 && stats.ResolverFailures == 0 && stats.UsableRate == 0 && stats.Successes > 0 {
-		return stats.SuccessRate
-	}
-	return stats.UsableRate
-}
-
 func scoreText(result benchmark.TargetResult) string {
 	if result.Stats.Scored == 0 {
 		return "—"
@@ -640,7 +629,7 @@ func summaryRowWithOptions(protocol catalog.Protocol, result benchmark.TargetRes
 	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	return []string{
 		string(protocol), view.Owner, view.Address, view.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(usableRate(result.Stats)),
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
 		scoreText(result), styledStatus(status, color),
 	}
 }
@@ -649,7 +638,7 @@ func comparisonRowWithOptions(report benchmark.Report, result benchmark.TargetRe
 	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	row := []string{
 		rankText(report, result.Target.ID()), view.Owner, view.Address, view.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(usableRate(result.Stats)),
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
 		scoreText(result),
 	}
 	if details {

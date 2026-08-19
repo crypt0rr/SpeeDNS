@@ -62,7 +62,7 @@ func reportTarget(id string, protocol catalog.Protocol, scored int, recommended 
 			Address:  "192.0.2." + id,
 		},
 		Stats: benchmark.Statistics{
-			Total: 2, Successes: 2, Scored: scored, SuccessRate: 1, MedianMS: 2, P95MS: 3,
+			Total: 2, Successes: 2, UsableResponses: 2, Scored: scored, SuccessRate: 1, UsableRate: 1, MedianMS: 2, P95MS: 3,
 			MinMS: 1, MaxMS: 4, MADMS: 0.5, ColdMedianMS: 5, ScoreMS: 2.4,
 			CILowMS: 1, CIHighMS: 4, Recommended: recommended,
 		},
@@ -697,6 +697,21 @@ func TestProtocolMatrixAndTruthfulStatuses(t *testing.T) {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("status output missing %q: %s", expected, text)
 		}
+	}
+}
+
+func TestReportDoesNotInferUsableRateFromTransportSuccess(t *testing.T) {
+	result := reportTarget("zero-usable", catalog.UDP, 0, false)
+	result.Stats = benchmark.Statistics{Total: 2, Successes: 2, SuccessRate: 1, UsableRate: 0}
+	var output bytes.Buffer
+	if err := WriteTable(&output, benchmark.Report{Seed: 1, SampleSize: 2, QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{result}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "100.00%  100.00%") {
+		t.Fatalf("report inferred usable rate from transport success: %s", output.String())
+	}
+	if !strings.Contains(output.String(), "100.00%  0.00%") {
+		t.Fatalf("report omitted explicit zero usable rate: %s", output.String())
 	}
 }
 

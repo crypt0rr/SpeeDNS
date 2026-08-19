@@ -103,30 +103,6 @@ func (p dialPlan) failed(errs []error) error {
 	return fmt.Errorf("all connection candidates failed: %s", strings.Join(parts, "; "))
 }
 
-func (p dialPlan) dialTCP(ctx context.Context, network string, onConnected func(string)) (net.Conn, error) {
-	if network == "" {
-		network = "tcp"
-	}
-	dialer := &net.Dialer{Timeout: p.timeout}
-	errs := make([]error, 0, len(p.addresses))
-	for _, address := range p.addresses {
-		openCtx, cancel := p.openContext(ctx)
-		conn, err := dialer.DialContext(openCtx, network, address)
-		cancel()
-		if err == nil {
-			if onConnected != nil {
-				onConnected(address)
-			}
-			return conn, nil
-		}
-		errs = append(errs, fmt.Errorf("%s: %w", address, err))
-		if ctx.Err() != nil {
-			break
-		}
-	}
-	return nil, p.failed(errs)
-}
-
 func (p dialPlan) openStream(ctx context.Context, tlsConfig *tls.Config) (net.Conn, string, error) {
 	dialer := &net.Dialer{Timeout: p.timeout}
 	errs := make([]error, 0, len(p.addresses))
@@ -468,9 +444,6 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		ForceAttemptHTTP2:      true,
 		TLSClientConfig:        tlsConfig,
 		MaxResponseHeaderBytes: doHMaxResponseHeaderBytes,
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return plan.dialTCP(ctx, network, session.setDialAddress)
-		},
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			conn, address, err := plan.openStream(ctx, tlsConfig)
 			if err == nil {
