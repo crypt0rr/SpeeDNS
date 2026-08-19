@@ -42,6 +42,7 @@ type cliConfig struct {
 	details       bool
 	raw           bool
 	noColor       bool
+	redactSystem  bool
 }
 
 var exit = os.Exit
@@ -210,6 +211,7 @@ func newRootCommand() *cobra.Command {
 	flags.BoolVar(&config.details, "details", false, "show cold latency, jitter, response outcomes, and expanded metrics")
 	flags.BoolVar(&config.raw, "raw", false, "include per-query observations in JSON output")
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
+	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
 
 	root.AddCommand(newResolversCommand())
 	root.AddCommand(newCorpusCommand())
@@ -342,12 +344,20 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	switch strings.ToLower(config.format) {
 	case "table":
 		err = writeTableReport(writer, result, report.TableOptions{
-			Details: config.details, Color: tableColorEnabled(config), Profiles: profiles, Protocols: selected,
+			Details: config.details, Color: tableColorEnabled(config), RedactSystem: config.redactSystem, Profiles: profiles, Protocols: selected,
 		})
 	case "json":
-		err = writeJSONReport(writer, result, config.raw)
+		if config.redactSystem {
+			err = report.WriteJSONWithOptions(writer, result, config.raw, report.JSONOptions{RedactSystem: true})
+		} else {
+			err = writeJSONReport(writer, result, config.raw)
+		}
 	case "csv":
-		err = writeCSVReport(writer, result)
+		if config.redactSystem {
+			err = report.WriteCSVWithOptions(writer, result, report.CSVOptions{RedactSystem: true})
+		} else {
+			err = writeCSVReport(writer, result)
+		}
 	}
 	if err != nil {
 		return err

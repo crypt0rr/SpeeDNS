@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 type testReadCloser struct {
@@ -120,10 +121,12 @@ func TestDiscoverMacOSFallbacks(t *testing.T) {
 	oldOS := currentOS
 	oldOpen := openResolvConf
 	oldRun := runScutil
+	oldTimeout := scutilTimeout
 	t.Cleanup(func() {
 		currentOS = oldOS
 		openResolvConf = oldOpen
 		runScutil = oldRun
+		scutilTimeout = oldTimeout
 	})
 	currentOS = "darwin"
 	openResolvConf = func() (io.ReadCloser, error) {
@@ -144,6 +147,41 @@ func TestDiscoverMacOSFallbacks(t *testing.T) {
 	}
 }
 
+func TestDiscoverMacOSScutilTimeoutFallsBack(t *testing.T) {
+	oldOS := currentOS
+	oldOpen := openResolvConf
+	oldRun := runScutil
+	oldTimeout := scutilTimeout
+	t.Cleanup(func() {
+		currentOS = oldOS
+		openResolvConf = oldOpen
+		runScutil = oldRun
+		scutilTimeout = oldTimeout
+	})
+	currentOS = "darwin"
+	scutilTimeout = 10 * time.Millisecond
+	deadlineSeen := false
+	runScutil = func(ctx context.Context) ([]byte, error) {
+		_, deadlineSeen = ctx.Deadline()
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	openResolvConf = func() (io.ReadCloser, error) {
+		return &testReadCloser{Reader: strings.NewReader("nameserver 192.0.2.10\n")}, nil
+	}
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 1 || profiles[0].Addresses[0] != "192.0.2.10" || !deadlineSeen {
+		t.Fatalf("bounded scutil fallback = %#v/%v, deadline=%v", profiles, err, deadlineSeen)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	openResolvConf = func() (io.ReadCloser, error) { return nil, errors.New("fallback must not run") }
+	runScutil = func(ctx context.Context) ([]byte, error) { return nil, ctx.Err() }
+	if _, err := Discover(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled scutil discovery error = %v", err)
+	}
+}
+
 func TestSystemSourceHelpers(t *testing.T) {
 	if got, ok := normalizeAddress(" 192.0.2.1 "); !ok || got != "192.0.2.1" {
 		t.Fatalf("normalized IPv4 = %q/%v", got, ok)
@@ -157,6 +195,9 @@ func TestSystemSourceHelpers(t *testing.T) {
 	if got := sourceLabel(resolverSource{Block: 1}); got != "resolver block" {
 		t.Fatalf("empty source label = %q", got)
 	}
+	if !isLocalStub("127.0.0.53") || !isLocalStub("::1") || isLocalStub("192.0.2.1") {
+		t.Fatal("local stub detection is incorrect")
+	}
 	sources := []resolverSource{
 		{Address: "192.0.2.1"},
 		{Address: "192.0.2.1"},
@@ -167,6 +208,10 @@ func TestSystemSourceHelpers(t *testing.T) {
 	profiles := profilesFromSources(sources)
 	if len(profiles) != 2 || profiles[0].ID != "system-192-0-2-1" || profiles[1].ID != "system-resolver-2-192-0-2-1" {
 		t.Fatalf("source profiles = %#v", profiles)
+	}
+	stubProfiles := profilesFromSources([]resolverSource{{Address: "127.0.0.53"}, {Address: "::1"}})
+	if len(stubProfiles) != 2 || stubProfiles[0].ID != "system-stub-127-0-0-53" || stubProfiles[0].Owner != "local stub/forwarder" || stubProfiles[0].Policy != "local forwarding (upstream unknown)" {
+		t.Fatalf("stub profiles = %#v", stubProfiles)
 	}
 }
 

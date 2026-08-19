@@ -75,6 +75,86 @@ type Target struct {
 	Spec     TransportSpec
 }
 
+// EndpointMetadata describes the connection and TLS choices made for one
+// target. It is intentionally derived from the target rather than copied
+// into benchmark results so reports cannot drift from transport behavior.
+//
+// For encrypted transports, server_name is the explicit opt-in for a TLS
+// identity. bootstrap_addresses is the explicit opt-in for alternate IP
+// connection candidates; it never changes the TLS identity. When neither is
+// configured, the target address is used directly if it is an IP literal or
+// resolved by the operating system otherwise.
+type EndpointMetadata struct {
+	EndpointURL        string
+	TLSServerName      string
+	TLSIdentitySource  string
+	BootstrapMode      string
+	BootstrapAddresses []string
+}
+
+const (
+	TLSIdentityNotApplicable = "none"
+	TLSIdentityConfigured    = "configured"
+	TLSIdentityURLHost       = "url_host"
+	TLSIdentityTarget        = "target_address"
+
+	BootstrapNotApplicable = "none"
+	BootstrapExplicit      = "explicit"
+	BootstrapTarget        = "target_address"
+	BootstrapSystem        = "system_resolver"
+)
+
+// EndpointMetadata returns the effective endpoint identity and bootstrap
+// mode. It does not perform DNS resolution or network I/O.
+func (t Target) EndpointMetadata() EndpointMetadata {
+	metadata := EndpointMetadata{
+		TLSIdentitySource: TLSIdentityNotApplicable,
+		BootstrapMode:     BootstrapNotApplicable,
+	}
+	if t.Protocol != DoH && t.Protocol != DoT && t.Protocol != DoQ {
+		return metadata
+	}
+
+	metadata.BootstrapMode = BootstrapSystem
+	if len(t.Spec.BootstrapAddresses) > 0 {
+		metadata.BootstrapMode = BootstrapExplicit
+		metadata.BootstrapAddresses = append([]string(nil), t.Spec.BootstrapAddresses...)
+	} else {
+		address := strings.TrimSpace(t.Address)
+		if address == "" && t.Protocol == DoH {
+			if endpoint, err := url.Parse(t.Spec.URL); err == nil {
+				address = endpoint.Hostname()
+			}
+		}
+		address = strings.Trim(strings.TrimSpace(address), "[]")
+		if net.ParseIP(address) != nil {
+			metadata.BootstrapMode = BootstrapTarget
+		}
+	}
+
+	switch t.Protocol {
+	case DoH:
+		metadata.EndpointURL = t.Spec.URL
+		endpoint, err := url.Parse(t.Spec.URL)
+		if t.Spec.ServerName != "" {
+			metadata.TLSServerName = strings.TrimSpace(t.Spec.ServerName)
+			metadata.TLSIdentitySource = TLSIdentityConfigured
+		} else if err == nil {
+			metadata.TLSServerName = endpoint.Hostname()
+			metadata.TLSIdentitySource = TLSIdentityURLHost
+		}
+	case DoT, DoQ:
+		if t.Spec.ServerName != "" {
+			metadata.TLSServerName = strings.TrimSpace(t.Spec.ServerName)
+			metadata.TLSIdentitySource = TLSIdentityConfigured
+		} else {
+			metadata.TLSServerName = strings.TrimSpace(t.Address)
+			metadata.TLSIdentitySource = TLSIdentityTarget
+		}
+	}
+	return metadata
+}
+
 func (t Target) ID() string {
 	return fmt.Sprintf("%s@%s/%s", t.Resolver.ID, t.Address, t.Protocol)
 }

@@ -88,7 +88,7 @@ func TestMainAndCommands(t *testing.T) {
 		t.Fatalf("corpus command error = %v", err)
 	}
 	root := newRootCommand()
-	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Commands() == nil {
+	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Commands() == nil {
 		t.Fatal("root command was not configured")
 	}
 }
@@ -346,6 +346,7 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 		config.output = filepath.Join(t.TempDir(), format+".out")
 		config.details = format == "table"
 		config.raw = format == "JSON"
+		config.redactSystem = format != "table"
 		if format == "table" {
 			config.seed = 0
 		}

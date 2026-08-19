@@ -78,6 +78,11 @@ func completeReport() benchmark.Report {
 	failed.Stats = benchmark.Statistics{}
 	failed.OpenError = "open failed"
 	missing := reportTarget("3", catalog.DoH, 2, false)
+	missing.Target.Spec = catalog.TransportSpec{
+		URL: "https://cdn.example/dns-query", ServerName: "resolver.example",
+		BootstrapAddresses: []string{"192.0.2.53", "2001:db8::53"},
+	}
+	missing.DialAddress = "2001:db8::53:443"
 	return benchmark.Report{
 		StartedAt: time.Unix(0, 0), FinishedAt: time.Unix(1, 0), Seed: 42, SampleSize: 2, Queries: 4,
 		QueryTypes: []uint16{1, 65000}, Targets: []benchmark.TargetResult{failed, winner, missing},
@@ -102,8 +107,10 @@ func TestJSONRawAndWriterErrors(t *testing.T) {
 			t.Fatalf("raw JSON missing %q: %s", expected, text)
 		}
 	}
-	if strings.Contains(text, "dial_address") {
-		t.Fatalf("JSON schema unexpectedly exposed human-only dial metadata: %s", text)
+	for _, expected := range []string{"\"endpoint_url\": \"https://cdn.example/dns-query\"", "\"tls_server_name\": \"resolver.example\"", "\"tls_identity_source\": \"configured\"", "\"bootstrap_mode\": \"explicit\"", "\"bootstrap_addresses\": [", "\"dial_address\": \"2001:db8::53:443\""} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("JSON missing endpoint audit field %q: %s", expected, text)
+		}
 	}
 	if err := WriteJSON(&failingWriter{failAt: 1}, run, false); err == nil {
 		t.Fatal("expected JSON writer error")
@@ -138,7 +145,7 @@ func TestCSVWriterErrorPathsAndMetadata(t *testing.T) {
 	if err := WriteCSV(&output, run); err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"target_id", "open_error", "reconnects", "incomplete", "open failed", "Owner 1"} {
+	for _, expected := range []string{"target_id", "open_error", "reconnects", "incomplete", "endpoint_url", "tls_server_name", "bootstrap_mode", "dial_address", "open failed", "Owner 1", "https://cdn.example/dns-query"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("CSV output missing %q: %s", expected, output.String())
 		}
@@ -208,6 +215,79 @@ func TestCSVFormulaProtectionCoversTargetAndErrorFields(t *testing.T) {
 	}
 }
 
+func TestSystemReportRedactionPreservesRankingsWithoutLocalAddresses(t *testing.T) {
+	systemTarget := catalog.Target{
+		Resolver: catalog.ResolverProfile{
+			ID: "system-stub-127-0-0-53", Name: "System DNS stub (scope: corp.example)",
+			Owner: "local stub/forwarder (interface: utun0)", Policy: "local forwarding",
+		},
+		Protocol: catalog.UDP, Address: "127.0.0.53", Spec: catalog.TransportSpec{Port: 53},
+	}
+	system := benchmark.TargetResult{
+		Target: systemTarget, DialAddress: "127.0.0.53:53", OpenError: "dial udp 127.0.0.53:53: timeout",
+		Observations: []benchmark.Observation{{Name: "example.com", Error: "read 127.0.0.53:53: timeout"}},
+		Cold:         []benchmark.ColdObservation{{Name: "example.com", Error: "dial 127.0.0.53:53: timeout"}},
+		Stats:        benchmark.Statistics{Total: 1, Failures: 1},
+	}
+	regular := reportTarget("regular", catalog.UDP, 0, false)
+	run := benchmark.Report{
+		Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{system, regular},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: systemTarget.ID(), Rank: 1}},
+		Warnings: []string{
+			targetWarningLabel(system) + ": dial 127.0.0.53:53 failed",
+			"global diagnostic mentions 127.0.0.53",
+		},
+	}
+
+	var jsonOutput bytes.Buffer
+	if err := WriteJSONWithOptions(&jsonOutput, run, true, JSONOptions{RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	jsonText := jsonOutput.String()
+	for _, forbidden := range []string{"127.0.0.53", "scope: corp.example", "interface: utun0"} {
+		if strings.Contains(jsonText, forbidden) {
+			t.Fatalf("redacted JSON leaked %q: %s", forbidden, jsonText)
+		}
+	}
+	for _, expected := range []string{"system-redacted-1@redacted/udp", "System DNS (redacted)", "configured locally (redacted)", "redacted", "global diagnostic mentions redacted"} {
+		if !strings.Contains(jsonText, expected) {
+			t.Fatalf("redacted JSON missing %q: %s", expected, jsonText)
+		}
+	}
+
+	var csvOutput bytes.Buffer
+	if err := WriteCSVWithOptions(&csvOutput, run, CSVOptions{RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	csvText := csvOutput.String()
+	if strings.Contains(csvText, "127.0.0.53") || !strings.Contains(csvText, "system-redacted-1@redacted/udp") || !strings.Contains(csvText, "redacted") {
+		t.Fatalf("redacted CSV = %s", csvText)
+	}
+
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{Details: true, RedactSystem: true, Protocols: []catalog.Protocol{catalog.UDP}}); err != nil {
+		t.Fatal(err)
+	}
+	tableText := table.String()
+	if strings.Contains(tableText, "127.0.0.53") || strings.Contains(tableText, "scope: corp.example") || !strings.Contains(tableText, "System DNS (redacted)") || !strings.Contains(tableText, "redacted") {
+		t.Fatalf("redacted table = %s", tableText)
+	}
+
+	unsupportedProfile := systemTarget.Resolver
+	unsupportedProfile.Transports = map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}}
+	table.Reset()
+	if err := WriteTableWithOptions(&table, run, TableOptions{RedactSystem: true, Profiles: []catalog.ResolverProfile{unsupportedProfile}, Protocols: []catalog.Protocol{catalog.DoQ}}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(table.String(), "127.0.0.53") || !strings.Contains(table.String(), "redacted") {
+		t.Fatalf("redacted unsupported matrix = %s", table.String())
+	}
+	if got := redactResultText(benchmark.TargetResult{Target: systemTarget}, "127.0.0.53", true, "system-redacted-1@redacted/udp"); got != "redacted" {
+		t.Fatalf("redaction with no selected dial address = %q", got)
+	}
+}
+
 func TestTableSuccessAndAllWriterFailureSites(t *testing.T) {
 	run := completeReport()
 	var output bytes.Buffer
@@ -226,6 +306,25 @@ func TestTableSuccessAndAllWriterFailureSites(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Cold") || !strings.Contains(output.String(), "MAD") || !strings.Contains(output.String(), "Reconnects") || !strings.Contains(output.String(), "Dial") || !strings.Contains(output.String(), "192.0.2.1:53") {
 		t.Fatalf("detailed table missing cold/MAD/dial: %s", output.String())
+	}
+	secure := reportTarget("secure", catalog.DoH, 1, false)
+	secure.Target.Spec = catalog.TransportSpec{
+		URL: "https://cdn.example/dns-query", ServerName: "resolver.example",
+		BootstrapAddresses: []string{"192.0.2.53", "2001:db8::53"},
+	}
+	secure.DialAddress = "192.0.2.53:443"
+	secureRun := benchmark.Report{
+		Seed: 1, SampleSize: 1, QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{secure},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.DoH, TargetID: secure.Target.ID(), Rank: 1}},
+	}
+	output.Reset()
+	if err := WriteTable(&output, secureRun, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Endpoint", "TLSName", "resolver.example", "configured", "explicit", "192.0.2.53;2001:db8::53", "https://cdn.example/dns-query"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("detailed endpoint audit missing %q: %s", expected, output.String())
+		}
 	}
 
 	// Exercise every top-level write failure path. Tables buffer their output

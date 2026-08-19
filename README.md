@@ -235,6 +235,18 @@ resolvers:
 
 Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order. TLS certificate validation is always enabled.
 
+For a hostname-only custom encrypted endpoint, SpeeDNS uses the operating
+system resolver to find the connection address. To make bootstrap deterministic
+and avoid that lookup, add `bootstrap_addresses` in a YAML profile; these must
+be explicit IPv4 or IPv6 literals and are tried in the order listed. A
+`server_name` value is the explicit TLS identity and may intentionally differ
+from the endpoint address or DoH URL host, for example when testing a CDN
+alias. It changes certificate validation only; it does not change the dial
+candidates. Use `--details`, JSON, or CSV to audit the effective TLS name,
+identity source, bootstrap mode, configured candidates, and selected dial
+address, endpoint URL, effective TLS identity, identity source, and bootstrap
+mode/candidates.
+
 Resolver profile files must contain exactly one YAML document. SpeeDNS rejects
 additional documents instead of silently ignoring them.
 
@@ -272,6 +284,20 @@ Use `--include-system` to include the resolver configured by the operating syste
 
 This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. Separate macOS scopes remain separate targets even when they use the same address.
 
+macOS discovery gives `scutil --dns` a two-second independent timeout. If it
+times out or returns no usable nameservers, SpeeDNS falls back to
+`/etc/resolv.conf`; a canceled run remains canceled. Loopback entries such as
+`127.0.0.53` and `::1` are labeled as local forwarding stubs because their
+ultimate upstream is not known to SpeeDNS. Scoped macOS entries are kept
+separate when the same address appears in more than one resolver block, since
+the scope and interface can change which DNS server answers.
+
+When sharing a report that includes the system resolver, add
+`--redact-system`. It keeps the measurements and rankings but replaces local
+resolver addresses, identifying labels, selected dial addresses, and matching
+error text with redacted values in table, JSON, and CSV output. Redaction is
+opt-in; local diagnostics are shown by default.
+
 System resolvers are tested only over transports discoverable from the operating system configuration, normally UDP and TCP.
 
 ## Output
@@ -302,6 +328,7 @@ Useful flags include:
 --format table|json|csv
 --output PATH       write output to a file
 --no-color          disable terminal colors
+--redact-system     hide local system resolver details in reports
 ```
 
 In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.

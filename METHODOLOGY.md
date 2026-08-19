@@ -101,6 +101,13 @@ JSON contains the structured result and optional raw observations. CSV keeps
 the aggregate schema and adds reconnect/incomplete diagnostics at the end.
 CSV cells beginning with `=`, `+`, `-`, `@`, tab, or carriage return are
 prefixed with an apostrophe to prevent spreadsheet formula interpretation.
+For encrypted targets, these reports also expose the effective TLS server
+name, whether it was configured explicitly or derived from the endpoint,
+whether bootstrap came from explicit IP candidates, the target address, or
+the system resolver, and the selected dial address when a connection opened.
+An explicit `server_name` is the only way to opt into a different TLS identity;
+`bootstrap_addresses` only changes connection candidates and never disables
+certificate validation.
 
 ## Reproducibility limits
 

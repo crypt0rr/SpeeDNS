@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 )
@@ -30,6 +31,10 @@ var openResolvConf = func() (io.ReadCloser, error) {
 var runScutil = func(ctx context.Context) ([]byte, error) {
 	return exec.CommandContext(ctx, "scutil", "--dns").Output()
 }
+
+const defaultScutilTimeout = 2 * time.Second
+
+var scutilTimeout = defaultScutilTimeout
 
 type resolverSource struct {
 	Address   string
@@ -71,12 +76,17 @@ func Discover(ctx context.Context) ([]catalog.ResolverProfile, error) {
 }
 
 func discoverMacOSSources(ctx context.Context) ([]resolverSource, error) {
-	output, err := runScutil(ctx)
+	scutilContext, cancel := context.WithTimeout(ctx, scutilTimeout)
+	defer cancel()
+	output, err := runScutil(scutilContext)
 	if err == nil {
 		sources := parseMacOSSources(output)
 		if len(sources) > 0 {
 			return sources, nil
 		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
 	addresses, fallbackErr := discoverResolvConf()
 	if fallbackErr != nil {
@@ -197,7 +207,14 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 
 		name := "System DNS"
 		owner := "configured locally"
+		policy := "unknown"
 		id := "system-" + sanitizeAddress(address)
+		if isLocalStub(address) {
+			name = "System DNS stub"
+			owner = "local stub/forwarder"
+			policy = "local forwarding (upstream unknown)"
+			id = "system-stub-" + sanitizeAddress(address)
+		}
 		if source.Block > 0 {
 			label := sourceLabel(source)
 			name += " (" + label + ")"
@@ -205,7 +222,7 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 			id = fmt.Sprintf("system-resolver-%d-%s", source.Block, sanitizeAddress(address))
 		}
 		profiles = append(profiles, catalog.ResolverProfile{
-			ID: id, Name: name, Owner: owner, Policy: "unknown",
+			ID: id, Name: name, Owner: owner, Policy: policy,
 			Scope: source.Scope, Interface: source.Interface,
 			Addresses: []string{address},
 			Transports: map[catalog.Protocol]catalog.TransportSpec{
@@ -215,6 +232,11 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 		})
 	}
 	return profiles
+}
+
+func isLocalStub(address string) bool {
+	ip := net.ParseIP(address)
+	return ip != nil && ip.IsLoopback()
 }
 
 func sourceLabel(source resolverSource) string {
