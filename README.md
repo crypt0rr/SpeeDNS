@@ -12,9 +12,9 @@ Prebuilt macOS and Debian/Linux binaries and packages are published with each re
 - Linux `amd64` and `arm64` archives;
 - Debian packages for Linux `amd64` and `arm64`.
 
-### Homebrew
+### Homebrew / Linuxbrew
 
-Install the macOS cask from the SpeeDNS tap:
+Install the SpeeDNS cask from the tap on macOS or Debian/Linux with Linuxbrew:
 
 ```sh
 brew tap crypt0rr/speedns

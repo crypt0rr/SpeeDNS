@@ -42,6 +42,7 @@ homebrew_casks:
       owner: crypt0rr
       name: homebrew-speedns
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    name: speedns
     homepage: https://github.com/crypt0rr/dns-speedtest
     description: Cross-platform DNS transport speed test CLI
     license: MIT
