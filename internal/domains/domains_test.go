@@ -15,6 +15,16 @@ func TestLoadNormalizesCommentsAndDuplicates(t *testing.T) {
 	}
 }
 
+func TestLoadValidatesBundledCorpus(t *testing.T) {
+	domains, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(domains) != 1000 {
+		t.Fatalf("bundled corpus count = %d, want 1000", len(domains))
+	}
+}
+
 func TestLoadRejectsInvalidName(t *testing.T) {
 	_, err := loadReader(strings.NewReader("example..com"))
 	if err == nil {
