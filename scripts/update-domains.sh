@@ -12,10 +12,39 @@ curl --fail --location --silent --show-error \
   "https://tranco-list.eu/download/${list_id}/1000" \
   -o "${temporary_dir}/tranco.csv"
 
-awk -F, 'NF >= 2 { print tolower($2) }' "${temporary_dir}/tranco.csv" \
-  | sed 's/\.$//' \
-  | awk 'NF && !seen[$0]++' \
-  > "${temporary_dir}/domains.txt"
+LC_ALL=C awk -F, '
+function invalid(name, labels, count, index) {
+  if (name !~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/) {
+    return "malformed label"
+  }
+  if (length(name) > 253) {
+    return "name exceeds 253 bytes"
+  }
+  count = split(name, labels, "\\.")
+  for (index = 1; index <= count; index++) {
+    if (length(labels[index]) > 63) {
+      return "label exceeds 63 bytes"
+    }
+  }
+  return ""
+}
+
+NF >= 2 {
+  name = tolower($2)
+  sub(/\.$/, "", name)
+  if (!name) {
+    next
+  }
+  reason = invalid(name)
+  if (reason) {
+    printf "invalid Tranco domain on CSV line %d (%s): %s\n", NR, name, reason > "/dev/stderr"
+    exit 1
+  }
+  if (!seen[name]++) {
+    print name
+  }
+}
+' "${temporary_dir}/tranco.csv" > "${temporary_dir}/domains.txt"
 
 entry_count="$(wc -l < "${temporary_dir}/domains.txt" | tr -d ' ')"
 if [[ "${entry_count}" != 1000 ]]; then

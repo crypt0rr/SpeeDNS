@@ -161,7 +161,7 @@ Bootstrap addresses are connection candidates, not separately ranked resolvers. 
 
 ## Custom domain lists
 
-Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; names are normalized before testing.
+Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line.
 
 ```sh
 ./speedns --domains my-domains.txt --sample 200 --seed 42
