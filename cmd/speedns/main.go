@@ -313,7 +313,9 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	switch strings.ToLower(config.format) {
 	case "table":
-		err = writeTableReport(writer, result, report.TableOptions{Details: config.details, Color: tableColorEnabled(config)})
+		err = writeTableReport(writer, result, report.TableOptions{
+			Details: config.details, Color: tableColorEnabled(config), Profiles: profiles, Protocols: selected,
+		})
 	case "json":
 		err = writeJSONReport(writer, result, config.raw)
 	case "csv":

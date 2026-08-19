@@ -97,9 +97,11 @@ The available transports are:
 | `dot` | DNS over TLS |
 | `doq` | Dedicated DNS over QUIC using RFC 9250 |
 
-SpeeDNS does not silently fall back from one protocol to another. A configured
-but unavailable transport is shown as `FAILED`; an unsupported transport for a
-resolver is shown as `—`.
+SpeeDNS does not silently fall back from one protocol to another. The table
+shows the complete selected resolver/protocol matrix: an unsupported transport
+is shown as `—`, an unavailable transport is `FAILED`, a transport-valid result
+that cannot qualify is `INELIGIBLE`, and a recommendation-eligible result is
+`QUALIFIED`.
 
 ## Default resolvers
 
