@@ -96,7 +96,7 @@ func WriteCSV(writer io.Writer, report benchmark.Report) error {
 	writerCSV := newCSVWriter(writer)
 	if err := writerCSV.Write([]string{
 		"target_id", "name", "owner", "policy", "address", "protocol", "rank", "recommended", "tie",
-		"total", "successes", "failures", "scored", "divergent", "truncated", "success_rate", "median_ms", "p95_ms",
+		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate", "rcode_counts", "median_ms", "p95_ms",
 		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error",
 	}); err != nil {
 		return err
@@ -108,7 +108,8 @@ func WriteCSV(writer io.Writer, report benchmark.Report) error {
 			result.Target.ID(), result.Target.DisplayName(), result.Target.Resolver.Owner, result.Target.Resolver.Policy,
 			result.Target.Address, result.Target.Protocol.String(), strconv.Itoa(rank), strconv.FormatBool(stats.Recommended),
 			strconv.FormatBool(stats.Tie), strconv.Itoa(stats.Total), strconv.Itoa(stats.Successes), strconv.Itoa(stats.Failures),
-			strconv.Itoa(stats.Scored), strconv.Itoa(stats.Divergent), strconv.Itoa(stats.Truncated), formatFloat(stats.SuccessRate), formatFloat(stats.MedianMS),
+			strconv.Itoa(stats.UsableResponses), strconv.Itoa(stats.ResolverFailures), strconv.Itoa(stats.Scored), strconv.Itoa(stats.Divergent), strconv.Itoa(stats.Truncated),
+			formatFloat(stats.SuccessRate), formatFloat(stats.UsableRate), formatFloat(stats.ResolverFailureRate), formatFloat(stats.ScoringFailureRate), rcodeCountsCSV(stats.RCodeCounts), formatFloat(stats.MedianMS),
 			formatFloat(stats.P95MS), formatFloat(stats.MinMS), formatFloat(stats.MaxMS), formatFloat(stats.MADMS),
 			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), result.OpenError,
 		}
@@ -130,6 +131,29 @@ func rankFor(report benchmark.Report, targetID string) int {
 }
 
 func formatFloat(value float64) string { return strconv.FormatFloat(value, 'f', 3, 64) }
+
+func rcodeCountsText(counts map[string]int) string {
+	if len(counts) == 0 {
+		return "—"
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, counts[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func rcodeCountsCSV(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	return rcodeCountsText(counts)
+}
 
 type TableOptions struct {
 	Details bool
@@ -228,6 +252,17 @@ func latencyText(value float64) string {
 
 func percentText(value float64) string { return fmt.Sprintf("%.2f%%", value*100) }
 
+func usableRate(stats benchmark.Statistics) float64 {
+	// Reports may be constructed by older callers that populate only the
+	// original success fields. Prefer the explicit semantic metric whenever
+	// the benchmark supplied one, including a real zero rate with resolver
+	// failures.
+	if stats.UsableResponses == 0 && stats.ResolverFailures == 0 && stats.UsableRate == 0 && stats.Successes > 0 {
+		return stats.SuccessRate
+	}
+	return stats.UsableRate
+}
+
 func scoreText(result benchmark.TargetResult) string {
 	if result.Stats.Scored == 0 {
 		return "—"
@@ -246,7 +281,7 @@ func rankText(report benchmark.Report, targetID string) string {
 func summaryRow(protocol catalog.Protocol, result benchmark.TargetResult, status string, color bool) []string {
 	return []string{
 		string(protocol), result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate),
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(usableRate(result.Stats)),
 		scoreText(result), styledStatus(status, color),
 	}
 }
@@ -255,14 +290,15 @@ func comparisonRow(report benchmark.Report, result benchmark.TargetResult, detai
 	row := []string{
 		rankText(report, result.Target.ID()), result.Target.Resolver.Owner, result.Target.Address,
 		result.Target.Resolver.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate),
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(usableRate(result.Stats)),
 		scoreText(result),
 	}
 	if details {
 		row = append(row,
 			latencyText(result.Stats.ColdMedianMS), latencyText(result.Stats.MADMS),
 			strconv.Itoa(result.Stats.Scored), strconv.Itoa(result.Stats.Failures),
-			strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated), dialAddressText(result),
+			strconv.Itoa(result.Stats.ResolverFailures), strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated),
+			rcodeCountsText(result.Stats.RCodeCounts), dialAddressText(result),
 		)
 	}
 	return append(row, styledStatus(resultStatus(result), color))
@@ -329,13 +365,13 @@ func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) erro
 }
 
 func summaryHeaders() []string {
-	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Score", "Status"}
+	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score", "Status"}
 }
 
 func comparisonHeaders(details bool) []string {
-	headers := []string{"Rank", "Owner", "Address", "Policy", "Median", "P95", "Success", "Score"}
+	headers := []string{"Rank", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score"}
 	if details {
-		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "Divergent", "Truncated", "Dial")
+		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "RCodes", "Dial")
 	}
 	return append(headers, "Status")
 }
@@ -367,17 +403,36 @@ func compactWarnings(report benchmark.Report) []string {
 			continue
 		}
 		allUnavailable := true
+		allTransportFailed := true
+		allResponsesUnusable := true
 		failedQueries := 0
 		totalQueries := 0
 		for _, result := range targets {
 			totalQueries += result.Stats.Total
 			failedQueries += result.Stats.Failures
-			if result.Stats.Total == 0 || result.Stats.Scored != 0 || result.Stats.Failures != result.Stats.Total {
+			if result.Stats.Total == 0 || result.Stats.Scored != 0 {
 				allUnavailable = false
+			}
+			if result.Stats.Total == 0 || result.Stats.Failures != result.Stats.Total {
+				allTransportFailed = false
+			}
+			if result.Stats.Total == 0 || result.Stats.UsableResponses != 0 {
+				allResponsesUnusable = false
 			}
 		}
 		if allUnavailable {
-			warnings = append(warnings, fmt.Sprintf("%s: %d/%d endpoints unavailable; %d/%d measured queries failed", protocol, len(targets), len(targets), failedQueries, totalQueries))
+			switch {
+			case allTransportFailed:
+				warnings = append(warnings, fmt.Sprintf("%s: %d/%d endpoints unavailable; %d/%d measured queries failed", protocol, len(targets), len(targets), failedQueries, totalQueries))
+			case allResponsesUnusable:
+				resolverFailures := 0
+				for _, result := range targets {
+					resolverFailures += result.Stats.ResolverFailures
+				}
+				warnings = append(warnings, fmt.Sprintf("%s: %d/%d endpoints returned no usable DNS responses; %d resolver errors", protocol, len(targets), len(targets), resolverFailures))
+			default:
+				warnings = append(warnings, fmt.Sprintf("%s: %d/%d endpoints unavailable; no endpoint produced a comparable result", protocol, len(targets), len(targets)))
+			}
 			for _, result := range targets {
 				handled[result.Target.ID()] = true
 			}
@@ -393,6 +448,13 @@ func compactWarnings(report benchmark.Report) []string {
 		}
 		if result.Stats.Failures > 0 {
 			parts = append(parts, fmt.Sprintf("%d/%d queries failed", result.Stats.Failures, result.Stats.Total))
+		}
+		if result.Stats.ResolverFailures > 0 {
+			resolverWarning := fmt.Sprintf("%d unusable DNS responses", result.Stats.ResolverFailures)
+			if codes := rcodeCountsText(result.Stats.RCodeCounts); codes != "" {
+				resolverWarning += " (" + codes + ")"
+			}
+			parts = append(parts, resolverWarning)
 		}
 		if result.Stats.Divergent > 0 {
 			parts = append(parts, fmt.Sprintf("%d divergent responses", result.Stats.Divergent))
@@ -455,7 +517,7 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 		}
 	}
 	if len(recommendations) == 0 {
-		if _, err := fmt.Fprintf(writer, "  none qualified (minimum %d comparable samples and %.0f%% success)\n", benchmark.MinimumRecommendedSamples, benchmark.MinimumRecommendedSuccessRate*100); err != nil {
+		if _, err := fmt.Fprintf(writer, "  none qualified (minimum %d comparable samples and %.0f%% usable responses)\n", benchmark.MinimumRecommendedSamples, benchmark.MinimumRecommendedSuccessRate*100); err != nil {
 			return err
 		}
 	} else if err := writeAlignedTable(writer, summaryHeaders(), recommendations); err != nil {

@@ -191,7 +191,7 @@ func newRootCommand() *cobra.Command {
 	flags.BoolVar(&config.includeSystem, "include-system", false, "include the configured system resolver as a baseline")
 	flags.StringVar(&config.format, "format", "table", "output format: table, json, or csv")
 	flags.StringVar(&config.output, "output", "", "write output to a file instead of stdout")
-	flags.BoolVar(&config.details, "details", false, "show cold latency, jitter, and expanded metrics")
+	flags.BoolVar(&config.details, "details", false, "show cold latency, jitter, response outcomes, and expanded metrics")
 	flags.BoolVar(&config.raw, "raw", false, "include per-query observations in JSON output")
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
 

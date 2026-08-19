@@ -55,13 +55,27 @@ The default run samples 100 names from an embedded, versioned 1,000-name domain 
 
 SpeeDNS reports warm query latency over reused connections and, for encrypted transports, cold first-query latency including connection setup. Results are ranked separately for each transport; a UDP result is not treated as interchangeable with a DoH, DoT, or DoQ result.
 
-The score is lower-is-better:
+The score is lower-is-better. The failure penalty includes transport failures,
+timeouts, truncated responses, and DNS resolver errors such as SERVFAIL or
+REFUSED:
 
 ```text
-0.60 × median latency + 0.40 × p95 latency + failure rate × timeout
+0.60 × median latency + 0.40 × p95 latency + scoring-failure rate × timeout
 ```
 
-An endpoint is marked `RECOMMENDED` only when it has at least 20 comparable samples and at least 99% successful responses. Short runs can show a `PROVISIONAL` winner, but use a larger sample or `--full` for a more stable comparison.
+SpeeDNS keeps three concepts separate: a transport success means that a
+validated DNS message was received, a usable response is a normal `NOERROR`
+(including NODATA) or `NXDOMAIN` result, and a scored sample is a usable result
+that is not divergent from the other resolvers in the same query group.
+Responses such as `SERVFAIL`, `REFUSED`, and other resolver errors are shown in
+the results but cannot win latency scoring. This prevents an unhealthy or
+blocked resolver from appearing fast merely because it rejects queries
+quickly.
+
+An endpoint is marked `RECOMMENDED` only when it has at least 20 comparable
+samples and at least 99% usable responses. Short runs can show a
+`PROVISIONAL` winner, but use a larger sample or `--full` for a more stable
+comparison.
 
 Resolvers can have different filtering policies. SpeeDNS shows the policy beside each result and excludes materially divergent responses from comparative latency scoring, so a blocking or filtered answer does not automatically win by responding sooner.
 
@@ -83,7 +97,9 @@ The available transports are:
 | `dot` | DNS over TLS |
 | `doq` | Dedicated DNS over QUIC using RFC 9250 |
 
-SpeeDNS does not silently fall back from one protocol to another. A configured but unavailable transport is shown as `FAIL`; an unsupported transport for a resolver is shown as `—`.
+SpeeDNS does not silently fall back from one protocol to another. A configured
+but unavailable transport is shown as `FAILED`; an unsupported transport for a
+resolver is shown as `—`.
 
 ## Default resolvers
 
@@ -165,7 +181,10 @@ System resolvers are tested only over transports discoverable from the operating
 
 ## Output
 
-Human-readable table output is the default. Use `--details` for cold latency, jitter, scored samples, failures, divergence, truncation, and the selected connection address.
+Human-readable table output is the default. It shows both transport success and
+usable-response rates. Use `--details` for cold latency, MAD jitter, scored
+samples, transport failures, resolver-error counts and RCODEs, divergence,
+truncation, and the selected connection address.
 
 For scripts and other tools, use JSON or CSV:
 
@@ -193,10 +212,11 @@ In an interactive terminal, progress is shown as one updating status line. Redir
 
 ## Troubleshooting
 
-- If a network blocks traditional DNS, UDP and TCP may show `FAIL` while encrypted transports still work. SpeeDNS reports these failures instead of retrying through another protocol.
+- If a network blocks traditional DNS, UDP and TCP may show `FAILED` while encrypted transports still work. SpeeDNS reports these failures instead of retrying through another protocol.
 - If no resolver is marked recommended, increase `--sample` or use `--full`. A short run may only qualify for a provisional winner.
+- If a resolver receives DNS messages but returns `SERVFAIL`, `REFUSED`, or another resolver error, it can have a high transport success rate but a low usable-response rate and will not be recommended.
 - Compare resolvers with similar policies when answer behavior matters. Protective, ad-blocking, and unfiltered services may intentionally return different response classes.
-- Use `--details` to inspect connection errors and response counters for a failing endpoint.
+- Use `--details` to inspect connection errors, response counters, and RCODEs for a failing endpoint.
 
 ## Privacy and platform support
 

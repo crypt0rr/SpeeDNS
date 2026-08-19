@@ -690,6 +690,24 @@ func TestQueryPackingAndClassification(t *testing.T) {
 	}
 }
 
+func TestResponseCodeSemantics(t *testing.T) {
+	usable := &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeSuccess}}
+	nxdomain := &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeNameError}}
+	servfail := &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeServerFailure}}
+	if !IsUsableResponse(usable) || !IsUsableResponse(nxdomain) {
+		t.Fatal("NOERROR and NXDOMAIN should be usable DNS outcomes")
+	}
+	if IsUsableResponse(servfail) || IsUsableResponse(nil) {
+		t.Fatal("resolver errors and nil responses should not be usable")
+	}
+	if got := ResponseCodeName(dns.RcodeServerFailure); got != "SERVFAIL" {
+		t.Fatalf("ResponseCodeName(SERVFAIL) = %q", got)
+	}
+	if got := ResponseCodeName(999); got != "RCODE999" {
+		t.Fatalf("ResponseCodeName(999) = %q", got)
+	}
+}
+
 func TestLocalDoQFactoryExercisesAdapter(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	certificates := server.TLS.Certificates

@@ -239,11 +239,24 @@ func TestRunTargetWithScriptedTransport(t *testing.T) {
 	if len(result.Cold) != 3 || !result.Cold[0].Success || result.Cold[1].Error != coldError.Error() || len(result.Observations) != 3 {
 		t.Fatalf("scripted cold/observations = %#v/%#v", result.Cold, result.Observations)
 	}
-	if !result.Observations[0].Success || !result.Observations[1].Truncated || result.Observations[1].Error == "" || result.Observations[2].Error == "" {
+	if !result.Observations[0].Success || !result.Observations[0].Usable || result.Observations[0].RCode != dns.RcodeSuccess || !result.Observations[1].Truncated || result.Observations[1].Error == "" || result.Observations[2].Error == "" {
 		t.Fatalf("scripted observations = %#v", result.Observations)
 	}
 	if warm.closes != 1 || cold[0].closes != 1 || cold[1].closes != 1 || cold[2].closes != 1 {
 		t.Fatalf("session close counts = %d/%d/%d/%d", warm.closes, cold[0].closes, cold[1].closes, cold[2].closes)
+	}
+
+	nilSession := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		if name == "nil.example" {
+			return nil, nil
+		}
+		return replyFor(name, qtype), nil
+	}}
+	nilFactory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: nilSession}}}
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return nilFactory, nil }
+	nilResult := runTarget(context.Background(), testTarget(catalog.UDP, "nil-response"), []Query{{Name: "nil.example", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(nilResult.Observations) != 1 || nilResult.Observations[0].Success || nilResult.Observations[0].Error != "empty DNS response" {
+		t.Fatalf("nil response observation = %#v", nilResult.Observations)
 	}
 }
 
@@ -316,7 +329,7 @@ func TestStatisticsRankingAndWarnings(t *testing.T) {
 		{Success: true, Truncated: true, LatencyMS: 9},
 	}, Cold: []ColdObservation{{Success: true, LatencyMS: 6}, {Success: false}, {Success: true, LatencyMS: 8}}}
 	stats := calculateStatistics(result, 2*time.Second, 11)
-	if stats.Total != 3 || stats.Successes != 2 || stats.Failures != 1 || stats.Divergent != 1 || stats.Truncated != 1 || stats.Scored != 1 || stats.ColdMedianMS != 7 {
+	if stats.Total != 3 || stats.Successes != 2 || stats.Failures != 1 || stats.Divergent != 1 || stats.Truncated != 1 || stats.Scored != 0 || stats.ColdMedianMS != 7 {
 		t.Fatalf("mixed statistics = %#v", stats)
 	}
 	empty := calculateStatistics(TargetResult{}, time.Second, 1)
