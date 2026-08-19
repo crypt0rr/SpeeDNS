@@ -260,8 +260,12 @@ func TestWarningAggregationAndColoredTables(t *testing.T) {
 	udpSecond.OpenError = "dial udp timeout"
 	partial := reportTarget("3", catalog.DoT, 2, false)
 	partial.Stats = benchmark.Statistics{Total: 5, Successes: 2, Failures: 3, Scored: 2, Divergent: 1, Truncated: 1, SuccessRate: .4, ScoreMS: 4}
+	rcodeOnly := reportTarget("4", catalog.TCP, 0, false)
+	rcodeOnly.Stats = benchmark.Statistics{Total: 5, Successes: 5, ResolverFailures: 5, RCodeCounts: map[string]int{"SERVFAIL": 5}}
+	divergentOnly := reportTarget("5", catalog.DoQ, 0, false)
+	divergentOnly.Stats = benchmark.Statistics{Total: 2, Successes: 2, UsableResponses: 2, Divergent: 2}
 	run := benchmark.Report{
-		Targets: []benchmark.TargetResult{udpFirst, udpSecond, partial},
+		Targets: []benchmark.TargetResult{udpFirst, udpSecond, partial, rcodeOnly, divergentOnly},
 		Warnings: []string{
 			targetWarningLabel(udpFirst) + " could not open a session: dial udp timeout",
 			targetWarningLabel(udpFirst) + " had 5/5 failed queries",
@@ -306,6 +310,57 @@ func TestWarningAggregationAndColoredTables(t *testing.T) {
 	}
 	if strings.Contains(plainOutput.String(), "\x1b[") {
 		t.Fatalf("plain table unexpectedly contains ANSI styling: %q", plainOutput.String())
+	}
+}
+
+func TestResolverOutcomeMetricsAreVisible(t *testing.T) {
+	result := reportTarget("semantic", catalog.UDP, 1, false)
+	result.Stats = benchmark.Statistics{
+		Total: 3, Successes: 3, UsableResponses: 1, ResolverFailures: 2, Scored: 1,
+		SuccessRate: 1, UsableRate: 1.0 / 3.0, ScoreMS: 4,
+		RCodeCounts: map[string]int{"SERVFAIL": 2, "NOERROR": 1},
+	}
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 3, Queries: 3, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{result},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: result.Target.ID(), Rank: 1}},
+	}
+
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{Details: true}); err != nil {
+		t.Fatal(err)
+	}
+	text := table.String()
+	for _, expected := range []string{"Usable", "ResolverFail", "RCodes", "33.33%", "NOERROR:1,SERVFAIL:2"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("semantic table output missing %q: %s", expected, text)
+		}
+	}
+	warnings := strings.Join(compactWarnings(run), "\n")
+	if !strings.Contains(warnings, "2 unusable DNS responses (NOERROR:1,SERVFAIL:2)") {
+		t.Fatalf("semantic warning missing response-code counts: %s", warnings)
+	}
+
+	var jsonOutput bytes.Buffer
+	result.Observations = []benchmark.Observation{{Success: true, Usable: false, RCode: 2, ResponseClass: "rcode-2"}}
+	run.Targets[0] = result
+	if err := WriteJSON(&jsonOutput, run, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"\"usable\": false", "\"rcode\": 2", "\"usable_rate\": 0.3333333333333333"} {
+		if !strings.Contains(jsonOutput.String(), expected) {
+			t.Fatalf("semantic JSON output missing %q: %s", expected, jsonOutput.String())
+		}
+	}
+
+	var csvOutput bytes.Buffer
+	if err := WriteCSV(&csvOutput, run); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"usable_responses", "resolver_failures", "usable_rate", "rcode_counts"} {
+		if !strings.Contains(csvOutput.String(), expected) {
+			t.Fatalf("semantic CSV output missing %q: %s", expected, csvOutput.String())
+		}
 	}
 }
 

@@ -680,3 +680,23 @@ func ResponseClass(message *dns.Msg) string {
 		return fmt.Sprintf("rcode-%d", message.Rcode)
 	}
 }
+
+// ResponseCodeName returns the conventional DNS response-code name used in
+// reports. Unknown extended or future codes retain their numeric value.
+func ResponseCodeName(rcode int) string {
+	if name, ok := dns.RcodeToString[rcode]; ok {
+		return name
+	}
+	return fmt.Sprintf("RCODE%d", rcode)
+}
+
+// IsUsableResponse reports whether a validated DNS response represents a
+// normal resolver outcome. NOERROR includes both answers and valid NODATA;
+// NXDOMAIN is also a useful, authoritative outcome. Resolver errors such as
+// SERVFAIL and REFUSED are transport-valid, but must not win latency scoring.
+func IsUsableResponse(message *dns.Msg) bool {
+	if message == nil {
+		return false
+	}
+	return message.Rcode == dns.RcodeSuccess || message.Rcode == dns.RcodeNameError
+}

@@ -64,6 +64,8 @@ type Observation struct {
 	Latency       time.Duration `json:"-"`
 	LatencyMS     float64       `json:"latency_ms,omitempty"`
 	Success       bool          `json:"success"`
+	Usable        bool          `json:"usable"`
+	RCode         int           `json:"rcode,omitempty"`
 	Truncated     bool          `json:"truncated,omitempty"`
 	ResponseClass string        `json:"response_class,omitempty"`
 	Divergent     bool          `json:"divergent,omitempty"`
@@ -80,25 +82,31 @@ type ColdObservation struct {
 }
 
 type Statistics struct {
-	Total        int     `json:"total"`
-	Successes    int     `json:"successes"`
-	Failures     int     `json:"failures"`
-	Scored       int     `json:"scored"`
-	Divergent    int     `json:"divergent"`
-	Truncated    int     `json:"truncated"`
-	SuccessRate  float64 `json:"success_rate"`
-	FailureRate  float64 `json:"failure_rate"`
-	MedianMS     float64 `json:"median_ms"`
-	P95MS        float64 `json:"p95_ms"`
-	MinMS        float64 `json:"min_ms"`
-	MaxMS        float64 `json:"max_ms"`
-	MADMS        float64 `json:"mad_ms"`
-	ColdMedianMS float64 `json:"cold_median_ms,omitempty"`
-	ScoreMS      float64 `json:"score_ms"`
-	CILowMS      float64 `json:"ci_low_ms,omitempty"`
-	CIHighMS     float64 `json:"ci_high_ms,omitempty"`
-	Recommended  bool    `json:"recommended"`
-	Tie          bool    `json:"tie,omitempty"`
+	Total               int            `json:"total"`
+	Successes           int            `json:"successes"`
+	Failures            int            `json:"failures"`
+	UsableResponses     int            `json:"usable_responses"`
+	ResolverFailures    int            `json:"resolver_failures"`
+	Scored              int            `json:"scored"`
+	Divergent           int            `json:"divergent"`
+	Truncated           int            `json:"truncated"`
+	SuccessRate         float64        `json:"success_rate"`
+	FailureRate         float64        `json:"failure_rate"`
+	UsableRate          float64        `json:"usable_rate"`
+	ResolverFailureRate float64        `json:"resolver_failure_rate"`
+	ScoringFailureRate  float64        `json:"scoring_failure_rate"`
+	RCodeCounts         map[string]int `json:"rcode_counts,omitempty"`
+	MedianMS            float64        `json:"median_ms"`
+	P95MS               float64        `json:"p95_ms"`
+	MinMS               float64        `json:"min_ms"`
+	MaxMS               float64        `json:"max_ms"`
+	MADMS               float64        `json:"mad_ms"`
+	ColdMedianMS        float64        `json:"cold_median_ms,omitempty"`
+	ScoreMS             float64        `json:"score_ms"`
+	CILowMS             float64        `json:"ci_low_ms,omitempty"`
+	CIHighMS            float64        `json:"ci_high_ms,omitempty"`
+	Recommended         bool           `json:"recommended"`
+	Tie                 bool           `json:"tie,omitempty"`
 }
 
 type TargetResult struct {
@@ -358,13 +366,19 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 		observation.LatencyMS = durationMS(observation.Latency)
 		if queryErr != nil {
 			observation.Error = queryErr.Error()
+		} else if message == nil {
+			// The transport should normally return an error for a nil
+			// response; keep the benchmark defensive at this boundary.
+			observation.Error = "empty DNS response"
 		} else {
+			observation.RCode = message.Rcode
 			observation.Truncated = message.Truncated
 			if message.Truncated {
 				observation.Error = "truncated DNS response"
 			} else {
 				observation.Success = true
 				observation.ResponseClass = transport.ResponseClass(message)
+				observation.Usable = transport.IsUsableResponse(message)
 			}
 		}
 		result.Observations = append(result.Observations, observation)
@@ -420,8 +434,9 @@ func queryKey(name string, qtype uint16) string {
 }
 
 func calculateStatistics(result TargetResult, timeout time.Duration, seed int64) Statistics {
-	stats := Statistics{Total: len(result.Observations)}
+	stats := Statistics{Total: len(result.Observations), RCodeCounts: make(map[string]int)}
 	latencies := make([]float64, 0, len(result.Observations))
+	scoringFailures := 0
 	for _, observation := range result.Observations {
 		if observation.Success {
 			stats.Successes++
@@ -432,18 +447,36 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		if observation.Truncated {
 			stats.Truncated++
 		}
+		usable := observationUsable(observation)
+		if observation.Success && !observation.Truncated && usable {
+			stats.UsableResponses++
+		}
+		if observation.Success && !observation.Truncated && !usable {
+			stats.ResolverFailures++
+		}
+		if observation.Success && !observation.Truncated && (observation.ResponseClass != "" || observation.RCode != 0 || observation.Usable) {
+			stats.RCodeCounts[transport.ResponseCodeName(observation.RCode)]++
+		}
 		if observation.Divergent {
 			stats.Divergent++
 			continue
 		}
-		if observation.Success {
+		if observation.Success && !observation.Truncated && usable {
 			stats.Scored++
 			latencies = append(latencies, observation.LatencyMS)
+		} else {
+			scoringFailures++
 		}
+	}
+	if len(stats.RCodeCounts) == 0 {
+		stats.RCodeCounts = nil
 	}
 	if stats.Total > 0 {
 		stats.SuccessRate = float64(stats.Successes) / float64(stats.Total)
 		stats.FailureRate = float64(stats.Failures) / float64(stats.Total)
+		stats.UsableRate = float64(stats.UsableResponses) / float64(stats.Total)
+		stats.ResolverFailureRate = float64(stats.ResolverFailures) / float64(stats.Total)
+		stats.ScoringFailureRate = float64(scoringFailures) / float64(stats.Total)
 	}
 	if len(latencies) > 0 {
 		sort.Float64s(latencies)
@@ -452,8 +485,8 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		stats.MinMS = latencies[0]
 		stats.MaxMS = latencies[len(latencies)-1]
 		stats.MADMS = mad(latencies, stats.MedianMS)
-		stats.ScoreMS = 0.60*stats.MedianMS + 0.40*stats.P95MS + stats.FailureRate*durationMS(timeout)
-		stats.CILowMS, stats.CIHighMS = bootstrapCI(latencies, stats.FailureRate, timeout, seed+int64(len(result.Target.ID())))
+		stats.ScoreMS = 0.60*stats.MedianMS + 0.40*stats.P95MS + stats.ScoringFailureRate*durationMS(timeout)
+		stats.CILowMS, stats.CIHighMS = bootstrapCI(latencies, stats.ScoringFailureRate, timeout, seed+int64(len(result.Target.ID())))
 	}
 	for _, observation := range result.Cold {
 		if observation.Success {
@@ -471,8 +504,29 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		sort.Float64s(cold)
 		stats.ColdMedianMS = percentile(cold, 0.5)
 	}
-	stats.Recommended = stats.Scored >= MinimumRecommendedSamples && stats.SuccessRate >= MinimumRecommendedSuccessRate
+	stats.Recommended = stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
 	return stats
+}
+
+// observationUsable keeps the semantic distinction explicit while retaining
+// compatibility with synthetic observations created by older callers and
+// tests, which only set Success and ResponseClass.
+func observationUsable(observation Observation) bool {
+	if !observation.Success || observation.Truncated {
+		return false
+	}
+	if observation.Usable {
+		return true
+	}
+	if observation.RCode != 0 {
+		return false
+	}
+	switch observation.ResponseClass {
+	case "", "answer", "nodata", "nxdomain":
+		return true
+	default:
+		return false
+	}
 }
 
 func percentile(sorted []float64, p float64) float64 {
@@ -568,11 +622,34 @@ func collectWarnings(results []TargetResult) []string {
 		if result.Stats.Truncated > 0 {
 			warnings = append(warnings, fmt.Sprintf("%s returned %d truncated responses; SpeeDNS did not fall back to another transport", label, result.Stats.Truncated))
 		}
+		if result.Stats.ResolverFailures > 0 {
+			warning := fmt.Sprintf("%s returned %d unusable DNS responses", label, result.Stats.ResolverFailures)
+			if codes := formatRCodeCounts(result.Stats.RCodeCounts); codes != "" {
+				warning += " (" + codes + ")"
+			}
+			warnings = append(warnings, warning)
+		}
 		if result.Stats.Scored > 0 && !result.Stats.Recommended {
-			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% success", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
+			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
 		}
 	}
 	return warnings
+}
+
+func formatRCodeCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, counts[key]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func durationMS(duration time.Duration) float64 { return float64(duration) / float64(time.Millisecond) }
