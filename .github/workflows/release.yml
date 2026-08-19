@@ -95,6 +95,19 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4
 
+      - name: Build release candidate snapshot
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --snapshot --clean --skip=sign
+
+      - name: Smoke-test release candidate artifacts
+        shell: bash
+        run: |
+          bash scripts/artifact-smoke.sh linux dist
+          bash scripts/artifact-smoke.sh macos-archives dist
+
       - name: Build and publish GitHub release
         uses: goreleaser/goreleaser-action@v7
         with:
