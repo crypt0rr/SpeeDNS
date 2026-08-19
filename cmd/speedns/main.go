@@ -57,6 +57,19 @@ var writeCSVReport = report.WriteCSV
 
 var terminalDetector = fileIsTerminal
 
+func exitCodeForError(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return 130
+	case errors.Is(err, benchmark.ErrNoComparableResults):
+		return 3
+	default:
+		return 2
+	}
+}
+
 type progressRenderer struct {
 	writer        io.Writer
 	interactive   bool
@@ -161,7 +174,7 @@ func tableColorEnabled(config *cliConfig) bool {
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		exit(1)
+		exit(exitCodeForError(err))
 	}
 }
 
@@ -287,7 +300,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if runErr != nil && result.FinishedAt.IsZero() {
 		return runErr
 	}
-	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {
+	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) && !errors.Is(runErr, benchmark.ErrNoComparableResults) {
 		return runErr
 	}
 	writer, closeWriter, err := outputWriter(config.output)
@@ -295,7 +308,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		return err
 	}
 	defer closeWriter()
-	if runErr != nil {
+	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
 		result.Warnings = append(result.Warnings, "benchmark interrupted before all targets completed")
 	}
 	switch strings.ToLower(config.format) {

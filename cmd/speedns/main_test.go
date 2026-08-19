@@ -54,7 +54,7 @@ func TestMainAndCommands(t *testing.T) {
 	}
 	os.Args = []string{"speedns", "--format", "invalid"}
 	main()
-	if exitCode != 1 {
+	if exitCode != 2 {
 		t.Fatalf("failed main exit code = %d", exitCode)
 	}
 	os.Args = []string{"speedns"}
@@ -76,6 +76,27 @@ func TestMainAndCommands(t *testing.T) {
 	root := newRootCommand()
 	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Commands() == nil {
 		t.Fatal("root command was not configured")
+	}
+}
+
+func TestExitCodeForError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "success", want: 0},
+		{name: "invalid", err: errors.New("invalid configuration"), want: 2},
+		{name: "no comparable", err: benchmark.ErrNoComparableResults, want: 3},
+		{name: "canceled", err: context.Canceled, want: 130},
+		{name: "deadline", err: context.DeadlineExceeded, want: 130},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := exitCodeForError(tc.err); got != tc.want {
+				t.Fatalf("exit code = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -356,6 +377,43 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 	}
 	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "engine failed") {
 		t.Fatalf("non-context engine error = %v", err)
+	}
+}
+
+func TestRunBenchmarkEmitsNoComparableReports(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		return benchmark.Report{
+			StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0), Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+			Targets: []benchmark.TargetResult{{
+				Target: catalog.Target{Resolver: catalog.ResolverProfile{ID: "dead", Name: "Dead", Owner: "Test owner", Policy: "unfiltered"}, Protocol: catalog.UDP, Address: "192.0.2.1", Spec: catalog.TransportSpec{Port: 53}},
+				Stats:  benchmark.Statistics{Total: 1, Failures: 1, SuccessRate: 0, FailureRate: 1}, OpenError: "connection refused",
+			}},
+			Warnings: []string{"Dead 192.0.2.1/udp could not open a session: connection refused"},
+		}, benchmark.ErrNoComparableResults
+	}
+	for _, format := range []string{"table", "json", "csv"} {
+		t.Run(format, func(t *testing.T) {
+			config := cliConfigForTest(t)
+			config.format = format
+			config.output = filepath.Join(t.TempDir(), format+"-no-comparable.out")
+			config.details = format == "table"
+			err := runBenchmark(context.Background(), config)
+			if !errors.Is(err, benchmark.ErrNoComparableResults) {
+				t.Fatalf("run error = %v, want no-comparable status", err)
+			}
+			content, readErr := os.ReadFile(config.output)
+			if readErr != nil || len(content) == 0 {
+				t.Fatalf("diagnostic %s output = %q/%v", format, content, readErr)
+			}
+			text := string(content)
+			for _, expected := range []string{"192.0.2.1", "connection refused"} {
+				if !strings.Contains(text, expected) {
+					t.Fatalf("diagnostic %s output missing %q: %s", format, expected, text)
+				}
+			}
+		})
 	}
 }
 
