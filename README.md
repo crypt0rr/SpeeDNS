@@ -421,6 +421,13 @@ warnings. The command returns a distinct non-zero status:
 
 SpeeDNS runs locally on macOS and Debian/Linux, supports IPv4 and IPv6 resolver addresses, and does not modify DNS settings or send telemetry. The domains you test are sent to the resolvers you select, just as they would be for normal DNS lookups.
 
+## Project policies
+
+Contributors can find development setup, test commands, fixture expectations,
+and release-file guidance in [`CONTRIBUTING.md`](CONTRIBUTING.md). To report a
+security vulnerability privately, follow [`SECURITY.md`](SECURITY.md) rather
+than opening a public issue.
+
 ## License
 
 SpeeDNS is released under the [MIT License](LICENSE).
