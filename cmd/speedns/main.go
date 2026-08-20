@@ -52,6 +52,7 @@ type cliConfig struct {
 	raw             bool
 	noColor         bool
 	redactSystem    bool
+	assertions      []string
 }
 
 var exit = os.Exit
@@ -83,6 +84,8 @@ func exitCodeForError(err error) int {
 		return 130
 	case errors.Is(err, benchmark.ErrNoComparableResults):
 		return 3
+	case errors.Is(err, ErrAssertionsFailed):
+		return 4
 	default:
 		return 2
 	}
@@ -285,6 +288,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.BoolVar(&config.raw, "raw", false, "include per-query observations in JSON output")
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
 	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
+	flags.StringArrayVar(&config.assertions, "assert", nil, "assert a winner metric or profile condition (repeatable)")
 }
 
 func newRunCommand(config *cliConfig) *cobra.Command {
@@ -390,6 +394,10 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	if config.profileView && strings.EqualFold(config.format, "csv") {
 		return errors.New("--profile-view requires table or json output")
+	}
+	assertions, err := parseAssertions(config.assertions)
+	if err != nil {
+		return err
 	}
 	selected, err := parseProtocols(config.protocols)
 	if err != nil {
@@ -527,7 +535,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if runErr != nil {
 		return runErr
 	}
-	return nil
+	return evaluateAssertions(result, assertions)
 }
 
 func loadProfiles(ctx context.Context, config *cliConfig) ([]catalog.ResolverProfile, error) {
