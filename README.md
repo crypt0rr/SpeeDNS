@@ -6,11 +6,30 @@ SpeeDNS does not change your system DNS settings, requires no root privileges, a
 
 ## Install
 
-Prebuilt macOS and Debian/Linux binaries and packages are published with each release on the [GitHub Releases page](https://github.com/crypt0rr/SpeeDNS/releases). Choose the archive for your platform and architecture. Releases include:
+Prebuilt macOS and Linux binaries and packages are published with each release on the [GitHub Releases page](https://github.com/crypt0rr/SpeeDNS/releases). Choose the archive for your platform and architecture. Releases include:
 
 - macOS Intel (`amd64`) and Apple silicon (`arm64`);
 - Linux `amd64` and `arm64` archives;
-- Debian packages for Linux `amd64` and `arm64`.
+- Debian, RPM, APK, and Arch Linux packages for Linux `amd64` and `arm64`.
+
+The package files are independent release assets. Verify the release
+checksums and Sigstore signature before installing. For example:
+
+```sh
+# Fedora/RHEL and compatible distributions
+sudo rpm -Uvh ./speedns_VERSION_linux_amd64.rpm
+
+# Alpine Linux; --allow-untrusted is needed because this is a downloaded
+# package, not an APK repository package with a local Alpine repository key.
+sudo apk add --allow-untrusted ./speedns_VERSION_linux_amd64.apk
+
+# Arch Linux
+sudo pacman -U ./speedns_VERSION_linux_amd64.pkg.tar.zst
+```
+
+Use the `arm64` asset on a 64-bit ARM host. Package-manager signatures are
+not substituted for the release checksum and Sigstore verification described
+below.
 
 ### Homebrew / Linuxbrew
 
