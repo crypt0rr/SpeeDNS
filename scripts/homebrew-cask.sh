@@ -75,7 +75,6 @@ mkdir -p "$(dirname "${output}")"
 	printf '%s\n' '  name "speedns"'
 	printf '%s\n' '  desc "Cross-platform DNS transport speed test CLI"'
 	printf '%s\n' '  homepage "https://github.com/crypt0rr/SpeeDNS"'
-	printf '%s\n' '  license "MIT"'
 	printf '%s\n' ''
 	printf '%s\n' '  livecheck do'
 	printf '%s\n' '    skip "Auto-generated on release."'

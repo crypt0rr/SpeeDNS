@@ -63,6 +63,10 @@ bash "${root_dir}/scripts/compare-release-artifacts.sh" \
 
 grep -Fq 'version "0.1.0-fixture"' "${fixture_dir}/first/speedns.rb"
 grep -Fq 'github.com/crypt0rr/SpeeDNS/releases/download' "${fixture_dir}/first/speedns.rb"
+if grep -Fq 'license "' "${fixture_dir}/first/speedns.rb"; then
+	echo "generated Homebrew cask contains unsupported license stanza" >&2
+	exit 1
+fi
 
 printf 'changed\n' >>"${fixture_dir}/second/SpeeDNS_${version}_linux_amd64.tar.gz"
 if bash "${root_dir}/scripts/compare-release-artifacts.sh" \

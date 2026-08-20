@@ -84,7 +84,6 @@ homebrew_casks:
     name: speedns
     homepage: https://github.com/crypt0rr/SpeeDNS
     description: Cross-platform DNS transport speed test CLI
-    license: MIT
     binaries:
       - speedns
     url:
