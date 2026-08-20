@@ -16,6 +16,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/spf13/cobra"
 )
 
 type cliErrorWriter struct{}
@@ -100,9 +101,51 @@ func TestMainAndCommands(t *testing.T) {
 	if err := newCorpusCommand().Execute(); err == nil || !strings.Contains(err.Error(), "corpus fixture failed") {
 		t.Fatalf("corpus command error = %v", err)
 	}
+	for _, tc := range []struct {
+		shell  string
+		marker string
+	}{
+		{shell: "bash", marker: "__start_speedns"},
+		{shell: "zsh", marker: "#compdef speedns"},
+		{shell: "fish", marker: "complete -c speedns"},
+		{shell: "powershell", marker: "Register-ArgumentCompleter"},
+	} {
+		t.Run("completion-"+tc.shell, func(t *testing.T) {
+			root := newRootCommand()
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetArgs([]string{"completion", tc.shell})
+			if err := root.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(output.String(), tc.marker) {
+				t.Fatalf("completion output for %s missing %q", tc.shell, tc.marker)
+			}
+		})
+	}
+	invalidCompletion := newRootCommand()
+	invalidCompletion.SetArgs([]string{"completion", "csh"})
+	if err := invalidCompletion.Execute(); err == nil || !strings.Contains(err.Error(), "unsupported shell") {
+		t.Fatalf("invalid completion shell error = %v", err)
+	}
 	root := newRootCommand()
 	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Commands() == nil {
 		t.Fatal("root command was not configured")
+	}
+	var runCommand *cobra.Command
+	for _, command := range root.Commands() {
+		if command.Name() == "run" {
+			runCommand = command
+			break
+		}
+	}
+	if runCommand == nil || runCommand.Flags().Lookup("protocol") == nil {
+		t.Fatal("explicit run command was not configured")
+	}
+	invalidRun := newRunCommand(&cliConfig{})
+	invalidRun.SetArgs([]string{"--format", "invalid"})
+	if err := invalidRun.Execute(); err == nil || !strings.Contains(err.Error(), "unsupported output format") {
+		t.Fatalf("invalid explicit run error = %v", err)
 	}
 }
 

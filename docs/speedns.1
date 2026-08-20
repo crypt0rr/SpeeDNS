@@ -1,0 +1,130 @@
+.TH SPEEDNS 1 "August 2026" "SpeeDNS" "User Commands"
+.SH NAME
+speedns \- compare recursive DNS resolver performance
+.SH SYNOPSIS
+.B speedns
+.RI [ options ]
+.br
+.B speedns run
+.RI [ options ]
+.br
+.B speedns completion
+.BR bash | zsh | fish | powershell
+.br
+.B speedns resolvers
+.br
+.B speedns corpus
+.br
+.B speedns version
+.SH DESCRIPTION
+.B speedns
+is a read-only command-line benchmark for recursive DNS resolvers. It measures
+UDP, TCP, DNS-over-HTTPS, DNS-over-TLS, and dedicated DNS-over-QUIC separately.
+It does not change system DNS settings, require root privileges, or send
+telemetry.
+.PP
+The default report compares the bundled resolver catalog using a reproducible
+sample of domain names and shows a recommendation for each selected transport.
+Use JSON or CSV output when another program needs the aggregate results.
+.SH COMMANDS
+.TP
+.B speedns
+Run a benchmark. The command is also the default when no subcommand is given.
+.TP
+.B speedns run
+Run a benchmark explicitly.
+.TP
+.B speedns completion SHELL
+Write a completion script for SHELL, which may be bash, zsh, fish, or
+PowerShell.
+.TP
+.B speedns resolvers
+List bundled resolver ownership, policy, addresses, and supported transports.
+.TP
+.B speedns corpus
+Show the embedded domain corpus provenance and checksum.
+.TP
+.B speedns version
+Show version, commit, and build information.
+.SH IMPORTANT OPTIONS
+.TP
+.B --protocol udp,tcp,doh,dot,doq
+Select the transports to benchmark.
+.TP
+.B --resolver NAME=URI
+Add a custom resolver endpoint. Repeat the option for multiple endpoints.
+.TP
+.B --resolver-file PATH
+Load strict, versioned resolver profiles from YAML.
+.TP
+.B --domains PATH
+Read one domain per line from a custom list. Blank lines and comments are
+ignored.
+.TP
+.B --sample N
+Sample N domains from the selected corpus.
+.TP
+.B --full
+Use the complete selected domain list.
+.TP
+.B --seed N
+Use a specific seed so the selected query order can be reproduced.
+.TP
+.B --type A,AAAA
+Select DNS record types.
+.TP
+.B --timeout DURATION
+Set the per-query and connection timeout, for example 2s.
+.TP
+.B --concurrency N
+Set the maximum number of measured exchanges in flight per transport.
+.TP
+.B --format table|json|csv
+Choose human-readable, JSON, or CSV output.
+.TP
+.B --output PATH
+Write the report to a file instead of standard output.
+.TP
+.B --details
+Include cold latency, jitter, response outcomes, and expanded diagnostics.
+.TP
+.B --raw
+Include per-query observations in JSON output.
+.TP
+.B --include-system
+Include resolvers discovered from the operating system configuration.
+.TP
+.B --no-color
+Disable ANSI styling in table output.
+.SH OUTPUT
+Table output is written to standard output by default. JSON output has a
+versioned schema and CSV output has one aggregate row per target. JSON and CSV
+runs keep progress messages off standard error.
+.PP
+A qualified recommendation requires at least 20 scored comparable samples and
+99 percent usable responses. A short run may show a provisional winner instead.
+.SH EXIT STATUS
+.TP
+.B 0
+The comparison completed successfully.
+.TP
+.B 2
+Input or configuration was invalid.
+.TP
+.B 3
+The run finished but produced no comparable DNS results.
+.TP
+.B 130
+The run was interrupted.
+.SH FILES
+.TP
+.I /etc/resolv.conf
+Fallback system resolver configuration on macOS and Linux.
+.SH EXAMPLES
+.EX
+speedns --protocol udp --sample 25 --type A --seed 42
+speedns --format json --output result.json
+speedns completion bash > speedns.bash
+.EE
+.SH SEE ALSO
+.BR resolv.conf (5)

@@ -253,7 +253,17 @@ func newRootCommand() *cobra.Command {
 			return runBenchmark(cmd.Context(), config)
 		},
 	}
-	flags := root.Flags()
+	addBenchmarkFlags(root, config)
+	root.AddCommand(newRunCommand(config))
+	root.AddCommand(newResolversCommand())
+	root.AddCommand(newCorpusCommand())
+	root.AddCommand(newCompletionCommand())
+	root.AddCommand(newVersionCommand())
+	return root
+}
+
+func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
+	flags := command.Flags()
 	flags.StringVar(&config.protocols, "protocol", "udp,tcp,doh,dot,doq", "comma-separated transports to test")
 	flags.StringArrayVar(&config.resolverFlags, "resolver", nil, "custom resolver NAME=URI (repeatable)")
 	flags.StringVar(&config.resolverFile, "resolver-file", "", "YAML resolver profile file")
@@ -275,11 +285,42 @@ func newRootCommand() *cobra.Command {
 	flags.BoolVar(&config.raw, "raw", false, "include per-query observations in JSON output")
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
 	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
+}
 
-	root.AddCommand(newResolversCommand())
-	root.AddCommand(newCorpusCommand())
-	root.AddCommand(newVersionCommand())
-	return root
+func newRunCommand(config *cliConfig) *cobra.Command {
+	command := &cobra.Command{
+		Use:          "run",
+		Short:        "Run a DNS resolver benchmark explicitly",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runBenchmark(cmd.Context(), config)
+		},
+	}
+	addBenchmarkFlags(command, config)
+	return command
+}
+
+func newCompletionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:       "completion [bash|zsh|fish|powershell]",
+		Short:     "Generate shell completion scripts",
+		Args:      cobra.ExactArgs(1),
+		ValidArgs: []string{"bash", "zsh", "fish", "powershell"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch strings.ToLower(strings.TrimSpace(args[0])) {
+			case "bash":
+				return cmd.Root().GenBashCompletion(cmd.OutOrStdout())
+			case "zsh":
+				return cmd.Root().GenZshCompletion(cmd.OutOrStdout())
+			case "fish":
+				return cmd.Root().GenFishCompletion(cmd.OutOrStdout(), true)
+			case "powershell":
+				return cmd.Root().GenPowerShellCompletion(cmd.OutOrStdout())
+			default:
+				return fmt.Errorf("unsupported shell %q (choose bash, zsh, fish, or powershell)", args[0])
+			}
+		},
+	}
 }
 
 func newVersionCommand() *cobra.Command {

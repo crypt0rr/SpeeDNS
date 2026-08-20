@@ -52,6 +52,12 @@ archives:
           owner: root
           group: root
           mtime: "2008-01-02T15:04:05Z"
+      - src: docs/speedns.1
+        dst: docs/speedns.1
+        info:
+          owner: root
+          group: root
+          mtime: "2008-01-02T15:04:05Z"
 
 nfpms:
   - id: deb
@@ -64,6 +70,11 @@ nfpms:
     formats: [deb, rpm, apk, archlinux]
     bindir: /usr/bin
     mtime: "{{ .CommitDate }}"
+    contents:
+      - src: docs/speedns.1
+        dst: /usr/share/man/man1/speedns.1
+        file_info:
+          mode: 0644
 
 homebrew_casks:
   - repository:
