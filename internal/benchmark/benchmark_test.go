@@ -1,6 +1,7 @@
 package benchmark
 
 import (
+	"context"
 	"math"
 	"reflect"
 	"strings"
@@ -49,6 +50,72 @@ func TestStatisticsAndRanking(t *testing.T) {
 	if stats.MedianMS <= 0 || stats.P95MS < stats.MedianMS || stats.ScoreMS <= 0 {
 		t.Fatalf("invalid latency stats: %#v", stats)
 	}
+}
+
+func TestRunWarnsWhenSampleIsClamped(t *testing.T) {
+	oldTarget := runTargetFunc
+	t.Cleanup(func() { runTargetFunc = oldTarget })
+	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+		return TargetResult{Target: target, Observations: []Observation{{
+			Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 1,
+		}}}
+	}
+
+	opts := validBenchmarkOptions()
+	opts.Domains = []string{"Example.COM.", "example.com", "example.org"}
+	opts.QueryTypes = []uint16{dns.TypeA}
+	opts.Sample = 99
+	report, err := Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "sample-warning")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SampleSize != 2 || report.Queries != 2 {
+		t.Fatalf("effective sample = %d domains/%d queries, want 2/2", report.SampleSize, report.Queries)
+	}
+	if !containsWarning(report.Warnings, "requested sample of 99 domains") || !containsWarning(report.Warnings, "using all 2 domains") {
+		t.Fatalf("sample clamp warnings = %#v", report.Warnings)
+	}
+
+	opts.Sample = 2
+	report, err = Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "sample-fits")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsWarning(report.Warnings, "requested sample") {
+		t.Fatalf("unexpected warning for fitting sample: %#v", report.Warnings)
+	}
+
+	opts.Full = true
+	opts.Sample = 99
+	report, err = Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "sample-full")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsWarning(report.Warnings, "requested sample") {
+		t.Fatalf("unexpected warning for full sample: %#v", report.Warnings)
+	}
+
+	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+		return TargetResult{Target: target}
+	}
+	opts.Full = false
+	opts.Sample = 99
+	report, err = Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "sample-no-result")}, opts)
+	if err == nil || !strings.Contains(err.Error(), "no comparable") {
+		t.Fatalf("no-comparable sample run error = %v", err)
+	}
+	if !containsWarning(report.Warnings, "requested sample of 99 domains") {
+		t.Fatalf("no-comparable report lost sample warning: %#v", report.Warnings)
+	}
+}
+
+func containsWarning(warnings []string, fragment string) bool {
+	for _, warning := range warnings {
+		if strings.Contains(warning, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDivergentResponsesAreExcluded(t *testing.T) {

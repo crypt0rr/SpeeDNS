@@ -250,6 +250,12 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 		Queries:    len(queries),
 		QueryTypes: append([]uint16(nil), opts.QueryTypes...),
 	}
+	if !opts.Full && opts.Sample > report.SampleSize {
+		report.Warnings = append(report.Warnings, fmt.Sprintf(
+			"requested sample of %d domains exceeds the normalized corpus size; using all %d domains",
+			opts.Sample, report.SampleSize,
+		))
+	}
 
 	byProtocol := make(map[catalog.Protocol][]catalog.Target)
 	for _, target := range targets {
@@ -275,7 +281,7 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 	})
 	report.Rankings = makeRankings(report.Targets)
 	report.PairedEffects = calculatePairedEffects(report.Targets, report.Rankings, report.Seed)
-	report.Warnings = collectWarnings(report.Targets)
+	report.Warnings = append(report.Warnings, collectWarnings(report.Targets)...)
 	if ctx.Err() != nil {
 		return report, ctx.Err()
 	}
