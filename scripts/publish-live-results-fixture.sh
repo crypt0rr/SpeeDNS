@@ -161,6 +161,24 @@ if python3 "${root_dir}/scripts/publish-live-results.py" \
 	exit 1
 fi
 
+cp -R "${temporary_dir}/original-evidence" "${temporary_dir}/malformed-ranking-evidence"
+python3 - "${temporary_dir}/malformed-ranking-evidence/udp.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+report["rankings"][0]["target_id"] = "unrelated-target"
+path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+PY
+if python3 "${root_dir}/scripts/publish-live-results.py" \
+	--evidence-dir "${temporary_dir}/malformed-ranking-evidence" \
+	--output-dir "${temporary_dir}/malformed-ranking-results"; then
+	echo "malformed ranking fixture unexpectedly passed" >&2
+	exit 1
+fi
+
 cp -R "${temporary_dir}/original-evidence" "${temporary_dir}/no-comparable-evidence"
 python3 - "${temporary_dir}/no-comparable-evidence/doq.json" <<'PY'
 import json

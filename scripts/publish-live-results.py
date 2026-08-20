@@ -238,16 +238,19 @@ def validate_report(report: dict[str, Any], protocol: str) -> dict[str, Any]:
     validate_stats(stats, protocol)
     open_error = result.get("open_error", "")
     require_string(open_error, f"{protocol}: result.open_error", allow_empty=True)
-    require(isinstance(result.get("incomplete", False), bool), f"{protocol}: result.incomplete must be boolean")
+    incomplete = result.get("incomplete", False)
+    require(isinstance(incomplete, bool), f"{protocol}: result.incomplete must be boolean")
 
     rankings = require_list(report.get("rankings"), f"{protocol}: rankings")
+    require(len(rankings) <= 1, f"{protocol}: single-endpoint evidence cannot contain multiple rankings")
     for index, ranking in enumerate(rankings):
         ranking = require_dict(ranking, f"{protocol}: rankings[{index}]")
         require(ranking.get("protocol") == protocol, f"{protocol}: ranking protocol does not match")
-        require_string(ranking.get("target_id"), f"{protocol}: ranking.target_id")
+        require(ranking.get("target_id") == target_id, f"{protocol}: ranking target does not match the measured endpoint")
         rank = require_integer(ranking.get("rank"), f"{protocol}: ranking.rank")
-        require(rank > 0, f"{protocol}: ranking rank must be positive")
+        require(rank == 1, f"{protocol}: single-endpoint ranking must be rank one")
         require(isinstance(ranking.get("tie"), bool), f"{protocol}: ranking.tie must be boolean")
+        require(not incomplete and stats["scored"] > 0, f"{protocol}: an incomplete or unscored result cannot be ranked")
     warnings = require_list(report.get("warnings", []), f"{protocol}: warnings")
     for index, warning in enumerate(warnings):
         warning = require_string(warning, f"{protocol}: warnings[{index}]")
