@@ -86,6 +86,42 @@ if PATH="${fake_bin}:${PATH}" \
 	exit 1
 fi
 
+validate_bin="${fixture_dir}/validate-bin"
+mkdir -p "${validate_bin}"
+fake_state="${fixture_dir}/validate-release-state"
+fake_gh="${validate_bin}/gh"
+# shellcheck disable=SC2016 # These strings are source for the temporary fake CLI.
+printf '%s\n' '#!/usr/bin/env bash' \
+	'set -euo pipefail' \
+	'if [[ "${1:-}" != release || "${2:-}" != view ]]; then exit 2; fi' \
+	'case "$(<"${FAKE_RELEASE_STATE}")" in' \
+	'published) printf "%s\\n" false ;;' \
+	'draft) printf "%s\\n" true ;;' \
+	'*) exit 1 ;;' \
+	'esac' >"${fake_gh}"
+chmod +x "${fake_gh}"
+printf '%s\n' published >"${fake_state}"
+PATH="${validate_bin}:${PATH}" \
+	GH_TOKEN=fixture-token \
+	FAKE_RELEASE_STATE="${fake_state}" \
+	bash "${root_dir}/scripts/validate-published-release.sh" "v${version}" "example/repository"
+printf '%s\n' draft >"${fake_state}"
+if PATH="${validate_bin}:${PATH}" \
+	GH_TOKEN=fixture-token \
+	FAKE_RELEASE_STATE="${fake_state}" \
+	bash "${root_dir}/scripts/validate-published-release.sh" "v${version}" "example/repository"; then
+	echo "draft release was unexpectedly accepted" >&2
+	exit 1
+fi
+printf '%s\n' missing >"${fake_state}"
+if PATH="${validate_bin}:${PATH}" \
+	GH_TOKEN=fixture-token \
+	FAKE_RELEASE_STATE="${fake_state}" \
+	bash "${root_dir}/scripts/validate-published-release.sh" "v${version}" "example/repository"; then
+	echo "missing release was unexpectedly accepted" >&2
+	exit 1
+fi
+
 bash "${root_dir}/scripts/release-assets.sh" verify "${fixture_dir}/first" \
 	"${fixture_dir}/first/release-assets.txt"
 bash "${root_dir}/scripts/homebrew-cask.sh" "v${version}" "${fixture_dir}/first" \
