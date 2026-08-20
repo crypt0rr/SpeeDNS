@@ -332,11 +332,17 @@ func Validate(profiles []ResolverProfile) error {
 		if len(profile.Addresses) == 0 {
 			return fmt.Errorf("resolver %q has no addresses", profile.ID)
 		}
+		seenAddresses := make(map[string]int, len(profile.Addresses))
 		for addressIndex, address := range profile.Addresses {
 			address = strings.TrimSpace(address)
 			if address == "" {
 				return fmt.Errorf("resolver %q address %d is empty", profile.ID, addressIndex+1)
 			}
+			addressKey := canonicalAddressKey(address)
+			if previousIndex, exists := seenAddresses[addressKey]; exists {
+				return fmt.Errorf("resolver %q address %d %q duplicates address %d", profile.ID, addressIndex+1, address, previousIndex)
+			}
+			seenAddresses[addressKey] = addressIndex + 1
 			profile.Addresses[addressIndex] = address
 		}
 		for protocol, spec := range profile.Transports {
@@ -395,6 +401,17 @@ func normalizeBootstrapAddresses(addresses []string) ([]string, error) {
 		normalized = append(normalized, address)
 	}
 	return normalized, nil
+}
+
+func canonicalAddressKey(address string) string {
+	address = strings.TrimSpace(address)
+	if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
+		address = strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
+	}
+	if ip := net.ParseIP(address); ip != nil {
+		return "ip:" + ip.String()
+	}
+	return "host:" + strings.ToLower(strings.TrimSuffix(address, "."))
 }
 
 func defaultPort(protocol Protocol) int {

@@ -73,6 +73,35 @@ resolvers:
 	}
 }
 
+func TestValidateRejectsDuplicateAddresses(t *testing.T) {
+	tests := []struct {
+		name      string
+		addresses []string
+	}{
+		{name: "exact duplicate", addresses: []string{"1.1.1.1", "1.1.1.1"}},
+		{name: "trimmed duplicate", addresses: []string{"1.1.1.1", " 1.1.1.1 "}},
+		{name: "equivalent IPv6 literals", addresses: []string{"2001:0db8:0:0:0:0:0:1", "[2001:db8::1]"}},
+		{name: "case and root dot hostname", addresses: []string{"DNS.Example.", "dns.example"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile := minimalProfile("duplicate")
+			profile.Addresses = test.addresses
+			if err := Validate([]ResolverProfile{profile}); err == nil || !strings.Contains(err.Error(), "duplicates address") {
+				t.Fatalf("duplicate validation error = %v", err)
+			}
+		})
+	}
+
+	first := minimalProfile("first")
+	first.Addresses = []string{"dns.example"}
+	second := minimalProfile("second")
+	second.Addresses = []string{"dns.example"}
+	if err := Validate([]ResolverProfile{first, second}); err != nil {
+		t.Fatalf("same address across profiles rejected: %v", err)
+	}
+}
+
 func TestParseResolverFlag(t *testing.T) {
 	profile, err := ParseResolverFlag("private=https://dns.example/dns-query")
 	if err != nil {
