@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crypt0rr/SpeeDNS/schema/report-v1.json",
+  "title": "SpeeDNS JSON report",
+  "description": "Version 1 JSON output emitted by SpeeDNS.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run", "results", "rankings"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run": {"$ref": "#/$defs/run"},
+    "results": {"type": "array", "items": {"$ref": "#/$defs/result"}},
+    "rankings": {"type": "array", "items": {"$ref": "#/$defs/ranking"}},
+    "paired_effects": {"type": "array", "items": {"$ref": "#/$defs/paired_effect"}},
+    "profile_comparisons": {"type": "array", "items": {"$ref": "#/$defs/profile_comparison"}},
+    "divergence": {"type": "array", "items": {"$ref": "#/$defs/divergence"}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "protocol": {
+      "type": "string",
+      "enum": ["udp", "tcp", "doh", "dot", "doq"]
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "finished_at", "seed", "sample_size", "queries_per_target", "query_types"],
+      "properties": {
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": "string", "format": "date-time"},
+        "seed": {"type": "integer"},
+        "corpus_mode": {"type": "string"},
+        "corpus_zone": {"type": "string"},
+        "corpus_nonce": {"type": "string"},
+        "sample_size": {"type": "integer", "minimum": 0},
+        "queries_per_target": {"type": "integer", "minimum": 0},
+        "query_types": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 65535}}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "owner", "policy", "address", "protocol", "tls_identity_source", "bootstrap_mode"],
+      "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "owner": {"type": "string"},
+        "policy": {"type": "string"},
+        "address": {"type": "string"},
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "endpoint_url": {"type": "string"},
+        "tls_server_name": {"type": "string"},
+        "tls_identity_source": {"type": "string"},
+        "bootstrap_mode": {"type": "string"},
+        "bootstrap_addresses": {"type": "array", "items": {"type": "string"}},
+        "dial_address": {"type": "string"}
+      }
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "reconnects",
+        "success_rate", "failure_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate",
+        "median_ms", "p95_ms", "min_ms", "max_ms", "mad_ms", "score_ms", "recommended"
+      ],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "successes": {"type": "integer", "minimum": 0},
+        "failures": {"type": "integer", "minimum": 0},
+        "usable_responses": {"type": "integer", "minimum": 0},
+        "resolver_failures": {"type": "integer", "minimum": 0},
+        "scored": {"type": "integer", "minimum": 0},
+        "divergent": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "integer", "minimum": 0},
+        "reconnects": {"type": "integer", "minimum": 0},
+        "success_rate": {"type": "number", "minimum": 0},
+        "failure_rate": {"type": "number", "minimum": 0},
+        "usable_rate": {"type": "number", "minimum": 0},
+        "resolver_failure_rate": {"type": "number", "minimum": 0},
+        "scoring_failure_rate": {"type": "number", "minimum": 0},
+        "rcode_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "median_ms": {"type": "number", "minimum": 0},
+        "p95_ms": {"type": "number", "minimum": 0},
+        "min_ms": {"type": "number", "minimum": 0},
+        "max_ms": {"type": "number", "minimum": 0},
+        "mad_ms": {"type": "number", "minimum": 0},
+        "cold_median_ms": {"type": "number", "minimum": 0},
+        "score_ms": {"type": "number", "minimum": 0},
+        "ci_low_ms": {"type": "number"},
+        "ci_high_ms": {"type": "number"},
+        "recommended": {"type": "boolean"},
+        "tie": {"type": "boolean"}
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "stats"],
+      "properties": {
+        "target": {"$ref": "#/$defs/target"},
+        "stats": {"$ref": "#/$defs/statistics"},
+        "open_error": {"type": "string"},
+        "incomplete": {"type": "boolean"},
+        "samples": {"type": "array", "items": {"$ref": "#/$defs/observation"}},
+        "cold": {"type": "array", "items": {"$ref": "#/$defs/cold_observation"}}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "qtype", "success", "usable"],
+      "properties": {
+        "name": {"type": "string"},
+        "qtype": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "latency_ms": {"type": "number", "minimum": 0},
+        "success": {"type": "boolean"},
+        "usable": {"type": "boolean"},
+        "rcode": {"type": "integer"},
+        "truncated": {"type": "boolean"},
+        "response_class": {"type": "string"},
+        "divergent": {"type": "boolean"},
+        "divergence_baseline": {"type": "string"},
+        "reconnected": {"type": "boolean"},
+        "error": {"type": "string"}
+      }
+    },
+    "cold_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "qtype", "success"],
+      "properties": {
+        "name": {"type": "string"},
+        "qtype": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "latency_ms": {"type": "number", "minimum": 0},
+        "success": {"type": "boolean"},
+        "error": {"type": "string"}
+      }
+    },
+    "ranking": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "target_id", "rank", "tie"],
+      "properties": {
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "target_id": {"type": "string"},
+        "rank": {"type": "integer", "minimum": 1},
+        "tie": {"type": "boolean"}
+      }
+    },
+    "paired_effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "policy", "target_id", "reference_target_id", "samples", "median_delta_ms", "ci_low_ms", "ci_high_ms", "indistinguishable"],
+      "properties": {
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "policy": {"type": "string"},
+        "target_id": {"type": "string"},
+        "reference_target_id": {"type": "string"},
+        "samples": {"type": "integer", "minimum": 0},
+        "median_delta_ms": {"type": "number"},
+        "ci_low_ms": {"type": "number"},
+        "ci_high_ms": {"type": "number"},
+        "indistinguishable": {"type": "boolean"},
+        "reference": {"type": "boolean"},
+        "reason": {"type": "string"}
+      }
+    },
+    "divergence_exclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "response_class", "treatment"],
+      "properties": {
+        "target_id": {"type": "string"},
+        "response_class": {"type": "string"},
+        "treatment": {"type": "string"}
+      }
+    },
+    "divergence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "qtype", "policy", "compared", "classes"],
+      "properties": {
+        "name": {"type": "string"},
+        "qtype": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "policy": {"type": "string"},
+        "compared": {"type": "integer", "minimum": 0},
+        "baseline": {"type": "string"},
+        "ambiguous": {"type": "boolean"},
+        "classes": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "excluded": {"type": "array", "items": {"$ref": "#/$defs/divergence_exclusion"}}
+      }
+    },
+    "profile_transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "target_id", "stats", "status"],
+      "properties": {
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "target_id": {"type": "string"},
+        "stats": {"$ref": "#/$defs/statistics"},
+        "status": {"type": "string"}
+      }
+    },
+    "profile_comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "owner", "address", "transports"],
+      "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "owner": {"type": "string"},
+        "address": {"type": "string"},
+        "transports": {"type": "array", "items": {"$ref": "#/$defs/profile_transport"}}
+      }
+    }
+  }
+}

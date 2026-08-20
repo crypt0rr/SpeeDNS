@@ -76,6 +76,9 @@ jobs:
       - name: Run unit and integration tests
         run: go test -count=1 ./...
 
+      - name: Validate published JSON report schema
+        run: go test -count=1 ./schema ./internal/report -run 'TestReportV1IsEmbeddedJSONSchema|TestJSONReportsMatchPublishedSchema'
+
       - name: Run go vet
         run: go vet ./...
 
