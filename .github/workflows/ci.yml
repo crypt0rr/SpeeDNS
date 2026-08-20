@@ -160,6 +160,13 @@ jobs:
         shell: bash
         run: bash scripts/release-fixture.sh
 
+      - name: Install Linux package inspection tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes rpm zstd
+
+      - name: Set reproducible package timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+
       - name: Build GoReleaser snapshot
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
@@ -167,7 +174,7 @@ jobs:
           version: '~> v2'
           args: release --snapshot --clean --skip=sign
 
-      - name: Smoke-test Linux archive and Debian package
+      - name: Smoke-test Linux archives and packages
         shell: bash
         run: bash scripts/artifact-smoke.sh linux dist
 

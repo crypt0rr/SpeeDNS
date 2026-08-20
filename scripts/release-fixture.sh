@@ -15,7 +15,15 @@ make_dist() {
 		"SpeeDNS_${version}_linux_amd64.tar.gz" \
 		"SpeeDNS_${version}_linux_arm64.tar.gz" \
 		"speedns_${version}_linux_amd64.deb" \
-		"speedns_${version}_linux_arm64.deb"; do
+		"speedns_${version}_linux_arm64.deb" \
+		"speedns_${version}_linux_amd64.rpm" \
+		"speedns_${version}_linux_arm64.rpm" \
+		"speedns_${version}_linux_amd64.apk" \
+		"speedns_${version}_linux_arm64.apk" \
+		"speedns_${version}_linux_amd64.pkg.tar.zst" \
+		"speedns_${version}_linux_arm64.pkg.tar.zst" \
+		"SpeeDNS_${version}_linux_amd64.tar.gz.sbom.json" \
+		"speedns_${version}_linux_amd64.rpm.sbom.json"; do
 		printf 'fixture %s\n' "${artifact}" >"${destination}/${artifact}"
 	done
 	(
@@ -27,11 +35,19 @@ make_dist() {
 			"SpeeDNS_${version}_linux_arm64.tar.gz" \
 			"speedns_${version}_linux_amd64.deb" \
 			"speedns_${version}_linux_arm64.deb" \
+			"speedns_${version}_linux_amd64.rpm" \
+			"speedns_${version}_linux_arm64.rpm" \
+			"speedns_${version}_linux_amd64.apk" \
+			"speedns_${version}_linux_arm64.apk" \
+			"speedns_${version}_linux_amd64.pkg.tar.zst" \
+			"speedns_${version}_linux_arm64.pkg.tar.zst" \
+			"SpeeDNS_${version}_linux_amd64.tar.gz.sbom.json" \
+			"speedns_${version}_linux_amd64.rpm.sbom.json" \
 			>checksums.txt
 	)
 	jq -n \
 		--arg version "${version}" \
-		'[{type:"Archive", path:("dist/SpeeDNS_"+$version+"_darwin_amd64.tar.gz")}, {type:"Archive", path:("dist/SpeeDNS_"+$version+"_darwin_arm64.tar.gz")}, {type:"Archive", path:("dist/SpeeDNS_"+$version+"_linux_amd64.tar.gz")}, {type:"Archive", path:("dist/SpeeDNS_"+$version+"_linux_arm64.tar.gz")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_amd64.deb")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_arm64.deb")}, {type:"Checksum", path:"dist/checksums.txt"}]' >"${destination}/artifacts.json"
+		'[{type:"Archive", path:("dist/SpeeDNS_"+$version+"_darwin_amd64.tar.gz")}, {type:"Archive", path:("dist/SpeeDNS_"+$version+"_darwin_arm64.tar.gz")}, {type:"Archive", path:("dist/SpeeDNS_"+$version+"_linux_amd64.tar.gz")}, {type:"Archive", path:("dist/SpeeDNS_"+$version+"_linux_arm64.tar.gz")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_amd64.deb")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_arm64.deb")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_amd64.rpm")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_arm64.rpm")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_amd64.apk")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_arm64.apk")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_amd64.pkg.tar.zst")}, {type:"Linux Package", path:("dist/speedns_"+$version+"_linux_arm64.pkg.tar.zst")}, {type:"SBOM", path:("dist/SpeeDNS_"+$version+"_linux_amd64.tar.gz.sbom.json")}, {type:"SBOM", path:("dist/speedns_"+$version+"_linux_amd64.rpm.sbom.json")}, {type:"Checksum", path:"dist/checksums.txt"}]' >"${destination}/artifacts.json"
 }
 
 version="0.1.0-fixture"

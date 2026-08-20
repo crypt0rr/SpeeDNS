@@ -1,7 +1,7 @@
 # Contributing to SpeeDNS
 
 Thanks for helping improve SpeeDNS. Contributions should keep the tool
-read-only, offline by default, and useful on both macOS and Debian/Linux.
+read-only, offline by default, and useful on both macOS and Linux.
 
 ## Before opening a pull request
 
@@ -25,6 +25,14 @@ for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
     go build -trimpath -o "speedns-${goos}-${goarch}" ./cmd/speedns
 done
 ```
+
+For a local GoReleaser snapshot, set the package timestamp from the checked-out
+commit so the archive and package reproducibility check matches CI:
+
+~~~bash
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
+  goreleaser release --snapshot --clean --skip=sign
+~~~
 
 The repository CI also runs the domain-updater, live-smoke, release-script,
 schema, package, and artifact fixtures. Normal tests must not depend on public

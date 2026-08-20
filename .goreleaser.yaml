@@ -13,6 +13,9 @@ builds:
       - CGO_ENABLED=0
     flags:
       - -trimpath
+    hooks:
+      post:
+        - cmd: ./scripts/normalize-build-mtime.sh {{ .Path }}
     mod_timestamp: "{{ .CommitTimestamp }}"
     goos:
       - darwin
@@ -29,7 +32,26 @@ builds:
 
 archives:
   - formats: [tar.gz]
+    ids: [speedns]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    builds_info:
+      owner: root
+      group: root
+      # A fixed archive member timestamp keeps tar headers reproducible.
+      mtime: "2008-01-02T15:04:05Z"
+    files:
+      - src: LICENSE
+        dst: LICENSE
+        info:
+          owner: root
+          group: root
+          mtime: "2008-01-02T15:04:05Z"
+      - src: README.md
+        dst: README.md
+        info:
+          owner: root
+          group: root
+          mtime: "2008-01-02T15:04:05Z"
 
 nfpms:
   - id: deb
@@ -39,7 +61,7 @@ nfpms:
     maintainer: SpeeDNS contributors
     description: Cross-platform DNS transport speed test CLI
     license: MIT
-    formats: [deb]
+    formats: [deb, rpm, apk, archlinux]
     bindir: /usr/bin
     mtime: "{{ .CommitDate }}"
 
@@ -71,7 +93,19 @@ signs:
       - ${artifact}
 
 sboms:
-  - artifacts: archive
+  - id: archive
+    artifacts: archive
+    cmd: ../scripts/reproducible-syft.sh
+    args:
+      - $artifact
+      - --output
+      - spdx-json=$document
+      - --enrich
+      - all
+    documents:
+      - "{{ .ArtifactName }}.sbom.json"
+  - id: package
+    artifacts: package
     cmd: ../scripts/reproducible-syft.sh
     args:
       - $artifact
