@@ -62,6 +62,15 @@ func TestLoadConvertsUnicodeToIDNAAndDeduplicatesAfterNormalization(t *testing.T
 	}
 }
 
+func TestCorpusDigestUsesCanonicalNormalizedSequence(t *testing.T) {
+	if got := CorpusDigest([]string{"example.com", "example.org"}); got != "ace801686b06c8b2d759d4bad10d00af484d636b25b373c59002031e8c4e1504" {
+		t.Fatalf("corpus digest = %q", got)
+	}
+	if CorpusDigest([]string{"example.org", "example.com"}) == CorpusDigest([]string{"example.com", "example.org"}) {
+		t.Fatal("corpus digest ignored domain order")
+	}
+}
+
 func TestLoadRejectsStrictDomainSyntaxWithSourceLine(t *testing.T) {
 	cases := []struct {
 		name  string

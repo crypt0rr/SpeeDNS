@@ -105,6 +105,119 @@ check_linux() {
 		exit 1
 	fi
 	"${binary}" version | grep -q '^speedns '
+
+	check_package_format rpm
+	check_package_format apk
+	check_package_format 'pkg.tar.zst'
+}
+
+check_package_format() {
+	local format="$1"
+	local -a package_artifacts=()
+	local artifact basename amd64_artifact arm64_artifact expected_arch package_name package_arch package_version package_license package_entries package_info
+	mapfile -t package_artifacts < <(find "${dist_dir}" -type f -iname "*.${format}" -print | sort)
+	if [[ "${#package_artifacts[@]}" -ne 2 ]]; then
+		echo "expected exactly two Linux ${format} packages, found ${#package_artifacts[@]}" >&2
+		exit 1
+	fi
+
+	for artifact in "${package_artifacts[@]}"; do
+		basename="$(basename "${artifact}")"
+		case "${basename}" in
+			*amd64*|*x86_64*)
+				if [[ -n "${amd64_artifact:-}" ]]; then
+					echo "multiple amd64 Linux ${format} packages found" >&2
+					exit 1
+				fi
+				amd64_artifact="${artifact}"
+				;;
+			*arm64*|*aarch64*)
+				if [[ -n "${arm64_artifact:-}" ]]; then
+					echo "multiple arm64 Linux ${format} packages found" >&2
+					exit 1
+				fi
+				arm64_artifact="${artifact}"
+				;;
+			*)
+				echo "Linux ${format} package has no recognized architecture: ${artifact}" >&2
+				exit 1
+				;;
+		esac
+	done
+
+	for artifact in "${amd64_artifact}" "${arm64_artifact}"; do
+		basename="$(basename "${artifact}")"
+		case "${basename}" in
+			*amd64*|*x86_64*) expected_arch=x86_64 ;;
+			*arm64*|*aarch64*) expected_arch=aarch64 ;;
+			*) echo "Linux ${format} package has no recognized architecture: ${artifact}" >&2; exit 1 ;;
+		esac
+		if [[ -n "${release_manifest}" ]] && ! grep -Fqx -- "${artifact}" "${release_manifest}"; then
+			echo "${artifact} is not present in the release asset manifest" >&2
+			exit 1
+		fi
+		if [[ ! -s "${artifact}" ]]; then
+			echo "Linux ${format} package is empty: ${artifact}" >&2
+			exit 1
+		fi
+		echo "using ${artifact}" >&2
+
+		case "${format}" in
+			rpm)
+				if ! command -v rpm >/dev/null 2>&1; then
+					echo "rpm is required for RPM package smoke tests" >&2
+					exit 1
+				fi
+				package_name="$(rpm -qp --queryformat '%{NAME}' "${artifact}")"
+				package_arch="$(rpm -qp --queryformat '%{ARCH}' "${artifact}")"
+				package_version="$(rpm -qp --queryformat '%{VERSION}' "${artifact}")"
+				package_license="$(rpm -qp --queryformat '%{LICENSE}' "${artifact}")"
+				if [[ "${package_name}" != speedns || "${package_arch}" != "${expected_arch}" || -z "${package_version}" || "${package_license}" != MIT ]]; then
+					echo "unexpected RPM metadata: package=${package_name} architecture=${package_arch} version=${package_version} license=${package_license}" >&2
+					exit 1
+				fi
+				if ! rpm -qpl "${artifact}" | sed 's#^/##;s#^\./##' | grep -Fqx 'usr/bin/speedns'; then
+					echo "RPM package does not contain /usr/bin/speedns" >&2
+					exit 1
+				fi
+				;;
+			apk)
+				package_entries="$(tar -tzf "${artifact}" 2>/dev/null | sed 's#^\./##')"
+				package_info="$(tar -xOzf "${artifact}" .PKGINFO 2>/dev/null)"
+				;;
+			pkg.tar.zst)
+				package_entries="$(tar --zstd -tf "${artifact}" 2>/dev/null | sed 's#^\./##')"
+				package_info="$(tar --zstd -xOf "${artifact}" .PKGINFO 2>/dev/null)"
+				;;
+		esac
+		if [[ "${format}" != rpm ]]; then
+			if ! grep -Fqx 'usr/bin/speedns' <<<"${package_entries}"; then
+				echo "Linux ${format} package does not contain /usr/bin/speedns" >&2
+				exit 1
+			fi
+			if ! grep -Fqx 'pkgname = speedns' <<<"${package_info}" ||
+				! grep -Fqx "arch = ${expected_arch}" <<<"${package_info}" ||
+				! grep -Eq '^pkgver = .+$' <<<"${package_info}" ||
+				! grep -Fqx 'license = MIT' <<<"${package_info}"; then
+				echo "unexpected Linux ${format} package metadata: ${artifact}" >&2
+				exit 1
+			fi
+		fi
+	done
+
+	if [[ -f "${dist_dir}/artifacts.json" ]]; then
+		if ! command -v jq >/dev/null 2>&1; then
+			echo "jq is required to validate the GoReleaser package catalog" >&2
+			exit 1
+		fi
+		if ! jq -e --arg extension ".${format}" '
+			[.[] | select(.type == "Linux Package" and (.name | endswith($extension))) | .goarch] |
+			sort == ["amd64", "arm64"]
+		' "${dist_dir}/artifacts.json" >/dev/null; then
+			echo "GoReleaser package catalog is incomplete for .${format}" >&2
+			exit 1
+		fi
+	fi
 }
 
 check_macos_archives() {

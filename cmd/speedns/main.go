@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,6 +72,8 @@ var outputWriterFunc = outputWriter
 var terminalDetector = fileIsTerminal
 
 var newCacheMissNonceFunc = domains.NewCacheMissNonce
+
+var listProvenanceInterfacesFunc = net.Interfaces
 
 func exitCodeForError(err error) int {
 	switch {
@@ -204,6 +208,31 @@ func tableColorEnabled(config *cliConfig) bool {
 		return false
 	}
 	return terminalDetector(os.Stdout)
+}
+
+// activeInterfaceNames returns best-effort names of interfaces currently
+// marked up. Names are useful provenance without exposing local addresses;
+// an inventory failure must never prevent a DNS benchmark from completing.
+func activeInterfaceNames() []string {
+	interfaces, err := listProvenanceInterfacesFunc()
+	if err != nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(interfaces))
+	names := make([]string, 0, len(interfaces))
+	for _, iface := range interfaces {
+		name := strings.TrimSpace(iface.Name)
+		if name == "" || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func main() {
@@ -443,6 +472,20 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	result.CorpusMode = corpusMode
 	result.CorpusZone = corpusZone
 	result.CorpusNonce = corpusNonce
+	buildVersion, buildCommit, buildDate := version.Values()
+	result.Provenance = &benchmark.RunProvenance{
+		Version:       buildVersion,
+		Commit:        buildCommit,
+		BuildDate:     buildDate,
+		OS:            runtime.GOOS,
+		Architecture:  runtime.GOARCH,
+		Interfaces:    activeInterfaceNames(),
+		Protocols:     append([]catalog.Protocol(nil), canonicalProtocols(selected)...),
+		CorpusEntries: len(domainList),
+		CorpusSHA256:  domains.CorpusDigest(domainList),
+		Timeout:       config.timeout,
+		Concurrency:   effectiveConcurrency,
+	}
 	if concurrencyCapped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
 	}

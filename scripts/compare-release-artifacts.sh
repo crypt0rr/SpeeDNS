@@ -18,7 +18,7 @@ trap 'rm -rf -- "${temporary_dir}"' EXIT
 artifact_names() {
 	local directory="$1"
 	find "${directory}" -maxdepth 1 -type f \
-		\( -name '*.tar.gz' -o -name '*.deb' -o -name 'checksums.txt' \) \
+		\( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' -o -name '*.apk' -o -name '*.pkg.tar.zst' -o -name '*.sbom.json' -o -name 'checksums.txt' \) \
 		-exec basename {} \; |
 		sort -u
 }

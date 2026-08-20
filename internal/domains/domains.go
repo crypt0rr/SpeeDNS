@@ -3,6 +3,7 @@ package domains
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -84,6 +85,18 @@ func Normalize(lines []string) ([]string, error) {
 		inputs = append(inputs, domainInput{value: line})
 	}
 	return validateInputs(inputs)
+}
+
+// CorpusDigest returns the SHA-256 digest of the exact normalized domain
+// sequence used by a benchmark. The canonical representation is one name per
+// line with a final LF, matching the embedded corpus metadata convention.
+func CorpusDigest(names []string) string {
+	canonical := strings.Join(names, "\n")
+	if len(names) > 0 {
+		canonical += "\n"
+	}
+	digest := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(digest[:])
 }
 
 // NewCacheMissNonce returns a local random nonce used to make cache-miss names

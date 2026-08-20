@@ -45,6 +45,28 @@ PATH="${fake_bin}:${PATH}" SPEEDNS_FIXTURE="${fixture}" \
 [[ "$(grep -c '^example.com$' "${output_dir}/domains.txt")" == "1" ]]
 grep -q '"entries": 1000' "${output_dir}/domains.meta.json"
 grep -Eq '"sha256": "[0-9a-f]{64}"' "${output_dir}/domains.meta.json"
+bash "${root_dir}/scripts/verify-domain-corpus.sh" "${output_dir}"
+
+mismatch_dir="${temporary_dir}/mismatch"
+cp -a "${output_dir}" "${mismatch_dir}"
+sed 's/"entries": 1000/"entries": 999/' \
+	"${mismatch_dir}/domains.meta.json" >"${mismatch_dir}/domains.meta.json.tmp"
+mv "${mismatch_dir}/domains.meta.json.tmp" "${mismatch_dir}/domains.meta.json"
+if bash "${root_dir}/scripts/verify-domain-corpus.sh" "${mismatch_dir}"; then
+	echo "metadata count mismatch unexpectedly passed" >&2
+	exit 1
+fi
+
+sed 's/"entries": 999/"entries": 1000/' \
+	"${mismatch_dir}/domains.meta.json" >"${mismatch_dir}/domains.meta.json.tmp"
+mv "${mismatch_dir}/domains.meta.json.tmp" "${mismatch_dir}/domains.meta.json"
+sed 's/"sha256": "[^"]*"/"sha256": "0000000000000000000000000000000000000000000000000000000000000000"/' \
+	"${mismatch_dir}/domains.meta.json" >"${mismatch_dir}/domains.meta.json.tmp"
+mv "${mismatch_dir}/domains.meta.json.tmp" "${mismatch_dir}/domains.meta.json"
+if bash "${root_dir}/scripts/verify-domain-corpus.sh" "${mismatch_dir}"; then
+	echo "metadata checksum mismatch unexpectedly passed" >&2
+	exit 1
+fi
 
 printf '1,bad..example\n' >"${fixture}"
 if PATH="${fake_bin}:${PATH}" SPEEDNS_FIXTURE="${fixture}" \

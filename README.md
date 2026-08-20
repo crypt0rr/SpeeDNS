@@ -6,11 +6,30 @@ SpeeDNS does not change your system DNS settings, requires no root privileges, a
 
 ## Install
 
-Prebuilt macOS and Debian/Linux binaries and packages are published with each release on the [GitHub Releases page](https://github.com/crypt0rr/SpeeDNS/releases). Choose the archive for your platform and architecture. Releases include:
+Prebuilt macOS and Linux binaries and packages are published with each release on the [GitHub Releases page](https://github.com/crypt0rr/SpeeDNS/releases). Choose the archive for your platform and architecture. Releases include:
 
 - macOS Intel (`amd64`) and Apple silicon (`arm64`);
 - Linux `amd64` and `arm64` archives;
-- Debian packages for Linux `amd64` and `arm64`.
+- Debian, RPM, APK, and Arch Linux packages for Linux `amd64` and `arm64`.
+
+The package files are independent release assets. Verify the release
+checksums and Sigstore signature before installing. For example:
+
+```sh
+# Fedora/RHEL and compatible distributions
+sudo rpm -Uvh ./speedns_VERSION_linux_amd64.rpm
+
+# Alpine Linux; --allow-untrusted is needed because this is a downloaded
+# package, not an APK repository package with a local Alpine repository key.
+sudo apk add --allow-untrusted ./speedns_VERSION_linux_amd64.apk
+
+# Arch Linux
+sudo pacman -U ./speedns_VERSION_linux_amd64.pkg.tar.zst
+```
+
+Use the `arm64` asset on a 64-bit ARM host. Package-manager signatures are
+not substituted for the release checksum and Sigstore verification described
+below.
 
 ### Homebrew / Linuxbrew
 
@@ -376,6 +395,34 @@ For scripts and other tools, use JSON or CSV:
 ./speedns --format json --raw --output result-with-samples.json
 ```
 
+The versioned JSON contract is published as
+[`schema/report-v1.json`](schema/report-v1.json). It describes the current
+`schema_version: 1` output, including optional raw samples, profile
+comparisons, paired effects, divergence details, and warnings. Consumers
+should select their parser and validation rules from the reported schema
+version rather than assuming that table or CSV output has the same shape.
+
+CLI-generated JSON reports also include `run.provenance`. It records the
+SpeeDNS build version, commit, build date, operating system, architecture,
+active interface names, selected protocols, effective timeout and concurrency,
+elapsed duration, and the SHA-256 digest plus entry count of the exact
+normalized domain sequence used by the run. This makes custom-domain and
+cache-miss results auditable without downloading anything at runtime. The
+`--redact-system` option replaces interface names with `redacted` along with
+other local resolver details; CSV output is unchanged.
+
+### Scheduled live results
+
+The project also runs a scheduled, non-blocking smoke check against one
+official endpoint for each transport. Complete runs are validated and
+published as compact JSON records and a static `index.html` on the [`results`
+branch](https://github.com/crypt0rr/SpeeDNS/tree/results). These checks are
+health and interoperability data, not a replacement for a local comparison:
+latency depends on the network where each run executes, and a failed run is
+retained with its diagnostics instead of being presented as a successful
+benchmark. Consumers can validate records with the published
+[`live-results-v1.schema.json`](https://github.com/crypt0rr/SpeeDNS/blob/results/live-results-v1.schema.json).
+
 Useful flags include:
 
 ```text
@@ -421,6 +468,13 @@ warnings. The command returns a distinct non-zero status:
 ## Privacy and platform support
 
 SpeeDNS runs locally on macOS and Debian/Linux, supports IPv4 and IPv6 resolver addresses, and does not modify DNS settings or send telemetry. The domains you test are sent to the resolvers you select, just as they would be for normal DNS lookups.
+
+## Project policies
+
+Contributors can find development setup, test commands, fixture expectations,
+and release-file guidance in [`CONTRIBUTING.md`](CONTRIBUTING.md). To report a
+security vulnerability privately, follow [`SECURITY.md`](SECURITY.md) rather
+than opening a public issue.
 
 ## License
 
