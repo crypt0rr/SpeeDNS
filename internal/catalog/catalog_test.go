@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -158,6 +159,54 @@ func TestValidateRejectsDuplicateAddresses(t *testing.T) {
 	second.Addresses = []string{"dns.example"}
 	if err := Validate([]ResolverProfile{first, second}); err != nil {
 		t.Fatalf("same address across profiles rejected: %v", err)
+	}
+}
+
+func TestYAMLDoHPortInheritance(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		port     string
+		wantPort int
+		wantErr  bool
+	}{
+		{name: "explicit URL port", url: "https://dns.example:8443/dns-query", wantPort: 8443},
+		{name: "URL default", url: "https://dns.example/dns-query", wantPort: 443},
+		{name: "explicit profile override", url: "https://dns.example:8443/dns-query", port: "9443", wantPort: 9443},
+		{name: "zero URL port", url: "https://dns.example:0/dns-query", wantErr: true},
+		{name: "invalid URL port", url: "https://dns.example:99999/dns-query", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			portLine := ""
+			if test.port != "" {
+				portLine = fmt.Sprintf("        port: %s\n", test.port)
+			}
+			input := fmt.Sprintf(`version: 1
+resolvers:
+  - id: example
+    name: Example
+    owner: Owner
+    policy: unfiltered
+    addresses: [192.0.2.53]
+    transports:
+      doh:
+        url: %s
+%s`, test.url, portLine)
+			profiles, err := LoadYAML(strings.NewReader(input))
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("invalid URL port unexpectedly succeeded")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := profiles[0].Transports[DoH].Port; got != test.wantPort {
+				t.Fatalf("DoH port = %d, want %d", got, test.wantPort)
+			}
+		})
 	}
 }
 

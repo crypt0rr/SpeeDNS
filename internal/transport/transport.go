@@ -415,6 +415,15 @@ func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error
 	port := target.Spec.Port
 	if port == 0 {
 		port = 443
+		if rawPort := u.Port(); rawPort != "" {
+			port, err = net.LookupPort("tcp", rawPort)
+			if err != nil {
+				return nil, fmt.Errorf("invalid DoH URL port %q: %w", rawPort, err)
+			}
+			if port < 1 || port > 65535 {
+				return nil, fmt.Errorf("invalid DoH URL port %q", rawPort)
+			}
+		}
 	}
 	dialAddress := target.Address
 	if dialAddress == "" {
