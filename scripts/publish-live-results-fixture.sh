@@ -116,6 +116,7 @@ python3 "${root_dir}/scripts/publish-live-results.py" \
 [[ -s "${results_dir}/runs/fixture-run.json" ]]
 [[ -s "${results_dir}/latest.json" ]]
 [[ -s "${results_dir}/index.html" ]]
+[[ -s "${results_dir}/live-results-v1.schema.json" ]]
 [[ -f "${results_dir}/.nojekyll" ]]
 grep -Fq '&lt;script&gt;' "${results_dir}/index.html"
 if grep -Fq '<script>' "${results_dir}/index.html"; then

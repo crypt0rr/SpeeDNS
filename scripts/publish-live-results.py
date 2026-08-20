@@ -22,6 +22,7 @@ from typing import Any
 
 
 PROTOCOLS = ("udp", "tcp", "doh", "dot", "doq")
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "live-results-v1.json"
 OFFICIAL_ENDPOINTS = {
     "udp": {"resolver": "google", "uri": "udp://8.8.8.8:53", "address": "8.8.8.8"},
     "tcp": {"resolver": "google", "uri": "tcp://8.8.8.8:53", "address": "8.8.8.8"},
@@ -620,6 +621,8 @@ def update_site(output_dir: Path, record: dict[str, Any]) -> None:
     records = load_history(output_dir)
     write_atomic(output_dir / "latest.json", json_bytes(records[-1]))
     write_atomic(output_dir / "index.html", render_index(records[-100:]).encode("utf-8"))
+    require(SCHEMA_PATH.is_file(), "live-results schema is missing from the source checkout")
+    write_atomic(output_dir / "live-results-v1.schema.json", SCHEMA_PATH.read_bytes())
     write_atomic(output_dir / ".nojekyll", b"")
 
 

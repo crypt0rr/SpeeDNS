@@ -403,7 +403,8 @@ branch](https://github.com/crypt0rr/SpeeDNS/tree/results). These checks are
 health and interoperability data, not a replacement for a local comparison:
 latency depends on the network where each run executes, and a failed run is
 retained with its diagnostics instead of being presented as a successful
-benchmark.
+benchmark. Consumers can validate records with the published
+[`live-results-v1.schema.json`](https://github.com/crypt0rr/SpeeDNS/blob/results/live-results-v1.schema.json).
 
 Useful flags include:
 
