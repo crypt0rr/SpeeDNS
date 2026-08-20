@@ -34,7 +34,27 @@
         "corpus_nonce": {"type": "string"},
         "sample_size": {"type": "integer", "minimum": 0},
         "queries_per_target": {"type": "integer", "minimum": 0},
-        "query_types": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 65535}}
+        "query_types": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 65535}},
+        "provenance": {"$ref": "#/$defs/provenance"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["speedns_version", "commit", "build_date", "os", "architecture", "protocols", "corpus_entries", "corpus_sha256", "timeout_ms", "concurrency", "duration_ms"],
+      "properties": {
+        "speedns_version": {"type": "string"},
+        "commit": {"type": "string"},
+        "build_date": {"type": "string"},
+        "os": {"type": "string"},
+        "architecture": {"type": "string"},
+        "interfaces": {"type": "array", "items": {"type": "string"}},
+        "protocols": {"type": "array", "items": {"$ref": "#/$defs/protocol"}},
+        "corpus_entries": {"type": "integer", "minimum": 0},
+        "corpus_sha256": {"type": "string"},
+        "timeout_ms": {"type": "integer", "minimum": 0},
+        "concurrency": {"type": "integer", "minimum": 0},
+        "duration_ms": {"type": "number", "minimum": 0}
       }
     },
     "target": {

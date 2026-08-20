@@ -142,6 +142,7 @@ type Report struct {
 	StartedAt     time.Time          `json:"started_at"`
 	FinishedAt    time.Time          `json:"finished_at"`
 	Seed          int64              `json:"seed"`
+	Provenance    *RunProvenance     `json:"provenance,omitempty"`
 	CorpusMode    string             `json:"corpus_mode,omitempty"`
 	CorpusZone    string             `json:"corpus_zone,omitempty"`
 	CorpusNonce   string             `json:"corpus_nonce,omitempty"`
@@ -153,6 +154,24 @@ type Report struct {
 	PairedEffects []PairedEffect     `json:"paired_effects,omitempty"`
 	Divergence    []DivergenceDetail `json:"divergence,omitempty"`
 	Warnings      []string           `json:"warnings,omitempty"`
+}
+
+// RunProvenance records the local build, platform, corpus, and effective
+// benchmark settings needed to compare a report with another run. It is
+// populated by the CLI because the benchmark package deliberately has no
+// knowledge of build metadata or command-line configuration.
+type RunProvenance struct {
+	Version       string
+	Commit        string
+	BuildDate     string
+	OS            string
+	Architecture  string
+	Interfaces    []string
+	Protocols     []catalog.Protocol
+	CorpusEntries int
+	CorpusSHA256  string
+	Timeout       time.Duration
+	Concurrency   int
 }
 
 // PairedEffect describes the latency difference between a target and the

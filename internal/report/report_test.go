@@ -40,3 +40,33 @@ func TestJSONAndCSVExposeTargetMetadata(t *testing.T) {
 		t.Fatalf("CSV output missing owner metadata: %s", csvOutput.String())
 	}
 }
+
+func TestJSONIncludesAndRedactsRunProvenance(t *testing.T) {
+	run := benchmark.Report{
+		StartedAt: time.Unix(10, 0), FinishedAt: time.Unix(12, 500000000),
+		Provenance: &benchmark.RunProvenance{
+			Version: "v0.1.0-alpha.33", Commit: "abc123", BuildDate: "2026-08-20",
+			OS: "linux", Architecture: "amd64", Interfaces: []string{"enp1s0", "lo"},
+			Protocols: []catalog.Protocol{catalog.UDP, catalog.DoH}, CorpusEntries: 2,
+			CorpusSHA256: "ace801686b06c8b2d759d4bad10d00af484d636b25b373c59002031e8c4e1504",
+			Timeout:      time.Second, Concurrency: 4,
+		},
+	}
+	var output bytes.Buffer
+	if err := WriteJSON(&output, run, false); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	for _, expected := range []string{"\"speedns_version\": \"v0.1.0-alpha.33\"", "\"architecture\": \"amd64\"", "\"corpus_entries\": 2", "\"timeout_ms\": 1000", "\"duration_ms\": 2500", "enp1s0"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("provenance JSON missing %q: %s", expected, text)
+		}
+	}
+	output.Reset()
+	if err := WriteJSONWithOptions(&output, run, false, JSONOptions{RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "enp1s0") || !strings.Contains(output.String(), "\"interfaces\"") || !strings.Contains(output.String(), "\"redacted\"") {
+		t.Fatalf("redacted provenance JSON = %s", output.String())
+	}
+}

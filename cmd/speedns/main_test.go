@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -199,6 +200,26 @@ func TestCLIParsersAndOutputHelpers(t *testing.T) {
 	}
 	values = nil
 	sort.Strings(values)
+}
+
+func TestActiveInterfaceNamesAreBestEffortAndSorted(t *testing.T) {
+	oldList := listProvenanceInterfacesFunc
+	t.Cleanup(func() { listProvenanceInterfacesFunc = oldList })
+	listProvenanceInterfacesFunc = func() ([]net.Interface, error) {
+		return []net.Interface{
+			{Name: "zeta", Flags: net.FlagUp},
+			{Name: "down", Flags: 0},
+			{Name: "alpha", Flags: net.FlagUp},
+			{Name: "alpha", Flags: net.FlagUp},
+		}, nil
+	}
+	if got := activeInterfaceNames(); strings.Join(got, ",") != "alpha,zeta" {
+		t.Fatalf("interface names = %#v", got)
+	}
+	listProvenanceInterfacesFunc = func() ([]net.Interface, error) { return nil, errors.New("interfaces unavailable") }
+	if got := activeInterfaceNames(); got != nil {
+		t.Fatalf("failed interface discovery = %#v, want nil", got)
+	}
 }
 
 func TestDisplayWidthUsesTerminalCells(t *testing.T) {
@@ -397,7 +418,7 @@ func TestRunBenchmarkCacheMissSafetyAndMetadata(t *testing.T) {
 		t.Fatalf("cache-miss engine options = %#v", captured)
 	}
 	content, err := os.ReadFile(config.output)
-	if err != nil || !strings.Contains(string(content), "\"corpus_mode\": \"cache-miss\"") || !strings.Contains(string(content), "cache-miss mode capped concurrency at 2") || !strings.Contains(string(content), "\"profile_comparisons\"") {
+	if err != nil || !strings.Contains(string(content), "\"corpus_mode\": \"cache-miss\"") || !strings.Contains(string(content), "cache-miss mode capped concurrency at 2") || !strings.Contains(string(content), "\"profile_comparisons\"") || !strings.Contains(string(content), "\"corpus_entries\": 2") || !strings.Contains(string(content), "\"corpus_sha256\"") || !strings.Contains(string(content), "\"protocols\"") {
 		t.Fatalf("cache-miss report = %q/%v", content, err)
 	}
 
