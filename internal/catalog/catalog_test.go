@@ -15,9 +15,14 @@ func TestDefaultResolversAreCorrectedAndProfiled(t *testing.T) {
 		t.Fatal(err)
 	}
 	seen := map[string]bool{}
+	addressCount := 0
 	doqCount := 0
 	for _, resolver := range resolvers {
+		if len(resolver.Addresses) != 2 {
+			t.Fatalf("resolver %s addresses = %#v, want IPv4 and IPv6", resolver.ID, resolver.Addresses)
+		}
 		for _, address := range resolver.Addresses {
+			addressCount++
 			if seen[address] {
 				t.Fatalf("duplicate default address %q", address)
 			}
@@ -29,6 +34,9 @@ func TestDefaultResolversAreCorrectedAndProfiled(t *testing.T) {
 	}
 	if seen["8.8.8.4"] {
 		t.Fatal("incorrect Google secondary address is present")
+	}
+	if addressCount != 20 || !seen["2001:4860:4860::8888"] || !seen["2620:fe::10"] || !seen["2606:4700:4700::1112"] || !seen["2a13:1001::86:54:11:100"] {
+		t.Fatalf("bundled IPv6 addresses = %d/%v", addressCount, seen)
 	}
 	if doqCount != 2 {
 		t.Fatalf("DoQ profile count = %d, want Quad9's two profiles", doqCount)
