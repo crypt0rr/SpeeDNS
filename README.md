@@ -359,6 +359,13 @@ For scripts and other tools, use JSON or CSV:
 ./speedns --format json --raw --output result-with-samples.json
 ```
 
+The versioned JSON contract is published as
+[`schema/report-v1.json`](schema/report-v1.json). It describes the current
+`schema_version: 1` output, including optional raw samples, profile
+comparisons, paired effects, divergence details, and warnings. Consumers
+should select their parser and validation rules from the reported schema
+version rather than assuming that table or CSV output has the same shape.
+
 Useful flags include:
 
 ```text
