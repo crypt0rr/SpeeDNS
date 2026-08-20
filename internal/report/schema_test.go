@@ -8,7 +8,10 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/schema"
+	"time"
 )
 
 func TestJSONReportsMatchPublishedSchema(t *testing.T) {
@@ -17,6 +20,12 @@ func TestJSONReportsMatchPublishedSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := completeReport()
+	run.Provenance = &benchmark.RunProvenance{
+		Version: "dev", Commit: "unknown", BuildDate: "unknown", OS: "linux", Architecture: "amd64",
+		Interfaces: []string{"lo"}, Protocols: []catalog.Protocol{catalog.UDP}, CorpusEntries: 1,
+		CorpusSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Timeout:      time.Second, Concurrency: 1,
+	}
 	cases := []struct {
 		name    string
 		write   func(*bytes.Buffer) error

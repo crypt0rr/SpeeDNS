@@ -366,6 +366,15 @@ comparisons, paired effects, divergence details, and warnings. Consumers
 should select their parser and validation rules from the reported schema
 version rather than assuming that table or CSV output has the same shape.
 
+CLI-generated JSON reports also include `run.provenance`. It records the
+SpeeDNS build version, commit, build date, operating system, architecture,
+active interface names, selected protocols, effective timeout and concurrency,
+elapsed duration, and the SHA-256 digest plus entry count of the exact
+normalized domain sequence used by the run. This makes custom-domain and
+cache-miss results auditable without downloading anything at runtime. The
+`--redact-system` option replaces interface names with `redacted` along with
+other local resolver details; CSV output is unchanged.
+
 Useful flags include:
 
 ```text

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
@@ -26,15 +27,31 @@ type JSONReport struct {
 }
 
 type JSONRun struct {
-	StartedAt   string   `json:"started_at"`
-	FinishedAt  string   `json:"finished_at"`
-	Seed        int64    `json:"seed"`
-	CorpusMode  string   `json:"corpus_mode,omitempty"`
-	CorpusZone  string   `json:"corpus_zone,omitempty"`
-	CorpusNonce string   `json:"corpus_nonce,omitempty"`
-	SampleSize  int      `json:"sample_size"`
-	Queries     int      `json:"queries_per_target"`
-	QueryTypes  []uint16 `json:"query_types"`
+	StartedAt   string          `json:"started_at"`
+	FinishedAt  string          `json:"finished_at"`
+	Seed        int64           `json:"seed"`
+	Provenance  *JSONProvenance `json:"provenance,omitempty"`
+	CorpusMode  string          `json:"corpus_mode,omitempty"`
+	CorpusZone  string          `json:"corpus_zone,omitempty"`
+	CorpusNonce string          `json:"corpus_nonce,omitempty"`
+	SampleSize  int             `json:"sample_size"`
+	Queries     int             `json:"queries_per_target"`
+	QueryTypes  []uint16        `json:"query_types"`
+}
+
+type JSONProvenance struct {
+	SpeeDNSVersion string             `json:"speedns_version"`
+	Commit         string             `json:"commit"`
+	BuildDate      string             `json:"build_date"`
+	OS             string             `json:"os"`
+	Architecture   string             `json:"architecture"`
+	Interfaces     []string           `json:"interfaces,omitempty"`
+	Protocols      []catalog.Protocol `json:"protocols"`
+	CorpusEntries  int                `json:"corpus_entries"`
+	CorpusSHA256   string             `json:"corpus_sha256"`
+	TimeoutMS      int64              `json:"timeout_ms"`
+	Concurrency    int                `json:"concurrency"`
+	DurationMS     float64            `json:"duration_ms"`
 }
 
 type JSONProfileComparison struct {
@@ -135,16 +152,44 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 	if options.ProfileView {
 		profileComparisons = profileComparisonsForJSON(report, redactedIDs)
 	}
+	var provenance *JSONProvenance
+	if report.Provenance != nil {
+		interfaces := append([]string(nil), report.Provenance.Interfaces...)
+		if options.RedactSystem && len(interfaces) > 0 {
+			interfaces = []string{redactedValue}
+		}
+		provenance = &JSONProvenance{
+			SpeeDNSVersion: report.Provenance.Version,
+			Commit:         report.Provenance.Commit,
+			BuildDate:      report.Provenance.BuildDate,
+			OS:             report.Provenance.OS,
+			Architecture:   report.Provenance.Architecture,
+			Interfaces:     interfaces,
+			Protocols:      append([]catalog.Protocol(nil), report.Provenance.Protocols...),
+			CorpusEntries:  report.Provenance.CorpusEntries,
+			CorpusSHA256:   report.Provenance.CorpusSHA256,
+			TimeoutMS:      report.Provenance.Timeout.Milliseconds(),
+			Concurrency:    report.Provenance.Concurrency,
+			DurationMS:     durationMilliseconds(report.StartedAt, report.FinishedAt),
+		}
+	}
 	return JSONReport{
 		SchemaVersion: 1,
 		Run: JSONRun{
 			StartedAt: report.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"), FinishedAt: report.FinishedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			Seed: report.Seed, CorpusMode: report.CorpusMode, CorpusZone: report.CorpusZone, CorpusNonce: report.CorpusNonce,
-			SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes,
+			SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes, Provenance: provenance,
 		},
 		Results: results, Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), ProfileComparisons: profileComparisons,
 		Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
 	}
+}
+
+func durationMilliseconds(started, finished time.Time) float64 {
+	if started.IsZero() || finished.Before(started) {
+		return 0
+	}
+	return float64(finished.Sub(started)) / float64(time.Millisecond)
 }
 
 func WriteJSON(writer io.Writer, report benchmark.Report, raw bool) error {
