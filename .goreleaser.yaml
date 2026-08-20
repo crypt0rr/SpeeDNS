@@ -72,6 +72,13 @@ signs:
 
 sboms:
   - artifacts: archive
+    cmd: ../scripts/reproducible-syft.sh
+    args:
+      - $artifact
+      - --output
+      - spdx-json=$document
+      - --enrich
+      - all
     documents:
       - "{{ .ArtifactName }}.sbom.json"
 
