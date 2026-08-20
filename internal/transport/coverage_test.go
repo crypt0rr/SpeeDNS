@@ -401,6 +401,9 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:99999/dns-query"}}, time.Second); err == nil {
 		t.Fatal("invalid DoH URL port unexpectedly succeeded")
 	}
+	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:0/dns-query"}}, time.Second); err == nil {
+		t.Fatal("zero DoH URL port unexpectedly succeeded")
+	}
 	fallback, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second)
 	if err != nil || fallback.(*doHFactory).dialAddr != "dns.example:443" || fallback.(*doHFactory).serverName != "dns.example" {
 		t.Fatalf("DoH fallback factory = %#v/%v", fallback, err)

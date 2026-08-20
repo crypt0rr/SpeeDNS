@@ -255,6 +255,9 @@ func Validate(profiles []ResolverProfile) error {
 						if portErr != nil {
 							return fmt.Errorf("resolver %q has invalid DoH URL port %q: %w", profile.ID, rawPort, portErr)
 						}
+						if port < 1 || port > 65535 {
+							return fmt.Errorf("resolver %q has invalid DoH URL port %q", profile.ID, rawPort)
+						}
 						spec.Port = port
 					}
 				}

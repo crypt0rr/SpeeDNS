@@ -173,6 +173,7 @@ func TestYAMLDoHPortInheritance(t *testing.T) {
 		{name: "explicit URL port", url: "https://dns.example:8443/dns-query", wantPort: 8443},
 		{name: "URL default", url: "https://dns.example/dns-query", wantPort: 443},
 		{name: "explicit profile override", url: "https://dns.example:8443/dns-query", port: "9443", wantPort: 9443},
+		{name: "zero URL port", url: "https://dns.example:0/dns-query", wantErr: true},
 		{name: "invalid URL port", url: "https://dns.example:99999/dns-query", wantErr: true},
 	}
 	for _, test := range tests {
