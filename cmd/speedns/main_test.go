@@ -129,7 +129,7 @@ func TestMainAndCommands(t *testing.T) {
 		t.Fatalf("invalid completion shell error = %v", err)
 	}
 	root := newRootCommand()
-	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Commands() == nil {
+	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Flags().Lookup("assert") == nil || root.Commands() == nil {
 		t.Fatal("root command was not configured")
 	}
 	var runCommand *cobra.Command
@@ -158,6 +158,7 @@ func TestExitCodeForError(t *testing.T) {
 		{name: "success", want: 0},
 		{name: "invalid", err: errors.New("invalid configuration"), want: 2},
 		{name: "no comparable", err: benchmark.ErrNoComparableResults, want: 3},
+		{name: "assertion failed", err: ErrAssertionsFailed, want: 4},
 		{name: "canceled", err: context.Canceled, want: 130},
 		{name: "deadline", err: context.DeadlineExceeded, want: 130},
 	}
@@ -398,6 +399,7 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 		{"concurrency", func(c *cliConfig) { c.concurrency = 0 }},
 		{"protocol", func(c *cliConfig) { c.protocols = "bad" }},
 		{"types", func(c *cliConfig) { c.queryTypes = "ANY" }},
+		{"assertion", func(c *cliConfig) { c.assertions = []string{"bad"} }},
 		{"domains", func(c *cliConfig) { c.domainFile = filepath.Join(t.TempDir(), "missing") }},
 		{"resolver", func(c *cliConfig) { c.resolverFlags = []string{"bad"} }},
 	}
@@ -683,6 +685,25 @@ func TestRunBenchmarkEmitsNoComparableReports(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunBenchmarkEmitsReportBeforeAssertionFailure(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+	config := cliConfigForTest(t)
+	config.assertions = []string{"p95<0.5ms"}
+	config.output = filepath.Join(t.TempDir(), "assertion-failure.json")
+	err := runBenchmark(context.Background(), config)
+	if !errors.Is(err, ErrAssertionsFailed) || !strings.Contains(err.Error(), "p95<0.5ms") {
+		t.Fatalf("assertion error = %v", err)
+	}
+	content, readErr := os.ReadFile(config.output)
+	if readErr != nil || len(content) == 0 || !strings.Contains(string(content), "\"results\"") {
+		t.Fatalf("report was not emitted before assertion failure: %q/%v", content, readErr)
 	}
 }
 

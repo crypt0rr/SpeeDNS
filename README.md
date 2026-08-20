@@ -443,6 +443,7 @@ Useful flags include:
 --no-color          disable terminal colors
 --redact-system     hide local system resolver details in reports
 --profile-view      show same-resolver transport costs and score confidence
+--assert EXPR       enforce a benchmark condition (repeatable)
 ```
 
 In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.
@@ -459,7 +460,29 @@ warnings. The command returns a distinct non-zero status:
 - `0` — comparison completed successfully;
 - `2` — invalid input or configuration;
 - `3` — no comparable DNS results were produced;
+- `4` — a requested benchmark assertion failed;
 - `130` — interrupted by the user or operating system.
+
+### Assertions for automation
+
+Use repeatable `--assert` flags when a benchmark should act as a CI or
+monitoring gate. Numeric assertions are checked for every qualified or
+provisional winner in every protocol that produced a ranking:
+
+```sh
+./speedns --protocol doh --assert 'usable>=0.99' --assert 'p95<50ms'
+./speedns --protocol udp,doh --assert winner=quad9-9999
+```
+
+Supported metrics are `usable` and `success` (rates from `0` to `1`) plus
+`median`, `p95`, and `score` (milliseconds). Bare latency numbers are treated
+as milliseconds; duration suffixes such as `50ms` and `1.5s` are also
+accepted. Operators are `>=`, `>`, `<=`, `<`, and `=`. `winner=` accepts a
+resolver profile ID or a complete target ID. A tied rank-one result satisfies
+the winner assertion. Invalid expressions return status `2`; failed
+assertions return status `4` after the normal report has been written. Status
+`3` for no comparable results and status `130` for interruption take
+precedence.
 
 ## Troubleshooting
 

@@ -181,3 +181,19 @@ score, and deterministic score confidence interval. Missing transport
 combinations are shown as unavailable in the table; profile view is a view of
 the same run, not a new cross-transport ranking and not a replacement for the
 per-protocol score.
+
+## Assertions
+
+The repeatable `--assert` option provides a small automation gate without
+changing JSON or CSV schemas. `usable` and `success` compare rates between 0
+and 1. `median`, `p95`, and `score` compare milliseconds; a bare number means
+milliseconds and Go-style duration suffixes such as `50ms` or `1.5s` are
+accepted. All support `>=`, `>`, `<=`, `<`, and `=`.
+
+Numeric assertions are evaluated against every qualified or provisional
+winner for every protocol that produced a ranking. `winner=PROFILE-ID` or
+`winner=TARGET-ID` requires the requested profile or target to be among the
+rank-one winners for every such protocol. Confidence-interval ties therefore
+count as winner membership. The ordinary report is emitted before an
+assertion failure; invalid expressions return status 2 and failed assertions
+return status 4. No-comparable and interruption statuses retain precedence.
