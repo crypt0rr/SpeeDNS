@@ -103,7 +103,7 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
-          version: '~> v2'
+          version: 'v2.17.1'
           args: release --snapshot --clean --skip=publish --skip=sign
 
       - name: Save reproducibility reference
@@ -114,7 +114,7 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
-          version: '~> v2'
+          version: 'v2.17.1'
           args: release --snapshot --clean --skip=publish --skip=sign
 
       - name: Compare reproducibility artifacts
@@ -129,7 +129,7 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
-          version: '~> v2'
+          version: 'v2.17.1'
           args: release --clean --skip=publish
         env:
           COSIGN_YES: 'true'
