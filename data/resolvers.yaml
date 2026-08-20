@@ -1,0 +1,207 @@
+version: 1
+resolvers:
+  - id: google-8888
+    name: Google Public DNS
+    owner: Google
+    policy: unfiltered
+    addresses:
+      - "8.8.8.8"
+      - "2001:4860:4860::8888"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: dns.google
+        url: https://dns.google/dns-query
+      dot:
+        port: 853
+        server_name: dns.google
+
+  - id: google-8844
+    name: Google Public DNS
+    owner: Google
+    policy: unfiltered
+    addresses:
+      - "8.8.4.4"
+      - "2001:4860:4860::8844"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: dns.google
+        url: https://dns.google/dns-query
+      dot:
+        port: 853
+        server_name: dns.google
+
+  - id: quad9-9999
+    name: Quad9
+    owner: Quad9
+    policy: threat blocking + DNSSEC
+    addresses:
+      - "9.9.9.9"
+      - "2620:fe::fe"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: dns.quad9.net
+        url: https://dns.quad9.net/dns-query
+      dot:
+        port: 853
+        server_name: dns.quad9.net
+      doq:
+        port: 853
+        server_name: dns.quad9.net
+
+  - id: quad9-99910
+    name: Quad9
+    owner: Quad9
+    policy: unfiltered
+    addresses:
+      - "9.9.9.10"
+      - "2620:fe::10"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: dns10.quad9.net
+        url: https://dns10.quad9.net/dns-query
+      dot:
+        port: 853
+        server_name: dns10.quad9.net
+      doq:
+        port: 853
+        server_name: dns10.quad9.net
+
+  - id: cloudflare-1111
+    name: Cloudflare 1.1.1.1
+    owner: Cloudflare
+    policy: unfiltered
+    addresses:
+      - "1.1.1.1"
+      - "2606:4700:4700::1111"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: one.one.one.one
+        url: https://cloudflare-dns.com/dns-query
+      dot:
+        port: 853
+        server_name: one.one.one.one
+
+  - id: cloudflare-1112
+    name: Cloudflare 1.1.1.2
+    owner: Cloudflare
+    policy: malware filtering
+    addresses:
+      - "1.1.1.2"
+      - "2606:4700:4700::1112"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: security.cloudflare-dns.com
+        url: https://security.cloudflare-dns.com/dns-query
+      dot:
+        port: 853
+        server_name: security.cloudflare-dns.com
+
+  - id: dns4eu-111
+    name: DNS4EU
+    owner: DNS4EU / JOINDNS4.eu
+    policy: protective
+    addresses:
+      - "86.54.11.1"
+      - "2a13:1001::86:54:11:1"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: protective.joindns4.eu
+        url: https://protective.joindns4.eu/dns-query
+      dot:
+        port: 853
+        server_name: protective.joindns4.eu
+
+  - id: dns4eu-1112
+    name: DNS4EU
+    owner: DNS4EU / JOINDNS4.eu
+    policy: protective + child protection
+    addresses:
+      - "86.54.11.12"
+      - "2a13:1001::86:54:11:12"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: child.joindns4.eu
+        url: https://child.joindns4.eu/dns-query
+      dot:
+        port: 853
+        server_name: child.joindns4.eu
+
+  - id: dns4eu-1113
+    name: DNS4EU
+    owner: DNS4EU / JOINDNS4.eu
+    policy: protective + ad blocking
+    addresses:
+      - "86.54.11.13"
+      - "2a13:1001::86:54:11:13"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: noads.joindns4.eu
+        url: https://noads.joindns4.eu/dns-query
+      dot:
+        port: 853
+        server_name: noads.joindns4.eu
+
+  - id: dns4eu-11100
+    name: DNS4EU
+    owner: DNS4EU / JOINDNS4.eu
+    policy: unfiltered
+    addresses:
+      - "86.54.11.100"
+      - "2a13:1001::86:54:11:100"
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+      doh:
+        port: 443
+        server_name: unfiltered.joindns4.eu
+        url: https://unfiltered.joindns4.eu/dns-query
+      dot:
+        port: 853
+        server_name: unfiltered.joindns4.eu

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/crypt0rr/SpeeDNS/data"
 	"gopkg.in/yaml.v3"
 )
 
@@ -166,123 +167,16 @@ func (t Target) DisplayName() string {
 	return t.Resolver.Name
 }
 
-// DefaultResolvers returns the focused initial public resolver catalog.
-func DefaultResolvers() []ResolverProfile {
-	return []ResolverProfile{
-		{
-			ID:        "google-8888",
-			Name:      "Google Public DNS",
-			Owner:     "Google",
-			Policy:    "unfiltered",
-			Addresses: []string{"8.8.8.8"},
-			Transports: encryptedTransports(
-				"dns.google", "https://dns.google/dns-query", false,
-			),
-		},
-		{
-			ID:        "google-8844",
-			Name:      "Google Public DNS",
-			Owner:     "Google",
-			Policy:    "unfiltered",
-			Addresses: []string{"8.8.4.4"},
-			Transports: encryptedTransports(
-				"dns.google", "https://dns.google/dns-query", false,
-			),
-		},
-		{
-			ID:        "quad9-9999",
-			Name:      "Quad9",
-			Owner:     "Quad9",
-			Policy:    "threat blocking + DNSSEC",
-			Addresses: []string{"9.9.9.9"},
-			Transports: encryptedTransports(
-				"dns.quad9.net", "https://dns.quad9.net/dns-query", true,
-			),
-		},
-		{
-			ID:        "quad9-99910",
-			Name:      "Quad9",
-			Owner:     "Quad9",
-			Policy:    "unfiltered",
-			Addresses: []string{"9.9.9.10"},
-			Transports: encryptedTransports(
-				"dns10.quad9.net", "https://dns10.quad9.net/dns-query", true,
-			),
-		},
-		{
-			ID:        "cloudflare-1111",
-			Name:      "Cloudflare 1.1.1.1",
-			Owner:     "Cloudflare",
-			Policy:    "unfiltered",
-			Addresses: []string{"1.1.1.1"},
-			Transports: encryptedTransports(
-				"one.one.one.one", "https://cloudflare-dns.com/dns-query", false,
-			),
-		},
-		{
-			ID:        "cloudflare-1112",
-			Name:      "Cloudflare 1.1.1.2",
-			Owner:     "Cloudflare",
-			Policy:    "malware filtering",
-			Addresses: []string{"1.1.1.2"},
-			Transports: encryptedTransports(
-				"security.cloudflare-dns.com", "https://security.cloudflare-dns.com/dns-query", false,
-			),
-		},
-		{
-			ID:        "dns4eu-111",
-			Name:      "DNS4EU",
-			Owner:     "DNS4EU / JOINDNS4.eu",
-			Policy:    "protective",
-			Addresses: []string{"86.54.11.1"},
-			Transports: encryptedTransports(
-				"protective.joindns4.eu", "https://protective.joindns4.eu/dns-query", false,
-			),
-		},
-		{
-			ID:        "dns4eu-1112",
-			Name:      "DNS4EU",
-			Owner:     "DNS4EU / JOINDNS4.eu",
-			Policy:    "protective + child protection",
-			Addresses: []string{"86.54.11.12"},
-			Transports: encryptedTransports(
-				"child.joindns4.eu", "https://child.joindns4.eu/dns-query", false,
-			),
-		},
-		{
-			ID:        "dns4eu-1113",
-			Name:      "DNS4EU",
-			Owner:     "DNS4EU / JOINDNS4.eu",
-			Policy:    "protective + ad blocking",
-			Addresses: []string{"86.54.11.13"},
-			Transports: encryptedTransports(
-				"noads.joindns4.eu", "https://noads.joindns4.eu/dns-query", false,
-			),
-		},
-		{
-			ID:        "dns4eu-11100",
-			Name:      "DNS4EU",
-			Owner:     "DNS4EU / JOINDNS4.eu",
-			Policy:    "unfiltered",
-			Addresses: []string{"86.54.11.100"},
-			Transports: encryptedTransports(
-				"unfiltered.joindns4.eu", "https://unfiltered.joindns4.eu/dns-query", false,
-			),
-		},
-	}
-}
+var defaultResolverCatalog = data.ResolverCatalog
 
-func encryptedTransports(serverName, dohURL string, doq bool) map[Protocol]TransportSpec {
-	transports := map[Protocol]TransportSpec{
-		UDP: {Port: 53},
-		TCP: {Port: 53},
-		DoH: {Port: 443, ServerName: serverName, URL: dohURL},
-		DoT: {Port: 853, ServerName: serverName},
+// DefaultResolvers returns the focused initial public resolver catalog loaded
+// from the embedded, versioned YAML asset.
+func DefaultResolvers() []ResolverProfile {
+	profiles, err := LoadYAML(strings.NewReader(defaultResolverCatalog()))
+	if err != nil {
+		panic(fmt.Sprintf("embedded resolver catalog is invalid: %v", err))
 	}
-	if doq {
-		transports[DoQ] = TransportSpec{Port: 853, ServerName: serverName}
-	}
-	return transports
+	return profiles
 }
 
 // LoadYAML loads a strict versioned resolver profile file.
