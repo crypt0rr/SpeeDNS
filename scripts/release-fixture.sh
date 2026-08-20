@@ -54,6 +54,38 @@ version="0.1.0-fixture"
 make_dist "${fixture_dir}/first" "${version}"
 make_dist "${fixture_dir}/second" "${version}"
 
+fake_bin="${fixture_dir}/fake-bin"
+mkdir -p "${fake_bin}"
+ln -s "${root_dir}/scripts/testdata/fake-gh-release.sh" "${fake_bin}/gh"
+release_state="${fixture_dir}/release-state"
+release_log="${fixture_dir}/release-log"
+printf '%s\n' missing >"${release_state}"
+: >"${release_log}"
+PATH="${fake_bin}:${PATH}" \
+	FAKE_GH_RELEASE_STATE="${release_state}" \
+	FAKE_GH_RELEASE_LOG="${release_log}" \
+	bash "${root_dir}/scripts/ensure-release.sh" "v${version}"
+grep -Fqx 'release view' "${release_log}"
+grep -Fqx 'release create' "${release_log}"
+
+PATH="${fake_bin}:${PATH}" \
+	FAKE_GH_RELEASE_STATE="${release_state}" \
+	FAKE_GH_RELEASE_LOG="${release_log}" \
+	bash "${root_dir}/scripts/ensure-release.sh" "v${version}"
+if [[ "$(grep -Fc 'release create' "${release_log}")" -ne 1 ]]; then
+	echo "draft release was recreated during retry" >&2
+	exit 1
+fi
+
+printf '%s\n' published >"${release_state}"
+if PATH="${fake_bin}:${PATH}" \
+	FAKE_GH_RELEASE_STATE="${release_state}" \
+	FAKE_GH_RELEASE_LOG="${release_log}" \
+	bash "${root_dir}/scripts/ensure-release.sh" "v${version}"; then
+	echo "published release was unexpectedly accepted" >&2
+	exit 1
+fi
+
 bash "${root_dir}/scripts/release-assets.sh" verify "${fixture_dir}/first" \
 	"${fixture_dir}/first/release-assets.txt"
 bash "${root_dir}/scripts/homebrew-cask.sh" "v${version}" "${fixture_dir}/first" \

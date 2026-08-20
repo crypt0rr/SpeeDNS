@@ -167,27 +167,17 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      - name: Create GitHub release draft
+      - name: Ensure GitHub release draft
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          release_args=(
-            --repo "${GITHUB_REPOSITORY}"
-            --verify-tag
-            --draft
-            --title "SpeeDNS ${RELEASE_TAG}"
-          )
-          if [[ "${RELEASE_TAG}" == *-* ]]; then
-            release_args+=(--prerelease)
-          fi
           if [[ -f dist/CHANGELOG.md ]]; then
-            release_args+=(--notes-file dist/CHANGELOG.md)
+            bash scripts/ensure-release.sh "${RELEASE_TAG}" dist/CHANGELOG.md
           else
-            release_args+=(--generate-notes)
+            bash scripts/ensure-release.sh "${RELEASE_TAG}"
           fi
-          gh release create "${RELEASE_TAG}" "${release_args[@]}"
 
       - name: Upload exact release assets
         shell: bash
