@@ -243,6 +243,22 @@ func Validate(profiles []ResolverProfile) error {
 			if !isKnownProtocol(protocol) {
 				return fmt.Errorf("resolver %q has unsupported protocol %q", profile.ID, protocol)
 			}
+			if protocol == DoH {
+				u, err := url.Parse(spec.URL)
+				if err != nil || u.Scheme != "https" || u.Host == "" || u.Path == "" {
+					return fmt.Errorf("resolver %q has invalid DoH URL %q", profile.ID, spec.URL)
+				}
+				if spec.Port == 0 {
+					spec.Port = defaultPort(protocol)
+					if rawPort := u.Port(); rawPort != "" {
+						port, portErr := net.LookupPort("tcp", rawPort)
+						if portErr != nil {
+							return fmt.Errorf("resolver %q has invalid DoH URL port %q: %w", profile.ID, rawPort, portErr)
+						}
+						spec.Port = port
+					}
+				}
+			}
 			if spec.Port == 0 {
 				spec.Port = defaultPort(protocol)
 				profile.Transports[protocol] = spec
@@ -259,12 +275,6 @@ func Validate(profiles []ResolverProfile) error {
 					return fmt.Errorf("resolver %q protocol %q has invalid bootstrap_addresses: %w", profile.ID, protocol, err)
 				}
 				spec.BootstrapAddresses = normalized
-			}
-			if protocol == DoH {
-				u, err := url.Parse(spec.URL)
-				if err != nil || u.Scheme != "https" || u.Host == "" || u.Path == "" {
-					return fmt.Errorf("resolver %q has invalid DoH URL %q", profile.ID, spec.URL)
-				}
 			}
 			if protocol == DoT || protocol == DoQ {
 				if strings.TrimSpace(spec.ServerName) == "" {

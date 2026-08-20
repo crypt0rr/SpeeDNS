@@ -388,6 +388,19 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	if dohFactory.dialAddr != "192.0.2.53:8443" || dohFactory.serverName != "tls.example" {
 		t.Fatalf("DoH factory = %#v", dohFactory)
 	}
+	urlPortFactory, err := newDoHFactory(catalog.Target{
+		Address: "192.0.2.53",
+		Spec:    catalog.TransportSpec{URL: "https://dns.example:9443/dns-query"},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := urlPortFactory.(*doHFactory).dialAddr; got != "192.0.2.53:9443" {
+		t.Fatalf("DoH URL port dial address = %q, want 192.0.2.53:9443", got)
+	}
+	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:99999/dns-query"}}, time.Second); err == nil {
+		t.Fatal("invalid DoH URL port unexpectedly succeeded")
+	}
 	fallback, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second)
 	if err != nil || fallback.(*doHFactory).dialAddr != "dns.example:443" || fallback.(*doHFactory).serverName != "dns.example" {
 		t.Fatalf("DoH fallback factory = %#v/%v", fallback, err)
