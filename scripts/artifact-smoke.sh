@@ -60,6 +60,10 @@ extract_archive() {
 		echo "packaged binary is not executable: ${binary}" >&2
 		exit 1
 	fi
+	if [[ -z "$(find "${destination}" -type f -name speedns.1 -print -quit)" ]]; then
+		echo "${archive} does not contain the speedns.1 man page" >&2
+		exit 1
+	fi
 	printf '%s\n' "${binary}"
 }
 
@@ -94,6 +98,10 @@ check_linux() {
 	binary="${deb_root}/usr/bin/speedns"
 	if [[ ! -f "${binary}" || ! -x "${binary}" ]]; then
 		echo "Debian package does not install executable /usr/bin/speedns" >&2
+		exit 1
+	fi
+	if [[ ! -f "${deb_root}/usr/share/man/man1/speedns.1" ]]; then
+		echo "Debian package does not install /usr/share/man/man1/speedns.1" >&2
 		exit 1
 	fi
 	"${binary}" version | grep -q '^speedns '

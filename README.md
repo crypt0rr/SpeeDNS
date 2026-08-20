@@ -51,6 +51,21 @@ go build -trimpath -ldflags "-s -w" -o speedns ./cmd/speedns
 
 The build is pure Go and has no runtime dependencies.
 
+### Shell completion and the man page
+
+Generate a completion script for your shell:
+
+```sh
+speedns completion bash >speedns.bash
+speedns completion zsh >_speedns
+speedns completion fish >speedns.fish
+speedns completion powershell >speedns.ps1
+```
+
+Release archives include `speedns.1`; Debian packages install it as
+`/usr/share/man/man1/speedns.1`. View it directly from an extracted archive
+with `man ./speedns.1`.
+
 The canonical Go module path is `github.com/crypt0rr/SpeeDNS`. Install the
 latest published command directly with:
 
@@ -94,6 +109,8 @@ Run the default comparison:
 ```sh
 ./speedns
 ```
+
+The explicit equivalent is `./speedns run`.
 
 Run a short, reproducible test against UDP resolvers:
 
