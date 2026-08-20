@@ -51,6 +51,42 @@ go build -trimpath -ldflags "-s -w" -o speedns ./cmd/speedns
 
 The build is pure Go and has no runtime dependencies.
 
+The canonical Go module path is `github.com/crypt0rr/SpeeDNS`. Install the
+latest published command directly with:
+
+```sh
+go install github.com/crypt0rr/SpeeDNS/cmd/speedns@latest
+```
+
+Older releases used `github.com/crypt0rr/dns-speedtest`. GitHub redirects that
+historical path, and existing users can continue to use old release tags while
+migrating imports. New source references and release metadata use the canonical
+`SpeeDNS` path.
+
+### Verify a downloaded release
+
+From the release assets directory, verify the checksums and the keyless
+Sigstore signature on the checksum file:
+
+```sh
+sha256sum -c checksums.txt
+cosign verify-blob checksums.txt \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/crypt0rr/SpeeDNS/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Release archives also carry a GitHub artifact attestation. With the GitHub CLI,
+verify an archive against this repository:
+
+```sh
+gh attestation verify speedns_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS
+```
+
+Replace the archive name with the exact asset you downloaded. The release
+workflow uses the protected `release` environment; maintainers must store
+`HOMEBREW_TAP_TOKEN` there and configure required reviewers before publishing.
+
 ## Quick start
 
 Run the default comparison:
@@ -77,7 +113,20 @@ Inspect the bundled resolver catalog without running a benchmark:
 ./speedns resolvers
 ```
 
+Show a profile-level transport view for the same resolver/address. This is
+useful when comparing the cost of enabling encrypted transports; it includes
+the existing score confidence interval and does not replace per-protocol
+rankings:
+
+```sh
+./speedns --profile-view --protocol udp,tcp,doh,dot,doq --sample 25 --type A
+```
+
 ## How the comparison works
+
+The complete ranking methodology, scoring denominators, confidence intervals,
+interruption behavior, and reproducibility limits are documented in
+[`METHODOLOGY.md`](METHODOLOGY.md).
 
 The default run samples 100 names from an embedded, versioned 1,000-name domain list and queries both A and AAAA records. `--full` uses the complete list. Every resolver eligible for the same transport receives the same names, query types, DNS settings, and randomized order.
 
@@ -94,18 +143,39 @@ REFUSED:
 SpeeDNS keeps three concepts separate: a transport success means that a
 validated DNS message was received, a usable response is a normal `NOERROR`
 (including NODATA) or `NXDOMAIN` result, and a scored sample is a usable result
-that is not divergent from the other resolvers in the same query group.
+that is not divergent from the other resolvers in the same policy group and
+was not obtained immediately after a stream reconnect.
 Responses such as `SERVFAIL`, `REFUSED`, and other resolver errors are shown in
 the results but cannot win latency scoring. This prevents an unhealthy or
 blocked resolver from appearing fast merely because it rejects queries
-quickly.
+quickly. Valid divergent responses and samples immediately following a stream
+reconnect are excluded from the scoring denominator; unusable responses remain
+failure-penalized even if they are divergent. See
+[`METHODOLOGY.md`](METHODOLOGY.md) for the exact rules.
 
 An endpoint is marked `RECOMMENDED` only when it has at least 20 comparable
 samples and at least 99% usable responses. Short runs can show a
 `PROVISIONAL` winner, but use a larger sample or `--full` for a more stable
 comparison.
 
-Resolvers can have different filtering policies. SpeeDNS shows the policy beside each result and excludes materially divergent responses from comparative latency scoring, so a blocking or filtered answer does not automatically win by responding sooner.
+Resolvers can have different filtering policies. SpeeDNS compares response
+classes only within the same declared policy. Within that group, the largest
+plurality is the baseline; an outlier is excluded from comparative latency
+scoring. Equal pluralities are reported as ambiguous and all successful
+observations in that group are excluded rather than receiving an arbitrary
+advantage. The detailed report shows the baseline, class counts, and excluded
+observations. This keeps blocking, filtered, `NXDOMAIN`, `NODATA`, `SERVFAIL`,
+and `REFUSED` behavior explicit without treating unlike policies as identical.
+
+The human-readable report also shows paired latency effects below the protocol
+tables. Within each protocol and policy group, the best-ranked target is the
+reference. The effect is the median per-name/type latency difference
+(`target - reference`) with a deterministic bootstrap 95% confidence interval.
+`NO CLEAR DIFFERENCE` means the interval includes zero, so the measured
+difference is not distinguishable from noise. These comparisons explain the
+ranking but do not replace the existing score or change rank order. JSON
+includes the same information in the additive `paired_effects` section; CSV
+keeps its aggregate schema.
 
 ## Choosing protocols
 
@@ -128,8 +198,8 @@ The available transports are:
 SpeeDNS does not silently fall back from one protocol to another. The table
 shows the complete selected resolver/protocol matrix: an unsupported transport
 is shown as `—`, an unavailable transport is `FAILED`, a transport-valid result
-that cannot qualify is `INELIGIBLE`, and a recommendation-eligible result is
-`QUALIFIED`.
+that cannot qualify is `INELIGIBLE`, an interrupted target is `INCOMPLETE`, and
+a recommendation-eligible result is `QUALIFIED`.
 
 ## Default resolvers
 
@@ -147,7 +217,11 @@ Each address is ranked independently. The owner and filtering policy are shown i
 | 86.54.11.13 | DNS4EU / JOINDNS4.eu | protective + ad blocking | `noads.joindns4.eu` |
 | 86.54.11.100 | DNS4EU / JOINDNS4.eu | unfiltered | `unfiltered.joindns4.eu` |
 
-Dedicated DoQ is currently configured for Quad9. DoH over HTTP/3 is a separate transport and is not mislabeled as DoQ.
+Dedicated DoQ is currently configured for Quad9. SpeeDNS uses TLS 1.3 and
+ALPN `doq`, sends an explicit QUIC keepalive at the configured timeout, and
+reconnects lazily after a connection or idle-timeout failure. The failed query
+is not retried. DoH over HTTP/3 is a separate transport and is not mislabeled
+as DoQ.
 
 ## Custom resolvers
 
@@ -187,6 +261,35 @@ resolvers:
 
 Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order. TLS certificate validation is always enabled.
 
+For a hostname-only custom encrypted endpoint, SpeeDNS uses the operating
+system resolver to find the connection address. To make bootstrap deterministic
+and avoid that lookup, add `bootstrap_addresses` in a YAML profile; these must
+be explicit IPv4 or IPv6 literals and are tried in the order listed. A
+`server_name` value is the explicit TLS identity and may intentionally differ
+from the endpoint address or DoH URL host, for example when testing a CDN
+alias. It changes certificate validation only; it does not change the dial
+candidates. Use `--details`, JSON, or CSV to audit the effective TLS name,
+identity source, bootstrap mode, configured candidates, and selected dial
+address, endpoint URL, effective TLS identity, identity source, and bootstrap
+mode/candidates.
+
+Resolver profile files must contain exactly one YAML document. SpeeDNS rejects
+additional documents instead of silently ignoring them.
+
+## Bundled domain corpus
+
+The default benchmark uses an embedded, pinned 1,000-domain corpus. SpeeDNS
+verifies its entry count, uniqueness, syntax, and SHA-256 checksum locally
+before using it. Show the source and integrity metadata with:
+
+```sh
+./speedns corpus
+```
+
+The corpus is a pinned Tranco snapshot. Its source, list ID, retrieval date,
+checksum, and attribution note are shipped with the program; benchmarking does
+not download or refresh the list.
+
 ## Custom domain lists
 
 Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line.
@@ -196,6 +299,23 @@ Provide one domain per line with `--domains`. Blank lines, comments beginning wi
 ```
 
 A custom list replaces the embedded list for that run. SpeeDNS does not download domain names while benchmarking.
+
+### Opt-in cache-miss mode
+
+For a bounded cache-miss experiment, use the separately documented reserved
+zone mode:
+
+```sh
+./speedns --cache-miss --cache-miss-sample 10 --no-defaults \
+  --resolver lab=udp://192.0.2.53:53 --type A
+```
+
+This generates 1–20 unique labels below the IANA-reserved `example.com` zone,
+caps measured concurrency at two, and records a random nonce in the report.
+It cannot be combined with `--domains` or `--full`. Cache-miss results are
+kept in their own run and ranking population; they are never mixed with the
+normal embedded warm-cache corpus. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
+using the mode, especially for ownership, traffic, and abuse limits.
 
 ## System resolver baseline
 
@@ -207,6 +327,20 @@ Use `--include-system` to include the resolver configured by the operating syste
 
 This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. Separate macOS scopes remain separate targets even when they use the same address.
 
+macOS discovery gives `scutil --dns` a two-second independent timeout. If it
+times out or returns no usable nameservers, SpeeDNS falls back to
+`/etc/resolv.conf`; a canceled run remains canceled. Loopback entries such as
+`127.0.0.53` and `::1` are labeled as local forwarding stubs because their
+ultimate upstream is not known to SpeeDNS. Scoped macOS entries are kept
+separate when the same address appears in more than one resolver block, since
+the scope and interface can change which DNS server answers.
+
+When sharing a report that includes the system resolver, add
+`--redact-system`. It keeps the measurements and rankings but replaces local
+resolver addresses, identifying labels, selected dial addresses, and matching
+error text with redacted values in table, JSON, and CSV output. Redaction is
+opt-in; local diagnostics are shown by default.
+
 System resolvers are tested only over transports discoverable from the operating system configuration, normally UDP and TCP.
 
 ## Output
@@ -214,7 +348,8 @@ System resolvers are tested only over transports discoverable from the operating
 Human-readable table output is the default. It shows both transport success and
 usable-response rates. Use `--details` for cold latency, MAD jitter, scored
 samples, transport failures, resolver-error counts and RCODEs, divergence,
-truncation, and the selected connection address.
+truncation, reconnects, incomplete targets, and the selected connection
+address.
 
 For scripts and other tools, use JSON or CSV:
 
@@ -229,16 +364,25 @@ Useful flags include:
 ```text
 --sample N          number of domains to sample
 --full              test the complete domain list
+--cache-miss        opt in to bounded reserved-zone cache-miss names
+--cache-miss-sample N  number of unique cache-miss names (maximum 20)
 --seed N            reproduce a domain order
 --type A,AAAA       record types to query
 --timeout 2s        per-endpoint timeout
---concurrency 4    maximum concurrent endpoint workers
+--concurrency 4    maximum measured DNS exchanges in flight per protocol
 --format table|json|csv
 --output PATH       write output to a file
 --no-color          disable terminal colors
+--redact-system     hide local system resolver details in reports
+--profile-view      show same-resolver transport costs and score confidence
 ```
 
 In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.
+
+Cache-miss JSON and CSV reports carry the corpus mode, reserved zone, and
+per-run nonce. JSON with `--profile-view` additionally includes
+`profile_comparisons`; the table view renders the same transport metrics and
+confidence intervals below the normal comparisons.
 
 When a benchmark finishes without a comparable result, SpeeDNS still writes the
 diagnostic report so you can inspect endpoint failures, resolver errors, and

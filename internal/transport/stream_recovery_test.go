@@ -100,6 +100,9 @@ func TestStreamSessionReconnectsAfterFatalErrors(t *testing.T) {
 			if opens != 0 {
 				t.Fatalf("failed query was retried through reconnect: opens=%d", opens)
 			}
+			if session.LastQueryReconnected() {
+				t.Fatal("failed initial query was marked as a reconnect")
+			}
 			if got := closeCalls(first); got != 1 {
 				t.Fatalf("failed connection close calls = %d, want 1", got)
 			}
@@ -116,6 +119,9 @@ func TestStreamSessionReconnectsAfterFatalErrors(t *testing.T) {
 			}
 			if opens != 1 {
 				t.Fatalf("reconnect attempts = %d, want 1", opens)
+			}
+			if !session.LastQueryReconnected() {
+				t.Fatal("recovered query did not report a reconnect")
 			}
 			if got := session.DialAddress(); got != "reconnected:853" {
 				t.Fatalf("reconnected dial address = %q", got)
@@ -163,12 +169,18 @@ func TestStreamSessionReconnectFailureCanRecoverLater(t *testing.T) {
 	if opens != 1 {
 		t.Fatalf("reconnect attempts after failed open = %d, want 1", opens)
 	}
+	if !session.LastQueryReconnected() {
+		t.Fatal("reconnect failure did not report a reconnect attempt")
+	}
 	response, err := session.Query(context.Background(), "example.com", dns.TypeA)
 	if err != nil || response == nil {
 		t.Fatalf("later reconnect = %#v/%v", response, err)
 	}
 	if opens != 2 || session.DialAddress() != "later:853" {
 		t.Fatalf("later reconnect state = attempts %d, address %q", opens, session.DialAddress())
+	}
+	if !session.LastQueryReconnected() {
+		t.Fatal("later recovery did not report a reconnect")
 	}
 }
 

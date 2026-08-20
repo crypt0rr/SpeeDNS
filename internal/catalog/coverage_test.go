@@ -28,6 +28,95 @@ func TestProtocolParsingAndTargetFormatting(t *testing.T) {
 	}
 }
 
+func TestEndpointMetadataMakesEncryptedChoicesAuditable(t *testing.T) {
+	tests := []struct {
+		name      string
+		target    Target
+		url       string
+		tlsName   string
+		tlsSource string
+		bootstrap string
+		addresses []string
+	}{
+		{
+			name:      "plain transport",
+			target:    Target{Protocol: UDP, Address: "192.0.2.53"},
+			bootstrap: BootstrapNotApplicable, tlsSource: TLSIdentityNotApplicable,
+		},
+		{
+			name: "matching default",
+			target: Target{Protocol: DoH, Address: "8.8.8.8", Spec: TransportSpec{
+				URL: "https://dns.google/dns-query", ServerName: "dns.google",
+			}},
+			url: "https://dns.google/dns-query", tlsName: "dns.google",
+			tlsSource: TLSIdentityConfigured, bootstrap: BootstrapTarget,
+		},
+		{
+			name: "hostname-only custom endpoint",
+			target: Target{Protocol: DoH, Address: "dns.example", Spec: TransportSpec{
+				URL: "https://dns.example/dns-query",
+			}},
+			url: "https://dns.example/dns-query", tlsName: "dns.example",
+			tlsSource: TLSIdentityURLHost, bootstrap: BootstrapSystem,
+		},
+		{
+			name: "intentional alias with IPv4 and IPv6 bootstrap",
+			target: Target{Protocol: DoH, Address: "192.0.2.53", Spec: TransportSpec{
+				URL: "https://cdn.example/dns-query", ServerName: "resolver.example",
+				BootstrapAddresses: []string{"192.0.2.53", "2001:db8::53"},
+			}},
+			url: "https://cdn.example/dns-query", tlsName: "resolver.example",
+			tlsSource: TLSIdentityConfigured, bootstrap: BootstrapExplicit,
+			addresses: []string{"192.0.2.53", "2001:db8::53"},
+		},
+		{
+			name:    "DoT target identity",
+			target:  Target{Protocol: DoT, Address: "dot.example"},
+			tlsName: "dot.example", tlsSource: TLSIdentityTarget, bootstrap: BootstrapSystem,
+		},
+		{
+			name:    "DoQ configured identity",
+			target:  Target{Protocol: DoQ, Address: "192.0.2.54", Spec: TransportSpec{ServerName: "doq.example"}},
+			tlsName: "doq.example", tlsSource: TLSIdentityConfigured, bootstrap: BootstrapTarget,
+		},
+		{
+			name:   "DoH URL IP fallback",
+			target: Target{Protocol: DoH, Spec: TransportSpec{URL: "https://192.0.2.55/dns-query"}},
+			url:    "https://192.0.2.55/dns-query", tlsName: "192.0.2.55",
+			tlsSource: TLSIdentityURLHost, bootstrap: BootstrapTarget,
+		},
+		{
+			name:   "malformed DoH metadata remains non-networking",
+			target: Target{Protocol: DoH, Spec: TransportSpec{URL: "https://%zz"}},
+			url:    "https://%zz", tlsSource: TLSIdentityNotApplicable, bootstrap: BootstrapSystem,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			metadata := test.target.EndpointMetadata()
+			if metadata.EndpointURL != test.url || metadata.TLSServerName != test.tlsName || metadata.TLSIdentitySource != test.tlsSource || metadata.BootstrapMode != test.bootstrap {
+				t.Fatalf("metadata = %#v", metadata)
+			}
+			if len(metadata.BootstrapAddresses) != len(test.addresses) {
+				t.Fatalf("bootstrap addresses = %#v, want %#v", metadata.BootstrapAddresses, test.addresses)
+			}
+			for index, address := range test.addresses {
+				if metadata.BootstrapAddresses[index] != address {
+					t.Fatalf("bootstrap address %d = %q, want %q", index, metadata.BootstrapAddresses[index], address)
+				}
+			}
+		})
+	}
+
+	target := tests[3].target
+	metadata := target.EndpointMetadata()
+	metadata.BootstrapAddresses[0] = "changed"
+	if target.Spec.BootstrapAddresses[0] == "changed" {
+		t.Fatal("metadata bootstrap addresses alias target configuration")
+	}
+}
+
 func TestLoadYAMLValidationAndDefaults(t *testing.T) {
 	valid := `version: 1
 resolvers:

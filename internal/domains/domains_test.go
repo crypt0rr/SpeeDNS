@@ -1,8 +1,11 @@
 package domains
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/crypt0rr/SpeeDNS/data"
 )
 
 func TestLoadNormalizesCommentsAndDuplicates(t *testing.T) {
@@ -22,6 +25,17 @@ func TestLoadValidatesBundledCorpus(t *testing.T) {
 	}
 	if len(domains) != 1000 {
 		t.Fatalf("bundled corpus count = %d, want 1000", len(domains))
+	}
+}
+
+func TestLoadReportsEmbeddedCorpusVerificationFailure(t *testing.T) {
+	oldVerify := verifyEmbeddedCorpus
+	verifyEmbeddedCorpus = func() (data.CorpusMetadata, error) {
+		return data.CorpusMetadata{}, errors.New("checksum mismatch")
+	}
+	t.Cleanup(func() { verifyEmbeddedCorpus = oldVerify })
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "verify embedded domain corpus") {
+		t.Fatalf("embedded corpus error = %v", err)
 	}
 }
 

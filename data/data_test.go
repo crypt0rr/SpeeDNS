@@ -58,3 +58,96 @@ func TestBundledDomainCorpusChecksum(t *testing.T) {
 		t.Fatalf("metadata SHA-256 = %q, want %q", metadata.SHA256, want)
 	}
 }
+
+func TestVerifyCorpus(t *testing.T) {
+	metadata, err := VerifyCorpus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Entries != 1000 || metadata.ListID == "" || metadata.Source == "" {
+		t.Fatalf("corpus metadata = %#v", metadata)
+	}
+}
+
+func TestVerifyCorpusReportsEmbeddedMetadataErrors(t *testing.T) {
+	oldMetadata := domainsMetadataFile
+	t.Cleanup(func() { domainsMetadataFile = oldMetadata })
+	metadata, err := VerifyCorpus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainsMetadataFile = "not-json"
+	if _, err := VerifyCorpus(); err == nil || !strings.Contains(err.Error(), "parse embedded corpus metadata") {
+		t.Fatalf("malformed metadata error = %v", err)
+	}
+	metadata.Entries++
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domainsMetadataFile = string(encoded)
+	if _, err := VerifyCorpus(); err == nil || !strings.Contains(err.Error(), "entry count") {
+		t.Fatalf("invalid metadata error = %v", err)
+	}
+}
+
+func TestVerifyCorpusRejectsInvalidMetadataOrDomains(t *testing.T) {
+	domains := []string{"example.com", "example.org"}
+	digest := sha256.Sum256([]byte(strings.Join(domains, "\n") + "\n"))
+	metadata := CorpusMetadata{
+		Source:      "fixture",
+		ListID:      "fixture",
+		RetrievedAt: "2026-01-01",
+		Entries:     len(domains),
+		SHA256:      hex.EncodeToString(digest[:]),
+	}
+	if err := verifyCorpus(domains, metadata); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		domains []string
+		change  func(*CorpusMetadata)
+		want    string
+	}{
+		{name: "count", domains: domains, change: func(metadata *CorpusMetadata) { metadata.Entries++ }, want: "entry count"},
+		{name: "duplicate", domains: []string{"example.com", "example.com"}, change: func(metadata *CorpusMetadata) {}, want: "duplicate"},
+		{name: "syntax", domains: []string{"example..com", "example.org"}, change: func(metadata *CorpusMetadata) {}, want: "invalid syntax"},
+		{name: "checksum", domains: domains, change: func(metadata *CorpusMetadata) { metadata.SHA256 = strings.Repeat("0", sha256.Size*2) }, want: "checksum mismatch"},
+		{name: "invalid checksum", domains: domains, change: func(metadata *CorpusMetadata) { metadata.SHA256 = strings.Repeat("z", sha256.Size*2) }, want: "SHA-256"},
+		{name: "metadata", domains: domains, change: func(metadata *CorpusMetadata) { metadata.Source = "" }, want: "missing source"},
+		{name: "empty", domains: nil, change: func(metadata *CorpusMetadata) { metadata.Entries = 0 }, want: "empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := metadata
+			if tc.name == "duplicate" || tc.name == "syntax" {
+				candidate.Entries = len(tc.domains)
+				digest := sha256.Sum256([]byte(strings.Join(tc.domains, "\n") + "\n"))
+				candidate.SHA256 = hex.EncodeToString(digest[:])
+			}
+			tc.change(&candidate)
+			if err := verifyCorpus(tc.domains, candidate); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("verification error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidCorpusDomainRejectsMalformedNames(t *testing.T) {
+	cases := []string{
+		"",
+		strings.Repeat("a", 254),
+		"example.com.",
+		"example..com",
+		"-example.com",
+		"example-.com",
+		strings.Repeat("a", 64) + ".example",
+		"example_com",
+	}
+	for _, domain := range cases {
+		if validCorpusDomain(domain) {
+			t.Errorf("validCorpusDomain(%q) = true, want false", domain)
+		}
+	}
+}

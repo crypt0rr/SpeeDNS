@@ -56,6 +56,23 @@ jobs:
           git diff --exit-code -- go.mod go.sum
           go mod verify
 
+      - name: Verify canonical Go install path
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/speedns-bin"
+          mkdir -p "${install_dir}"
+          GOBIN="${install_dir}" go install github.com/crypt0rr/SpeeDNS/cmd/speedns
+          "${install_dir}/speedns" version
+
+      - name: Test domain corpus updater fixture
+        shell: bash
+        run: bash scripts/update-domains-fixture.sh
+
+      - name: Test live smoke retry fixture
+        shell: bash
+        run: bash scripts/live-smoke-fixture.sh
+
       - name: Run unit and integration tests
         run: go test -count=1 ./...
 
@@ -135,6 +152,10 @@ jobs:
 
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+
+      - name: Test release scripts fixture
+        shell: bash
+        run: bash scripts/release-fixture.sh
 
       - name: Build GoReleaser snapshot
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7

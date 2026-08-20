@@ -7,17 +7,30 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/benchmark"
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/data"
+	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 )
 
 type cliErrorWriter struct{}
 
 func (cliErrorWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+type fakeOutputFile struct {
+	bytes.Buffer
+	name     string
+	syncErr  error
+	closeErr error
+}
+
+func (f *fakeOutputFile) Sync() error  { return f.syncErr }
+func (f *fakeOutputFile) Close() error { return f.closeErr }
+func (f *fakeOutputFile) Name() string { return f.name }
 
 func cliDomainFile(t *testing.T) string {
 	t.Helper()
@@ -73,8 +86,21 @@ func TestMainAndCommands(t *testing.T) {
 	if err := resolversCommand.Execute(); err != nil || !strings.Contains(resolverOutput.String(), "Google") || !strings.Contains(resolverOutput.String(), "doq") {
 		t.Fatalf("resolvers command = %v/%q", err, resolverOutput.String())
 	}
+	corpusCommand := newCorpusCommand()
+	var corpusOutput bytes.Buffer
+	corpusCommand.SetOut(&corpusOutput)
+	corpusCommand.SetArgs(nil)
+	if err := corpusCommand.Execute(); err != nil || !strings.Contains(corpusOutput.String(), "List ID:") || !strings.Contains(corpusOutput.String(), "Entries: 1000") || !strings.Contains(corpusOutput.String(), "SHA-256:") {
+		t.Fatalf("corpus command = %v/%q", err, corpusOutput.String())
+	}
+	oldVerifyCorpus := verifyCorpusFunc
+	verifyCorpusFunc = func() (data.CorpusMetadata, error) { return data.CorpusMetadata{}, errors.New("corpus fixture failed") }
+	t.Cleanup(func() { verifyCorpusFunc = oldVerifyCorpus })
+	if err := newCorpusCommand().Execute(); err == nil || !strings.Contains(err.Error(), "corpus fixture failed") {
+		t.Fatalf("corpus command error = %v", err)
+	}
 	root := newRootCommand()
-	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Commands() == nil {
+	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Commands() == nil {
 		t.Fatal("root command was not configured")
 	}
 }
@@ -121,22 +147,26 @@ func TestCLIParsersAndOutputHelpers(t *testing.T) {
 	}
 
 	for _, path := range []string{"", " ", "-"} {
-		writer, closeWriter, err := outputWriter(path)
+		writer, finalize, err := outputWriter(path)
 		if err != nil || writer != os.Stdout {
 			t.Fatalf("stdout writer for %q = %#v/%v", path, writer, err)
 		}
-		closeWriter()
+		if err := finalize(true); err != nil {
+			t.Fatalf("stdout finalize for %q = %v", path, err)
+		}
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "output.txt")
-	writer, closeWriter, err := outputWriter(path)
+	writer, finalize, err := outputWriter(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := io.WriteString(writer, "hello"); err != nil {
 		t.Fatal(err)
 	}
-	closeWriter()
+	if err := finalize(true); err != nil {
+		t.Fatal(err)
+	}
 	content, err := os.ReadFile(path)
 	if err != nil || string(content) != "hello" {
 		t.Fatalf("file output = %q/%v", content, err)
@@ -144,13 +174,43 @@ func TestCLIParsersAndOutputHelpers(t *testing.T) {
 	if _, _, err := outputWriter(dir); err == nil {
 		t.Fatal("expected output directory creation error")
 	}
+	oldPath := filepath.Join(dir, "old.txt")
+	if err := os.WriteFile(oldPath, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writer, finalize, err = outputWriter(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(writer, "discarded"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(false); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(oldPath)
+	if err != nil || string(content) != "keep" {
+		t.Fatalf("discarded output changed destination = %q/%v", content, err)
+	}
 	values := []string{"z", "a", "a", "m"}
-	sortStrings(values)
+	sort.Strings(values)
 	if strings.Join(values, ",") != "a,a,m,z" {
 		t.Fatalf("sorted values = %#v", values)
 	}
 	values = nil
-	sortStrings(values)
+	sort.Strings(values)
+}
+
+func TestDisplayWidthUsesTerminalCells(t *testing.T) {
+	if got := displayWidth("ascii"); got != 5 {
+		t.Fatalf("ASCII display width = %d", got)
+	}
+	if got := displayWidth("e\u0301"); got != 1 {
+		t.Fatalf("combining display width = %d", got)
+	}
+	if got := displayWidth("東京"); got != 4 {
+		t.Fatalf("wide display width = %d", got)
+	}
 }
 
 func TestProgressRendererHandlesConcurrentCompletionStyles(t *testing.T) {
@@ -268,6 +328,7 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 		apply func(*cliConfig)
 	}{
 		{"format", func(c *cliConfig) { c.format = "xml" }},
+		{"profile csv", func(c *cliConfig) { c.format = "csv"; c.profileView = true }},
 		{"sample", func(c *cliConfig) { c.sample = 0 }},
 		{"timeout", func(c *cliConfig) { c.timeout = 0 }},
 		{"concurrency", func(c *cliConfig) { c.concurrency = 0 }},
@@ -311,14 +372,65 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 	}
 }
 
+func TestRunBenchmarkCacheMissSafetyAndMetadata(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldNonce := newCacheMissNonceFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		newCacheMissNonceFunc = oldNonce
+	})
+	var captured benchmark.Options
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		captured = options
+		return fakeCLIReport(), nil
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+	config := &cliConfig{
+		protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true,
+		cacheMiss: true, cacheMissSample: 2, sample: 100, seed: 7, queryTypes: "A", timeout: time.Second,
+		concurrency: 4, format: "json", profileView: true, output: filepath.Join(t.TempDir(), "cache.json"),
+	}
+	if err := runBenchmark(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured.Domains) != 2 || !strings.HasPrefix(captured.Domains[0], "speedns-0123456789abcdef-") || captured.Concurrency != 2 {
+		t.Fatalf("cache-miss engine options = %#v", captured)
+	}
+	content, err := os.ReadFile(config.output)
+	if err != nil || !strings.Contains(string(content), "\"corpus_mode\": \"cache-miss\"") || !strings.Contains(string(content), "cache-miss mode capped concurrency at 2") || !strings.Contains(string(content), "\"profile_comparisons\"") {
+		t.Fatalf("cache-miss report = %q/%v", content, err)
+	}
+
+	config.domainFile = cliDomainFile(t)
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "cannot be combined with --domains") {
+		t.Fatalf("cache-miss domain combination error = %v", err)
+	}
+	config.domainFile = ""
+	config.full = true
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "cannot be combined with --full") {
+		t.Fatalf("cache-miss full combination error = %v", err)
+	}
+	config.full = false
+	config.cacheMissSample = 0
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "cache-miss sample") {
+		t.Fatalf("cache-miss sample error = %v", err)
+	}
+	config.cacheMissSample = 2
+	newCacheMissNonceFunc = func() (string, error) { return "", errors.New("nonce fixture failed") }
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "nonce fixture failed") {
+		t.Fatalf("cache-miss nonce error = %v", err)
+	}
+}
+
 func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 	oldEngine := runBenchmarkEngine
 	oldLoad := loadProfilesFunc
-	oldTable, oldJSON, oldCSV := writeTableReport, writeJSONReport, writeCSVReport
+	oldTable, oldJSON, oldCSV, oldOutputWriter := writeTableReport, writeJSONReport, writeCSVReport, outputWriterFunc
 	t.Cleanup(func() {
 		runBenchmarkEngine = oldEngine
 		loadProfilesFunc = oldLoad
 		writeTableReport, writeJSONReport, writeCSVReport = oldTable, oldJSON, oldCSV
+		outputWriterFunc = oldOutputWriter
 	})
 	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
 		if options.OnProgress != nil && len(targets) > 0 {
@@ -332,6 +444,7 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 		config.output = filepath.Join(t.TempDir(), format+".out")
 		config.details = format == "table"
 		config.raw = format == "JSON"
+		config.redactSystem = format != "table"
 		if format == "table" {
 			config.seed = 0
 		}
@@ -355,6 +468,18 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 		t.Fatalf("report writer error = %v", err)
 	}
 	writeJSONReport = oldJSON
+	outputWriterFunc = func(string) (io.Writer, outputFinalizer, error) {
+		return io.Discard, func(bool) error { return errors.New("finalize failed") }, nil
+	}
+	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "finalize failed") {
+		t.Fatalf("finalizer error = %v", err)
+	}
+	writeJSONReport = func(io.Writer, benchmark.Report, bool) error { return errors.New("report write failed") }
+	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "report write failed") || !strings.Contains(err.Error(), "finalize failed") {
+		t.Fatalf("combined report/finalizer error = %v", err)
+	}
+	writeJSONReport = oldJSON
+	outputWriterFunc = oldOutputWriter
 
 	for _, runErr := range []error{context.Canceled, context.DeadlineExceeded} {
 		runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
@@ -377,6 +502,86 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 	}
 	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "engine failed") {
 		t.Fatalf("non-context engine error = %v", err)
+	}
+}
+
+func TestOutputWriterErrorPaths(t *testing.T) {
+	oldStat := statOutputPath
+	oldCreate := createTempOutputFile
+	oldRemove := removeOutputFile
+	oldRename := renameOutputFile
+	t.Cleanup(func() {
+		statOutputPath = oldStat
+		createTempOutputFile = oldCreate
+		removeOutputFile = oldRemove
+		renameOutputFile = oldRename
+	})
+
+	statOutputPath = func(string) (os.FileInfo, error) { return nil, errors.New("stat failed") }
+	if _, _, err := outputWriter("stat-target"); err == nil || !strings.Contains(err.Error(), "stat failed") {
+		t.Fatalf("stat output error = %v", err)
+	}
+	statOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	createTempOutputFile = func(string, string) (outputFileHandle, error) { return nil, errors.New("create failed") }
+	if _, _, err := outputWriter("create-target"); err == nil || !strings.Contains(err.Error(), "create failed") {
+		t.Fatalf("create output error = %v", err)
+	}
+
+	newFile := func() *fakeOutputFile { return &fakeOutputFile{name: "temporary"} }
+	createTempOutputFile = func(string, string) (outputFileHandle, error) { return newFile(), nil }
+	removeOutputFile = func(string) error { return nil }
+	renameOutputFile = func(string, string) error { return nil }
+	file := &fakeOutputFile{name: "discard-close", closeErr: errors.New("close failed")}
+	createTempOutputFile = func(string, string) (outputFileHandle, error) { return file, nil }
+	writer, finalize, err := outputWriter("discard-close-target")
+	if err != nil || writer != file {
+		t.Fatalf("discard-close writer = %#v/%v", writer, err)
+	}
+	if err := finalize(false); err == nil || !strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("discard close error = %v", err)
+	}
+
+	file = &fakeOutputFile{name: "discard-remove"}
+	createTempOutputFile = func(string, string) (outputFileHandle, error) { return file, nil }
+	removeOutputFile = func(string) error { return errors.New("remove failed") }
+	_, finalize, err = outputWriter("discard-remove-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(false); err == nil || !strings.Contains(err.Error(), "remove failed") {
+		t.Fatalf("discard remove error = %v", err)
+	}
+
+	removeOutputFile = func(string) error { return nil }
+	file = &fakeOutputFile{name: "sync-fail", syncErr: errors.New("sync failed")}
+	createTempOutputFile = func(string, string) (outputFileHandle, error) { return file, nil }
+	_, finalize, err = outputWriter("sync-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err == nil || !strings.Contains(err.Error(), "sync failed") {
+		t.Fatalf("sync error = %v", err)
+	}
+
+	file = &fakeOutputFile{name: "close-fail", closeErr: errors.New("close failed")}
+	createTempOutputFile = func(string, string) (outputFileHandle, error) { return file, nil }
+	_, finalize, err = outputWriter("close-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err == nil || !strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("commit close error = %v", err)
+	}
+
+	file = &fakeOutputFile{name: "rename-fail"}
+	createTempOutputFile = func(string, string) (outputFileHandle, error) { return file, nil }
+	renameOutputFile = func(string, string) error { return errors.New("rename failed") }
+	_, finalize, err = outputWriter("rename-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err == nil || !strings.Contains(err.Error(), "rename failed") {
+		t.Fatalf("rename error = %v", err)
 	}
 }
 

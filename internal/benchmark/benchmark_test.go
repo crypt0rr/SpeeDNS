@@ -1,11 +1,13 @@
 package benchmark
 
 import (
+	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/miekg/dns"
 )
 
@@ -138,5 +140,133 @@ func TestRecommendationRequiresUsableResponses(t *testing.T) {
 	}})
 	if len(warnings) != 2 || !strings.Contains(strings.Join(warnings, "\n"), "SERVFAIL:1") {
 		t.Fatalf("resolver-error warnings = %#v", warnings)
+	}
+}
+
+func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
+	observation := func(name string, latency float64) Observation {
+		return Observation{Name: name, QType: dns.TypeA, Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: latency}
+	}
+	reference := testTarget(catalog.UDP, "reference")
+	slower := testTarget(catalog.UDP, "slower")
+	noise := testTarget(catalog.UDP, "noise")
+	protective := testTarget(catalog.UDP, "protective")
+	protective.Resolver.Policy = " Protective "
+	missing := testTarget(catalog.UDP, "missing")
+	unscored := testTarget(catalog.UDP, "unscored")
+	incomplete := testTarget(catalog.UDP, "incomplete")
+	emptyReference := testTarget(catalog.TCP, "empty-reference")
+
+	referenceResult := TargetResult{
+		Target: reference,
+		Stats:  Statistics{Scored: 2, ScoreMS: 1},
+		Observations: []Observation{
+			observation("A.Example.", 10), observation("b.example", 20),
+			observation("a.example", 99),
+			{Success: false, Name: "failed.example", QType: dns.TypeA},
+			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: math.NaN()},
+			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: math.Inf(1)},
+			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: -1},
+		},
+	}
+	slowerResult := TargetResult{
+		Target: slower, Stats: Statistics{Scored: 2, ScoreMS: 2},
+		Observations: []Observation{observation("a.example", 12), observation("B.EXAMPLE.", 25),
+			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: 50, Divergent: true},
+			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: 50, Reconnected: true}},
+	}
+	noiseResult := TargetResult{
+		Target: noise, Stats: Statistics{Scored: 2, ScoreMS: 3},
+		Observations: []Observation{observation("a.example", 9), observation("b.example", 21)},
+	}
+	protectiveResult := TargetResult{
+		Target: protective, Stats: Statistics{Scored: 1, ScoreMS: 4},
+		Observations: []Observation{observation("a.example", 30)},
+	}
+	missingResult := TargetResult{
+		Target: missing, Stats: Statistics{Scored: 1, ScoreMS: 5},
+		Observations: []Observation{observation("other.example", 40)},
+	}
+	results := []TargetResult{
+		referenceResult, slowerResult, noiseResult, protectiveResult, missingResult,
+		{Target: unscored}, {Target: incomplete, Incomplete: true, Stats: Statistics{Scored: 1, ScoreMS: 0.5}},
+		{Target: emptyReference, Stats: Statistics{Scored: 1, ScoreMS: 6}},
+	}
+	rankings := []Ranking{
+		{Protocol: catalog.UDP, TargetID: reference.ID(), Rank: 1},
+		{Protocol: catalog.UDP, TargetID: slower.ID(), Rank: 2},
+		{Protocol: catalog.UDP, TargetID: noise.ID(), Rank: 3},
+		{Protocol: catalog.UDP, TargetID: protective.ID(), Rank: 4},
+	}
+	first := calculatePairedEffects(results, rankings, 42)
+	second := calculatePairedEffects(results, rankings, 42)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("paired effects are not deterministic:\nfirst=%#v\nsecond=%#v", first, second)
+	}
+	find := func(id string) PairedEffect {
+		for _, effect := range first {
+			if effect.TargetID == id {
+				return effect
+			}
+		}
+		t.Fatalf("missing paired effect for %s: %#v", id, first)
+		return PairedEffect{}
+	}
+	refEffect := find(reference.ID())
+	if !refEffect.Reference || refEffect.ReferenceTargetID != reference.ID() || refEffect.Samples != 2 || refEffect.Reason != "" {
+		t.Fatalf("reference effect = %#v", refEffect)
+	}
+	slowEffect := find(slower.ID())
+	if slowEffect.Samples != 2 || slowEffect.MedianDeltaMS != 3.5 || slowEffect.Indistinguishable {
+		t.Fatalf("slower effect = %#v", slowEffect)
+	}
+	noiseEffect := find(noise.ID())
+	if noiseEffect.Samples != 2 || !noiseEffect.Indistinguishable || noiseEffect.CILowMS > 0 || noiseEffect.CIHighMS < 0 {
+		t.Fatalf("noise effect = %#v", noiseEffect)
+	}
+	protectiveEffect := find(protective.ID())
+	if !protectiveEffect.Reference || protectiveEffect.Policy != "protective" || protectiveEffect.Samples != 1 {
+		t.Fatalf("policy-local effect = %#v", protectiveEffect)
+	}
+	missingEffect := find(missing.ID())
+	if missingEffect.Samples != 0 || missingEffect.Reason != "no shared scored samples" {
+		t.Fatalf("missing-pair effect = %#v", missingEffect)
+	}
+	if len(first) != 6 {
+		t.Fatalf("paired effect count = %d, want 6", len(first))
+	}
+	emptyEffect := find(emptyReference.ID())
+	if !emptyEffect.Reference || emptyEffect.Samples != 0 || emptyEffect.Reason != "no scored samples" {
+		t.Fatalf("empty reference effect = %#v", emptyEffect)
+	}
+
+	fallbackA := testTarget(catalog.TCP, "fallback-a")
+	fallbackB := testTarget(catalog.TCP, "fallback-b")
+	fallback := calculatePairedEffects([]TargetResult{
+		{Target: fallbackB, Stats: Statistics{Scored: 1, ScoreMS: 2}, Observations: []Observation{observation("a.example", 2)}},
+		{Target: fallbackA, Stats: Statistics{Scored: 1, ScoreMS: 1}, Observations: []Observation{observation("a.example", 1)}},
+	}, nil, 42)
+	if len(fallback) != 2 || fallback[0].ReferenceTargetID != fallbackA.ID() {
+		t.Fatalf("unranked fallback reference = %#v", fallback)
+	}
+	equalFallback := calculatePairedEffects([]TargetResult{
+		{Target: fallbackB, Stats: Statistics{Scored: 1, ScoreMS: 1}, Observations: []Observation{observation("a.example", 2)}},
+		{Target: fallbackA, Stats: Statistics{Scored: 1, ScoreMS: 1}, Observations: []Observation{observation("a.example", 1)}},
+	}, nil, 42)
+	if len(equalFallback) != 2 || equalFallback[0].ReferenceTargetID != fallbackA.ID() {
+		t.Fatalf("equal unranked fallback reference = %#v", equalFallback)
+	}
+
+	if low, high := bootstrapPairedCI(nil, 1); low != 0 || high != 0 {
+		t.Fatalf("empty paired interval = %v/%v", low, high)
+	}
+	if low, high := bootstrapPairedCI([]float64{2}, 1); low != 2 || high != 2 {
+		t.Fatalf("single paired interval = %v/%v", low, high)
+	}
+	if low, high := bootstrapPairedCI([]float64{1, 3}, 1); low > high {
+		t.Fatalf("paired interval inverted = %v/%v", low, high)
+	}
+	if pairedBootstrapSeed(1, catalog.UDP, "unfiltered", "a", "b") == pairedBootstrapSeed(1, catalog.UDP, "unfiltered", "a", "c") {
+		t.Fatal("paired bootstrap seed ignored target identity")
 	}
 }

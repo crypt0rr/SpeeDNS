@@ -14,12 +14,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 )
@@ -63,34 +62,6 @@ func TestDialPlanDefensiveBranches(t *testing.T) {
 	if boundedContext == nil {
 		t.Fatal("bounded context is nil")
 	}
-	canceledContext, canceled := context.WithCancel(context.Background())
-	canceled()
-	if _, err := (dialPlan{addresses: []string{"127.0.0.1:1"}, timeout: time.Second}).dialTCP(canceledContext, "tcp", nil); err == nil {
-		t.Fatal("expected canceled TCP dial error")
-	}
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			accepted <- nil
-			return
-		}
-		accepted <- conn
-	}()
-	conn, err := (dialPlan{addresses: []string{listener.Addr().String()}, timeout: time.Second}).dialTCP(context.Background(), "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = conn.Close()
-	if serverConn := <-accepted; serverConn != nil {
-		_ = serverConn.Close()
-	}
-	_ = listener.Close()
 }
 
 func TestOpenStreamStopsAfterCanceledCandidate(t *testing.T) {
@@ -123,6 +94,124 @@ func TestOpenStreamReportsTLSHandshakeTimeout(t *testing.T) {
 	}
 	if conn := <-accepted; conn != nil {
 		_ = conn.Close()
+	}
+}
+
+func TestOpenStreamStopsAfterCanceledTLSCandidate(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- conn
+		cancel()
+	}()
+
+	plan := dialPlan{addresses: []string{listener.Addr().String(), "127.0.0.1:1"}, timeout: time.Second}
+	if _, _, err := plan.openStream(ctx, &tls.Config{InsecureSkipVerify: true}); err == nil {
+		t.Fatal("expected canceled TLS handshake error")
+	}
+	if conn := <-accepted; conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func TestOpenStreamStopsAfterTLSContextExpires(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- conn
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	plan := dialPlan{addresses: []string{listener.Addr().String()}, timeout: time.Second}
+	if _, _, err := plan.openStream(ctx, &tls.Config{InsecureSkipVerify: true}); err == nil {
+		t.Fatal("expected TLS context expiry")
+	}
+	if conn := <-accepted; conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func TestOpenStreamRetriesAfterCandidateTimeout(t *testing.T) {
+	const serverName = "dns.example"
+	certificate, roots := testServerCertificate(t, serverName)
+
+	firstListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstListener.Close()
+	firstAccepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := firstListener.Accept()
+		if acceptErr != nil {
+			firstAccepted <- nil
+			return
+		}
+		firstAccepted <- conn
+	}()
+
+	secondListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsListener := tls.NewListener(secondListener, &tls.Config{Certificates: []tls.Certificate{certificate}})
+	defer tlsListener.Close()
+	secondResult := make(chan error, 1)
+	go func() {
+		conn, acceptErr := tlsListener.Accept()
+		if acceptErr != nil {
+			secondResult <- acceptErr
+			return
+		}
+		tlsConn := conn.(*tls.Conn)
+		handshakeErr := tlsConn.Handshake()
+		_ = conn.Close()
+		secondResult <- handshakeErr
+	}()
+
+	plan := dialPlan{
+		addresses: []string{firstListener.Addr().String(), secondListener.Addr().String()},
+		timeout:   100 * time.Millisecond,
+	}
+	conn, address, err := plan.openStream(context.Background(), &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: serverName,
+		RootCAs:    roots,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if address != secondListener.Addr().String() {
+		t.Fatalf("selected address = %q, want %q", address, secondListener.Addr().String())
+	}
+	_ = conn.Close()
+
+	if firstConn := <-firstAccepted; firstConn != nil {
+		_ = firstConn.Close()
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second candidate TLS handshake = %v", err)
 	}
 }
 
@@ -182,18 +271,7 @@ func TestStreamFactoryFallsBackToNextCandidate(t *testing.T) {
 }
 
 func TestDoHFactoryUsesBootstrapCandidates(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	closedListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	closedAddress := closedListener.Addr().String()
-	_ = closedListener.Close()
-	port := listener.Addr().(*net.TCPAddr).Port
+	const port = 443
 	factory, err := newDoHFactory(catalog.Target{
 		Address: "192.0.2.53",
 		Spec: catalog.TransportSpec{
@@ -207,27 +285,18 @@ func TestDoHFactoryUsesBootstrapCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	dohFactory := factory.(*doHFactory)
-	if got := dohFactory.connectionPlan.addresses; len(got) != 2 || got[0] != net.JoinHostPort("127.0.0.2", strconv.Itoa(port)) || got[1] != listener.Addr().String() {
+	if got := dohFactory.connectionPlan.addresses; len(got) != 2 || got[0] != "127.0.0.2:443" || got[1] != "127.0.0.1:443" {
 		t.Fatalf("DoH bootstrap plan = %#v", got)
 	}
-	// Use a locally allocated and then closed port for the first candidate. A
-	// non-local loopback address can blackhole on some runners instead of
-	// failing promptly, which prevents the second candidate from being tried.
-	dohFactory.connectionPlan = dialPlan{addresses: []string{closedAddress, listener.Addr().String()}, timeout: time.Second}
 	session, err := dohFactory.Open(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer session.Close()
 	transport := session.(*doHSession).client.Transport.(*http.Transport)
-	conn, err := transport.DialContext(context.Background(), "", "ignored")
-	if err != nil {
-		t.Fatal(err)
+	if transport.MaxResponseHeaderBytes != doHMaxResponseHeaderBytes {
+		t.Fatalf("DoH response header limit = %d, want %d", transport.MaxResponseHeaderBytes, doHMaxResponseHeaderBytes)
 	}
-	if got := session.(*doHSession).DialAddress(); got != listener.Addr().String() {
-		t.Fatalf("DoH selected dial address = %q, want %q", got, listener.Addr().String())
-	}
-	_ = conn.Close()
 }
 
 func TestDoHQueryUsesBootstrapIPWithHostnameTLSIdentity(t *testing.T) {
@@ -433,6 +502,37 @@ func TestDoQFactoryStopsWhenOpenContextExpires(t *testing.T) {
 	if called != 1 {
 		t.Fatalf("expired DoQ candidates attempted = %d, want 1", called)
 	}
+}
+
+func TestDoQFactoryRetriesAfterCandidateTimeout(t *testing.T) {
+	oldDial := dialDoQ
+	t.Cleanup(func() { dialDoQ = oldDial })
+	_, fakeConn := newFakeDoQStream()
+	addresses := make([]string, 0, 2)
+	dialDoQ = func(ctx context.Context, address string, _ *tls.Config, _ *quic.Config) (doqConn, error) {
+		addresses = append(addresses, address)
+		if len(addresses) == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return fakeConn, nil
+	}
+	factory := &doqFactory{
+		connectionPlan: dialPlan{addresses: []string{"192.0.2.1:853", "192.0.2.2:853"}, timeout: 20 * time.Millisecond},
+		timeout:        20 * time.Millisecond,
+		tlsConfig:      &tls.Config{NextProtos: []string{"doq"}},
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := session.(*doqSession).DialAddress(); got != "192.0.2.2:853" {
+		t.Fatalf("DoQ selected address = %q", got)
+	}
+	if strings.Join(addresses, ",") != "192.0.2.1:853,192.0.2.2:853" {
+		t.Fatalf("DoQ dial order = %#v", addresses)
+	}
+	_ = session.Close()
 }
 
 func TestDoHRedirectRequiresHTTPSOrigin(t *testing.T) {

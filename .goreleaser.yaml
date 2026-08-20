@@ -1,4 +1,5 @@
 version: 2
+project_name: SpeeDNS
 
 before:
   hooks:
@@ -10,6 +11,9 @@ builds:
     binary: speedns
     env:
       - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
     goos:
       - darwin
       - linux
@@ -18,9 +22,10 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/crypt0rr/dns-speedtest/internal/version.Version={{.Version}}
-      - -X github.com/crypt0rr/dns-speedtest/internal/version.Commit={{.Commit}}
-      - -X github.com/crypt0rr/dns-speedtest/internal/version.Date={{.Date}}
+      - -buildid=
+      - -X github.com/crypt0rr/SpeeDNS/internal/version.Version={{.Version}}
+      - -X github.com/crypt0rr/SpeeDNS/internal/version.Commit={{.Commit}}
+      - -X github.com/crypt0rr/SpeeDNS/internal/version.Date={{.CommitDate}}
 
 archives:
   - formats: [tar.gz]
@@ -30,12 +35,13 @@ nfpms:
   - id: deb
     package_name: speedns
     vendor: SpeeDNS contributors
-    homepage: https://github.com/crypt0rr/dns-speedtest
+    homepage: https://github.com/crypt0rr/SpeeDNS
     maintainer: SpeeDNS contributors
     description: Cross-platform DNS transport speed test CLI
     license: MIT
     formats: [deb]
     bindir: /usr/bin
+    mtime: "{{ .CommitDate }}"
 
 homebrew_casks:
   - repository:
@@ -43,13 +49,13 @@ homebrew_casks:
       name: homebrew-speedns
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     name: speedns
-    homepage: https://github.com/crypt0rr/dns-speedtest
+    homepage: https://github.com/crypt0rr/SpeeDNS
     description: Cross-platform DNS transport speed test CLI
     license: MIT
     binaries:
       - speedns
     url:
-      verified: github.com/crypt0rr/dns-speedtest/releases/download
+      verified: github.com/crypt0rr/SpeeDNS/releases/download
 
 checksum:
   name_template: checksums.txt
@@ -68,6 +74,9 @@ sboms:
   - artifacts: archive
     documents:
       - "{{ .ArtifactName }}.sbom.json"
+
+metadata:
+  mod_timestamp: "{{ .CommitTimestamp }}"
 
 release:
   draft: true

@@ -10,42 +10,79 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/crypt0rr/dns-speedtest/internal/benchmark"
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 )
 
 type JSONReport struct {
-	SchemaVersion int                 `json:"schema_version"`
-	Run           JSONRun             `json:"run"`
-	Results       []JSONResult        `json:"results"`
-	Rankings      []benchmark.Ranking `json:"rankings"`
-	Warnings      []string            `json:"warnings,omitempty"`
+	SchemaVersion      int                          `json:"schema_version"`
+	Run                JSONRun                      `json:"run"`
+	Results            []JSONResult                 `json:"results"`
+	Rankings           []benchmark.Ranking          `json:"rankings"`
+	PairedEffects      []benchmark.PairedEffect     `json:"paired_effects,omitempty"`
+	ProfileComparisons []JSONProfileComparison      `json:"profile_comparisons,omitempty"`
+	Divergence         []benchmark.DivergenceDetail `json:"divergence,omitempty"`
+	Warnings           []string                     `json:"warnings,omitempty"`
 }
 
 type JSONRun struct {
-	StartedAt  string   `json:"started_at"`
-	FinishedAt string   `json:"finished_at"`
-	Seed       int64    `json:"seed"`
-	SampleSize int      `json:"sample_size"`
-	Queries    int      `json:"queries_per_target"`
-	QueryTypes []uint16 `json:"query_types"`
+	StartedAt   string   `json:"started_at"`
+	FinishedAt  string   `json:"finished_at"`
+	Seed        int64    `json:"seed"`
+	CorpusMode  string   `json:"corpus_mode,omitempty"`
+	CorpusZone  string   `json:"corpus_zone,omitempty"`
+	CorpusNonce string   `json:"corpus_nonce,omitempty"`
+	SampleSize  int      `json:"sample_size"`
+	Queries     int      `json:"queries_per_target"`
+	QueryTypes  []uint16 `json:"query_types"`
+}
+
+type JSONProfileComparison struct {
+	ID         string                 `json:"id"`
+	Name       string                 `json:"name"`
+	Owner      string                 `json:"owner"`
+	Address    string                 `json:"address"`
+	Transports []JSONProfileTransport `json:"transports"`
+}
+
+type JSONProfileTransport struct {
+	Protocol catalog.Protocol     `json:"protocol"`
+	TargetID string               `json:"target_id"`
+	Stats    benchmark.Statistics `json:"stats"`
+	Status   string               `json:"status"`
 }
 
 type JSONResult struct {
 	Target       JSONTarget                  `json:"target"`
 	Stats        benchmark.Statistics        `json:"stats"`
 	OpenError    string                      `json:"open_error,omitempty"`
+	Incomplete   bool                        `json:"incomplete,omitempty"`
 	Observations []benchmark.Observation     `json:"samples,omitempty"`
 	Cold         []benchmark.ColdObservation `json:"cold,omitempty"`
 }
 
 type JSONTarget struct {
-	ID       string           `json:"id"`
-	Name     string           `json:"name"`
-	Owner    string           `json:"owner"`
-	Policy   string           `json:"policy"`
-	Address  string           `json:"address"`
-	Protocol catalog.Protocol `json:"protocol"`
+	ID                 string           `json:"id"`
+	Name               string           `json:"name"`
+	Owner              string           `json:"owner"`
+	Policy             string           `json:"policy"`
+	Address            string           `json:"address"`
+	Protocol           catalog.Protocol `json:"protocol"`
+	EndpointURL        string           `json:"endpoint_url,omitempty"`
+	TLSServerName      string           `json:"tls_server_name,omitempty"`
+	TLSIdentitySource  string           `json:"tls_identity_source,omitempty"`
+	BootstrapMode      string           `json:"bootstrap_mode"`
+	BootstrapAddresses []string         `json:"bootstrap_addresses,omitempty"`
+	DialAddress        string           `json:"dial_address,omitempty"`
+}
+
+type JSONOptions struct {
+	RedactSystem bool
+	ProfileView  bool
+}
+
+type CSVOptions struct {
+	RedactSystem bool
 }
 
 type csvWriter interface {
@@ -58,60 +95,103 @@ var newCSVWriter = func(writer io.Writer) csvWriter {
 	return csv.NewWriter(writer)
 }
 
-func toJSON(report benchmark.Report, raw bool) JSONReport {
+func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) JSONReport {
 	results := make([]JSONResult, 0, len(report.Targets))
+	redactedIDs := redactedTargetIDs(report, options.RedactSystem)
 	for _, result := range report.Targets {
+		metadata := result.Target.EndpointMetadata()
+		view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
+		dialAddress := result.DialAddress
+		if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
+			dialAddress = redactedValue
+		}
 		jsonResult := JSONResult{
 			Target: JSONTarget{
-				ID: result.Target.ID(), Name: result.Target.DisplayName(),
-				Owner: result.Target.Resolver.Owner, Policy: result.Target.Resolver.Policy,
-				Address: result.Target.Address, Protocol: result.Target.Protocol,
+				ID: view.ID, Name: view.Name, Owner: view.Owner, Policy: view.Policy,
+				Address: view.Address, Protocol: result.Target.Protocol,
+				EndpointURL: metadata.EndpointURL, TLSServerName: metadata.TLSServerName,
+				TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
+				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: dialAddress,
 			},
-			Stats: result.Stats, OpenError: result.OpenError,
+			Stats: result.Stats, OpenError: redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()]), Incomplete: result.Incomplete,
 		}
 		if raw {
-			jsonResult.Observations = result.Observations
-			jsonResult.Cold = result.Cold
+			jsonResult.Observations = redactObservations(result, options.RedactSystem, redactedIDs[result.Target.ID()])
+			jsonResult.Cold = redactColdObservations(result, options.RedactSystem, redactedIDs[result.Target.ID()])
 		}
 		results = append(results, jsonResult)
+	}
+	rankings := append([]benchmark.Ranking(nil), report.Rankings...)
+	for index := range rankings {
+		if redactedID, ok := redactedIDs[rankings[index].TargetID]; ok {
+			rankings[index].TargetID = redactedID
+		}
+	}
+	warnings := append([]string(nil), report.Warnings...)
+	if options.RedactSystem {
+		warnings = redactWarnings(report, redactedIDs)
+	}
+	var profileComparisons []JSONProfileComparison
+	if options.ProfileView {
+		profileComparisons = profileComparisonsForJSON(report, redactedIDs)
 	}
 	return JSONReport{
 		SchemaVersion: 1,
 		Run: JSONRun{
-			StartedAt:  report.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-			FinishedAt: report.FinishedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-			Seed:       report.Seed, SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes,
+			StartedAt: report.StartedAt.UTC().Format("2006-01-02T15:04:05.000Z"), FinishedAt: report.FinishedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+			Seed: report.Seed, CorpusMode: report.CorpusMode, CorpusZone: report.CorpusZone, CorpusNonce: report.CorpusNonce,
+			SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes,
 		},
-		Results: results, Rankings: report.Rankings, Warnings: report.Warnings,
+		Results: results, Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), ProfileComparisons: profileComparisons,
+		Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
 	}
 }
 
 func WriteJSON(writer io.Writer, report benchmark.Report, raw bool) error {
+	return WriteJSONWithOptions(writer, report, raw, JSONOptions{})
+}
+
+func WriteJSONWithOptions(writer io.Writer, report benchmark.Report, raw bool, options JSONOptions) error {
 	encoder := json.NewEncoder(writer)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(toJSON(report, raw))
+	return encoder.Encode(toJSONWithOptions(report, raw, options))
 }
 
 func WriteCSV(writer io.Writer, report benchmark.Report) error {
+	return WriteCSVWithOptions(writer, report, CSVOptions{})
+}
+
+func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVOptions) error {
 	writerCSV := newCSVWriter(writer)
 	if err := writerCSV.Write([]string{
 		"target_id", "name", "owner", "policy", "address", "protocol", "rank", "recommended", "tie",
 		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate", "rcode_counts", "median_ms", "p95_ms",
-		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error",
+		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error", "reconnects", "incomplete",
+		"endpoint_url", "tls_server_name", "tls_identity_source", "bootstrap_mode", "bootstrap_addresses", "dial_address",
+		"corpus_mode", "corpus_zone", "corpus_nonce",
 	}); err != nil {
 		return err
 	}
 	for _, result := range report.Targets {
 		rank := rankFor(report, result.Target.ID())
 		stats := result.Stats
+		metadata := result.Target.EndpointMetadata()
+		redactedIDs := redactedTargetIDs(report, options.RedactSystem)
+		view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
+		dialAddress := result.DialAddress
+		if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
+			dialAddress = redactedValue
+		}
 		row := []string{
-			result.Target.ID(), result.Target.DisplayName(), result.Target.Resolver.Owner, result.Target.Resolver.Policy,
-			result.Target.Address, result.Target.Protocol.String(), strconv.Itoa(rank), strconv.FormatBool(stats.Recommended),
+			csvCell(view.ID), csvCell(view.Name), csvCell(view.Owner), csvCell(view.Policy),
+			csvCell(view.Address), csvCell(result.Target.Protocol.String()), strconv.Itoa(rank), strconv.FormatBool(stats.Recommended),
 			strconv.FormatBool(stats.Tie), strconv.Itoa(stats.Total), strconv.Itoa(stats.Successes), strconv.Itoa(stats.Failures),
 			strconv.Itoa(stats.UsableResponses), strconv.Itoa(stats.ResolverFailures), strconv.Itoa(stats.Scored), strconv.Itoa(stats.Divergent), strconv.Itoa(stats.Truncated),
 			formatFloat(stats.SuccessRate), formatFloat(stats.UsableRate), formatFloat(stats.ResolverFailureRate), formatFloat(stats.ScoringFailureRate), rcodeCountsCSV(stats.RCodeCounts), formatFloat(stats.MedianMS),
 			formatFloat(stats.P95MS), formatFloat(stats.MinMS), formatFloat(stats.MaxMS), formatFloat(stats.MADMS),
-			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), result.OpenError,
+			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), csvCell(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), strconv.Itoa(stats.Reconnects), strconv.FormatBool(result.Incomplete),
+			csvCell(metadata.EndpointURL), csvCell(metadata.TLSServerName), csvCell(metadata.TLSIdentitySource), csvCell(metadata.BootstrapMode), csvCell(bootstrapAddressesCSV(metadata.BootstrapAddresses)), csvCell(dialAddress),
+			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -131,6 +211,28 @@ func rankFor(report benchmark.Report, targetID string) int {
 }
 
 func formatFloat(value float64) string { return strconv.FormatFloat(value, 'f', 3, 64) }
+
+func placeholderText(value string) string {
+	if value == "" {
+		return "—"
+	}
+	return value
+}
+
+// csvCell prefixes values that spreadsheet applications may interpret as a
+// formula. The leading apostrophe is part of the exported cell value and is
+// understood by spreadsheet programs as text protection.
+func csvCell(value string) string {
+	if value == "" {
+		return value
+	}
+	switch value[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + value
+	default:
+		return value
+	}
+}
 
 func rcodeCountsText(counts map[string]int) string {
 	if len(counts) == 0 {
@@ -155,11 +257,237 @@ func rcodeCountsCSV(counts map[string]int) string {
 	return rcodeCountsText(counts)
 }
 
+func bootstrapAddressesCSV(addresses []string) string {
+	return strings.Join(addresses, ";")
+}
+
+const (
+	redactedValue       = "redacted"
+	redactedSystemName  = "System DNS (redacted)"
+	redactedSystemOwner = "configured locally (redacted)"
+)
+
+type targetView struct {
+	ID      string
+	Name    string
+	Owner   string
+	Policy  string
+	Address string
+}
+
+func isSystemTarget(target catalog.Target) bool {
+	return strings.HasPrefix(target.Resolver.ID, "system-")
+}
+
+func redactedTargetIDs(report benchmark.Report, redact bool) map[string]string {
+	if !redact {
+		return nil
+	}
+	ids := make(map[string]string)
+	ordinal := 0
+	for _, result := range report.Targets {
+		if !isSystemTarget(result.Target) {
+			continue
+		}
+		ordinal++
+		ids[result.Target.ID()] = fmt.Sprintf("system-redacted-%d@redacted/%s", ordinal, result.Target.Protocol)
+	}
+	return ids
+}
+
+func targetViewFor(target catalog.Target, redact bool, redactedID string) targetView {
+	view := targetView{
+		ID: target.ID(), Name: target.DisplayName(), Owner: target.Resolver.Owner,
+		Policy: target.Resolver.Policy, Address: target.Address,
+	}
+	if redact && isSystemTarget(target) {
+		view.ID = redactedID
+		view.Name = redactedSystemName
+		view.Owner = redactedSystemOwner
+		view.Address = redactedValue
+	}
+	return view
+}
+
+func redactResultText(result benchmark.TargetResult, value string, redact bool, redactedID string) string {
+	if !redact || !isSystemTarget(result.Target) || value == "" {
+		return value
+	}
+	replacements := []string{
+		result.Target.ID(), redactedID,
+		result.Target.DisplayName(), redactedSystemName,
+		result.Target.Resolver.Owner, redactedSystemOwner,
+		result.DialAddress, redactedValue,
+		result.Target.Address, redactedValue,
+	}
+	filtered := replacements[:0]
+	for index := 0; index+1 < len(replacements); index += 2 {
+		if replacements[index] == "" {
+			continue
+		}
+		filtered = append(filtered, replacements[index], replacements[index+1])
+	}
+	return strings.NewReplacer(filtered...).Replace(value)
+}
+
+func redactObservations(result benchmark.TargetResult, redact bool, redactedID string) []benchmark.Observation {
+	if !redact || !isSystemTarget(result.Target) || len(result.Observations) == 0 {
+		return result.Observations
+	}
+	observations := append([]benchmark.Observation(nil), result.Observations...)
+	for index := range observations {
+		observations[index].Error = redactResultText(result, observations[index].Error, true, redactedID)
+	}
+	return observations
+}
+
+func redactColdObservations(result benchmark.TargetResult, redact bool, redactedID string) []benchmark.ColdObservation {
+	if !redact || !isSystemTarget(result.Target) || len(result.Cold) == 0 {
+		return result.Cold
+	}
+	observations := append([]benchmark.ColdObservation(nil), result.Cold...)
+	for index := range observations {
+		observations[index].Error = redactResultText(result, observations[index].Error, true, redactedID)
+	}
+	return observations
+}
+
+func redactWarningValue(report benchmark.Report, warning string, redactedIDs map[string]string) string {
+	for _, result := range report.Targets {
+		if isSystemTarget(result.Target) {
+			warning = redactResultText(result, warning, true, redactedIDs[result.Target.ID()])
+		}
+	}
+	return warning
+}
+
+func redactWarnings(report benchmark.Report, redactedIDs map[string]string) []string {
+	warnings := append([]string(nil), report.Warnings...)
+	for index := range warnings {
+		warnings[index] = redactWarningValue(report, warnings[index], redactedIDs)
+	}
+	return warnings
+}
+
+func divergenceForJSON(report benchmark.Report, redactedIDs map[string]string) []benchmark.DivergenceDetail {
+	if len(report.Divergence) == 0 {
+		return nil
+	}
+	details := make([]benchmark.DivergenceDetail, len(report.Divergence))
+	copy(details, report.Divergence)
+	for index := range details {
+		details[index].Classes = cloneIntMap(details[index].Classes)
+		details[index].Excluded = append([]benchmark.DivergenceExclusion(nil), details[index].Excluded...)
+		for exclusionIndex := range details[index].Excluded {
+			if replacement, ok := redactedIDs[details[index].Excluded[exclusionIndex].TargetID]; ok {
+				details[index].Excluded[exclusionIndex].TargetID = replacement
+			}
+		}
+	}
+	return details
+}
+
+func pairedEffectsForJSON(report benchmark.Report, redactedIDs map[string]string) []benchmark.PairedEffect {
+	if len(report.PairedEffects) == 0 {
+		return nil
+	}
+	effects := append([]benchmark.PairedEffect(nil), report.PairedEffects...)
+	for index := range effects {
+		if replacement, ok := redactedIDs[effects[index].TargetID]; ok {
+			effects[index].TargetID = replacement
+		}
+		if replacement, ok := redactedIDs[effects[index].ReferenceTargetID]; ok {
+			effects[index].ReferenceTargetID = replacement
+		}
+	}
+	return effects
+}
+
+type profileGroup struct {
+	Target  catalog.Target
+	Results map[catalog.Protocol]benchmark.TargetResult
+}
+
+func profileGroupKey(target catalog.Target) string {
+	return target.Resolver.ID + "\x00" + target.Address
+}
+
+func profileGroups(report benchmark.Report) map[string]profileGroup {
+	groups := make(map[string]profileGroup)
+	for _, result := range report.Targets {
+		key := profileGroupKey(result.Target)
+		group, ok := groups[key]
+		if !ok {
+			group = profileGroup{Target: result.Target, Results: make(map[catalog.Protocol]benchmark.TargetResult)}
+		}
+		group.Results[result.Target.Protocol] = result
+		groups[key] = group
+	}
+	return groups
+}
+
+func sortedProfileGroupKeys(groups map[string]profileGroup) []string {
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left, right := groups[keys[i]].Target, groups[keys[j]].Target
+		if left.Resolver.ID != right.Resolver.ID {
+			return left.Resolver.ID < right.Resolver.ID
+		}
+		return left.Address < right.Address
+	})
+	return keys
+}
+
+func profileComparisonsForJSON(report benchmark.Report, redactedIDs map[string]string) []JSONProfileComparison {
+	groups := profileGroups(report)
+	comparisons := make([]JSONProfileComparison, 0, len(groups))
+	for _, key := range sortedProfileGroupKeys(groups) {
+		group := groups[key]
+		view := targetViewFor(group.Target, len(redactedIDs) > 0, redactedIDs[group.Target.ID()])
+		profileID := group.Target.Resolver.ID
+		if len(redactedIDs) > 0 && isSystemTarget(group.Target) {
+			profileID = "system-redacted"
+		}
+		comparison := JSONProfileComparison{ID: profileID, Name: view.Name, Owner: view.Owner, Address: view.Address}
+		for _, protocol := range catalog.AllProtocols {
+			result, ok := group.Results[protocol]
+			if !ok {
+				continue
+			}
+			targetID := result.Target.ID()
+			if replacement, exists := redactedIDs[targetID]; exists {
+				targetID = replacement
+			}
+			comparison.Transports = append(comparison.Transports, JSONProfileTransport{
+				Protocol: protocol, TargetID: targetID, Stats: result.Stats, Status: resultStatus(result),
+			})
+		}
+		comparisons = append(comparisons, comparison)
+	}
+	return comparisons
+}
+
+func cloneIntMap(values map[string]int) map[string]int {
+	if len(values) == 0 {
+		return nil
+	}
+	clone := make(map[string]int, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
+}
+
 type TableOptions struct {
-	Details   bool
-	Color     bool
-	Profiles  []catalog.ResolverProfile
-	Protocols []catalog.Protocol
+	Details      bool
+	Color        bool
+	ProfileView  bool
+	RedactSystem bool
+	Profiles     []catalog.ResolverProfile
+	Protocols    []catalog.Protocol
 }
 
 const (
@@ -175,7 +503,9 @@ func rankedResult(report benchmark.Report, protocol catalog.Protocol, rank int) 
 			continue
 		}
 		if result, ok := report.ResultFor(ranking.TargetID); ok {
-			return result, true
+			if !result.Incomplete {
+				return result, true
+			}
 		}
 	}
 	return benchmark.TargetResult{}, false
@@ -187,7 +517,7 @@ func recommendedResult(report benchmark.Report, protocol catalog.Protocol) (benc
 			continue
 		}
 		result, ok := report.ResultFor(ranking.TargetID)
-		if ok && result.Stats.Recommended {
+		if ok && !result.Incomplete && result.Stats.Recommended {
 			return result, true
 		}
 	}
@@ -241,6 +571,9 @@ func tableProtocols(report benchmark.Report, options TableOptions) []catalog.Pro
 }
 
 func resultStatus(result benchmark.TargetResult) string {
+	if result.Incomplete {
+		return "INCOMPLETE"
+	}
 	if result.Stats.Successes == 0 {
 		return "FAILED"
 	}
@@ -256,9 +589,9 @@ func styledStatus(status string, color bool) string {
 	}
 	colorCode := ""
 	switch status {
-	case "RECOMMENDED", "QUALIFIED":
+	case "RECOMMENDED", "QUALIFIED", "REFERENCE":
 		colorCode = ansiGreen
-	case "PROVISIONAL", "INELIGIBLE":
+	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED":
 		colorCode = ansiYellow
 	case "FAILED":
 		colorCode = ansiRed
@@ -277,17 +610,6 @@ func latencyText(value float64) string {
 
 func percentText(value float64) string { return fmt.Sprintf("%.2f%%", value*100) }
 
-func usableRate(stats benchmark.Statistics) float64 {
-	// Reports may be constructed by older callers that populate only the
-	// original success fields. Prefer the explicit semantic metric whenever
-	// the benchmark supplied one, including a real zero rate with resolver
-	// failures.
-	if stats.UsableResponses == 0 && stats.ResolverFailures == 0 && stats.UsableRate == 0 && stats.Successes > 0 {
-		return stats.SuccessRate
-	}
-	return stats.UsableRate
-}
-
 func scoreText(result benchmark.TargetResult) string {
 	if result.Stats.Scored == 0 {
 		return "—"
@@ -303,37 +625,78 @@ func rankText(report benchmark.Report, targetID string) string {
 	return strconv.Itoa(rank)
 }
 
-func summaryRow(protocol catalog.Protocol, result benchmark.TargetResult, status string, color bool) []string {
+func summaryRowWithOptions(protocol catalog.Protocol, result benchmark.TargetResult, status string, color bool, redactSystem bool) []string {
+	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	return []string{
-		string(protocol), result.Target.Resolver.Owner, result.Target.Address, result.Target.Resolver.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(usableRate(result.Stats)),
+		string(protocol), view.Owner, view.Address, view.Policy,
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
 		scoreText(result), styledStatus(status, color),
 	}
 }
 
-func comparisonRow(report benchmark.Report, result benchmark.TargetResult, details bool, color bool) []string {
+func comparisonRowWithOptions(report benchmark.Report, result benchmark.TargetResult, details bool, color bool, redactSystem bool) []string {
+	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	row := []string{
-		rankText(report, result.Target.ID()), result.Target.Resolver.Owner, result.Target.Address,
-		result.Target.Resolver.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(usableRate(result.Stats)),
+		rankText(report, result.Target.ID()), view.Owner, view.Address, view.Policy,
+		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
 		scoreText(result),
 	}
 	if details {
+		metadata := result.Target.EndpointMetadata()
 		row = append(row,
 			latencyText(result.Stats.ColdMedianMS), latencyText(result.Stats.MADMS),
 			strconv.Itoa(result.Stats.Scored), strconv.Itoa(result.Stats.Failures),
-			strconv.Itoa(result.Stats.ResolverFailures), strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated),
-			rcodeCountsText(result.Stats.RCodeCounts), dialAddressText(result),
+			strconv.Itoa(result.Stats.ResolverFailures), strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated), strconv.Itoa(result.Stats.Reconnects),
+			rcodeCountsText(result.Stats.RCodeCounts), endpointURLText(metadata.EndpointURL), tlsServerNameText(metadata.TLSServerName),
+			tlsIdentitySourceText(metadata.TLSIdentitySource), bootstrapModeText(metadata.BootstrapMode), bootstrapAddressesText(metadata.BootstrapAddresses), dialAddressTextWithOptions(result, redactSystem),
 		)
 	}
 	return append(row, styledStatus(resultStatus(result), color))
 }
 
-func dialAddressText(result benchmark.TargetResult) string {
+func dialAddressTextWithOptions(result benchmark.TargetResult, redactSystem bool) string {
 	if result.DialAddress == "" {
 		return "—"
 	}
+	if redactSystem && isSystemTarget(result.Target) {
+		return redactedValue
+	}
 	return result.DialAddress
+}
+
+func endpointURLText(value string) string {
+	if value == "" {
+		return "—"
+	}
+	return value
+}
+
+func tlsServerNameText(value string) string {
+	if value == "" {
+		return "—"
+	}
+	return value
+}
+
+func tlsIdentitySourceText(value string) string {
+	if value == "" || value == catalog.TLSIdentityNotApplicable {
+		return "—"
+	}
+	return value
+}
+
+func bootstrapModeText(value string) string {
+	if value == "" || value == catalog.BootstrapNotApplicable {
+		return "—"
+	}
+	return value
+}
+
+func bootstrapAddressesText(addresses []string) string {
+	if len(addresses) == 0 {
+		return "—"
+	}
+	return strings.Join(addresses, ";")
 }
 
 func sortComparisonResults(report benchmark.Report, results []benchmark.TargetResult) {
@@ -357,6 +720,10 @@ func sortComparisonResults(report benchmark.Report, results []benchmark.TargetRe
 }
 
 func comparisonRows(report benchmark.Report, protocol catalog.Protocol, details bool, color bool) [][]string {
+	return comparisonRowsWithOptions(report, protocol, details, color, false)
+}
+
+func comparisonRowsWithOptions(report benchmark.Report, protocol catalog.Protocol, details bool, color bool, redactSystem bool) [][]string {
 	results := make([]benchmark.TargetResult, 0)
 	for _, result := range report.Targets {
 		if result.Target.Protocol == protocol {
@@ -366,21 +733,24 @@ func comparisonRows(report benchmark.Report, protocol catalog.Protocol, details 
 	sortComparisonResults(report, results)
 	rows := make([][]string, 0, len(results))
 	for _, result := range results {
-		rows = append(rows, comparisonRow(report, result, details, color))
+		rows = append(rows, comparisonRowWithOptions(report, result, details, color, redactSystem))
 	}
 	return rows
 }
 
-func unsupportedComparisonRow(target catalog.Target, details bool) []string {
-	row := []string{"—", target.Resolver.Owner, target.Address, target.Resolver.Policy, "—", "—", "—", "—", "—"}
+func unsupportedComparisonRowWithOptions(target catalog.Target, details bool, redactSystem bool) []string {
+	view := targetViewFor(target, redactSystem, redactedValue)
+	row := []string{"—", view.Owner, view.Address, view.Policy, "—", "—", "—", "—", "—"}
 	if details {
-		row = append(row, "—", "—", "—", "—", "—", "—", "—", "—", "—", "—")
+		for range comparisonHeaders(true)[len(comparisonHeaders(false))-1 : len(comparisonHeaders(true))-1] {
+			row = append(row, "—")
+		}
 	}
 	return append(row, "—")
 }
 
 func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, options TableOptions) [][]string {
-	rows := comparisonRows(report, protocol, options.Details, options.Color)
+	rows := comparisonRowsWithOptions(report, protocol, options.Details, options.Color, options.RedactSystem)
 	if len(options.Profiles) == 0 {
 		return rows
 	}
@@ -397,10 +767,152 @@ func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, 
 			if present[target.ID()] {
 				continue
 			}
-			rows = append(rows, unsupportedComparisonRow(target, options.Details))
+			rows = append(rows, unsupportedComparisonRowWithOptions(target, options.Details, options.RedactSystem))
 		}
 	}
 	return rows
+}
+
+func pairedEffectTargetText(report benchmark.Report, targetID string, redactSystem bool) string {
+	result, ok := report.ResultFor(targetID)
+	if !ok {
+		return "—"
+	}
+	view := targetViewFor(result.Target, redactSystem, redactedValue)
+	return strings.TrimSpace(view.Owner + " " + view.Address)
+}
+
+func pairedDeltaText(effect benchmark.PairedEffect) string {
+	if effect.Samples == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%+.2f ms", effect.MedianDeltaMS)
+}
+
+func pairedCIText(effect benchmark.PairedEffect) string {
+	if effect.Samples == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("[%+.2f, %+.2f] ms", effect.CILowMS, effect.CIHighMS)
+}
+
+func pairedInterpretation(effect benchmark.PairedEffect, color bool) string {
+	if effect.Reference {
+		return styledStatus("REFERENCE", color)
+	}
+	if effect.Samples == 0 {
+		return styledStatus("NOT COMPARABLE", color)
+	}
+	if effect.Indistinguishable || effect.MedianDeltaMS == 0 {
+		return styledStatus("NO CLEAR DIFFERENCE", color)
+	}
+	if effect.MedianDeltaMS < 0 {
+		return "FASTER"
+	}
+	return "SLOWER"
+}
+
+func pairedEffectRows(report benchmark.Report, options TableOptions) [][]string {
+	effects := append([]benchmark.PairedEffect(nil), report.PairedEffects...)
+	sort.SliceStable(effects, func(i, j int) bool {
+		if effects[i].Protocol != effects[j].Protocol {
+			return effects[i].Protocol < effects[j].Protocol
+		}
+		if effects[i].Policy != effects[j].Policy {
+			return effects[i].Policy < effects[j].Policy
+		}
+		return effects[i].TargetID < effects[j].TargetID
+	})
+	rows := make([][]string, 0, len(effects))
+	for _, effect := range effects {
+		rows = append(rows, []string{
+			string(effect.Protocol), effect.Policy,
+			pairedEffectTargetText(report, effect.TargetID, options.RedactSystem),
+			pairedEffectTargetText(report, effect.ReferenceTargetID, options.RedactSystem),
+			strconv.Itoa(effect.Samples), pairedDeltaText(effect), pairedCIText(effect),
+			pairedInterpretation(effect, options.Color),
+		})
+	}
+	return rows
+}
+
+func writePairedEffects(writer io.Writer, report benchmark.Report, options TableOptions) error {
+	if len(report.PairedEffects) == 0 {
+		return nil
+	}
+	if _, err := io.WriteString(writer, "\nPaired latency effects (target - reference; policy-local reference)\n"); err != nil {
+		return err
+	}
+	return writeAlignedTable(writer, []string{"Protocol", "Policy", "Target", "Reference", "Samples", "Median Δ", "95% CI", "Interpretation"}, pairedEffectRows(report, options))
+}
+
+func profileGroupsForTable(report benchmark.Report, options TableOptions) map[string]profileGroup {
+	groups := profileGroups(report)
+	for _, profile := range options.Profiles {
+		for _, address := range profile.Addresses {
+			target := catalog.Target{Resolver: profile, Address: address}
+			key := profileGroupKey(target)
+			if _, exists := groups[key]; !exists {
+				groups[key] = profileGroup{Target: target, Results: make(map[catalog.Protocol]benchmark.TargetResult)}
+			}
+		}
+	}
+	return groups
+}
+
+func profileViewProtocols(report benchmark.Report, options TableOptions) []catalog.Protocol {
+	if len(options.Protocols) > 0 {
+		return tableProtocols(report, options)
+	}
+	return reportProtocols(report)
+}
+
+func profileScoreCIText(stats benchmark.Statistics) string {
+	if stats.Scored == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("[%.2f, %.2f] ms", stats.CILowMS, stats.CIHighMS)
+}
+
+func profileViewRow(group profileGroup, protocol catalog.Protocol, options TableOptions) []string {
+	view := targetViewFor(group.Target, options.RedactSystem, redactedValue)
+	result, ok := group.Results[protocol]
+	if !ok {
+		status := "—"
+		if _, supported := group.Target.Resolver.Transports[protocol]; supported {
+			status = styledStatus("NOT MEASURED", options.Color)
+		}
+		return []string{view.Name, view.Owner, view.Address, string(protocol), "—", "—", "—", "—", "—", "—", status}
+	}
+	return []string{
+		view.Name, view.Owner, view.Address, string(protocol), latencyText(result.Stats.MedianMS),
+		latencyText(result.Stats.P95MS), latencyText(result.Stats.ColdMedianMS), scoreText(result),
+		profileScoreCIText(result.Stats), percentText(result.Stats.SuccessRate), styledStatus(resultStatus(result), options.Color),
+	}
+}
+
+func profileViewRows(report benchmark.Report, options TableOptions) [][]string {
+	groups := profileGroupsForTable(report, options)
+	protocols := profileViewProtocols(report, options)
+	rows := make([][]string, 0, len(groups)*len(protocols))
+	for _, key := range sortedProfileGroupKeys(groups) {
+		for _, protocol := range protocols {
+			rows = append(rows, profileViewRow(groups[key], protocol, options))
+		}
+	}
+	return rows
+}
+
+func writeProfileView(writer io.Writer, report benchmark.Report, options TableOptions) error {
+	if _, err := io.WriteString(writer, "\nProfile-level transport view (same resolver/address; score 95% CI)\n"); err != nil {
+		return err
+	}
+	rows := profileViewRows(report, options)
+	if len(rows) == 0 {
+		_, err := io.WriteString(writer, "  no profile results\n")
+		return err
+	}
+	return writeAlignedTable(writer, []string{"Profile", "Owner", "Address", "Protocol", "Median", "P95", "Cold", "Score", "Score 95% CI", "Success", "Status"}, rows)
 }
 
 func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
@@ -428,18 +940,23 @@ func summaryHeaders() []string {
 func comparisonHeaders(details bool) []string {
 	headers := []string{"Rank", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score"}
 	if details {
-		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "RCodes", "Dial")
+		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "Reconnects", "RCodes", "Endpoint", "TLSName", "TLSSource", "Bootstrap", "BootstrapAddrs", "Dial")
 	}
 	return append(headers, "Status")
 }
 
 func targetWarningLabel(result benchmark.TargetResult) string {
-	return fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol)
+	return targetWarningLabelWithOptions(result, false)
 }
 
-func isTargetWarning(warning string, results []benchmark.TargetResult) bool {
+func targetWarningLabelWithOptions(result benchmark.TargetResult, redactSystem bool) string {
+	view := targetViewFor(result.Target, redactSystem, redactedValue)
+	return fmt.Sprintf("%s %s/%s", view.Name, view.Address, result.Target.Protocol)
+}
+
+func isTargetWarningWithOptions(warning string, results []benchmark.TargetResult, redactSystem bool) bool {
 	for _, result := range results {
-		if strings.HasPrefix(warning, targetWarningLabel(result)) {
+		if strings.HasPrefix(warning, targetWarningLabel(result)) || strings.HasPrefix(warning, targetWarningLabelWithOptions(result, redactSystem)) {
 			return true
 		}
 	}
@@ -447,6 +964,10 @@ func isTargetWarning(warning string, results []benchmark.TargetResult) bool {
 }
 
 func compactWarnings(report benchmark.Report) []string {
+	return compactWarningsWithOptions(report, false)
+}
+
+func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []string {
 	warnings := make([]string, 0)
 	handled := make(map[string]bool)
 	for _, protocol := range reportProtocols(report) {
@@ -467,7 +988,7 @@ func compactWarnings(report benchmark.Report) []string {
 		for _, result := range targets {
 			totalQueries += result.Stats.Total
 			failedQueries += result.Stats.Failures
-			if result.Stats.Total == 0 || result.Stats.Scored != 0 {
+			if result.Incomplete || result.Stats.Total == 0 || result.Stats.Scored != 0 {
 				allUnavailable = false
 			}
 			if result.Stats.Total == 0 || result.Stats.Failures != result.Stats.Total {
@@ -500,7 +1021,10 @@ func compactWarnings(report benchmark.Report) []string {
 			continue
 		}
 		parts := make([]string, 0, 4)
-		if result.OpenError != "" && result.Stats.Scored == 0 {
+		if result.Incomplete {
+			parts = append(parts, "incomplete; excluded from ranking")
+		}
+		if result.OpenError != "" && !result.Incomplete && result.Stats.Scored == 0 {
 			parts = append(parts, "unavailable")
 		}
 		if result.Stats.Failures > 0 {
@@ -520,11 +1044,14 @@ func compactWarnings(report benchmark.Report) []string {
 			parts = append(parts, fmt.Sprintf("%d truncated responses", result.Stats.Truncated))
 		}
 		if len(parts) > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabel(result), strings.Join(parts, "; ")))
+			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabelWithOptions(result, redactSystem), strings.Join(parts, "; ")))
 		}
 	}
 	for _, warning := range report.Warnings {
-		if !isTargetWarning(warning, report.Targets) {
+		if !isTargetWarningWithOptions(warning, report.Targets, redactSystem) {
+			if redactSystem {
+				warning = redactWarningValue(report, warning, redactedTargetIDs(report, true))
+			}
 			warnings = append(warnings, warning)
 		}
 	}
@@ -532,9 +1059,15 @@ func compactWarnings(report benchmark.Report) []string {
 }
 
 func writeWarnings(writer io.Writer, report benchmark.Report, details bool) error {
+	return writeWarningsWithOptions(writer, report, details, false)
+}
+
+func writeWarningsWithOptions(writer io.Writer, report benchmark.Report, details bool, redactSystem bool) error {
 	warnings := report.Warnings
 	if !details {
-		warnings = compactWarnings(report)
+		warnings = compactWarningsWithOptions(report, redactSystem)
+	} else if redactSystem {
+		warnings = redactWarnings(report, redactedTargetIDs(report, true))
 	}
 	if len(warnings) == 0 {
 		return nil
@@ -550,6 +1083,63 @@ func writeWarnings(writer io.Writer, report benchmark.Report, details bool) erro
 	return nil
 }
 
+func divergenceClassesText(classes map[string]int) string {
+	if len(classes) == 0 {
+		return "—"
+	}
+	keys := make([]string, 0, len(classes))
+	for key := range classes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", key, classes[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func divergenceExcludedText(detail benchmark.DivergenceDetail, redactedIDs map[string]string) string {
+	if len(detail.Excluded) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(detail.Excluded))
+	for _, exclusion := range detail.Excluded {
+		targetID := exclusion.TargetID
+		if replacement, ok := redactedIDs[targetID]; ok {
+			targetID = replacement
+		}
+		part := targetID + "=" + exclusion.ResponseClass
+		if exclusion.Treatment != "" {
+			part += "[" + exclusion.Treatment + "]"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ",")
+}
+
+func writeDivergenceDetails(writer io.Writer, report benchmark.Report, redactSystem bool) error {
+	if len(report.Divergence) == 0 {
+		return nil
+	}
+	if _, err := io.WriteString(writer, "\nDivergence details\n"); err != nil {
+		return err
+	}
+	redactedIDs := redactedTargetIDs(report, redactSystem)
+	for _, detail := range report.Divergence {
+		baseline := detail.Baseline
+		if detail.Ambiguous {
+			baseline = "ambiguous (no baseline)"
+		}
+		if _, err := fmt.Fprintf(writer, "  - %s/%s policy=%s compared=%d baseline=%s; classes=%s; excluded=%s\n",
+			detail.Name, benchmark.QueryTypeName(detail.QType), detail.Policy, detail.Compared, baseline,
+			divergenceClassesText(detail.Classes), divergenceExcludedText(detail, redactedIDs)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func WriteTable(writer io.Writer, report benchmark.Report, details bool) error {
 	return WriteTableWithOptions(writer, report, TableOptions{Details: details})
 }
@@ -557,6 +1147,11 @@ func WriteTable(writer io.Writer, report benchmark.Report, details bool) error {
 func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options TableOptions) error {
 	if _, err := fmt.Fprintf(writer, "SpeeDNS benchmark\nSeed: %d | sample: %d domains | query types: %s\n\n", report.Seed, report.SampleSize, queryTypes(report.QueryTypes)); err != nil {
 		return err
+	}
+	if report.CorpusMode != "" {
+		if _, err := fmt.Fprintf(writer, "Corpus: %s | zone: %s | nonce: %s\n\n", report.CorpusMode, placeholderText(report.CorpusZone), placeholderText(report.CorpusNonce)); err != nil {
+			return err
+		}
 	}
 	if _, err := io.WriteString(writer, "Recommendations\n"); err != nil {
 		return err
@@ -566,11 +1161,11 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 	provisionals := make([][]string, 0, len(protocols))
 	for _, protocol := range protocols {
 		if winner, found := recommendedResult(report, protocol); found {
-			recommendations = append(recommendations, summaryRow(protocol, winner, "RECOMMENDED", options.Color))
+			recommendations = append(recommendations, summaryRowWithOptions(protocol, winner, "RECOMMENDED", options.Color, options.RedactSystem))
 			continue
 		}
 		if winner, found := rankedResult(report, protocol, 1); found {
-			provisionals = append(provisionals, summaryRow(protocol, winner, "PROVISIONAL", options.Color))
+			provisionals = append(provisionals, summaryRowWithOptions(protocol, winner, "PROVISIONAL", options.Color, options.RedactSystem))
 		}
 	}
 	if len(recommendations) == 0 {
@@ -606,7 +1201,20 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 			return err
 		}
 	}
-	if err := writeWarnings(writer, report, options.Details); err != nil {
+	if err := writePairedEffects(writer, report, options); err != nil {
+		return err
+	}
+	if options.ProfileView {
+		if err := writeProfileView(writer, report, options); err != nil {
+			return err
+		}
+	}
+	if options.Details {
+		if err := writeDivergenceDetails(writer, report, options.RedactSystem); err != nil {
+			return err
+		}
+	}
+	if err := writeWarningsWithOptions(writer, report, options.Details, options.RedactSystem); err != nil {
 		return err
 	}
 	return nil

@@ -3,14 +3,16 @@ package benchmark
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
-	"github.com/crypt0rr/dns-speedtest/internal/domains"
-	"github.com/crypt0rr/dns-speedtest/internal/transport"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/domains"
+	"github.com/crypt0rr/SpeeDNS/internal/transport"
 	"github.com/miekg/dns"
 )
 
@@ -36,10 +38,23 @@ func (f *fakeFactory) Open(context.Context) (transport.Session, error) {
 	return f.opens[index].session, f.opens[index].err
 }
 
+type scriptedFactory struct {
+	open  func(int, context.Context) (transport.Session, error)
+	count int
+}
+
+func (f *scriptedFactory) Open(ctx context.Context) (transport.Session, error) {
+	index := f.count
+	f.count++
+	return f.open(index, ctx)
+}
+
 type fakeSession struct {
-	query    func(context.Context, string, uint16) (*dns.Msg, error)
-	closeErr error
-	closes   int
+	query       func(context.Context, string, uint16) (*dns.Msg, error)
+	closeErr    error
+	closeDelay  time.Duration
+	reconnected bool
+	closes      int
 }
 
 func (s *fakeSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
@@ -50,8 +65,31 @@ func (s *fakeSession) Query(ctx context.Context, name string, qtype uint16) (*dn
 }
 
 func (s *fakeSession) Close() error {
+	if s.closeDelay > 0 {
+		time.Sleep(s.closeDelay)
+	}
 	s.closes++
 	return s.closeErr
+}
+
+func (s *fakeSession) LastQueryReconnected() bool { return s.reconnected }
+
+type minimalSession struct{}
+
+func (minimalSession) Query(context.Context, string, uint16) (*dns.Msg, error) {
+	return replyFor("example.com", dns.TypeA), nil
+}
+
+func (minimalSession) Close() error { return nil }
+
+type cancelDialSession struct {
+	*fakeSession
+	cancel context.CancelFunc
+}
+
+func (s *cancelDialSession) DialAddress() string {
+	s.cancel()
+	return ""
 }
 
 func replyFor(name string, qtype uint16) *dns.Msg {
@@ -198,7 +236,7 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
 	}
-	if len(cancelledReport.Targets) != 1 || cancelledReport.Targets[0].Target.ID() == "@/" || cancelledReport.Targets[0].Target.ID() != cancelledTargets[0].ID() {
+	if len(cancelledReport.Targets) != 1 || len(cancelledReport.Rankings) != 0 || !cancelledReport.Targets[0].Incomplete || cancelledReport.Targets[0].Target.ID() == "@/" || cancelledReport.Targets[0].Target.ID() != cancelledTargets[0].ID() {
 		t.Fatalf("cancelled Run targets = %#v, want only the first dispatched target", cancelledReport.Targets)
 	}
 
@@ -207,6 +245,229 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	}
 	if _, err := Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "none")}, opts); err == nil || !strings.Contains(err.Error(), "no comparable") {
 		t.Fatalf("unscored Run error = %v", err)
+	}
+}
+
+func TestFairProtocolSchedulingIsOrderIndependent(t *testing.T) {
+	oldTarget := runTargetFunc
+	oldFactory := newFactory
+	t.Cleanup(func() {
+		runTargetFunc = oldTarget
+		newFactory = oldFactory
+	})
+	runTargetFunc = runTarget
+
+	targets := []catalog.Target{
+		testTarget(catalog.UDP, "one"),
+		testTarget(catalog.UDP, "two"),
+		testTarget(catalog.UDP, "three"),
+	}
+	opts := validBenchmarkOptions()
+	opts.Domains = []string{"one.example", "two.example", "three.example"}
+	opts.QueryTypes = []uint16{dns.TypeA}
+	opts.Sample = 3
+	opts.Concurrency = 2
+	opts.OnProgress = func(Progress) {}
+
+	type event struct {
+		target string
+		round  int
+		seq    int
+	}
+	run := func(order []catalog.Target) (Report, []event, int) {
+		var mu sync.Mutex
+		events := make([]event, 0, len(order)*opts.Sample)
+		active := 0
+		maxActive := 0
+		sequence := 0
+		factories := make(map[string]transport.Factory, len(order))
+		for _, target := range order {
+			target := target
+			delay := map[string]time.Duration{"one": 5 * time.Millisecond, "two": 30 * time.Millisecond, "three": 60 * time.Millisecond}[target.Address]
+			measured := 0
+			session := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+				if strings.HasSuffix(name, ".example") {
+					mu.Lock()
+					round := measured
+					measured++
+					active++
+					if active > maxActive {
+						maxActive = active
+					}
+					sequence++
+					events = append(events, event{target: target.Address, round: round, seq: sequence})
+					mu.Unlock()
+					time.Sleep(delay)
+					mu.Lock()
+					active--
+					mu.Unlock()
+				}
+				return replyFor(name, qtype), nil
+			}}
+			factories[target.Address] = &fakeFactory{opens: []fakeOpen{
+				{session: &fakeSession{}},
+				{session: &fakeSession{}},
+				{session: &fakeSession{}},
+				{session: session},
+			}}
+		}
+		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+			return factories[target.Address], nil
+		}
+		report, err := Run(context.Background(), order, opts)
+		if err != nil {
+			t.Fatalf("fair run failed: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return report, append([]event(nil), events...), maxActive
+	}
+
+	first, firstEvents, firstMax := run(targets)
+	reversed := append([]catalog.Target(nil), targets...)
+	sort.Slice(reversed, func(i, j int) bool { return reversed[i].Address > reversed[j].Address })
+	second, secondEvents, secondMax := run(reversed)
+	if firstMax > opts.Concurrency || secondMax > opts.Concurrency {
+		t.Fatalf("measured concurrency exceeded limit: %d/%d > %d", firstMax, secondMax, opts.Concurrency)
+	}
+	if len(firstEvents) != opts.Sample*len(targets) || len(secondEvents) != len(firstEvents) {
+		t.Fatalf("measured event counts = %d/%d", len(firstEvents), len(secondEvents))
+	}
+	for _, events := range [][]event{firstEvents, secondEvents} {
+		for round := 1; round < opts.Sample; round++ {
+			previousLast := 0
+			currentFirst := 0
+			for _, item := range events {
+				if item.round == round-1 && item.seq > previousLast {
+					previousLast = item.seq
+				}
+				if item.round == round && (currentFirst == 0 || item.seq < currentFirst) {
+					currentFirst = item.seq
+				}
+			}
+			if previousLast == 0 || currentFirst <= previousLast {
+				t.Fatalf("round %d was not fully completed before the next round: %#v", round, events)
+			}
+		}
+	}
+	normalizeRankings := func(rankings []Ranking) []Ranking {
+		normalized := append([]Ranking(nil), rankings...)
+		for index := range normalized {
+			normalized[index].Tie = false
+		}
+		return normalized
+	}
+	if !reflect.DeepEqual(normalizeRankings(first.Rankings), normalizeRankings(second.Rankings)) {
+		t.Fatalf("ranking order changed with target input order: %#v != %#v", first.Rankings, second.Rankings)
+	}
+	sequenceFor := func(events []event) map[string][]int {
+		got := make(map[string][]int)
+		for _, item := range events {
+			got[item.target] = append(got[item.target], item.round)
+		}
+		return got
+	}
+	if !reflect.DeepEqual(sequenceFor(firstEvents), sequenceFor(secondEvents)) {
+		t.Fatalf("per-target query rounds changed with target input order: %#v != %#v", firstEvents, secondEvents)
+	}
+}
+
+func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
+	oldTarget := runTargetFunc
+	oldFactory := newFactory
+	t.Cleanup(func() {
+		runTargetFunc = oldTarget
+		newFactory = oldFactory
+	})
+	target := testTarget(catalog.UDP, "edge")
+	query := Query{Name: "edge.example", QType: dns.TypeA}
+	opts := Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1}
+
+	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1, ResponseClass: "answer"}}}
+	}
+	runProtocol(context.Background(), []catalog.Target{target}, []Query{query}, Options{Concurrency: 5})
+	runTargetFunc = runTarget
+
+	runQueryRound(context.Background(), nil, query, 1)
+	readyRunner := &targetRunner{
+		target:  target,
+		opts:    opts,
+		ready:   true,
+		session: minimalSession{},
+		result:  TargetResult{Target: target},
+	}
+	cancelledRoundCtx, cancelRound := context.WithCancel(context.Background())
+	cancelRound()
+	runQueryRound(cancelledRoundCtx, []*targetRunner{readyRunner}, query, 1)
+	readyRunner.finished = false
+	readyRunner.ready = true
+	runQueryRound(context.Background(), []*targetRunner{readyRunner}, query, 0)
+	runQueryRound(context.Background(), []*targetRunner{readyRunner}, query, 5)
+	if readyRunner.measure(context.Background(), query) == false {
+		t.Fatal("ready runner did not measure a query")
+	}
+	readyRunner.finished = true
+	if readyRunner.measure(context.Background(), query) {
+		t.Fatal("finished runner measured a query")
+	}
+	readyRunner.finished = false
+	readyRunner.ready = false
+	if readyRunner.measure(context.Background(), query) {
+		t.Fatal("unready runner measured a query")
+	}
+	readyRunner.close()
+	readyRunner.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+			if index == 0 {
+				cancel()
+			}
+			return minimalSession{}, nil
+		}}, nil
+	}
+	results := runProtocol(ctx, []catalog.Target{target}, []Query{query}, opts)
+	if len(results) != 1 || !results[0].Incomplete {
+		t.Fatalf("fair prepare cancellation results = %#v", results)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	release := make(chan struct{})
+	blocking := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		if strings.HasSuffix(name, ".example") {
+			startedOnce.Do(func() { close(started) })
+			<-release
+		}
+		return replyFor(name, qtype), nil
+	}}
+	newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+		session := &fakeSession{}
+		if target.Address == "one" {
+			session = blocking
+		}
+		return &fakeFactory{opens: []fakeOpen{
+			{session: &fakeSession{}},
+			{session: &fakeSession{}},
+			{session: &fakeSession{}},
+			{session: session},
+		}}, nil
+	}
+	resultCh := make(chan []TargetResult, 1)
+	go func() {
+		resultCh <- runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "one"), testTarget(catalog.UDP, "two")}, []Query{query}, opts)
+	}()
+	<-started
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+	close(release)
+	results = <-resultCh
+	if len(results) != 2 || !results[0].Incomplete || !results[1].Incomplete {
+		t.Fatalf("fair measured cancellation results = %#v", results)
 	}
 }
 
@@ -376,7 +637,7 @@ func TestRunTargetStopsWhenContextCancelsDuringWarmup(t *testing.T) {
 	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
 	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
 	result := runTarget(ctx, testTarget(catalog.UDP, "cancel-warmup"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
-	if result.OpenError != context.Canceled.Error() || result.Observations[0].Error != context.Canceled.Error() {
+	if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
 		t.Fatalf("cancelled warmup result = %#v", result)
 	}
 
@@ -390,7 +651,7 @@ func TestRunTargetStopsWhenContextCancelsDuringWarmup(t *testing.T) {
 	factory = &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
 	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
 	result = runTarget(ctx, testTarget(catalog.UDP, "cancel-query"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
-	if result.OpenError != "" || result.Observations[0].Error != context.Canceled.Error() {
+	if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
 		t.Fatalf("cancelled measured query result = %#v", result)
 	}
 }
@@ -415,11 +676,17 @@ func TestStatisticsRankingAndWarnings(t *testing.T) {
 	second := TargetResult{Target: testTarget(catalog.UDP, "slow"), Stats: Statistics{Scored: 2, ScoreMS: 2, CILowMS: 0.5, CIHighMS: 3}}
 	other := TargetResult{Target: testTarget(catalog.TCP, "other"), Stats: Statistics{Scored: 2, ScoreMS: 5, CILowMS: 5, CIHighMS: 5}}
 	rankings := makeRankings([]TargetResult{second, other, first})
-	if len(rankings) != 3 || rankings[0].Protocol != catalog.TCP || rankings[0].Rank != 1 || !rankings[2].Tie {
+	if len(rankings) != 3 || rankings[0].Protocol != catalog.TCP || rankings[0].Rank != 1 || !rankings[1].Tie || !rankings[2].Tie {
 		t.Fatalf("rankings = %#v", rankings)
 	}
 	if len(makeRankings(nil)) != 0 || len(makeRankings([]TargetResult{{Target: target}})) != 0 {
 		t.Fatal("unscored results should not be ranked")
+	}
+	equalA := TargetResult{Target: testTarget(catalog.UDP, "equal-a"), Stats: Statistics{Scored: 1, ScoreMS: 5}}
+	equalB := TargetResult{Target: testTarget(catalog.UDP, "equal-b"), Stats: Statistics{Scored: 1, ScoreMS: 5}}
+	equalRankings := makeRankings([]TargetResult{equalB, equalA})
+	if len(equalRankings) != 2 || equalRankings[0].TargetID != equalA.Target.ID() || !equalRankings[0].Tie || !equalRankings[1].Tie {
+		t.Fatalf("equal-score rankings = %#v", equalRankings)
 	}
 
 	warningResult := TargetResult{Target: target, OpenError: "open failed", Stats: Statistics{Total: 4, Failures: 1, Divergent: 1, Truncated: 1, Scored: 1, Recommended: false}}
@@ -430,6 +697,222 @@ func TestStatisticsRankingAndWarnings(t *testing.T) {
 	if got := failedObservations([]Query{{Name: "x", QType: dns.TypeA}}, errors.New("failed")); got[0].Error != "failed" {
 		t.Fatalf("failed observation = %#v", got)
 	}
+}
+
+func TestDivergentUnusableResponsesRemainScoringFailures(t *testing.T) {
+	badTarget := testTarget(catalog.UDP, "fast-errors")
+	goodTarget := testTarget(catalog.UDP, "steady")
+	badObservations := make([]Observation, 0, 20)
+	goodObservations := make([]Observation, 0, 20)
+	for index := 0; index < 12; index++ {
+		badObservations = append(badObservations, Observation{Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 1})
+		goodObservations = append(goodObservations, Observation{Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 10})
+	}
+	for index := 0; index < 8; index++ {
+		badObservations = append(badObservations, Observation{Success: true, RCode: dns.RcodeServerFailure, ResponseClass: "rcode-2", Divergent: true, LatencyMS: 1})
+		goodObservations = append(goodObservations, Observation{Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 10})
+	}
+	bad := calculateStatistics(TargetResult{Target: badTarget, Observations: badObservations}, 2*time.Second, 42)
+	good := calculateStatistics(TargetResult{Target: goodTarget, Observations: goodObservations}, 2*time.Second, 42)
+	if bad.ResolverFailures != 8 || bad.Divergent != 8 || bad.ScoringFailureRate != .4 {
+		t.Fatalf("divergent unusable metrics = %#v", bad)
+	}
+	if bad.ScoreMS <= good.ScoreMS {
+		t.Fatalf("fast resolver errors outranked usable peer: bad=%#v good=%#v", bad, good)
+	}
+}
+
+func TestBootstrapUsesCompleteOutcomesAndTargetIdentity(t *testing.T) {
+	samples := []scoreSample{{latencyMS: 10, success: true}, {latencyMS: 20, success: true}, {success: false}}
+	low, high := bootstrapCI(samples, 2*time.Second, bootstrapSeed(42, "one@192.0.2.1/udp"))
+	if high <= low {
+		t.Fatalf("bootstrap interval omitted outcome uncertainty: %v/%v", low, high)
+	}
+	if bootstrapSeed(42, "one@192.0.2.1/udp") == bootstrapSeed(42, "two@192.0.2.2/udp") {
+		t.Fatal("distinct target identities reused a bootstrap seed")
+	}
+	if got := scoreFromSamples([]scoreSample{{success: false}}, 2000); got != 4000 {
+		t.Fatalf("all-failure bootstrap score = %v, want 4000", got)
+	}
+}
+
+func TestIncompleteTargetsAreExcludedFromRankings(t *testing.T) {
+	target := testTarget(catalog.UDP, "partial")
+	result := TargetResult{Target: target, Incomplete: true, Stats: Statistics{Scored: 20, ScoreMS: 1}}
+	if rankings := makeRankings([]TargetResult{result}); len(rankings) != 0 {
+		t.Fatalf("incomplete target was ranked: %#v", rankings)
+	}
+	if warnings := collectWarnings([]TargetResult{result}); len(warnings) != 1 || !strings.Contains(warnings[0], "excluded from ranking") {
+		t.Fatalf("incomplete target warnings = %#v", warnings)
+	}
+}
+
+func TestColdLatencyExcludesSessionTeardown(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	factory := &fakeFactory{opens: []fakeOpen{
+		{session: &fakeSession{closeDelay: 100 * time.Millisecond}},
+		{session: &fakeSession{closeDelay: 100 * time.Millisecond}},
+		{session: &fakeSession{closeDelay: 100 * time.Millisecond}},
+		{session: &fakeSession{}},
+	}}
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	result := runTarget(context.Background(), testTarget(catalog.UDP, "cold-timing"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(result.Cold) != 3 || result.Cold[0].Latency >= 80*time.Millisecond {
+		t.Fatalf("cold latency included teardown: %#v", result.Cold)
+	}
+}
+
+func TestRunTargetRecordsReconnectDiagnostics(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	warm := &fakeSession{reconnected: true}
+	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	result := runTarget(context.Background(), testTarget(catalog.TCP, "reconnect-metric"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(result.Observations) != 1 || !result.Observations[0].Reconnected {
+		t.Fatalf("reconnect observation = %#v", result.Observations)
+	}
+	stats := calculateStatistics(result, time.Second, 42)
+	if stats.Reconnects != 1 || stats.Scored != 0 {
+		t.Fatalf("reconnect statistics = %#v", stats)
+	}
+}
+
+func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	target := testTarget(catalog.UDP, "cancel-branches")
+	queries := []Query{{Name: "x", QType: dns.TypeA}}
+	options := Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second}
+
+	t.Run("factory creation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return nil, errors.New("factory failed")
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("factory cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("before cold probe", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) { return minimalSession{}, nil }}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Cold) != 0 {
+			t.Fatalf("pre-cold cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("cold open", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index == 0 {
+					cancel()
+					return nil, errors.New("cold open canceled")
+				}
+				return minimalSession{}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Cold) != 1 || len(result.Observations) != 0 {
+			t.Fatalf("cold-open cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("cold query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
+				return &fakeSession{query: func(context.Context, string, uint16) (*dns.Msg, error) {
+					cancel()
+					return replyFor("example.com", dns.TypeA), nil
+				}}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Cold) != 1 || len(result.Observations) != 0 {
+			t.Fatalf("cold-query cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("warm open", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				cancel()
+				return nil, errors.New("warm open canceled")
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
+			t.Fatalf("warm-open cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("before warmup", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				cancel()
+				return minimalSession{}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("pre-warmup cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("before measured query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				return &cancelDialSession{fakeSession: &fakeSession{}, cancel: cancel}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("pre-measured cancellation result = %#v", result)
+		}
+	})
+
+	t.Run("during measured query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index < 3 {
+					return minimalSession{}, nil
+				}
+				return &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+					if name == "x" {
+						cancel()
+					}
+					return replyFor(name, qtype), nil
+				}}, nil
+			}}, nil
+		}
+		result := runTarget(ctx, target, queries, options)
+		if !result.Incomplete || len(result.Observations) != 0 {
+			t.Fatalf("measured cancellation result = %#v", result)
+		}
+	})
 }
 
 func TestDivergenceAndStatisticsHelpers(t *testing.T) {
@@ -454,10 +937,10 @@ func TestDivergenceAndStatisticsHelpers(t *testing.T) {
 	if got := percentile([]float64{1, 3, 7, 9}, .25); got != 2.5 {
 		t.Fatalf("interpolated percentile = %v", got)
 	}
-	if low, high := bootstrapCI(nil, .25, 2*time.Second, 1); low != 500 || high != 500 {
+	if low, high := bootstrapCI(nil, 2*time.Second, 1); low != 0 || high != 0 {
 		t.Fatalf("empty bootstrap CI = %v/%v", low, high)
 	}
-	if low, high := bootstrapCI([]float64{10}, .5, 2*time.Second, 1); low != high || low != 1010 {
+	if low, high := bootstrapCI([]scoreSample{{latencyMS: 10, success: true}}, 2*time.Second, 1); low != high || low != 10 {
 		t.Fatalf("single bootstrap CI = %v/%v", low, high)
 	}
 	if got := QueryTypeName(dns.TypeAAAA); got != "AAAA" {
@@ -472,6 +955,130 @@ func TestDivergenceAndStatisticsHelpers(t *testing.T) {
 	if got := sessionDialAddress(&reportedSession{address: "192.0.2.1:853"}); got != "192.0.2.1:853" {
 		t.Fatalf("reported session dial metadata = %q", got)
 	}
+	if sessionQueryReconnected(minimalSession{}) {
+		t.Fatal("session without reconnect metadata reported a reconnect")
+	}
+	if !confidenceIntervalsOverlap(Statistics{ScoreMS: 1.5}, Statistics{ScoreMS: 1.5}) {
+		t.Fatal("equal fallback score intervals should overlap")
+	}
+	if confidenceIntervalsOverlap(Statistics{ScoreMS: 1}, Statistics{ScoreMS: 3}) {
+		t.Fatal("separated fallback score intervals should not overlap")
+	}
+	if confidenceIntervalsOverlap(Statistics{CILowMS: 1, CIHighMS: 2}, Statistics{CILowMS: 3, CIHighMS: 4}) {
+		t.Fatal("separated confidence intervals should not overlap")
+	}
+}
+
+func TestPolicyAwareDivergenceBaselines(t *testing.T) {
+	observation := func(class string, rcode int) Observation {
+		return Observation{
+			Name: "Example.COM.", QType: dns.TypeA, Success: true,
+			Usable: class == "answer" || class == "nxdomain", RCode: rcode,
+			ResponseClass: class, LatencyMS: 5,
+		}
+	}
+	makeResult := func(address, policy, class string, rcode int) TargetResult {
+		target := testTarget(catalog.UDP, address)
+		target.Resolver.Policy = policy
+		return TargetResult{Target: target, Observations: []Observation{observation(class, rcode)}}
+	}
+
+	t.Run("unanimous classes do not diverge", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("unanimous-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("unanimous-b", "unfiltered", "answer", dns.RcodeSuccess),
+		}
+		if details := markDivergence(results); len(details) != 0 {
+			t.Fatalf("unanimous divergence details = %#v", details)
+		}
+		for _, result := range results {
+			if result.Observations[0].Divergent {
+				t.Fatal("unanimous response was marked divergent")
+			}
+		}
+	})
+
+	t.Run("plurality excludes only the outlier", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("plurality-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("plurality-b", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("plurality-c", "unfiltered", "nxdomain", dns.RcodeNameError),
+		}
+		details := markDivergence(results)
+		if len(details) != 1 || details[0].Baseline != "answer" || details[0].Ambiguous || len(details[0].Excluded) != 1 {
+			t.Fatalf("plurality details = %#v", details)
+		}
+		if details[0].Excluded[0].TargetID != results[2].Target.ID() || details[0].Excluded[0].ResponseClass != "nxdomain" || details[0].Excluded[0].Treatment != "latency-excluded" {
+			t.Fatalf("plurality exclusion = %#v", details[0].Excluded)
+		}
+		if results[0].Observations[0].Divergent || results[1].Observations[0].Divergent || !results[2].Observations[0].Divergent {
+			t.Fatalf("plurality divergence flags = %#v", results)
+		}
+		for _, result := range results {
+			if result.Observations[0].DivergenceBaseline != "answer" {
+				t.Fatalf("plurality baseline = %#v", result.Observations[0])
+			}
+		}
+	})
+
+	t.Run("equal classes are ambiguous", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("tie-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("tie-b", "unfiltered", "nxdomain", dns.RcodeNameError),
+		}
+		details := markDivergence(results)
+		if len(details) != 1 || !details[0].Ambiguous || details[0].Baseline != "" || len(details[0].Excluded) != 2 {
+			t.Fatalf("ambiguous details = %#v", details)
+		}
+		for _, result := range results {
+			if !result.Observations[0].Divergent || result.Observations[0].DivergenceBaseline != "ambiguous" {
+				t.Fatalf("ambiguous observation = %#v", result.Observations[0])
+			}
+		}
+	})
+
+	t.Run("declared policies are not compared", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("policy-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("policy-b", "protective", "nxdomain", dns.RcodeNameError),
+		}
+		if details := markDivergence(results); len(details) != 0 {
+			t.Fatalf("policy divergence details = %#v", details)
+		}
+		for _, result := range results {
+			if result.Observations[0].Divergent {
+				t.Fatal("different declared policies were compared")
+			}
+		}
+	})
+
+	t.Run("unusable outlier remains a scoring failure", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("rcode-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("rcode-b", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("rcode-c", "unfiltered", "rcode-2", dns.RcodeServerFailure),
+		}
+		details := markDivergence(results)
+		stats := calculateStatistics(results[2], 2*time.Second, 42)
+		if len(details) != 1 || details[0].Excluded[0].Treatment != "failure-penalized" || !results[2].Observations[0].Divergent || stats.ResolverFailures != 1 || stats.ScoringFailureRate != 1 {
+			t.Fatalf("unusable divergent response = %#v / %#v", results[2].Observations[0], stats)
+		}
+	})
+
+	t.Run("sorts query types deterministically", func(t *testing.T) {
+		results := []TargetResult{
+			makeResult("qtype-a", "unfiltered", "answer", dns.RcodeSuccess),
+			makeResult("qtype-b", "unfiltered", "nxdomain", dns.RcodeNameError),
+		}
+		results[0].Observations = append(results[0].Observations, observation("answer", dns.RcodeSuccess))
+		results[1].Observations = append(results[1].Observations, observation("nxdomain", dns.RcodeNameError))
+		results[0].Observations[1].QType = dns.TypeAAAA
+		results[1].Observations[1].QType = dns.TypeAAAA
+		details := markDivergence(results)
+		if len(details) != 2 || details[0].QType != dns.TypeA || details[1].QType != dns.TypeAAAA {
+			t.Fatalf("query-type divergence details = %#v", details)
+		}
+	})
 }
 
 type reportedSession struct {

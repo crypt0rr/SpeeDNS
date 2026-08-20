@@ -7,40 +7,49 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
-	"github.com/crypt0rr/dns-speedtest/internal/benchmark"
-	"github.com/crypt0rr/dns-speedtest/internal/catalog"
-	"github.com/crypt0rr/dns-speedtest/internal/domains"
-	"github.com/crypt0rr/dns-speedtest/internal/report"
-	"github.com/crypt0rr/dns-speedtest/internal/systemdns"
-	"github.com/crypt0rr/dns-speedtest/internal/version"
+	"github.com/crypt0rr/SpeeDNS/data"
+	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/domains"
+	"github.com/crypt0rr/SpeeDNS/internal/report"
+	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
+	"github.com/crypt0rr/SpeeDNS/internal/version"
 	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
+	"golang.org/x/text/width"
 )
 
 type cliConfig struct {
-	protocols     string
-	resolverFlags []string
-	resolverFile  string
-	noDefaults    bool
-	domainFile    string
-	sample        int
-	full          bool
-	seed          int64
-	queryTypes    string
-	timeout       time.Duration
-	concurrency   int
-	includeSystem bool
-	format        string
-	output        string
-	details       bool
-	raw           bool
-	noColor       bool
+	protocols       string
+	resolverFlags   []string
+	resolverFile    string
+	noDefaults      bool
+	domainFile      string
+	cacheMiss       bool
+	cacheMissSample int
+	sample          int
+	full            bool
+	seed            int64
+	queryTypes      string
+	timeout         time.Duration
+	concurrency     int
+	includeSystem   bool
+	format          string
+	output          string
+	details         bool
+	profileView     bool
+	raw             bool
+	noColor         bool
+	redactSystem    bool
 }
 
 var exit = os.Exit
@@ -51,11 +60,16 @@ var discoverSystemResolvers = systemdns.Discover
 
 var loadProfilesFunc = loadProfiles
 
+var verifyCorpusFunc = data.VerifyCorpus
+
 var writeTableReport = report.WriteTableWithOptions
 var writeJSONReport = report.WriteJSON
 var writeCSVReport = report.WriteCSV
+var outputWriterFunc = outputWriter
 
 var terminalDetector = fileIsTerminal
+
+var newCacheMissNonceFunc = domains.NewCacheMissNonce
 
 func exitCodeForError(err error) int {
 	switch {
@@ -129,11 +143,12 @@ func (p *progressRenderer) Update(update benchmark.Progress) {
 	if p.interactive {
 		line := p.progressLine()
 		padding := ""
-		if p.lastLineWidth > len(line) {
-			padding = strings.Repeat(" ", p.lastLineWidth-len(line))
+		lineWidth := displayWidth(line)
+		if p.lastLineWidth > lineWidth {
+			padding = strings.Repeat(" ", p.lastLineWidth-lineWidth)
 		}
 		_, _ = fmt.Fprintf(p.writer, "\r%s%s", line, padding)
-		p.lastLineWidth = len(line)
+		p.lastLineWidth = lineWidth
 		p.rendered = true
 		return
 	}
@@ -153,6 +168,26 @@ func (p *progressRenderer) progressLine() string {
 		parts = append(parts, fmt.Sprintf("%s %d/%d", protocol, p.completed[protocol], total))
 	}
 	return strings.Join(parts, " | ")
+}
+
+// displayWidth returns the number of terminal cells used by a progress line.
+// Resolver metadata can contain Unicode, so byte length is not a safe measure
+// when erasing the previous line. Combining marks occupy no cells and common
+// wide/full-width characters occupy two.
+func displayWidth(value string) int {
+	result := 0
+	for _, character := range value {
+		if unicode.Is(unicode.Mn, character) || unicode.Is(unicode.Me, character) {
+			continue
+		}
+		switch width.LookupRune(character).Kind() {
+		case width.EastAsianWide, width.EastAsianFullwidth:
+			result += 2
+		default:
+			result++
+		}
+	}
+	return result
 }
 
 func (p *progressRenderer) Finish() {
@@ -195,20 +230,25 @@ func newRootCommand() *cobra.Command {
 	flags.StringVar(&config.resolverFile, "resolver-file", "", "YAML resolver profile file")
 	flags.BoolVar(&config.noDefaults, "no-defaults", false, "do not include bundled public resolvers")
 	flags.StringVar(&config.domainFile, "domains", "", "newline-delimited domain list; defaults to the embedded corpus")
+	flags.BoolVar(&config.cacheMiss, "cache-miss", false, "opt in to bounded random names below the reserved example.com zone")
+	flags.IntVar(&config.cacheMissSample, "cache-miss-sample", domains.CacheMissDefaultSample, "number of unique reserved-zone names for --cache-miss (maximum 20)")
 	flags.IntVar(&config.sample, "sample", benchmark.DefaultSample, "number of domains to sample")
 	flags.BoolVar(&config.full, "full", false, "test the complete embedded or custom domain list")
 	flags.Int64Var(&config.seed, "seed", 0, "random seed (0 chooses and prints a new seed)")
 	flags.StringVar(&config.queryTypes, "type", "A,AAAA", "comma-separated DNS record types")
 	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout")
-	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum resolver targets tested concurrently")
+	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum measured DNS exchanges in flight per protocol")
 	flags.BoolVar(&config.includeSystem, "include-system", false, "include the configured system resolver as a baseline")
 	flags.StringVar(&config.format, "format", "table", "output format: table, json, or csv")
 	flags.StringVar(&config.output, "output", "", "write output to a file instead of stdout")
 	flags.BoolVar(&config.details, "details", false, "show cold latency, jitter, response outcomes, and expanded metrics")
+	flags.BoolVar(&config.profileView, "profile-view", false, "show same-resolver transport comparisons with score confidence intervals")
 	flags.BoolVar(&config.raw, "raw", false, "include per-query observations in JSON output")
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
+	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
 
 	root.AddCommand(newResolversCommand())
+	root.AddCommand(newCorpusCommand())
 	root.AddCommand(newVersionCommand())
 	return root
 }
@@ -234,8 +274,32 @@ func newResolversCommand() *cobra.Command {
 				for protocol := range resolver.Transports {
 					protocols = append(protocols, protocol.String())
 				}
-				sortStrings(protocols)
+				sort.Strings(protocols)
 				fmt.Fprintf(cmd.OutOrStdout(), "%-16s %-22s %-24s %-34s %s\n", resolver.ID, resolver.Owner, strings.Join(resolver.Addresses, ","), resolver.Policy, strings.Join(protocols, ","))
+			}
+			return nil
+		},
+	}
+}
+
+func newCorpusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "corpus",
+		Short: "Show the embedded domain corpus provenance and checksum",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			metadata, err := verifyCorpusFunc()
+			if err != nil {
+				return err
+			}
+			writer := cmd.OutOrStdout()
+			fmt.Fprintln(writer, "SpeeDNS domain corpus")
+			fmt.Fprintf(writer, "Source: %s\n", metadata.Source)
+			fmt.Fprintf(writer, "List ID: %s\n", metadata.ListID)
+			fmt.Fprintf(writer, "Retrieved: %s\n", metadata.RetrievedAt)
+			fmt.Fprintf(writer, "Entries: %d\n", metadata.Entries)
+			fmt.Fprintf(writer, "SHA-256: %s\n", metadata.SHA256)
+			if metadata.DownloadURL != "" {
+				fmt.Fprintf(writer, "Source URL: %s\n", metadata.DownloadURL)
 			}
 			return nil
 		},
@@ -254,6 +318,9 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if config.timeout <= 0 || config.concurrency <= 0 {
 		return errors.New("--timeout and --concurrency must be positive")
 	}
+	if config.profileView && strings.EqualFold(config.format, "csv") {
+		return errors.New("--profile-view requires table or json output")
+	}
 	selected, err := parseProtocols(config.protocols)
 	if err != nil {
 		return err
@@ -262,9 +329,32 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if err != nil {
 		return err
 	}
-	domainList, err := domains.Load(config.domainFile)
-	if err != nil {
-		return err
+	corpusMode := benchmark.CorpusWarmCache
+	corpusZone := ""
+	corpusNonce := ""
+	var domainList []string
+	if config.cacheMiss {
+		if strings.TrimSpace(config.domainFile) != "" {
+			return errors.New("--cache-miss cannot be combined with --domains")
+		}
+		if config.full {
+			return errors.New("--cache-miss cannot be combined with --full; use --cache-miss-sample")
+		}
+		corpusNonce, err = newCacheMissNonceFunc()
+		if err != nil {
+			return err
+		}
+		domainList, err = domains.CacheMissNames(corpusNonce, config.cacheMissSample)
+		if err != nil {
+			return err
+		}
+		corpusMode = benchmark.CorpusCacheMiss
+		corpusZone = domains.CacheMissZone
+	} else {
+		domainList, err = domains.Load(config.domainFile)
+		if err != nil {
+			return err
+		}
 	}
 	profiles, err := loadProfilesFunc(ctx, config)
 	if err != nil {
@@ -281,6 +371,12 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
+	effectiveConcurrency := config.concurrency
+	concurrencyCapped := false
+	if config.cacheMiss && effectiveConcurrency > domains.CacheMissMaxConcurrency {
+		effectiveConcurrency = domains.CacheMissMaxConcurrency
+		concurrencyCapped = true
+	}
 	var progressView *progressRenderer
 	var onProgress func(benchmark.Progress)
 	if strings.EqualFold(config.format, "table") {
@@ -291,7 +387,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	defer stop()
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
 		Domains: domainList, QueryTypes: queryTypes, Sample: config.sample, Full: config.full,
-		Seed: seed, Timeout: config.timeout, Concurrency: config.concurrency, Protocols: selected,
+		Seed: seed, Timeout: config.timeout, Concurrency: effectiveConcurrency, Protocols: selected,
 		OnProgress: onProgress,
 	})
 	if progressView != nil {
@@ -303,26 +399,46 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) && !errors.Is(runErr, benchmark.ErrNoComparableResults) {
 		return runErr
 	}
-	writer, closeWriter, err := outputWriter(config.output)
+	result.CorpusMode = corpusMode
+	result.CorpusZone = corpusZone
+	result.CorpusNonce = corpusNonce
+	if concurrencyCapped {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
+	}
+	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {
 		return err
 	}
-	defer closeWriter()
 	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
 		result.Warnings = append(result.Warnings, "benchmark interrupted before all targets completed")
 	}
+	var reportErr error
 	switch strings.ToLower(config.format) {
 	case "table":
-		err = writeTableReport(writer, result, report.TableOptions{
-			Details: config.details, Color: tableColorEnabled(config), Profiles: profiles, Protocols: selected,
+		reportErr = writeTableReport(writer, result, report.TableOptions{
+			Details: config.details, Color: tableColorEnabled(config), ProfileView: config.profileView, RedactSystem: config.redactSystem, Profiles: profiles, Protocols: selected,
 		})
 	case "json":
-		err = writeJSONReport(writer, result, config.raw)
+		if config.redactSystem || config.profileView {
+			reportErr = report.WriteJSONWithOptions(writer, result, config.raw, report.JSONOptions{RedactSystem: config.redactSystem, ProfileView: config.profileView})
+		} else {
+			reportErr = writeJSONReport(writer, result, config.raw)
+		}
 	case "csv":
-		err = writeCSVReport(writer, result)
+		if config.redactSystem {
+			reportErr = report.WriteCSVWithOptions(writer, result, report.CSVOptions{RedactSystem: true})
+		} else {
+			reportErr = writeCSVReport(writer, result)
+		}
 	}
-	if err != nil {
+	if err := finalizeOutput(reportErr == nil); err != nil {
+		if reportErr != nil {
+			return fmt.Errorf("write report: %v; finalize output: %w", reportErr, err)
+		}
 		return err
+	}
+	if reportErr != nil {
+		return reportErr
 	}
 	if runErr != nil {
 		return runErr
@@ -412,23 +528,64 @@ func parseQueryTypes(value string) ([]uint16, error) {
 	return types, nil
 }
 
-func outputWriter(path string) (io.Writer, func(), error) {
-	if strings.TrimSpace(path) == "" || path == "-" {
-		return os.Stdout, func() {}, nil
-	}
-	file, err := os.Create(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create output file: %w", err)
-	}
-	return file, func() { _ = file.Close() }, nil
+type outputFinalizer func(commit bool) error
+
+type outputFileHandle interface {
+	io.Writer
+	Sync() error
+	Close() error
+	Name() string
 }
 
-func sortStrings(values []string) {
-	for i := 0; i < len(values); i++ {
-		for j := i + 1; j < len(values); j++ {
-			if values[j] < values[i] {
-				values[i], values[j] = values[j], values[i]
-			}
-		}
+var statOutputPath = os.Stat
+var createTempOutputFile = func(directory, pattern string) (outputFileHandle, error) {
+	return os.CreateTemp(directory, pattern)
+}
+var removeOutputFile = os.Remove
+var renameOutputFile = os.Rename
+
+func outputWriter(path string) (io.Writer, outputFinalizer, error) {
+	if strings.TrimSpace(path) == "" || path == "-" {
+		return os.Stdout, func(bool) error { return nil }, nil
 	}
+	if info, err := statOutputPath(path); err == nil && info.IsDir() {
+		return nil, nil, fmt.Errorf("output path is a directory: %s", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("inspect output path: %w", err)
+	}
+	directory := filepath.Dir(path)
+	base := filepath.Base(path)
+	file, err := createTempOutputFile(directory, "."+base+".speedns-*")
+	if err != nil {
+		return nil, nil, fmt.Errorf("create temporary output file: %w", err)
+	}
+	temporaryPath := file.Name()
+	finalize := func(commit bool) error {
+		if !commit {
+			closeErr := file.Close()
+			removeErr := removeOutputFile(temporaryPath)
+			if closeErr != nil {
+				return fmt.Errorf("discard output file: %w", closeErr)
+			}
+			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return fmt.Errorf("remove temporary output file: %w", removeErr)
+			}
+			return nil
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			_ = removeOutputFile(temporaryPath)
+			return fmt.Errorf("flush output file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			_ = removeOutputFile(temporaryPath)
+			return fmt.Errorf("close output file: %w", err)
+		}
+		if err := renameOutputFile(temporaryPath, path); err != nil {
+			_ = removeOutputFile(temporaryPath)
+			return fmt.Errorf("replace output file: %w", err)
+		}
+		return nil
+	}
+	return file, finalize, nil
 }

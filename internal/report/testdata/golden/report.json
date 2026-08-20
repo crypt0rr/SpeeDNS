@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "run": {
+    "started_at": "0001-01-01T00:00:00.000Z",
+    "finished_at": "0001-01-01T00:00:00.000Z",
+    "seed": 42,
+    "sample_size": 1,
+    "queries_per_target": 1,
+    "query_types": [
+      1
+    ]
+  },
+  "results": [
+    {
+      "target": {
+        "id": "11@192.0.2.11/tcp",
+        "name": "Resolver 11",
+        "owner": "Owner 11",
+        "policy": "unfiltered",
+        "address": "192.0.2.11",
+        "protocol": "tcp",
+        "tls_identity_source": "none",
+        "bootstrap_mode": "none"
+      },
+      "stats": {
+        "total": 2,
+        "successes": 0,
+        "failures": 2,
+        "usable_responses": 0,
+        "resolver_failures": 0,
+        "scored": 0,
+        "divergent": 0,
+        "truncated": 0,
+        "reconnects": 0,
+        "success_rate": 0,
+        "failure_rate": 0,
+        "usable_rate": 0,
+        "resolver_failure_rate": 0,
+        "scoring_failure_rate": 0,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "min_ms": 0,
+        "max_ms": 0,
+        "mad_ms": 0,
+        "score_ms": 0,
+        "recommended": false
+      },
+      "open_error": "fixture connection failed"
+    },
+    {
+      "target": {
+        "id": "10@192.0.2.10/udp",
+        "name": "Resolver 10",
+        "owner": "Owner 10",
+        "policy": "unfiltered",
+        "address": "192.0.2.10",
+        "protocol": "udp",
+        "tls_identity_source": "none",
+        "bootstrap_mode": "none"
+      },
+      "stats": {
+        "total": 2,
+        "successes": 2,
+        "failures": 0,
+        "usable_responses": 2,
+        "resolver_failures": 0,
+        "scored": 2,
+        "divergent": 0,
+        "truncated": 0,
+        "reconnects": 0,
+        "success_rate": 1,
+        "failure_rate": 0,
+        "usable_rate": 1,
+        "resolver_failure_rate": 0,
+        "scoring_failure_rate": 0,
+        "median_ms": 2,
+        "p95_ms": 3,
+        "min_ms": 1,
+        "max_ms": 4,
+        "mad_ms": 0.5,
+        "cold_median_ms": 5,
+        "score_ms": 2.4,
+        "ci_low_ms": 1,
+        "ci_high_ms": 4,
+        "recommended": true
+      }
+    }
+  ],
+  "rankings": [
+    {
+      "protocol": "udp",
+      "target_id": "10@192.0.2.10/udp",
+      "rank": 1,
+      "tie": false
+    }
+  ],
+  "divergence": [
+    {
+      "name": "example.com",
+      "qtype": 1,
+      "policy": "unfiltered",
+      "compared": 2,
+      "baseline": "answer",
+      "classes": {
+        "answer": 1,
+        "nxdomain": 1
+      },
+      "excluded": [
+        {
+          "target_id": "10@192.0.2.10/udp",
+          "response_class": "nxdomain",
+          "treatment": "latency-excluded"
+        }
+      ]
+    }
+  ],
+  "warnings": [
+    "fixture warning"
+  ]
+}
