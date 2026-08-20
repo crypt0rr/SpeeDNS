@@ -161,6 +161,58 @@ if python3 "${root_dir}/scripts/publish-live-results.py" \
 	exit 1
 fi
 
+cp -R "${temporary_dir}/original-evidence" "${temporary_dir}/no-comparable-evidence"
+python3 - "${temporary_dir}/no-comparable-evidence/doq.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+report = json.loads(path.read_text(encoding="utf-8"))
+stats = report["results"][0]["stats"]
+stats.update(
+    {
+        "successes": 0,
+        "failures": 1,
+        "usable_responses": 0,
+        "resolver_failures": 0,
+        "scored": 0,
+        "success_rate": 0.0,
+        "failure_rate": 1.0,
+        "usable_rate": 0.0,
+        "resolver_failure_rate": 0.0,
+        "scoring_failure_rate": 1.0,
+        "median_ms": 0.0,
+        "p95_ms": 0.0,
+        "min_ms": 0.0,
+        "max_ms": 0.0,
+        "mad_ms": 0.0,
+        "cold_median_ms": 0.0,
+        "score_ms": 0.0,
+        "ci_low_ms": 0.0,
+        "ci_high_ms": 0.0,
+        "recommended": False,
+        "tie": False,
+    }
+)
+report["rankings"] = []
+path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+PY
+export SPEEDNS_RESULTS_RUN_ID=fixture-no-comparable-run
+python3 "${root_dir}/scripts/publish-live-results.py" \
+	--evidence-dir "${temporary_dir}/no-comparable-evidence" \
+	--output-dir "${temporary_dir}/no-comparable-results"
+python3 - "${temporary_dir}/no-comparable-results/latest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+record = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert record["run"]["outcome"] == "failed"
+assert record["failures"] == ["doq: no comparable ranking"]
+assert record["summary"][-1]["status"] == "failed"
+PY
+
 cp -R "${temporary_dir}/original-evidence" "${temporary_dir}/failed-evidence"
 python3 - "${temporary_dir}/failed-evidence" <<'PY'
 import pathlib
