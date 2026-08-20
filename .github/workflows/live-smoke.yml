@@ -65,3 +65,57 @@ jobs:
             cat "${RUNNER_TEMP}/speedns-smoke/failures.txt" >&2
             exit 1
           fi
+
+  publish:
+    name: Publish live results
+    if: ${{ always() && needs.smoke.result != 'cancelled' }}
+    needs: smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Download smoke-test evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: speedns-live-smoke
+          path: ${{ runner.temp }}/speedns-smoke
+
+      - name: Prepare results branch worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          worktree="${RUNNER_TEMP}/speedns-results"
+          git fetch origin refs/heads/results:refs/remotes/origin/results || true
+          if git show-ref --verify --quiet refs/remotes/origin/results; then
+            git worktree add --detach "${worktree}" origin/results
+          else
+            git worktree add --detach "${worktree}" "${GITHUB_SHA}"
+            git -C "${worktree}" switch --orphan results
+            git -C "${worktree}" rm -rf -- . >/dev/null 2>&1 || true
+          fi
+          echo "SPEEDNS_RESULTS_DIR=${worktree}" >> "${GITHUB_ENV}"
+
+      - name: Validate and generate results site
+        run: |
+          python3 scripts/publish-live-results.py \
+            --evidence-dir "${RUNNER_TEMP}/speedns-smoke" \
+            --output-dir "${SPEEDNS_RESULTS_DIR}"
+
+      - name: Commit and push results branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C "${SPEEDNS_RESULTS_DIR}" config user.name "github-actions[bot]"
+          git -C "${SPEEDNS_RESULTS_DIR}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "${SPEEDNS_RESULTS_DIR}" add --all -- index.html latest.json runs .nojekyll
+          if git -C "${SPEEDNS_RESULTS_DIR}" diff --cached --quiet; then
+            echo "results branch is already current"
+            exit 0
+          fi
+          git -C "${SPEEDNS_RESULTS_DIR}" commit -m "Publish live DNS results for ${GITHUB_RUN_ID}"
+          git -C "${SPEEDNS_RESULTS_DIR}" push origin HEAD:results

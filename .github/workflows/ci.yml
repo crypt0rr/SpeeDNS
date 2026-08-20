@@ -73,6 +73,10 @@ jobs:
         shell: bash
         run: bash scripts/live-smoke-fixture.sh
 
+      - name: Test live results publisher fixture
+        shell: bash
+        run: bash scripts/publish-live-results-fixture.sh
+
       - name: Run unit and integration tests
         run: go test -count=1 ./...
 
