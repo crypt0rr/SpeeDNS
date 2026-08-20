@@ -394,6 +394,18 @@ cache-miss results auditable without downloading anything at runtime. The
 `--redact-system` option replaces interface names with `redacted` along with
 other local resolver details; CSV output is unchanged.
 
+### Scheduled live results
+
+The project also runs a scheduled, non-blocking smoke check against one
+official endpoint for each transport. Complete runs are validated and
+published as compact JSON records and a static `index.html` on the [`results`
+branch](https://github.com/crypt0rr/SpeeDNS/tree/results). These checks are
+health and interoperability data, not a replacement for a local comparison:
+latency depends on the network where each run executes, and a failed run is
+retained with its diagnostics instead of being presented as a successful
+benchmark. Consumers can validate records with the published
+[`live-results-v1.schema.json`](https://github.com/crypt0rr/SpeeDNS/blob/results/live-results-v1.schema.json).
+
 Useful flags include:
 
 ```text

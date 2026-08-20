@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crypt0rr/SpeeDNS/schema/live-results-v1.json",
+  "title": "SpeeDNS live results",
+  "description": "Version 1 compact record published by the scheduled live smoke workflow.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run", "transports", "summary", "warnings", "failures"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run": {"$ref": "#/$defs/run"},
+    "transports": {
+      "type": "array",
+      "minItems": 5,
+      "items": {"$ref": "#/$defs/transport"}
+    },
+    "summary": {
+      "type": "array",
+      "minItems": 5,
+      "items": {"$ref": "#/$defs/summary"}
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "failures": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "protocol": {
+      "type": "string",
+      "enum": ["udp", "tcp", "doh", "dot", "doq"]
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "outcome", "published_at", "started_at", "finished_at", "seed",
+        "sample_size", "query_types", "protocols", "source", "corpus", "commands"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$"},
+        "outcome": {"type": "string", "enum": ["passed", "failed"]},
+        "published_at": {"type": "string", "format": "date-time"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": "string", "format": "date-time"},
+        "seed": {"type": "integer"},
+        "sample_size": {"type": "integer", "minimum": 1},
+        "query_types": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer", "minimum": 1, "maximum": 65535}
+        },
+        "protocols": {
+          "type": "array",
+          "minItems": 5,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/protocol"}
+        },
+        "source": {"$ref": "#/$defs/source"},
+        "corpus": {"$ref": "#/$defs/corpus"},
+        "commands": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["udp", "tcp", "doh", "dot", "doq"],
+          "properties": {
+            "udp": {"$ref": "#/$defs/command"},
+            "tcp": {"$ref": "#/$defs/command"},
+            "doh": {"$ref": "#/$defs/command"},
+            "dot": {"$ref": "#/$defs/command"},
+            "doq": {"$ref": "#/$defs/command"}
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository", "commit", "ref", "workflow_run_id", "workflow_run_attempt", "workflow_run_number"
+      ],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "commit": {"type": "string", "pattern": "^(?:[0-9a-fA-F]{7,64}|dev|unknown)$"},
+        "ref": {"type": "string", "minLength": 1},
+        "workflow_run_id": {"type": "string", "minLength": 1},
+        "workflow_run_attempt": {"type": "string", "minLength": 1},
+        "workflow_run_number": {"type": "string", "minLength": 1}
+      }
+    },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "sha256", "mode", "zone"],
+      "properties": {
+        "entries": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "mode": {"type": "string"},
+        "zone": {"type": "string"}
+      }
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_id", "name", "owner", "policy", "address", "endpoint_url", "tls_server_name"
+      ],
+      "properties": {
+        "target_id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "owner": {"type": "string", "minLength": 1},
+        "policy": {"type": "string", "minLength": 1},
+        "address": {"type": "string", "minLength": 1},
+        "endpoint_url": {"type": "string"},
+        "tls_server_name": {"type": "string"}
+      }
+    },
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total", "successes", "failures", "usable_responses", "resolver_failures", "scored",
+        "divergent", "truncated", "success_rate", "usable_rate", "median_ms", "p95_ms", "mad_ms",
+        "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "recommended", "tie"
+      ],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "successes": {"type": "integer", "minimum": 0},
+        "failures": {"type": "integer", "minimum": 0},
+        "usable_responses": {"type": "integer", "minimum": 0},
+        "resolver_failures": {"type": "integer", "minimum": 0},
+        "scored": {"type": "integer", "minimum": 0},
+        "divergent": {"type": "integer", "minimum": 0},
+        "truncated": {"type": "integer", "minimum": 0},
+        "success_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "usable_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "median_ms": {"type": "number", "minimum": 0},
+        "p95_ms": {"type": "number", "minimum": 0},
+        "mad_ms": {"type": "number", "minimum": 0},
+        "cold_median_ms": {"type": "number", "minimum": 0},
+        "score_ms": {"type": "number", "minimum": 0},
+        "ci_low_ms": {"type": "number", "minimum": 0},
+        "ci_high_ms": {"type": "number", "minimum": 0},
+        "recommended": {"type": "boolean"},
+        "tie": {"type": "boolean"}
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "status", "endpoint", "stats"],
+      "properties": {
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "status": {"type": "string", "enum": ["recommended", "measured", "ineligible", "failed"]},
+        "endpoint": {"$ref": "#/$defs/endpoint"},
+        "stats": {"$ref": "#/$defs/stats"}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "status", "winner", "stats"],
+      "properties": {
+        "protocol": {"$ref": "#/$defs/protocol"},
+        "status": {"type": "string", "enum": ["recommended", "provisional", "failed"]},
+        "winner": {
+          "anyOf": [
+            {"$ref": "#/$defs/endpoint"},
+            {"type": "null"}
+          ]
+        },
+        "stats": {"$ref": "#/$defs/stats"}
+      }
+    }
+  }
+}
