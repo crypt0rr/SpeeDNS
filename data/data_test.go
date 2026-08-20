@@ -48,6 +48,16 @@ func TestBundledDomainCorpus(t *testing.T) {
 	}
 }
 
+func TestBundledResolverCatalogAsset(t *testing.T) {
+	contents := ResolverCatalog()
+	if strings.TrimSpace(contents) == "" {
+		t.Fatal("bundled resolver catalog is empty")
+	}
+	if !strings.Contains(contents, "version: 1") || !strings.Contains(contents, "resolvers:") {
+		t.Fatalf("bundled resolver catalog is missing its versioned root: %q", contents[:min(len(contents), 80)])
+	}
+}
+
 func TestBundledDomainCorpusChecksum(t *testing.T) {
 	domains := Domains()
 	canonical := strings.Join(domains, "\n") + "\n"

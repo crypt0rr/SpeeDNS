@@ -259,6 +259,10 @@ reconnects lazily after a connection or idle-timeout failure. The failed query
 is not retried. DoH over HTTP/3 is a separate transport and is not mislabeled
 as DoQ.
 
+The bundled resolver profiles use the same strict, versioned YAML model as
+custom profiles and are embedded into the binary at build time. SpeeDNS does
+not download or read a resolver catalog at runtime.
+
 ## Custom resolvers
 
 Add one-off endpoints with repeatable `--resolver NAME=URI` flags. Use `--no-defaults` when you want to test only your own endpoints:

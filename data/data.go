@@ -16,6 +16,9 @@ var domainsFile string
 //go:embed domains.meta.json
 var domainsMetadataFile string
 
+//go:embed resolvers.yaml
+var resolverCatalogFile string
+
 // CorpusMetadata describes the source and integrity of the embedded domain
 // corpus. It is returned by VerifyCorpus and exposed by the corpus command.
 type CorpusMetadata struct {
@@ -42,6 +45,12 @@ func Domains() []string {
 		}
 	}
 	return domains
+}
+
+// ResolverCatalog returns the embedded, versioned default resolver catalog in
+// the same strict YAML format accepted by custom resolver files.
+func ResolverCatalog() string {
+	return resolverCatalogFile
 }
 
 // VerifyCorpus validates the embedded corpus and its pinned provenance

@@ -34,6 +34,65 @@ func TestDefaultResolversAreCorrectedAndProfiled(t *testing.T) {
 	}
 }
 
+func TestDefaultResolverTransportMetadata(t *testing.T) {
+	expected := map[string]struct {
+		server string
+		dohURL string
+		doq    bool
+	}{
+		"google-8888":     {server: "dns.google", dohURL: "https://dns.google/dns-query"},
+		"google-8844":     {server: "dns.google", dohURL: "https://dns.google/dns-query"},
+		"quad9-9999":      {server: "dns.quad9.net", dohURL: "https://dns.quad9.net/dns-query", doq: true},
+		"quad9-99910":     {server: "dns10.quad9.net", dohURL: "https://dns10.quad9.net/dns-query", doq: true},
+		"cloudflare-1111": {server: "one.one.one.one", dohURL: "https://cloudflare-dns.com/dns-query"},
+		"cloudflare-1112": {server: "security.cloudflare-dns.com", dohURL: "https://security.cloudflare-dns.com/dns-query"},
+		"dns4eu-111":      {server: "protective.joindns4.eu", dohURL: "https://protective.joindns4.eu/dns-query"},
+		"dns4eu-1112":     {server: "child.joindns4.eu", dohURL: "https://child.joindns4.eu/dns-query"},
+		"dns4eu-1113":     {server: "noads.joindns4.eu", dohURL: "https://noads.joindns4.eu/dns-query"},
+		"dns4eu-11100":    {server: "unfiltered.joindns4.eu", dohURL: "https://unfiltered.joindns4.eu/dns-query"},
+	}
+	for _, resolver := range DefaultResolvers() {
+		want, ok := expected[resolver.ID]
+		if !ok {
+			t.Fatalf("unexpected resolver %q", resolver.ID)
+		}
+		for _, protocol := range []Protocol{UDP, TCP} {
+			if resolver.Transports[protocol].Port != 53 {
+				t.Fatalf("%s %s port = %d, want 53", resolver.ID, protocol, resolver.Transports[protocol].Port)
+			}
+		}
+		doh := resolver.Transports[DoH]
+		if doh.Port != 443 || doh.ServerName != want.server || doh.URL != want.dohURL {
+			t.Fatalf("%s DoH metadata = %#v, want server=%q URL=%q", resolver.ID, doh, want.server, want.dohURL)
+		}
+		for _, protocol := range []Protocol{DoT} {
+			if resolver.Transports[protocol].Port != 853 || resolver.Transports[protocol].ServerName != want.server {
+				t.Fatalf("%s %s metadata = %#v", resolver.ID, protocol, resolver.Transports[protocol])
+			}
+		}
+		_, hasDoQ := resolver.Transports[DoQ]
+		if hasDoQ != want.doq {
+			t.Fatalf("%s DoQ presence = %t, want %t", resolver.ID, hasDoQ, want.doq)
+		}
+		if hasDoQ && (resolver.Transports[DoQ].Port != 853 || resolver.Transports[DoQ].ServerName != want.server) {
+			t.Fatalf("%s DoQ metadata = %#v", resolver.ID, resolver.Transports[DoQ])
+		}
+	}
+}
+
+func TestDefaultResolversFailClosedWhenEmbeddedAssetIsInvalid(t *testing.T) {
+	oldCatalog := defaultResolverCatalog
+	t.Cleanup(func() { defaultResolverCatalog = oldCatalog })
+	defaultResolverCatalog = func() string { return "version: 2\nresolvers: []\n" }
+	defer func() {
+		recovered, ok := recover().(string)
+		if !ok || !strings.Contains(recovered, "embedded resolver catalog is invalid") {
+			t.Fatalf("invalid embedded catalog panic = %v", recovered)
+		}
+	}()
+	_ = DefaultResolvers()
+}
+
 func TestLoadYAMLRejectsUnknownFields(t *testing.T) {
 	_, err := LoadYAML(strings.NewReader("version: 1\nresolvers: []\nunknown: true\n"))
 	if err == nil {
