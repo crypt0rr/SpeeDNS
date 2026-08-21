@@ -56,6 +56,17 @@ jobs:
             exit 1
           fi
 
+      - name: Validate release credentials
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "GITHUB_TOKEN is unavailable to the release job" >&2
+            exit 1
+          fi
+
       - name: Set reproducible package timestamp
         shell: bash
         run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
