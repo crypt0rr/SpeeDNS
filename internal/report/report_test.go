@@ -70,3 +70,12 @@ func TestJSONIncludesAndRedactsRunProvenance(t *testing.T) {
 		t.Fatalf("redacted provenance JSON = %s", output.String())
 	}
 }
+
+func TestDurationMillisecondsRejectsInvalidRanges(t *testing.T) {
+	if got := durationMilliseconds(time.Time{}, time.Now()); got != 0 {
+		t.Fatalf("zero start duration = %v, want zero", got)
+	}
+	if got := durationMilliseconds(time.Unix(2, 0), time.Unix(1, 0)); got != 0 {
+		t.Fatalf("reverse duration = %v, want zero", got)
+	}
+}

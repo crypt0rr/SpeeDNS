@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 type cliErrorWriter struct{}
 
 func (cliErrorWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+var originalInterfaceAddressesFunc = interfaceAddressesFunc
 
 type fakeNetAddr struct{}
 
@@ -38,6 +41,18 @@ type fakeOutputFile struct {
 func (f *fakeOutputFile) Sync() error  { return f.syncErr }
 func (f *fakeOutputFile) Close() error { return f.closeErr }
 func (f *fakeOutputFile) Name() string { return f.name }
+
+type progressSignalWriter struct {
+	bytes.Buffer
+	signal chan struct{}
+	once   sync.Once
+}
+
+func (w *progressSignalWriter) Write(value []byte) (int, error) {
+	n, err := w.Buffer.Write(value)
+	w.once.Do(func() { close(w.signal) })
+	return n, err
+}
 
 func cliDomainFile(t *testing.T) string {
 	t.Helper()
@@ -293,36 +308,153 @@ func TestProgressRendererHandlesConcurrentCompletionStyles(t *testing.T) {
 
 	var logOutput bytes.Buffer
 	logProgress := newProgressRenderer(&logOutput, false, selected, targets)
-	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Completed: 1, Total: 1, Target: targets[2]})
-	logProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Completed: 1, Total: 1, Target: targets[0]})
-	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Completed: 1, Total: 1, Target: targets[2]})
-	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Completed: 1, Total: 1, Target: targets[1]})
-	if got, want := logOutput.String(), "tested doq 1/1 targets\ntested udp 1/1 targets\ntested tcp 1/1 targets\n"; got != want {
+	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 2})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 2, ExchangesTotal: 2})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 2})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 2, ExchangesTotal: 2})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressPreparing, TargetsCompleted: 0, TargetsTotal: 1})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 2})
+	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 2})
+	want := "progress doq: preparing 0/1 targets\nprogress udp: preparing 0/1 targets\nprogress doq: measuring 0/2 exchanges\ntested doq 1/1 targets\nprogress udp: measuring 0/2 exchanges\ntested udp 1/1 targets\nprogress tcp: preparing 0/1 targets\nprogress tcp: measuring 0/2 exchanges\ntested tcp 1/1 targets\n"
+	if got := logOutput.String(); got != want {
 		t.Fatalf("non-TTY progress = %q, want %q", got, want)
 	}
 	if strings.Contains(logOutput.String(), "192.0.2.") {
 		t.Fatalf("non-TTY progress leaked target addresses: %q", logOutput.String())
 	}
+	beforeStale := logOutput.String()
+	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 2})
+	if got := logOutput.String(); got != beforeStale {
+		t.Fatalf("stale progress phase was rendered after completion: %q", got)
+	}
+	logProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 2, ExchangesTotal: 2})
+	if got := logOutput.String(); got != beforeStale {
+		t.Fatalf("duplicate progress phase was rendered: %q", got)
+	}
 
 	var ttyOutput bytes.Buffer
 	ttyProgress := newProgressRenderer(&ttyOutput, true, selected, targets)
+	ttyProgress.refreshInterval = time.Hour
+	ttyProgress.Start()
+	ttyProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	ttyProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsCompleted: 1, TargetsTotal: 1})
+	base := ttyProgress.started
 	ttyProgress.lastLineWidth = 200
-	ttyProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Completed: 1, Total: 1, Target: targets[2]})
-	ttyProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Completed: 1, Total: 1, Target: targets[0]})
+	ttyProgress.renderAt(base.Add(2 * time.Second))
+	ttyProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 2})
+	ttyProgress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 2, ExchangesTotal: 2})
 	ttyProgress.Finish()
-	if !strings.Contains(ttyOutput.String(), "testing | udp 1/1 | tcp 0/1 | doq 1/1") {
+	if !strings.Contains(ttyOutput.String(), "testing | udp queued | tcp queued | doq queued") {
 		t.Fatalf("TTY progress did not use canonical order: %q", ttyOutput.String())
+	}
+	if !strings.Contains(ttyOutput.String(), "testing | udp preparing 1/1 | tcp queued | doq preparing 0/1") {
+		t.Fatalf("TTY progress did not use canonical order: %q", ttyOutput.String())
+	}
+	if !strings.Contains(ttyOutput.String(), "elapsed 00:02") || !strings.Contains(ttyOutput.String(), "\\") {
+		t.Fatalf("TTY progress did not render elapsed spinner refresh: %q", ttyOutput.String())
 	}
 	if !strings.HasSuffix(ttyOutput.String(), "\n") {
 		t.Fatalf("TTY progress was not terminated before the report: %q", ttyOutput.String())
 	}
+	ttyProgress.Finish()
 
 	var fallbackOutput bytes.Buffer
 	fallbackProgress := newProgressRenderer(&fallbackOutput, false, []catalog.Protocol{catalog.UDP}, nil)
-	fallbackProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Completed: 1, Total: 1})
+	fallbackProgress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1})
 	if fallbackOutput.String() != "tested udp 1/1 targets\n" {
 		t.Fatalf("fallback progress = %q", fallbackOutput.String())
 	}
+}
+
+func TestProgressRendererHandlesConcurrentUpdates(t *testing.T) {
+	var output bytes.Buffer
+	progress := newProgressRenderer(&output, false, []catalog.Protocol{catalog.UDP}, []catalog.Target{{Protocol: catalog.UDP}})
+	var workers sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			progress.Update(benchmark.Progress{
+				Protocol:           catalog.UDP,
+				Phase:              benchmark.ProgressMeasuring,
+				TargetsCompleted:   1,
+				TargetsTotal:       1,
+				ExchangesCompleted: index,
+				ExchangesTotal:     32,
+			})
+		}(index)
+	}
+	workers.Wait()
+	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 32, ExchangesTotal: 32})
+	if !strings.Contains(output.String(), "progress udp: measuring") || !strings.Contains(output.String(), "tested udp 1/1 targets") {
+		t.Fatalf("concurrent progress output = %q", output.String())
+	}
+}
+
+func TestProgressRendererLifecycleAndTimingEdges(t *testing.T) {
+	finished := newProgressRenderer(io.Discard, false, []catalog.Protocol{catalog.UDP}, nil)
+	finished.Finish()
+	finished.Start()
+	finished.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	finished.renderAt(time.Now())
+
+	var interactiveOutput bytes.Buffer
+	interactive := newProgressRenderer(&interactiveOutput, true, []catalog.Protocol{catalog.UDP}, []catalog.Target{{Protocol: catalog.UDP}})
+	interactive.renderAt(time.Unix(10, 0))
+	interactive.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	interactive.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 1})
+	interactive.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 1})
+	interactive.Finish()
+	interactive.renderAt(time.Unix(11, 0))
+
+	var refreshOutput progressSignalWriter
+	refreshOutput.signal = make(chan struct{})
+	live := newProgressRenderer(&refreshOutput, true, []catalog.Protocol{catalog.UDP}, []catalog.Target{{Protocol: catalog.UDP}})
+	live.started = time.Now()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go live.refreshLoop(stop, done, time.Millisecond)
+	select {
+	case <-refreshOutput.signal:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("live progress refresh did not render")
+	}
+	close(stop)
+	<-done
+
+	defaultStop := make(chan struct{})
+	defaultDone := make(chan struct{})
+	go live.refreshLoop(defaultStop, defaultDone, 0)
+	close(defaultStop)
+	<-defaultDone
+
+	skip := newProgressRenderer(io.Discard, true, []catalog.Protocol{catalog.UDP}, []catalog.Target{{Protocol: catalog.UDP}})
+	skip.finished = true
+	skipStop := make(chan struct{})
+	skipDone := make(chan struct{})
+	go skip.refreshLoop(skipStop, skipDone, time.Millisecond)
+	time.Sleep(3 * time.Millisecond)
+	close(skipStop)
+	<-skipDone
+
+	var unknown bytes.Buffer
+	unknownProgress := newProgressRenderer(&unknown, false, nil, nil)
+	unknownProgress.Update(benchmark.Progress{Protocol: catalog.DoH, Phase: benchmark.ProgressPhase("unknown")})
+	if unknown.Len() != 0 {
+		t.Fatalf("unknown progress phase output = %q", unknown.String())
+	}
+	if got := progressElapsed(time.Time{}, time.Now()); got != "00:00" {
+		t.Fatalf("zero progress elapsed = %q", got)
+	}
+	if got := progressElapsed(time.Unix(2, 0), time.Unix(1, 0)); got != "00:00" {
+		t.Fatalf("reverse progress elapsed = %q", got)
+	}
+	if got := progressElapsed(time.Unix(0, 0), time.Unix(3600+62, 0)); got != "01:01:02" {
+		t.Fatalf("long progress elapsed = %q", got)
+	}
+	_, _ = originalInterfaceAddressesFunc(net.Interface{})
 }
 
 func TestTableColorDetectionHonorsTTYAndOverrides(t *testing.T) {
@@ -611,7 +743,7 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 	})
 	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
 		if options.OnProgress != nil && len(targets) > 0 {
-			options.OnProgress(benchmark.Progress{Protocol: targets[0].Protocol, Completed: 1, Total: 1, Target: targets[0]})
+			options.OnProgress(benchmark.Progress{Protocol: targets[0].Protocol, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1})
 		}
 		return fakeCLIReport(), nil
 	}
@@ -679,6 +811,55 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 	}
 	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "engine failed") {
 		t.Fatalf("non-context engine error = %v", err)
+	}
+}
+
+func TestRunBenchmarkProgressUsesStderrAndMachineFormatsStaySilent(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldDetector := terminalDetector
+	oldProgressWriter := progressWriterFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		terminalDetector = oldDetector
+		progressWriterFunc = oldProgressWriter
+	})
+	terminalDetector = func(*os.File) bool { return false }
+	var stderr bytes.Buffer
+	progressWriterFunc = func() io.Writer { return &stderr }
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		if options.OnProgress != nil {
+			options.OnProgress(benchmark.Progress{Protocol: targets[0].Protocol, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+			options.OnProgress(benchmark.Progress{Protocol: targets[0].Protocol, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 1})
+			options.OnProgress(benchmark.Progress{Protocol: targets[0].Protocol, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 1})
+		}
+		return fakeCLIReport(), nil
+	}
+
+	tableConfig := cliConfigForTest(t)
+	tableConfig.format = "table"
+	tableConfig.output = filepath.Join(t.TempDir(), "table.out")
+	if err := runBenchmark(context.Background(), tableConfig); err != nil {
+		t.Fatalf("table benchmark = %v", err)
+	}
+	if got := stderr.String(); got != "progress udp: preparing 0/1 targets\nprogress udp: measuring 0/1 exchanges\ntested udp 1/1 targets\n" {
+		t.Fatalf("table progress stderr = %q", got)
+	}
+	reportBytes, err := os.ReadFile(tableConfig.output)
+	if err != nil || strings.Contains(string(reportBytes), "progress udp") {
+		t.Fatalf("table report stream = %q/%v", reportBytes, err)
+	}
+
+	for _, format := range []string{"json", "csv"} {
+		stderr.Reset()
+		config := cliConfigForTest(t)
+		config.format = format
+		config.output = filepath.Join(t.TempDir(), format+".out")
+		if err := runBenchmark(context.Background(), config); err != nil {
+			t.Fatalf("%s benchmark = %v", format, err)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("%s progress stderr = %q, want silent", format, stderr.String())
+		}
 	}
 }
 

@@ -14,6 +14,9 @@ type testReadCloser struct {
 	closed bool
 }
 
+var originalOpenResolvConf = openResolvConf
+var originalRunScutil = runScutil
+
 func (r *testReadCloser) Close() error {
 	r.closed = true
 	return nil
@@ -179,6 +182,13 @@ func TestDiscoverMacOSScutilTimeoutFallsBack(t *testing.T) {
 }
 
 func TestSystemSourceHelpers(t *testing.T) {
+	if reader, err := originalOpenResolvConf(); err == nil {
+		_ = reader.Close()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = originalRunScutil(ctx)
+
 	if got, ok := normalizeAddress(" 192.0.2.1 "); !ok || got != "192.0.2.1" {
 		t.Fatalf("normalized IPv4 = %q/%v", got, ok)
 	}

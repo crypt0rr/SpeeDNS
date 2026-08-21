@@ -55,11 +55,24 @@ type Options struct {
 	OnProgress  func(Progress)
 }
 
+// ProgressPhase identifies the kind of work represented by a progress event.
+// Preparation includes connection setup, cold probes, and warm-up queries;
+// measuring includes only the scored query exchanges.
+type ProgressPhase string
+
+const (
+	ProgressPreparing ProgressPhase = "preparing"
+	ProgressMeasuring ProgressPhase = "measuring"
+	ProgressComplete  ProgressPhase = "complete"
+)
+
 type Progress struct {
-	Protocol  catalog.Protocol
-	Completed int
-	Total     int
-	Target    catalog.Target
+	Protocol           catalog.Protocol
+	Phase              ProgressPhase
+	TargetsCompleted   int
+	TargetsTotal       int
+	ExchangesCompleted int
+	ExchangesTotal     int
 }
 
 type Query struct {
@@ -342,11 +355,20 @@ func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query,
 }
 
 func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
+	if len(targets) == 0 {
+		return nil
+	}
+	emitProgress(opts, Progress{
+		Protocol:     targets[0].Protocol,
+		Phase:        ProgressPreparing,
+		TargetsTotal: len(targets),
+	})
 	results := make([]TargetResult, len(targets))
 	dispatched := make([]bool, len(targets))
 	jobs := make(chan int)
 	var wg sync.WaitGroup
-	var completed atomic.Int32
+	var completedTargets atomic.Int32
+	var completedExchanges atomic.Int32
 	workers := opts.Concurrency
 	if workers > len(targets) {
 		workers = len(targets)
@@ -364,12 +386,20 @@ func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []
 					markIncomplete(&result, ctx.Err())
 				}
 				results[index] = result
-				if opts.OnProgress != nil {
-					opts.OnProgress(Progress{Protocol: targets[index].Protocol, Completed: int(completed.Add(1)), Total: len(targets), Target: targets[index]})
-				}
+				targetsDone := int(completedTargets.Add(1))
+				exchangesDone := int(completedExchanges.Add(int32(len(result.Observations))))
+				emitProgress(opts, Progress{
+					Protocol:           targets[index].Protocol,
+					Phase:              ProgressMeasuring,
+					TargetsCompleted:   targetsDone,
+					TargetsTotal:       len(targets),
+					ExchangesCompleted: exchangesDone,
+					ExchangesTotal:     len(targets) * len(queries),
+				})
 			}
 		}()
 	}
+dispatch:
 	for index := range targets {
 		if ctx.Err() != nil {
 			break
@@ -378,20 +408,35 @@ func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []
 		case jobs <- index:
 			dispatched[index] = true
 		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			return dispatchedResults(results, dispatched)
+			break dispatch
 		}
 	}
 	close(jobs)
 	wg.Wait()
-	return dispatchedResults(results, dispatched)
+	compacted := dispatchedResults(results, dispatched)
+	emitProgress(opts, Progress{
+		Protocol:           targets[0].Protocol,
+		Phase:              ProgressComplete,
+		TargetsCompleted:   int(completedTargets.Load()),
+		TargetsTotal:       len(targets),
+		ExchangesCompleted: int(completedExchanges.Load()),
+		ExchangesTotal:     len(targets) * len(queries),
+	})
+	return compacted
 }
 
 func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
 	orderedTargets := append([]catalog.Target(nil), targets...)
+	if len(orderedTargets) == 0 {
+		return nil
+	}
 	sort.Slice(orderedTargets, func(i, j int) bool {
 		return orderedTargets[i].ID() < orderedTargets[j].ID()
+	})
+	emitProgress(opts, Progress{
+		Protocol:     orderedTargets[0].Protocol,
+		Phase:        ProgressPreparing,
+		TargetsTotal: len(orderedTargets),
 	})
 
 	runners := make([]*targetRunner, 0, len(orderedTargets))
@@ -402,7 +447,15 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 		}
 		runner := newTargetRunner(ctx, target, queries, opts)
 		runners = append(runners, runner)
-		if runner.prepare(ctx) {
+		prepared := runner.prepare(ctx)
+		preparedTargets := len(runners)
+		emitProgress(opts, Progress{
+			Protocol:         target.Protocol,
+			Phase:            ProgressPreparing,
+			TargetsCompleted: preparedTargets,
+			TargetsTotal:     len(orderedTargets),
+		})
+		if prepared {
 			ready = append(ready, runner)
 			continue
 		}
@@ -411,9 +464,28 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 		}
 	}
 
+	completedExchanges := 0
+	exchangesTotal := len(ready) * len(queries)
 	if ctx.Err() == nil {
+		emitProgress(opts, Progress{
+			Protocol:         orderedTargets[0].Protocol,
+			Phase:            ProgressMeasuring,
+			TargetsCompleted: len(runners),
+			TargetsTotal:     len(orderedTargets),
+			ExchangesTotal:   exchangesTotal,
+		})
 		for _, query := range queries {
-			runQueryRound(ctx, ready, query, opts.Concurrency)
+			completedExchanges += runQueryRound(ctx, ready, query, opts.Concurrency)
+			if len(ready) > 0 {
+				emitProgress(opts, Progress{
+					Protocol:           orderedTargets[0].Protocol,
+					Phase:              ProgressMeasuring,
+					TargetsCompleted:   len(runners),
+					TargetsTotal:       len(orderedTargets),
+					ExchangesCompleted: completedExchanges,
+					ExchangesTotal:     exchangesTotal,
+				})
+			}
 			if ctx.Err() != nil {
 				break
 			}
@@ -426,24 +498,24 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 	}
 
 	results := make([]TargetResult, 0, len(runners))
-	for index, runner := range runners {
+	for _, runner := range runners {
 		runner.close()
 		results = append(results, runner.result)
-		if opts.OnProgress != nil {
-			opts.OnProgress(Progress{
-				Protocol:  runner.target.Protocol,
-				Completed: index + 1,
-				Total:     len(targets),
-				Target:    runner.target,
-			})
-		}
 	}
+	emitProgress(opts, Progress{
+		Protocol:           orderedTargets[0].Protocol,
+		Phase:              ProgressComplete,
+		TargetsCompleted:   len(runners),
+		TargetsTotal:       len(orderedTargets),
+		ExchangesCompleted: completedExchanges,
+		ExchangesTotal:     exchangesTotal,
+	})
 	return results
 }
 
-func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, concurrency int) {
+func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, concurrency int) int {
 	if len(runners) == 0 {
-		return
+		return 0
 	}
 	if concurrency <= 0 {
 		concurrency = 1
@@ -453,13 +525,16 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 	}
 	jobs := make(chan int)
 	dispatched := make([]bool, len(runners))
+	var completed atomic.Int32
 	var wg sync.WaitGroup
 	for worker := 0; worker < concurrency; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
-				runners[index].measure(ctx, query)
+				if runners[index].measure(ctx, query) {
+					completed.Add(1)
+				}
 			}
 		}()
 	}
@@ -485,6 +560,13 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 				runners[index].abort(ctx.Err())
 			}
 		}
+	}
+	return int(completed.Load())
+}
+
+func emitProgress(opts Options, progress Progress) {
+	if opts.OnProgress != nil {
+		opts.OnProgress(progress)
 	}
 }
 

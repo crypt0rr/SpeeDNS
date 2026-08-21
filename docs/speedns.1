@@ -98,8 +98,15 @@ Include resolvers discovered from the operating system configuration.
 Disable ANSI styling in table output.
 .SH OUTPUT
 Table output is written to standard output by default. JSON output has a
-versioned schema and CSV output has one aggregate row per target. JSON and CSV
-runs keep progress messages off standard error.
+versioned schema and CSV output has one aggregate row per target. Table runs
+write progress only to standard error: terminals receive one updating line,
+while redirected standard error receives deterministic preparation,
+measurement, and completion lines. JSON and CSV runs are silent on standard
+error.
+.PP
+Preparation covers connection setup, cold probes, and warm-up queries.
+Measurement counts completed DNS exchanges, including failures. Progress does
+not show an ETA or resolver addresses and does not change report contents.
 .PP
 A qualified recommendation requires at least 20 scored comparable samples and
 99 percent usable responses. A short run may show a provisional winner instead.
@@ -124,6 +131,7 @@ Fallback system resolver configuration on macOS and Linux.
 .EX
 speedns --protocol udp --sample 25 --type A --seed 42
 speedns --format json --output result.json
+speedns --protocol doq --sample 25 2>speedns-progress.log
 speedns completion bash > speedns.bash
 .EE
 .SH SEE ALSO
