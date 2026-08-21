@@ -479,6 +479,14 @@ tested doq 10/10 targets
 JSON and CSV runs remain completely silent on standard error. Progress never
 changes benchmark measurements or report contents.
 
+Transport-library diagnostics, such as a Linux QUIC socket-buffer warning, use
+the same standard-error channel. Interactive progress briefly clears its
+status line, prints the diagnostic, and restores the status line so messages do
+not overwrite the report or become mixed into the progress text. When every
+selected IPv6 endpoint fails before receiving a usable DNS response, table
+warnings summarize the condition as an unavailable IPv6 path; partial IPv6
+failures remain visible per endpoint.
+
 Cache-miss JSON and CSV reports carry the corpus mode, reserved zone, and
 per-run nonce. JSON with `--profile-view` additionally includes
 `profile_comparisons`; the table view renders the same transport metrics and

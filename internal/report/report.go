@@ -1015,10 +1015,16 @@ func compactWarnings(report benchmark.Report) []string {
 func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []string {
 	warnings := make([]string, 0)
 	handled := make(map[string]bool)
+	if ipv6Warning, targets := ipv6UnavailableWarning(report); ipv6Warning != "" {
+		warnings = append(warnings, ipv6Warning)
+		for _, result := range targets {
+			handled[result.Target.ID()] = true
+		}
+	}
 	for _, protocol := range reportProtocols(report) {
 		targets := make([]benchmark.TargetResult, 0)
 		for _, result := range report.Targets {
-			if result.Target.Protocol == protocol {
+			if result.Target.Protocol == protocol && !handled[result.Target.ID()] {
 				targets = append(targets, result)
 			}
 		}
@@ -1101,6 +1107,56 @@ func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []st
 		}
 	}
 	return warnings
+}
+
+// ipv6UnavailableWarning collapses the common case where every selected
+// IPv6 endpoint fails at the transport layer because the local network has no
+// usable IPv6 path. It deliberately leaves partial failures and DNS-level
+// errors visible per endpoint, since those can identify a resolver-specific
+// problem rather than a local address-family limitation.
+func ipv6UnavailableWarning(report benchmark.Report) (string, []benchmark.TargetResult) {
+	targets := make([]benchmark.TargetResult, 0)
+	for _, result := range report.Targets {
+		family, ok := catalog.AddressFamilyForAddress(result.Target.Address)
+		if ok && family == catalog.Family6 {
+			targets = append(targets, result)
+		}
+	}
+	if len(targets) < 2 {
+		return "", nil
+	}
+	for _, result := range targets {
+		if !transportUnavailable(result) {
+			return "", nil
+		}
+	}
+	protocols := make(map[catalog.Protocol]bool, len(targets))
+	for _, result := range targets {
+		protocols[result.Target.Protocol] = true
+	}
+	orderedProtocols := make([]catalog.Protocol, 0, len(protocols))
+	for _, protocol := range catalog.AllProtocols {
+		if protocols[protocol] {
+			orderedProtocols = append(orderedProtocols, protocol)
+		}
+	}
+	protocolNames := make([]string, 0, len(orderedProtocols))
+	for _, protocol := range orderedProtocols {
+		protocolNames = append(protocolNames, protocol.String())
+	}
+	return fmt.Sprintf("IPv6: %d/%d endpoints unavailable across %s; no usable IPv6 path detected", len(targets), len(targets), strings.Join(protocolNames, ",")), targets
+}
+
+func transportUnavailable(result benchmark.TargetResult) bool {
+	if result.Incomplete || result.Stats.Total == 0 {
+		return result.OpenError != "" && !result.Incomplete
+	}
+	return result.Stats.Failures == result.Stats.Total &&
+		result.Stats.Successes == 0 &&
+		result.Stats.UsableResponses == 0 &&
+		result.Stats.ResolverFailures == 0 &&
+		result.Stats.Divergent == 0 &&
+		result.Stats.Truncated == 0
 }
 
 func writeWarnings(writer io.Writer, report benchmark.Report, details bool) error {

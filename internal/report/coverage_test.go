@@ -571,6 +571,49 @@ func TestWarningAggregationAndColoredTables(t *testing.T) {
 	}
 }
 
+func TestWarningAggregationCollapsesUnavailableIPv6Targets(t *testing.T) {
+	failedIPv4 := reportTarget("v4", catalog.UDP, 1, false)
+	failedIPv6UDP := reportTarget("v6-udp", catalog.UDP, 0, false)
+	failedIPv6UDP.Target.Address = "2001:db8::1"
+	failedIPv6UDP.Stats = benchmark.Statistics{Total: 4, Failures: 4}
+	failedIPv6DoH := reportTarget("v6-doh", catalog.DoH, 0, false)
+	failedIPv6DoH.Target.Address = "2001:db8::2"
+	failedIPv6DoH.Stats = benchmark.Statistics{Total: 4, Failures: 4}
+	run := benchmark.Report{
+		Targets: []benchmark.TargetResult{failedIPv4, failedIPv6UDP, failedIPv6DoH},
+		Warnings: []string{
+			targetWarningLabel(failedIPv6UDP) + " had 4/4 failed queries",
+			targetWarningLabel(failedIPv6DoH) + " had 4/4 failed queries",
+		},
+	}
+
+	warnings := compactWarnings(run)
+	if len(warnings) != 1 || warnings[0] != "IPv6: 2/2 endpoints unavailable across udp,doh; no usable IPv6 path detected" {
+		t.Fatalf("IPv6 warning aggregation = %#v", warnings)
+	}
+	if strings.Contains(warnings[0], "2001:db8") {
+		t.Fatalf("IPv6 warning leaked endpoint addresses: %#v", warnings)
+	}
+
+	availableIPv6 := failedIPv6DoH
+	availableIPv6.Stats = benchmark.Statistics{Total: 4, Successes: 4, UsableResponses: 4, Scored: 4}
+	partial := benchmark.Report{Targets: []benchmark.TargetResult{failedIPv4, failedIPv6UDP, availableIPv6}}
+	partialWarnings := strings.Join(compactWarnings(partial), "\n")
+	if strings.Contains(partialWarnings, "no usable IPv6 path detected") || !strings.Contains(partialWarnings, "v6-udp") {
+		t.Fatalf("partial IPv6 failures were over-aggregated: %s", partialWarnings)
+	}
+
+	if !transportUnavailable(benchmark.TargetResult{OpenError: "dial failed"}) {
+		t.Fatal("open failure with no measurements was not treated as unavailable")
+	}
+	if transportUnavailable(benchmark.TargetResult{}) {
+		t.Fatal("empty target was treated as unavailable")
+	}
+	if transportUnavailable(benchmark.TargetResult{Incomplete: true, OpenError: "context canceled"}) {
+		t.Fatal("incomplete target was treated as unavailable")
+	}
+}
+
 func TestResolverOutcomeMetricsAreVisible(t *testing.T) {
 	result := reportTarget("semantic", catalog.UDP, 1, false)
 	result.Stats = benchmark.Statistics{
