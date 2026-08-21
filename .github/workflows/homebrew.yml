@@ -1,0 +1,91 @@
+name: Publish Homebrew cask
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published v* tag
+        required: true
+        type: string
+
+concurrency:
+  group: homebrew-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+
+jobs:
+  publish:
+    name: Publish Homebrew cask
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    steps:
+      - name: Check out release scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+
+      - name: Validate published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/validate-published-release.sh "${RELEASE_TAG}" "${GITHUB_REPOSITORY}"
+
+      - name: Validate Homebrew credential
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${HOMEBREW_TAP_TOKEN}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN is missing; add it to the protected release environment" >&2
+            exit 1
+          fi
+
+      - name: Download published checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_dir="${RUNNER_TEMP}/speedns-release"
+          mkdir -p "${release_dir}"
+          gh release download "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern checksums.txt \
+            --dir "${release_dir}" \
+            --clobber
+
+      - name: Generate cask from published checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/homebrew-cask.sh \
+            "${RELEASE_TAG}" \
+            "${RUNNER_TEMP}/speedns-release" \
+            "${RUNNER_TEMP}/speedns.rb"
+
+      - name: Publish Homebrew cask
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: bash scripts/publish-homebrew-cask.sh "${RUNNER_TEMP}/speedns.rb" "${RELEASE_TAG}"
+
+      - name: Upload cask evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: speedns-homebrew-cask
+          path: |
+            ${{ runner.temp }}/speedns-release/checksums.txt
+            ${{ runner.temp }}/speedns.rb
+          if-no-files-found: ignore
+          retention-days: 14

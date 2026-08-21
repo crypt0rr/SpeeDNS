@@ -20,7 +20,10 @@ and verification instructions are in `README.md`.
 3. Create and push an annotated `v*` tag from the intended commit, or start the
    release workflow manually with an existing `v*` tag.
 4. Approve the protected `release` environment when GitHub requests it.
-5. Confirm the published GitHub release, Debian packages, macOS archives,
+5. Review the generated release evidence, then publish the GitHub draft from
+   the release page. Publishing triggers the Homebrew workflow; wait for that
+   workflow to update `crypt0rr/homebrew-speedns` before testing `brew install`.
+6. Confirm the published GitHub release, Debian packages, macOS archives,
    checksums, SBOMs, Cosign bundle, Homebrew cask update, and artifact
    attestations are present.
 
