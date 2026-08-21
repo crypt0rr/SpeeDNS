@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -124,6 +125,33 @@ type progressState struct {
 	targetsTotal       int
 	exchangesCompleted int
 	exchangesTotal     int
+}
+
+// Write keeps diagnostics emitted by dependencies from corrupting an active
+// interactive progress line. The benchmark installs the renderer as the
+// standard logger's output for table runs; machine-readable runs discard
+// dependency log noise so it cannot leak into a pipeline's stderr.
+func (p *progressRenderer) Write(value []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.interactive || !p.rendered || p.finished {
+		return p.writer.Write(value)
+	}
+	if _, err := fmt.Fprintf(p.writer, "\r%s\r", strings.Repeat(" ", p.lastLineWidth)); err != nil {
+		return 0, err
+	}
+	n, err := p.writer.Write(value)
+	if err != nil {
+		return n, err
+	}
+	if len(value) == 0 || value[len(value)-1] != '\n' {
+		if _, err := io.WriteString(p.writer, "\n"); err != nil {
+			return n, err
+		}
+	}
+	p.renderLocked(time.Now())
+	return n, nil
 }
 
 const defaultProgressRefreshInterval = 500 * time.Millisecond
@@ -704,11 +732,20 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	var progressView *progressRenderer
 	var onProgress func(benchmark.Progress)
+	var restoreLogOutput func()
 	if strings.EqualFold(config.format, "table") {
 		progressView = newProgressRenderer(progressWriterFunc(), terminalDetector(os.Stderr), selected, targets)
 		progressView.Start()
 		onProgress = progressView.Update
+		previousLogWriter := log.Writer()
+		log.SetOutput(progressView)
+		restoreLogOutput = func() { log.SetOutput(previousLogWriter) }
+	} else {
+		previousLogWriter := log.Writer()
+		log.SetOutput(io.Discard)
+		restoreLogOutput = func() { log.SetOutput(previousLogWriter) }
 	}
+	defer restoreLogOutput()
 	runContext, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{

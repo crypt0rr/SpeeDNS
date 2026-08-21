@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -46,6 +47,21 @@ type progressSignalWriter struct {
 	bytes.Buffer
 	signal chan struct{}
 	once   sync.Once
+}
+
+type progressFailWriter struct {
+	data   []byte
+	failAt int
+	writes int
+}
+
+func (w *progressFailWriter) Write(value []byte) (int, error) {
+	w.writes++
+	if w.failAt > 0 && w.writes == w.failAt {
+		return 0, errors.New("progress write failed")
+	}
+	w.data = append(w.data, value...)
+	return len(value), nil
 }
 
 func (w *progressSignalWriter) Write(value []byte) (int, error) {
@@ -390,6 +406,74 @@ func TestProgressRendererHandlesConcurrentUpdates(t *testing.T) {
 	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 32, ExchangesTotal: 32})
 	if !strings.Contains(output.String(), "progress udp: measuring") || !strings.Contains(output.String(), "tested udp 1/1 targets") {
 		t.Fatalf("concurrent progress output = %q", output.String())
+	}
+}
+
+func TestProgressRendererKeepsDependencyDiagnosticsReadable(t *testing.T) {
+	var output bytes.Buffer
+	progress := newProgressRenderer(&output, true, []catalog.Protocol{catalog.DoQ}, []catalog.Target{{Protocol: catalog.DoQ}})
+	progress.refreshInterval = time.Hour
+	progress.Start()
+	progress.Update(benchmark.Progress{Protocol: catalog.DoQ, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	if _, err := progress.Write([]byte("2026/08/21 warning from transport\n")); err != nil {
+		t.Fatal(err)
+	}
+	progress.Finish()
+
+	text := output.String()
+	if !strings.Contains(text, "warning from transport\n") {
+		t.Fatalf("diagnostic was not emitted: %q", text)
+	}
+	if !strings.Contains(text, "\r2026/08/21 warning from transport\n\rtesting") {
+		t.Fatalf("diagnostic did not interrupt and restore progress cleanly: %q", text)
+	}
+	if !strings.HasSuffix(text, "\n") {
+		t.Fatalf("progress output was not terminated: %q", text)
+	}
+}
+
+func TestProgressRendererWriteErrorPaths(t *testing.T) {
+	var raw bytes.Buffer
+	nonInteractive := newProgressRenderer(&raw, false, []catalog.Protocol{catalog.UDP}, nil)
+	if _, err := nonInteractive.Write([]byte("raw diagnostic")); err != nil {
+		t.Fatal(err)
+	}
+	if raw.String() != "raw diagnostic" {
+		t.Fatalf("non-interactive diagnostic = %q", raw.String())
+	}
+
+	finished := newProgressRenderer(&raw, true, []catalog.Protocol{catalog.UDP}, nil)
+	finished.finished = true
+	if _, err := finished.Write([]byte("finished diagnostic")); err != nil {
+		t.Fatal(err)
+	}
+
+	noLine := newProgressRenderer(&raw, true, []catalog.Protocol{catalog.UDP}, nil)
+	if _, err := noLine.Write([]byte("not rendered")); err != nil {
+		t.Fatal(err)
+	}
+
+	clearError := newProgressRenderer(&cliErrorWriter{}, true, []catalog.Protocol{catalog.UDP}, nil)
+	clearError.rendered = true
+	clearError.lastLineWidth = 5
+	if _, err := clearError.Write([]byte("diagnostic")); err == nil {
+		t.Fatal("expected progress-line clear error")
+	}
+
+	diagnosticErrorWriter := &progressFailWriter{failAt: 2}
+	diagnosticError := newProgressRenderer(diagnosticErrorWriter, true, []catalog.Protocol{catalog.UDP}, nil)
+	diagnosticError.rendered = true
+	diagnosticError.lastLineWidth = 5
+	if _, err := diagnosticError.Write([]byte("diagnostic\n")); err == nil {
+		t.Fatal("expected diagnostic write error")
+	}
+
+	newlineErrorWriter := &progressFailWriter{failAt: 3}
+	newlineError := newProgressRenderer(newlineErrorWriter, true, []catalog.Protocol{catalog.UDP}, nil)
+	newlineError.rendered = true
+	newlineError.lastLineWidth = 5
+	if _, err := newlineError.Write([]byte("diagnostic")); err == nil {
+		t.Fatal("expected diagnostic newline error")
 	}
 }
 
@@ -859,6 +943,33 @@ func TestRunBenchmarkProgressUsesStderrAndMachineFormatsStaySilent(t *testing.T)
 		}
 		if stderr.Len() != 0 {
 			t.Fatalf("%s progress stderr = %q, want silent", format, stderr.String())
+		}
+	}
+}
+
+func TestRunBenchmarkSuppressesDependencyLogsForMachineFormats(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldLogWriter := log.Writer()
+	var stderr bytes.Buffer
+	log.SetOutput(&stderr)
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		log.SetOutput(oldLogWriter)
+	})
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		log.Print("transport diagnostic")
+		return fakeCLIReport(), nil
+	}
+
+	for _, format := range []string{"json", "csv"} {
+		config := cliConfigForTest(t)
+		config.format = format
+		config.output = filepath.Join(t.TempDir(), format+".out")
+		if err := runBenchmark(context.Background(), config); err != nil {
+			t.Fatalf("%s benchmark = %v", format, err)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("%s dependency logs leaked to stderr: %q", format, stderr.String())
 		}
 	}
 }
