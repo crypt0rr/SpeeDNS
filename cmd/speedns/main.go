@@ -73,6 +73,8 @@ var outputWriterFunc = outputWriter
 
 var terminalDetector = fileIsTerminal
 
+var progressWriterFunc = func() io.Writer { return os.Stderr }
+
 var newCacheMissNonceFunc = domains.NewCacheMissNonce
 
 var listProvenanceInterfacesFunc = net.Interfaces
@@ -100,16 +102,33 @@ func exitCodeForError(err error) int {
 }
 
 type progressRenderer struct {
-	writer        io.Writer
-	interactive   bool
-	protocols     []catalog.Protocol
-	totals        map[catalog.Protocol]int
-	completed     map[catalog.Protocol]int
-	printed       map[catalog.Protocol]bool
-	lastLineWidth int
-	rendered      bool
-	mu            sync.Mutex
+	writer          io.Writer
+	interactive     bool
+	protocols       []catalog.Protocol
+	states          map[catalog.Protocol]progressState
+	printedPhases   map[catalog.Protocol]map[benchmark.ProgressPhase]bool
+	lastLineWidth   int
+	rendered        bool
+	started         time.Time
+	spinner         int
+	refreshInterval time.Duration
+	stop            chan struct{}
+	done            chan struct{}
+	finished        bool
+	mu              sync.Mutex
 }
+
+type progressState struct {
+	phase              benchmark.ProgressPhase
+	targetsCompleted   int
+	targetsTotal       int
+	exchangesCompleted int
+	exchangesTotal     int
+}
+
+const defaultProgressRefreshInterval = 500 * time.Millisecond
+
+var progressSpinner = []string{"-", "\\", "|", "/"}
 
 func fileIsTerminal(file *os.File) bool {
 	info, err := file.Stat()
@@ -132,57 +151,203 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 
 func newProgressRenderer(writer io.Writer, interactive bool, selected []catalog.Protocol, targets []catalog.Target) *progressRenderer {
 	progress := &progressRenderer{
-		writer:      writer,
-		interactive: interactive,
-		protocols:   canonicalProtocols(selected),
-		totals:      make(map[catalog.Protocol]int),
-		completed:   make(map[catalog.Protocol]int),
-		printed:     make(map[catalog.Protocol]bool),
+		writer:          writer,
+		interactive:     interactive,
+		protocols:       canonicalProtocols(selected),
+		states:          make(map[catalog.Protocol]progressState),
+		printedPhases:   make(map[catalog.Protocol]map[benchmark.ProgressPhase]bool),
+		refreshInterval: defaultProgressRefreshInterval,
+	}
+	for _, protocol := range progress.protocols {
+		progress.states[protocol] = progressState{}
+		progress.printedPhases[protocol] = make(map[benchmark.ProgressPhase]bool)
 	}
 	for _, target := range targets {
-		progress.totals[target.Protocol]++
+		state := progress.states[target.Protocol]
+		state.targetsTotal++
+		progress.states[target.Protocol] = state
 	}
 	return progress
+}
+
+func (p *progressRenderer) Start() {
+	p.mu.Lock()
+	if p.finished {
+		p.mu.Unlock()
+		return
+	}
+	if p.started.IsZero() {
+		p.started = time.Now()
+	}
+	if p.interactive {
+		p.renderLocked(time.Now())
+		if p.stop == nil {
+			p.stop = make(chan struct{})
+			p.done = make(chan struct{})
+			stop, done := p.stop, p.done
+			interval := p.refreshInterval
+			p.mu.Unlock()
+			go p.refreshLoop(stop, done, interval)
+			return
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *progressRenderer) refreshLoop(stop <-chan struct{}, done chan<- struct{}, interval time.Duration) {
+	defer close(done)
+	if interval <= 0 {
+		interval = defaultProgressRefreshInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.mu.Lock()
+			if !p.finished {
+				p.renderLocked(time.Now())
+			}
+			p.mu.Unlock()
+		case <-stop:
+			return
+		}
+	}
 }
 
 func (p *progressRenderer) Update(update benchmark.Progress) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if update.Completed > p.completed[update.Protocol] {
-		p.completed[update.Protocol] = update.Completed
-	}
-	if update.Total > p.totals[update.Protocol] {
-		p.totals[update.Protocol] = update.Total
-	}
-	if p.interactive {
-		line := p.progressLine()
-		padding := ""
-		lineWidth := displayWidth(line)
-		if p.lastLineWidth > lineWidth {
-			padding = strings.Repeat(" ", p.lastLineWidth-lineWidth)
-		}
-		_, _ = fmt.Fprintf(p.writer, "\r%s%s", line, padding)
-		p.lastLineWidth = lineWidth
-		p.rendered = true
+	if p.finished {
 		return
 	}
-	if update.Completed >= p.totals[update.Protocol] && !p.printed[update.Protocol] {
-		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", update.Protocol, update.Completed, update.Total)
-		p.printed[update.Protocol] = true
+	if p.started.IsZero() {
+		p.started = time.Now()
+	}
+	state := p.states[update.Protocol]
+	if update.TargetsTotal > state.targetsTotal {
+		state.targetsTotal = update.TargetsTotal
+	}
+	if update.TargetsCompleted > state.targetsCompleted {
+		state.targetsCompleted = update.TargetsCompleted
+	}
+	if update.ExchangesTotal > state.exchangesTotal {
+		state.exchangesTotal = update.ExchangesTotal
+	}
+	if update.ExchangesCompleted > state.exchangesCompleted {
+		state.exchangesCompleted = update.ExchangesCompleted
+	}
+	phaseAccepted := progressPhaseRank(update.Phase) >= progressPhaseRank(state.phase)
+	if phaseAccepted {
+		state.phase = update.Phase
+	}
+	p.states[update.Protocol] = state
+	if !phaseAccepted {
+		return
+	}
+	p.renderUpdateLocked(update, time.Now())
+}
+
+func progressPhaseRank(phase benchmark.ProgressPhase) int {
+	switch phase {
+	case benchmark.ProgressPreparing:
+		return 1
+	case benchmark.ProgressMeasuring:
+		return 2
+	case benchmark.ProgressComplete:
+		return 3
+	default:
+		return 0
 	}
 }
 
-func (p *progressRenderer) progressLine() string {
+func (p *progressRenderer) renderUpdateLocked(update benchmark.Progress, now time.Time) {
+	if p.interactive {
+		p.renderLocked(now)
+		return
+	}
+	if p.printedPhases[update.Protocol] == nil {
+		p.printedPhases[update.Protocol] = make(map[benchmark.ProgressPhase]bool)
+	}
+	if p.printedPhases[update.Protocol][update.Phase] {
+		return
+	}
+	state := p.states[update.Protocol]
+	switch update.Phase {
+	case benchmark.ProgressPreparing:
+		_, _ = fmt.Fprintf(p.writer, "progress %s: preparing %d/%d targets\n", update.Protocol, state.targetsCompleted, state.targetsTotal)
+	case benchmark.ProgressMeasuring:
+		_, _ = fmt.Fprintf(p.writer, "progress %s: measuring %d/%d exchanges\n", update.Protocol, state.exchangesCompleted, state.exchangesTotal)
+	case benchmark.ProgressComplete:
+		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", update.Protocol, state.targetsCompleted, state.targetsTotal)
+	default:
+		return
+	}
+	p.printedPhases[update.Protocol][update.Phase] = true
+}
+
+func (p *progressRenderer) renderLocked(now time.Time) {
+	line := p.progressLineLocked(now)
+	padding := ""
+	lineWidth := displayWidth(line)
+	if p.lastLineWidth > lineWidth {
+		padding = strings.Repeat(" ", p.lastLineWidth-lineWidth)
+	}
+	_, _ = fmt.Fprintf(p.writer, "\r%s%s", line, padding)
+	p.lastLineWidth = lineWidth
+	p.rendered = true
+}
+
+// renderAt is a deterministic rendering seam for tests and callers that need
+// to drive a refresh without waiting for the live ticker.
+func (p *progressRenderer) renderAt(now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.finished {
+		return
+	}
+	if p.started.IsZero() {
+		p.started = now
+	}
+	p.renderLocked(now)
+}
+
+func (p *progressRenderer) progressLineLocked(now time.Time) string {
 	parts := []string{"testing"}
 	for _, protocol := range p.protocols {
-		total := p.totals[protocol]
-		if total == 0 {
+		state := p.states[protocol]
+		if state.targetsTotal == 0 {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s %d/%d", protocol, p.completed[protocol], total))
+		switch state.phase {
+		case benchmark.ProgressPreparing:
+			parts = append(parts, fmt.Sprintf("%s preparing %d/%d", protocol, state.targetsCompleted, state.targetsTotal))
+		case benchmark.ProgressMeasuring:
+			parts = append(parts, fmt.Sprintf("%s measuring %d/%d", protocol, state.exchangesCompleted, state.exchangesTotal))
+		case benchmark.ProgressComplete:
+			parts = append(parts, fmt.Sprintf("%s done", protocol))
+		default:
+			parts = append(parts, fmt.Sprintf("%s queued", protocol))
+		}
 	}
+	parts = append(parts, fmt.Sprintf("elapsed %s", progressElapsed(p.started, now)))
+	parts = append(parts, progressSpinner[p.spinner%len(progressSpinner)])
+	p.spinner++
 	return strings.Join(parts, " | ")
+}
+
+func progressElapsed(started, now time.Time) string {
+	if started.IsZero() || now.Before(started) {
+		return "00:00"
+	}
+	seconds := int(now.Sub(started) / time.Second)
+	hours := seconds / 3600
+	minutes := (seconds / 60) % 60
+	seconds %= 60
+	if hours > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+	}
+	return fmt.Sprintf("%02d:%02d", minutes, seconds)
 }
 
 // displayWidth returns the number of terminal cells used by a progress line.
@@ -206,6 +371,18 @@ func displayWidth(value string) int {
 }
 
 func (p *progressRenderer) Finish() {
+	p.mu.Lock()
+	if p.finished {
+		p.mu.Unlock()
+		return
+	}
+	p.finished = true
+	stop, done := p.stop, p.done
+	p.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.interactive && p.rendered {
@@ -528,7 +705,8 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	var progressView *progressRenderer
 	var onProgress func(benchmark.Progress)
 	if strings.EqualFold(config.format, "table") {
-		progressView = newProgressRenderer(os.Stderr, terminalDetector(os.Stderr), selected, targets)
+		progressView = newProgressRenderer(progressWriterFunc(), terminalDetector(os.Stderr), selected, targets)
+		progressView.Start()
 		onProgress = progressView.Update
 	}
 	runContext, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)

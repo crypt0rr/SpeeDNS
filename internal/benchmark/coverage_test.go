@@ -185,8 +185,20 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Targets) != 2 || len(report.Rankings) != 2 || len(progress) != 2 {
+	if len(report.Targets) != 2 || len(report.Rankings) != 2 || len(progress) != 6 {
 		t.Fatalf("report targets/rankings/progress = %d/%d/%d", len(report.Targets), len(report.Rankings), len(progress))
+	}
+	wantPhases := []ProgressPhase{
+		ProgressPreparing, ProgressMeasuring, ProgressComplete,
+		ProgressPreparing, ProgressMeasuring, ProgressComplete,
+	}
+	for index, want := range wantPhases {
+		if progress[index].Phase != want {
+			t.Fatalf("progress[%d] phase = %q, want %q", index, progress[index].Phase, want)
+		}
+	}
+	if progress[0].Protocol != catalog.TCP || progress[3].Protocol != catalog.UDP {
+		t.Fatalf("progress protocol order = %#v/%#v, want tcp then udp", progress[0].Protocol, progress[3].Protocol)
 	}
 	if _, ok := report.ResultFor(report.Targets[0].Target.ID()); !ok {
 		t.Fatal("ResultFor did not find an existing result")
@@ -221,8 +233,12 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	if got := <-resultCh; len(got) != 1 || got[0].Target.ID() != targets[0].ID() {
 		t.Fatalf("cancelled scheduler results = %#v, want only dispatched target %#v", got, targets[0])
 	}
-	if len(cancelledProgress) != 1 || cancelledProgress[0].Completed != 1 || cancelledProgress[0].Total != len(targets) {
-		t.Fatalf("cancelled scheduler progress = %#v, want one completed dispatched target", cancelledProgress)
+	if len(cancelledProgress) != 3 {
+		t.Fatalf("cancelled scheduler progress = %#v, want preparation, measuring, and complete events", cancelledProgress)
+	}
+	lastProgress := cancelledProgress[len(cancelledProgress)-1]
+	if lastProgress.Phase != ProgressComplete || lastProgress.TargetsCompleted != 1 || lastProgress.TargetsTotal != len(targets) {
+		t.Fatalf("cancelled scheduler final progress = %#v, want one completed dispatched target", lastProgress)
 	}
 
 	ctx, cancel = context.WithCancel(context.Background())
@@ -245,6 +261,95 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	}
 	if _, err := Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "none")}, opts); err == nil || !strings.Contains(err.Error(), "no comparable") {
 		t.Fatalf("unscored Run error = %v", err)
+	}
+}
+
+func TestFairProgressEventsCoverPreparationAndFailedExchanges(t *testing.T) {
+	oldFactory := newFactory
+	oldTarget := runTargetFunc
+	t.Cleanup(func() {
+		newFactory = oldFactory
+		runTargetFunc = oldTarget
+	})
+	runTargetFunc = runTarget
+	var opens int
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		opens++
+		failedSession := func() transport.Session {
+			return &fakeSession{query: func(context.Context, string, uint16) (*dns.Msg, error) {
+				return nil, errors.New("fixture exchange failed")
+			}}
+		}
+		return &fakeFactory{opens: []fakeOpen{
+			{session: failedSession()},
+			{session: failedSession()},
+			{session: failedSession()},
+			{session: failedSession()},
+		}}, nil
+	}
+	queries := []Query{{Name: "a.example", QType: dns.TypeA}, {Name: "b.example", QType: dns.TypeA}}
+	var events []Progress
+	result := runProtocol(context.Background(), []catalog.Target{testTarget(catalog.UDP, "fixture")}, queries, Options{
+		QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1,
+		OnProgress: func(progress Progress) { events = append(events, progress) },
+	})
+	if opens != 1 || len(result) != 1 || len(result[0].Observations) != len(queries) {
+		t.Fatalf("fair progress fixture opens/results = %d/%d observations %d", opens, len(result), len(result[0].Observations))
+	}
+	if len(events) != 6 {
+		t.Fatalf("fair progress events = %#v, want initial/preparation, measuring rounds, and complete", events)
+	}
+	if events[0].Phase != ProgressPreparing || events[0].TargetsCompleted != 0 || events[0].TargetsTotal != 1 {
+		t.Fatalf("initial preparation event = %#v", events[0])
+	}
+	if events[1].Phase != ProgressPreparing || events[1].TargetsCompleted != 1 || events[1].TargetsTotal != 1 {
+		t.Fatalf("completed preparation event = %#v", events[1])
+	}
+	if events[2].Phase != ProgressMeasuring || events[2].ExchangesCompleted != 0 || events[2].ExchangesTotal != 2 {
+		t.Fatalf("initial measuring event = %#v", events[2])
+	}
+	if events[4].ExchangesCompleted != 2 || events[4].ExchangesTotal != 2 {
+		t.Fatalf("failed exchanges were not counted as completed work = %#v", events[4])
+	}
+	last := events[len(events)-1]
+	if last.Phase != ProgressComplete || last.ExchangesCompleted != 2 || last.ExchangesTotal != 2 {
+		t.Fatalf("complete event = %#v", last)
+	}
+}
+
+func TestFairProgressEventsReportOpenFailures(t *testing.T) {
+	oldFactory := newFactory
+	oldTarget := runTargetFunc
+	t.Cleanup(func() {
+		newFactory = oldFactory
+		runTargetFunc = oldTarget
+	})
+	runTargetFunc = runTarget
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		return nil, errors.New("fixture open failed")
+	}
+	var events []Progress
+	result := runProtocol(context.Background(), []catalog.Target{testTarget(catalog.DoQ, "fixture")}, []Query{{Name: "a.example", QType: dns.TypeA}}, Options{
+		QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1,
+		OnProgress: func(progress Progress) { events = append(events, progress) },
+	})
+	if len(result) != 1 || result[0].OpenError == "" || len(result[0].Observations) != 1 {
+		t.Fatalf("open failure result = %#v", result)
+	}
+	if len(events) != 4 {
+		t.Fatalf("open failure progress = %#v, want preparation, measuring, and complete events", events)
+	}
+	if events[0].Phase != ProgressPreparing || events[0].TargetsCompleted != 0 {
+		t.Fatalf("open failure initial event = %#v", events[0])
+	}
+	if events[1].Phase != ProgressPreparing || events[1].TargetsCompleted != 1 {
+		t.Fatalf("open failure preparation event = %#v", events[1])
+	}
+	if events[2].Phase != ProgressMeasuring || events[2].ExchangesTotal != 0 {
+		t.Fatalf("open failure measuring event = %#v", events[2])
+	}
+	if events[3].Phase != ProgressComplete || events[3].TargetsCompleted != 1 {
+		t.Fatalf("open failure complete event = %#v", events[3])
 	}
 }
 
@@ -382,6 +487,12 @@ func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
 	target := testTarget(catalog.UDP, "edge")
 	query := Query{Name: "edge.example", QType: dns.TypeA}
 	opts := Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1}
+	if got := runProtocolLegacy(context.Background(), nil, nil, opts); got != nil {
+		t.Fatalf("empty legacy protocol results = %#v", got)
+	}
+	if got := runProtocolFair(context.Background(), nil, nil, opts); got != nil {
+		t.Fatalf("empty fair protocol results = %#v", got)
+	}
 
 	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1, ResponseClass: "answer"}}}

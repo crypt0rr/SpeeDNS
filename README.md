@@ -457,7 +457,27 @@ Useful flags include:
 --family 4|6|both|auto  choose resolver address family (default: auto)
 ```
 
-In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.
+For table runs, SpeeDNS writes progress only to standard error so the report
+stream stays clean. In an interactive terminal it starts with one updating
+status line, for example:
+
+```text
+testing | udp done | tcp done | doh queued | dot queued | doq preparing 2/10 | elapsed 00:04 | /
+```
+
+Preparation covers connection setup, cold probes, and warm-ups. Measuring
+shows completed DNS exchanges, including failed exchanges; no ETA or resolver
+addresses are shown. When standard error is not a terminal, SpeeDNS prints
+deterministic phase-start and protocol-completion lines instead:
+
+```text
+progress doq: preparing 0/10 targets
+progress doq: measuring 0/1000 exchanges
+tested doq 10/10 targets
+```
+
+JSON and CSV runs remain completely silent on standard error. Progress never
+changes benchmark measurements or report contents.
 
 Cache-miss JSON and CSV reports carry the corpus mode, reserved zone, and
 per-run nonce. JSON with `--profile-view` additionally includes
