@@ -53,6 +53,7 @@ type cliConfig struct {
 	noColor         bool
 	redactSystem    bool
 	assertions      []string
+	family          string
 }
 
 var exit = os.Exit
@@ -75,6 +76,13 @@ var terminalDetector = fileIsTerminal
 var newCacheMissNonceFunc = domains.NewCacheMissNonce
 
 var listProvenanceInterfacesFunc = net.Interfaces
+var listNetworkInterfacesFunc = net.Interfaces
+
+var interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
+	return iface.Addrs()
+}
+
+var detectAddressFamiliesFunc = detectAddressFamilies
 
 func exitCodeForError(err error) int {
 	switch {
@@ -238,6 +246,49 @@ func activeInterfaceNames() []string {
 	return names
 }
 
+// detectAddressFamilies reports IP families present on an up interface. It
+// deliberately performs no DNS lookup or connection attempt; auto mode uses
+// the local interface inventory as a safe, offline bootstrap signal.
+func detectAddressFamilies() (map[catalog.AddressFamily]bool, error) {
+	interfaces, err := listNetworkInterfacesFunc()
+	if err != nil {
+		return nil, fmt.Errorf("inspect network interfaces: %w", err)
+	}
+	available := make(map[catalog.AddressFamily]bool)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addresses, err := interfaceAddressesFunc(iface)
+		if err != nil {
+			return nil, fmt.Errorf("inspect addresses for interface %q: %w", iface.Name, err)
+		}
+		for _, address := range addresses {
+			ip, ok := interfaceAddressIP(address)
+			if !ok || !ip.IsGlobalUnicast() {
+				continue
+			}
+			if ip.To4() != nil {
+				available[catalog.Family4] = true
+			} else {
+				available[catalog.Family6] = true
+			}
+		}
+	}
+	return available, nil
+}
+
+func interfaceAddressIP(address net.Addr) (net.IP, bool) {
+	switch value := address.(type) {
+	case *net.IPNet:
+		return value.IP, value.IP != nil
+	case *net.IPAddr:
+		return value.IP, value.IP != nil
+	default:
+		return nil, false
+	}
+}
+
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -289,6 +340,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
 	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
 	flags.StringArrayVar(&config.assertions, "assert", nil, "assert a winner metric or profile condition (repeatable)")
+	flags.StringVar(&config.family, "family", "auto", "resolver address family: 4, 6, both, or auto")
 }
 
 func newRunCommand(config *cliConfig) *cobra.Command {
@@ -399,6 +451,10 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if err != nil {
 		return err
 	}
+	family, err := catalog.ParseAddressFamily(config.family)
+	if err != nil {
+		return err
+	}
 	selected, err := parseProtocols(config.protocols)
 	if err != nil {
 		return err
@@ -440,6 +496,20 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	if err := catalog.Validate(profiles); err != nil {
 		return err
+	}
+	availableFamilies := map[catalog.AddressFamily]bool{}
+	if family == catalog.FamilyAuto {
+		availableFamilies, err = detectAddressFamiliesFunc()
+		if err != nil {
+			return err
+		}
+	}
+	profiles, err = catalog.FilterProfilesByFamily(profiles, family, availableFamilies)
+	if err != nil {
+		return err
+	}
+	if len(profiles) == 0 {
+		return fmt.Errorf("no resolver addresses match --family %s", family)
 	}
 	targets := catalog.Expand(profiles, selected)
 	if len(targets) == 0 {

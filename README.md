@@ -241,17 +241,18 @@ a recommendation-eligible result is `QUALIFIED`.
 
 Each address is ranked independently. The owner and filtering policy are shown in the terminal report so that unfiltered and protective services can be compared knowingly.
 
-| Address | Owner | Policy | Encrypted hostname |
-| --- | --- | --- | --- |
-| 8.8.8.8, 8.8.4.4 | Google | unfiltered | `dns.google` |
-| 9.9.9.9 | Quad9 | threat blocking + DNSSEC | `dns.quad9.net` |
-| 9.9.9.10 | Quad9 | unfiltered | `dns10.quad9.net` |
-| 1.1.1.1 | Cloudflare | unfiltered | `one.one.one.one`, `cloudflare-dns.com` |
-| 1.1.1.2 | Cloudflare | malware filtering | `security.cloudflare-dns.com` |
-| 86.54.11.1 | DNS4EU / JOINDNS4.eu | protective | `protective.joindns4.eu` |
-| 86.54.11.12 | DNS4EU / JOINDNS4.eu | protective + child protection | `child.joindns4.eu` |
-| 86.54.11.13 | DNS4EU / JOINDNS4.eu | protective + ad blocking | `noads.joindns4.eu` |
-| 86.54.11.100 | DNS4EU / JOINDNS4.eu | unfiltered | `unfiltered.joindns4.eu` |
+| IPv4 | IPv6 | Owner | Policy | Encrypted hostname |
+| --- | --- | --- | --- | --- |
+| 8.8.8.8 | `2001:4860:4860::8888` | Google | unfiltered | `dns.google` |
+| 8.8.4.4 | `2001:4860:4860::8844` | Google | unfiltered | `dns.google` |
+| 9.9.9.9 | `2620:fe::fe` | Quad9 | threat blocking + DNSSEC | `dns.quad9.net` |
+| 9.9.9.10 | `2620:fe::10` | Quad9 | unfiltered | `dns10.quad9.net` |
+| 1.1.1.1 | `2606:4700:4700::1111` | Cloudflare | unfiltered | `one.one.one.one`, `cloudflare-dns.com` |
+| 1.1.1.2 | `2606:4700:4700::1112` | Cloudflare | malware filtering | `security.cloudflare-dns.com` |
+| 86.54.11.1 | `2a13:1001::86:54:11:1` | DNS4EU / JOINDNS4.eu | protective | `protective.joindns4.eu` |
+| 86.54.11.12 | `2a13:1001::86:54:11:12` | DNS4EU / JOINDNS4.eu | protective + child protection | `child.joindns4.eu` |
+| 86.54.11.13 | `2a13:1001::86:54:11:13` | DNS4EU / JOINDNS4.eu | protective + ad blocking | `noads.joindns4.eu` |
+| 86.54.11.100 | `2a13:1001::86:54:11:100` | DNS4EU / JOINDNS4.eu | unfiltered | `unfiltered.joindns4.eu` |
 
 Dedicated DoQ is currently configured for Quad9. SpeeDNS uses TLS 1.3 and
 ALPN `doq`, sends an explicit QUIC keepalive at the configured timeout, and
@@ -262,6 +263,15 @@ as DoQ.
 The bundled resolver profiles use the same strict, versioned YAML model as
 custom profiles and are embedded into the binary at build time. SpeeDNS does
 not download or read a resolver catalog at runtime.
+
+The bundled catalog includes the provider-published IPv4 and IPv6 addresses.
+Use `--family 4`, `--family 6`, or `--family both` to choose deterministically.
+The default `--family auto` keeps literal address families visible on usable
+local interfaces. Hostname-only custom encrypted endpoints remain available
+in `auto` and `both`; explicit `4` or `6` requires IP literals so SpeeDNS does
+not perform an unmeasured bootstrap lookup to guess a family.
+
+The bundled addresses are sourced from [Google Public DNS](https://developers.google.com/speed/public-dns/docs/using), [Cloudflare](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/), [Quad9](https://quad9.net/service/service-addresses-and-features/), and [DNS4EU](https://joindns4.eu/for-public).
 
 ## Custom resolvers
 
@@ -444,6 +454,7 @@ Useful flags include:
 --redact-system     hide local system resolver details in reports
 --profile-view      show same-resolver transport costs and score confidence
 --assert EXPR       enforce a benchmark condition (repeatable)
+--family 4|6|both|auto  choose resolver address family (default: auto)
 ```
 
 In an interactive terminal, progress is shown as one updating status line. Redirected output uses one completion line per protocol, and JSON/CSV runs remain quiet on standard error.

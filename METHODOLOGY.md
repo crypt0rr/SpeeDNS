@@ -197,3 +197,14 @@ rank-one winners for every such protocol. Confidence-interval ties therefore
 count as winner membership. The ordinary report is emitted before an
 assertion failure; invalid expressions return status 2 and failed assertions
 return status 4. No-comparable and interruption statuses retain precedence.
+
+## Address-family selection
+
+Bundled resolver profiles carry the provider-published IPv4 and IPv6 literals.
+`--family 4`, `--family 6`, and `--family both` are deterministic filters.
+The default `--family auto` uses the up-interface address inventory without
+performing DNS lookups or connection probes; when no usable family can be
+detected, both literal families are retained rather than silently claiming a
+route. Hostname-only custom endpoints remain available in `auto` and `both`,
+while explicit family selection requires literals so the benchmark does not
+include an unmeasured bootstrap lookup.

@@ -23,6 +23,11 @@ type cliErrorWriter struct{}
 
 func (cliErrorWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 
+type fakeNetAddr struct{}
+
+func (fakeNetAddr) Network() string { return "fake" }
+func (fakeNetAddr) String() string  { return "fake" }
+
 type fakeOutputFile struct {
 	bytes.Buffer
 	name     string
@@ -46,7 +51,7 @@ func cliDomainFile(t *testing.T) string {
 func cliConfigForTest(t *testing.T) *cliConfig {
 	return &cliConfig{
 		protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true,
-		domainFile: cliDomainFile(t), sample: 1, seed: 7, queryTypes: "A", timeout: time.Second, concurrency: 1, format: "json",
+		domainFile: cliDomainFile(t), sample: 1, seed: 7, queryTypes: "A", timeout: time.Second, concurrency: 1, format: "json", family: "4",
 	}
 }
 
@@ -129,7 +134,7 @@ func TestMainAndCommands(t *testing.T) {
 		t.Fatalf("invalid completion shell error = %v", err)
 	}
 	root := newRootCommand()
-	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Flags().Lookup("assert") == nil || root.Commands() == nil {
+	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Flags().Lookup("assert") == nil || root.Flags().Lookup("family") == nil || root.Commands() == nil {
 		t.Fatal("root command was not configured")
 	}
 	var runCommand *cobra.Command
@@ -335,6 +340,50 @@ func TestTableColorDetectionHonorsTTYAndOverrides(t *testing.T) {
 	}
 }
 
+func TestDetectAddressFamilies(t *testing.T) {
+	oldInterfaces := listNetworkInterfacesFunc
+	oldAddresses := interfaceAddressesFunc
+	t.Cleanup(func() {
+		listNetworkInterfacesFunc = oldInterfaces
+		interfaceAddressesFunc = oldAddresses
+	})
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) {
+		return []net.Interface{
+			{Name: "down", Flags: 0},
+			{Name: "up", Flags: net.FlagUp},
+		}, nil
+	}
+	interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
+		if iface.Name == "down" {
+			return nil, errors.New("down interface should not be inspected")
+		}
+		return []net.Addr{
+			&net.IPNet{IP: net.ParseIP("192.0.2.10")},
+			&net.IPNet{IP: net.ParseIP("2001:db8::10")},
+			&net.IPAddr{IP: net.ParseIP("127.0.0.1")},
+			fakeNetAddr{},
+		}, nil
+	}
+	available, err := detectAddressFamilies()
+	if err != nil || !available[catalog.Family4] || !available[catalog.Family6] {
+		t.Fatalf("detected families = %#v/%v", available, err)
+	}
+	for _, address := range []net.Addr{&net.IPNet{}, &net.IPAddr{}, fakeNetAddr{}, nil} {
+		if ip, ok := interfaceAddressIP(address); ok || ip != nil {
+			t.Fatalf("invalid interface address = %#v/%v", ip, ok)
+		}
+	}
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) { return nil, errors.New("interfaces unavailable") }
+	if _, err := detectAddressFamilies(); err == nil || !strings.Contains(err.Error(), "inspect network interfaces") {
+		t.Fatalf("interface discovery error = %v", err)
+	}
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) { return []net.Interface{{Name: "up", Flags: net.FlagUp}}, nil }
+	interfaceAddressesFunc = func(net.Interface) ([]net.Addr, error) { return nil, errors.New("addresses unavailable") }
+	if _, err := detectAddressFamilies(); err == nil || !strings.Contains(err.Error(), "inspect addresses") {
+		t.Fatalf("address discovery error = %v", err)
+	}
+}
+
 func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 	defaultProfiles, err := loadProfiles(context.Background(), &cliConfig{})
 	if err != nil || len(defaultProfiles) != 10 {
@@ -386,7 +435,7 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 	path := cliDomainFile(t)
 	base := func() *cliConfig {
-		return &cliConfig{protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true, domainFile: path, sample: 1, seed: 1, queryTypes: "A", timeout: time.Second, concurrency: 1, format: "json"}
+		return &cliConfig{protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true, domainFile: path, sample: 1, seed: 1, queryTypes: "A", timeout: time.Second, concurrency: 1, format: "json", family: "4"}
 	}
 	cases := []struct {
 		name  string
@@ -397,6 +446,7 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 		{"sample", func(c *cliConfig) { c.sample = 0 }},
 		{"timeout", func(c *cliConfig) { c.timeout = 0 }},
 		{"concurrency", func(c *cliConfig) { c.concurrency = 0 }},
+		{"family", func(c *cliConfig) { c.family = "5" }},
 		{"protocol", func(c *cliConfig) { c.protocols = "bad" }},
 		{"types", func(c *cliConfig) { c.queryTypes = "ANY" }},
 		{"assertion", func(c *cliConfig) { c.assertions = []string{"bad"} }},
@@ -438,6 +488,67 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 	}
 }
 
+func TestRunBenchmarkFamilySelection(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldDetector := detectAddressFamiliesFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		detectAddressFamiliesFunc = oldDetector
+	})
+	var captured []catalog.Target
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		captured = append([]catalog.Target(nil), targets...)
+		return fakeCLIReport(), nil
+	}
+	for _, test := range []struct {
+		family string
+		count  int
+	}{
+		{family: "4", count: 1},
+		{family: "6", count: 1},
+		{family: "both", count: 2},
+	} {
+		config := &cliConfig{
+			protocols: "udp", resolverFlags: []string{"v4=udp://192.0.2.53:53", "v6=udp://[2001:db8::53]:53"},
+			noDefaults: true, domainFile: cliDomainFile(t), sample: 1, seed: 1, queryTypes: "A", timeout: time.Second,
+			concurrency: 1, format: "json", family: test.family, output: filepath.Join(t.TempDir(), test.family+".json"),
+		}
+		if err := runBenchmark(context.Background(), config); err != nil {
+			t.Fatalf("family %s run = %v", test.family, err)
+		}
+		if len(captured) != test.count {
+			t.Fatalf("family %s targets = %d, want %d (%#v)", test.family, len(captured), test.count, captured)
+		}
+	}
+
+	config := &cliConfig{
+		protocols: "udp", resolverFlags: []string{"v4=udp://192.0.2.53:53"}, noDefaults: true,
+		domainFile: cliDomainFile(t), sample: 1, seed: 1, queryTypes: "A", timeout: time.Second, concurrency: 1,
+		format: "json", family: "6", output: filepath.Join(t.TempDir(), "empty.json"),
+	}
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "no resolver addresses match") {
+		t.Fatalf("empty family selection error = %v", err)
+	}
+
+	detectAddressFamiliesFunc = func() (map[catalog.AddressFamily]bool, error) {
+		return nil, errors.New("family detector failed")
+	}
+	config = &cliConfig{
+		protocols: "udp", resolverFlags: []string{"v4=udp://192.0.2.53:53"}, noDefaults: true,
+		domainFile: cliDomainFile(t), sample: 1, seed: 1, queryTypes: "A", timeout: time.Second, concurrency: 1,
+		format: "json", family: "auto", output: filepath.Join(t.TempDir(), "detector.json"),
+	}
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "family detector failed") {
+		t.Fatalf("family detector error = %v", err)
+	}
+	detectAddressFamiliesFunc = oldDetector
+	config.resolverFlags = []string{"hostname=udp://dns.example:53"}
+	config.family = "4"
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "not an IP literal") {
+		t.Fatalf("hostname family error = %v", err)
+	}
+}
+
 func TestRunBenchmarkCacheMissSafetyAndMetadata(t *testing.T) {
 	oldEngine := runBenchmarkEngine
 	oldNonce := newCacheMissNonceFunc
@@ -454,7 +565,7 @@ func TestRunBenchmarkCacheMissSafetyAndMetadata(t *testing.T) {
 	config := &cliConfig{
 		protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true,
 		cacheMiss: true, cacheMissSample: 2, sample: 100, seed: 7, queryTypes: "A", timeout: time.Second,
-		concurrency: 4, format: "json", profileView: true, output: filepath.Join(t.TempDir(), "cache.json"),
+		concurrency: 4, format: "json", profileView: true, family: "4", output: filepath.Join(t.TempDir(), "cache.json"),
 	}
 	if err := runBenchmark(context.Background(), config); err != nil {
 		t.Fatal(err)
