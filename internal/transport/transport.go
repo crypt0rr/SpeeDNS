@@ -179,6 +179,12 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				ServerName: serverName,
+				// RFC 7858 registers the "dot" ALPN token and RFC 8310 says a
+				// DNS-over-TLS client SHOULD offer it. DoQ and DoH already
+				// negotiate their own tokens here; without one, a server or
+				// middlebox that routes by ALPN cannot tell what this
+				// connection carries.
+				NextProtos: []string{"dot"},
 			},
 		}, nil
 	case catalog.DoH:
@@ -208,8 +214,40 @@ type udpFactory struct {
 	timeout time.Duration
 }
 
-func (f *udpFactory) Open(context.Context) (Session, error) {
-	return &udpSession{address: f.address, timeout: f.timeout}, nil
+// resolveUDPAddress is a seam so the bootstrap lookup can be exercised without
+// a real system resolver.
+var resolveUDPAddress = func(ctx context.Context, address string) (string, error) {
+	resolved, err := net.DefaultResolver.LookupNetIP(ctx, "ip", address)
+	if err != nil {
+		return "", err
+	}
+	if len(resolved) == 0 {
+		return "", fmt.Errorf("no addresses for %q", address)
+	}
+	return resolved[0].String(), nil
+}
+
+// Open resolves a hostname endpoint once, here, rather than leaving it to every
+// exchange. dns.Client.ExchangeContext dials the address it is given, so a
+// hostname target sent the benchmark through the system resolver inside the
+// timed region on every single query, measuring the local resolver's latency
+// as if it were the target's. METHODOLOGY.md states that UDP reports the DNS
+// transaction time only, and a bootstrap lookup is not part of that
+// transaction. An address that is already a literal costs nothing here.
+func (f *udpFactory) Open(ctx context.Context) (Session, error) {
+	address := f.address
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid UDP endpoint %q: %w", address, err)
+	}
+	if net.ParseIP(host) == nil {
+		resolvedHost, resolveErr := resolveUDPAddress(ctx, host)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve UDP endpoint %q: %w", host, resolveErr)
+		}
+		address = net.JoinHostPort(resolvedHost, port)
+	}
+	return &udpSession{address: address, timeout: f.timeout}, nil
 }
 
 type streamFactory struct {
@@ -241,6 +279,10 @@ type udpSession struct {
 	address string
 	timeout time.Duration
 }
+
+// DialAddress reports the literal endpoint the session exchanges with, which
+// for a hostname target is the address resolved once when the session opened.
+func (s *udpSession) DialAddress() string { return s.address }
 
 func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	query := newQuery(name, qtype, dns.Id(), false)
