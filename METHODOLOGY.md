@@ -102,6 +102,18 @@ to receive `RECOMMENDED`. A result with valid samples but insufficient quality
 is `INELIGIBLE`; a result with no transport-valid response is `FAILED`.
 Interrupted targets are `INCOMPLETE` and are never ranked.
 
+A resolver that runs on the local host, such as a loopback stub or forwarder,
+is measured and reported but is never ranked and never recommended. It answers
+from its own cache, so the measurement is cache-hit latency and excludes the
+upstream resolution it forwards to; comparing it with a resolver reached over
+the network would compare two different quantities. Such a target is
+`NOT COMPARABLE`, has no rank, and carries a permanent warning naming that
+reason. The classification comes from system resolver discovery, not from the
+resolver file format, so it cannot be asserted by a catalog. JSON reports it
+in the additive `local` field on the target and CSV in a trailing `local`
+column, so a consumer can tell a missing rank caused by non-comparability
+apart from one caused by a failure.
+
 ## Confidence intervals and ties
 
 Confidence intervals use a deterministic bootstrap seeded from the run seed

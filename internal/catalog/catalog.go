@@ -52,6 +52,12 @@ type TransportSpec struct {
 // ResolverProfile is the stable configuration unit shown to users. A profile
 // may expose more than one address, but each address is benchmarked as its own
 // target.
+//
+// Local marks a resolver that runs on the local host, such as a loopback stub
+// or forwarder. Its latency is the latency of a local cache lookup and
+// excludes the upstream resolution it forwards to, so it is not comparable
+// with a resolver reached over the network. It is set by discovery, not by the
+// resolver file format, so catalogs stay portable between hosts.
 type ResolverProfile struct {
 	ID         string                     `yaml:"id"`
 	Name       string                     `yaml:"name"`
@@ -59,6 +65,7 @@ type ResolverProfile struct {
 	Policy     string                     `yaml:"policy"`
 	Scope      string                     `yaml:"scope,omitempty"`
 	Interface  string                     `yaml:"interface,omitempty"`
+	Local      bool                       `yaml:"-"`
 	Addresses  []string                   `yaml:"addresses"`
 	Transports map[Protocol]TransportSpec `yaml:"transports"`
 }
