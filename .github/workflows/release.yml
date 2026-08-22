@@ -25,6 +25,10 @@ permissions:
 env:
   GO_VERSION: '1.25.x'
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # A stable tag can point to the same commit as its final prerelease. Tell
+  # GoReleaser which tag is being published instead of relying on git
+  # describe's choice among multiple tags on that commit.
+  GORELEASER_CURRENT_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
