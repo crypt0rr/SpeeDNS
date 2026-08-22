@@ -267,9 +267,15 @@ not download or read a resolver catalog at runtime.
 The bundled catalog includes the provider-published IPv4 and IPv6 addresses.
 Use `--family 4`, `--family 6`, or `--family both` to choose deterministically.
 The default `--family auto` keeps literal address families visible on usable
-local interfaces. Hostname-only custom encrypted endpoints remain available
-in `auto` and `both`; explicit `4` or `6` requires IP literals so SpeeDNS does
-not perform an unmeasured bootstrap lookup to guess a family.
+local interfaces. Unique-local IPv6 (`fc00::/7`, including Tailscale and
+router-issued ULAs) does not count as IPv6 availability, because IPv6 has no
+NAT equivalent and a ULA is not evidence of a public route; private IPv4 still
+counts. `auto` prunes only the bundled catalog and warns when it drops
+addresses, so resolvers you name with `--resolver`, `--resolver-file`, or
+`--include-system` are always benchmarked. Hostname-only custom encrypted
+endpoints remain available in `auto` and `both`; explicit `4` or `6` requires
+IP literals so SpeeDNS does not perform an unmeasured bootstrap lookup to guess
+a family.
 
 The bundled addresses are sourced from [Google Public DNS](https://developers.google.com/speed/public-dns/docs/using), [Cloudflare](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/), [Quad9](https://quad9.net/service/service-addresses-and-features/), and [DNS4EU](https://joindns4.eu/for-public).
 
