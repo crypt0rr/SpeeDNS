@@ -456,7 +456,10 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			conn, address, err := plan.openStream(ctx, tlsConfig)
 			if err == nil {
-				session.setDialAddress(address)
+				// http.Transport re-dials transparently when a pooled
+				// connection is gone, so this hook is the only place a new
+				// TCP+TLS(+HTTP/2) handshake becomes observable.
+				session.recordConnection(address)
 			}
 			return conn, err
 		},
@@ -508,17 +511,49 @@ func joinAddress(host string, port int) string {
 }
 
 type doHSession struct {
-	client    *http.Client
-	transport *http.Transport
-	endpoint  string
-	mu        sync.RWMutex
-	dialAddr  string
+	client          *http.Client
+	transport       *http.Transport
+	endpoint        string
+	mu              sync.RWMutex
+	dialAddr        string
+	connections     uint64
+	lastReconnected bool
 }
 
-func (s *doHSession) setDialAddress(address string) {
+// recordConnection is called from the transport dial hook, which runs on the
+// http.Transport's own goroutines, once per newly opened HTTPS connection.
+func (s *doHSession) recordConnection(address string) {
 	s.mu.Lock()
 	s.dialAddr = address
+	s.connections++
 	s.mu.Unlock()
+}
+
+// beginQuery resets the per-query reconnect state and returns the number of
+// connections opened so far, so the query can tell whether it had to open one.
+func (s *doHSession) beginQuery() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReconnected = false
+	return s.connections
+}
+
+// endQuery records whether the exchange had to replace a connection that the
+// session had already established. The very first connection is opened lazily
+// by the first exchange and is the DoH analogue of the dial the stream
+// transports perform in Open, so it is not counted as a reconnect.
+func (s *doHSession) endQuery(connectionsBefore uint64) {
+	s.mu.Lock()
+	s.lastReconnected = connectionsBefore > 0 && s.connections > connectionsBefore
+	s.mu.Unlock()
+}
+
+// LastQueryReconnected reports whether the most recent Query had to open a
+// fresh HTTPS connection after the previous one was dropped.
+func (s *doHSession) LastQueryReconnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastReconnected
 }
 
 func (s *doHSession) DialAddress() string {
@@ -528,6 +563,7 @@ func (s *doHSession) DialAddress() string {
 }
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	connectionsBefore := s.beginQuery()
 	query := newQuery(name, qtype, 0, true)
 	packed, err := packSessionQuery(query)
 	if err != nil {
@@ -540,6 +576,7 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	request.Header.Set("Accept", "application/dns-message")
 	request.Header.Set("Content-Type", "application/dns-message")
 	response, err := s.client.Do(request)
+	s.endQuery(connectionsBefore)
 	if err != nil {
 		return nil, err
 	}
