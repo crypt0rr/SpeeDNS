@@ -109,9 +109,9 @@ func TestRunWarnsWhenSampleIsClamped(t *testing.T) {
 	}
 }
 
-func containsWarning(warnings []string, fragment string) bool {
+func containsWarning(warnings []Warning, fragment string) bool {
 	for _, warning := range warnings {
-		if strings.Contains(warning, fragment) {
+		if strings.Contains(warning.String(), fragment) {
 			return true
 		}
 	}
@@ -205,7 +205,7 @@ func TestRecommendationRequiresUsableResponses(t *testing.T) {
 		Target: target,
 		Stats:  Statistics{Total: 2, Scored: 1, ResolverFailures: 1, RCodeCounts: map[string]int{"SERVFAIL": 1}},
 	}})
-	if len(warnings) != 2 || !strings.Contains(strings.Join(warnings, "\n"), "SERVFAIL:1") {
+	if len(warnings) != 2 || !strings.Contains(warningText(warnings), "SERVFAIL:1") {
 		t.Fatalf("resolver-error warnings = %#v", warnings)
 	}
 }

@@ -166,7 +166,7 @@ type Report struct {
 	Rankings      []Ranking          `json:"rankings"`
 	PairedEffects []PairedEffect     `json:"paired_effects,omitempty"`
 	Divergence    []DivergenceDetail `json:"divergence,omitempty"`
-	Warnings      []string           `json:"warnings,omitempty"`
+	Warnings      []Warning          `json:"warnings,omitempty"`
 }
 
 // RunProvenance records the local build, platform, corpus, and effective
@@ -264,10 +264,10 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 		QueryTypes: append([]uint16(nil), opts.QueryTypes...),
 	}
 	if !opts.Full && opts.Sample > report.SampleSize {
-		report.Warnings = append(report.Warnings, fmt.Sprintf(
+		report.Warnings = append(report.Warnings, RunWarning(fmt.Sprintf(
 			"requested sample of %d domains exceeds the normalized corpus size; using all %d domains",
 			opts.Sample, report.SampleSize,
-		))
+		)))
 	}
 
 	byProtocol := make(map[catalog.Protocol][]catalog.Target)
@@ -1368,34 +1368,33 @@ func confidenceIntervalsOverlap(left, right Statistics) bool {
 	return leftLow <= rightHigh && rightLow <= leftHigh
 }
 
-func collectWarnings(results []TargetResult) []string {
-	warnings := make([]string, 0)
+func collectWarnings(results []TargetResult) []Warning {
+	warnings := make([]Warning, 0)
 	for _, result := range results {
-		label := fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol)
 		if result.Incomplete {
-			warnings = append(warnings, fmt.Sprintf("%s was incomplete and excluded from ranking", label))
+			warnings = append(warnings, TargetWarning(result.Target, "was incomplete and excluded from ranking"))
 		}
 		if result.OpenError != "" {
-			warnings = append(warnings, fmt.Sprintf("%s could not open a session: %s", label, result.OpenError))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("could not open a session: %s", result.OpenError)))
 		}
 		if result.Stats.Failures > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s had %d/%d failed queries", label, result.Stats.Failures, result.Stats.Total))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("had %d/%d failed queries", result.Stats.Failures, result.Stats.Total)))
 		}
 		if result.Stats.Divergent > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s had %d divergent responses excluded from latency scoring", label, result.Stats.Divergent))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("had %d divergent responses excluded from latency scoring", result.Stats.Divergent)))
 		}
 		if result.Stats.Truncated > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s returned %d truncated responses; SpeeDNS did not fall back to another transport", label, result.Stats.Truncated))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("returned %d truncated responses; SpeeDNS did not fall back to another transport", result.Stats.Truncated)))
 		}
 		if result.Stats.ResolverFailures > 0 {
-			warning := fmt.Sprintf("%s returned %d unusable DNS responses", label, result.Stats.ResolverFailures)
+			message := fmt.Sprintf("returned %d unusable DNS responses", result.Stats.ResolverFailures)
 			if codes := formatRCodeCounts(result.Stats.RCodeCounts); codes != "" {
-				warning += " (" + codes + ")"
+				message += " (" + codes + ")"
 			}
-			warnings = append(warnings, warning)
+			warnings = append(warnings, TargetWarning(result.Target, message))
 		}
 		if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
-			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100)))
 		}
 	}
 	return warnings

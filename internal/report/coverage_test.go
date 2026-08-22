@@ -91,7 +91,7 @@ func completeReport() benchmark.Report {
 			{Protocol: catalog.UDP, TargetID: winner.Target.ID(), Rank: 1},
 			{Protocol: catalog.UDP, TargetID: winner.Target.ID(), Rank: 2},
 		},
-		Warnings: []string{"example warning"},
+		Warnings: []benchmark.Warning{benchmark.RunWarning("example warning")},
 	}
 }
 
@@ -234,9 +234,9 @@ func TestSystemReportRedactionPreservesRankingsWithoutLocalAddresses(t *testing.
 		Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
 		Targets:  []benchmark.TargetResult{system, regular},
 		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: systemTarget.ID(), Rank: 1}},
-		Warnings: []string{
-			targetWarningLabel(system) + ": dial 127.0.0.53:53 failed",
-			"global diagnostic mentions 127.0.0.53",
+		Warnings: []benchmark.Warning{
+			benchmark.TargetWarning(system.Target, "could not open a session: dial 127.0.0.53:53: timeout"),
+			benchmark.RunWarning("global diagnostic mentions 127.0.0.53"),
 		},
 	}
 
@@ -517,11 +517,11 @@ func TestWarningAggregationAndColoredTables(t *testing.T) {
 	divergentOnly.Stats = benchmark.Statistics{Total: 2, Successes: 2, UsableResponses: 2, Divergent: 2}
 	run := benchmark.Report{
 		Targets: []benchmark.TargetResult{udpFirst, udpSecond, partial, rcodeOnly, divergentOnly},
-		Warnings: []string{
-			targetWarningLabel(udpFirst) + " could not open a session: dial udp timeout",
-			targetWarningLabel(udpFirst) + " had 5/5 failed queries",
-			targetWarningLabel(partial) + " had 3/5 failed queries",
-			"benchmark interrupted before all targets completed",
+		Warnings: []benchmark.Warning{
+			benchmark.TargetWarning(udpFirst.Target, "could not open a session: dial udp timeout"),
+			benchmark.TargetWarning(udpFirst.Target, "had 5/5 failed queries"),
+			benchmark.TargetWarning(partial.Target, "had 3/5 failed queries"),
+			benchmark.RunWarning("benchmark interrupted before all targets completed"),
 		},
 	}
 
@@ -581,9 +581,9 @@ func TestWarningAggregationCollapsesUnavailableIPv6Targets(t *testing.T) {
 	failedIPv6DoH.Stats = benchmark.Statistics{Total: 4, Failures: 4}
 	run := benchmark.Report{
 		Targets: []benchmark.TargetResult{failedIPv4, failedIPv6UDP, failedIPv6DoH},
-		Warnings: []string{
-			targetWarningLabel(failedIPv6UDP) + " had 4/4 failed queries",
-			targetWarningLabel(failedIPv6DoH) + " had 4/4 failed queries",
+		Warnings: []benchmark.Warning{
+			benchmark.TargetWarning(failedIPv6UDP.Target, "had 4/4 failed queries"),
+			benchmark.TargetWarning(failedIPv6DoH.Target, "had 4/4 failed queries"),
 		},
 	}
 
@@ -802,7 +802,7 @@ func TestReportFormattingBranchesAndWriteErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	warningReport := benchmark.Report{Warnings: []string{"generic warning"}}
+	warningReport := benchmark.Report{Warnings: []benchmark.Warning{benchmark.RunWarning("generic warning")}}
 	if err := writeWarnings(&failingWriter{failAt: 1}, warningReport, false); err == nil {
 		t.Fatal("warning heading write failure was not returned")
 	}
@@ -840,7 +840,7 @@ func TestReportFormattingBranchesAndWriteErrors(t *testing.T) {
 		t.Fatal("comparison table write failure was not returned")
 	}
 	warningReportWithTarget := provisionalReport
-	warningReportWithTarget.Warnings = []string{"generic warning"}
+	warningReportWithTarget.Warnings = []benchmark.Warning{benchmark.RunWarning("generic warning")}
 	if err := WriteTableWithOptions(contentFailWriter{needle: "generic warning"}, warningReportWithTarget, TableOptions{}); err == nil {
 		t.Fatal("warning row propagation was not returned")
 	}

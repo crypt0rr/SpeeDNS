@@ -780,14 +780,14 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		Concurrency:   effectiveConcurrency,
 	}
 	if concurrencyCapped {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency)))
 	}
 	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {
 		return err
 	}
 	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
-		result.Warnings = append(result.Warnings, "benchmark interrupted before all targets completed")
+		result.Warnings = append(result.Warnings, benchmark.RunWarning("benchmark interrupted before all targets completed"))
 	}
 	var reportErr error
 	switch strings.ToLower(config.format) {
