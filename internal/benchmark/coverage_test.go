@@ -197,8 +197,8 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 			t.Fatalf("progress[%d] phase = %q, want %q", index, progress[index].Phase, want)
 		}
 	}
-	if progress[0].Protocol != catalog.TCP || progress[3].Protocol != catalog.UDP {
-		t.Fatalf("progress protocol order = %#v/%#v, want tcp then udp", progress[0].Protocol, progress[3].Protocol)
+	if progress[0].Protocol != catalog.UDP || progress[3].Protocol != catalog.TCP {
+		t.Fatalf("progress protocol order = %#v/%#v, want udp then tcp", progress[0].Protocol, progress[3].Protocol)
 	}
 	if _, ok := report.ResultFor(report.Targets[0].Target.ID()); !ok {
 		t.Fatal("ResultFor did not find an existing result")
@@ -247,7 +247,7 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 		cancel()
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1}}}
 	}
-	cancelledTargets := []catalog.Target{testTarget(catalog.TCP, "cancel-first"), testTarget(catalog.UDP, "not-dispatched")}
+	cancelledTargets := []catalog.Target{testTarget(catalog.UDP, "cancel-first"), testTarget(catalog.TCP, "not-dispatched")}
 	cancelledReport, err := Run(ctx, cancelledTargets, opts)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
