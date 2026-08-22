@@ -3,8 +3,10 @@ package transport
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,5 +165,98 @@ func serveTCP(listener net.Listener, stop <-chan struct{}) {
 				}
 			}
 		}()
+	}
+}
+
+// TestDoTOffersTheALPNToken pins the ALPN token on DNS-over-TLS. RFC 7858
+// registers "dot" and RFC 8310 says a client SHOULD offer it; DoQ and DoH
+// already negotiate their own tokens, so DoT was the one transport that
+// presented an unlabelled connection.
+func TestDoTOffersTheALPNToken(t *testing.T) {
+	factory, err := NewFactory(catalog.Target{
+		Protocol: catalog.DoT, Address: "192.0.2.1",
+		Spec: catalog.TransportSpec{Port: 853, ServerName: "dns.example"},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, ok := factory.(*streamFactory)
+	if !ok {
+		t.Fatalf("DoT factory type = %T", factory)
+	}
+	if got := stream.tlsConfig.NextProtos; len(got) != 1 || got[0] != "dot" {
+		t.Fatalf("DoT NextProtos = %#v, want [dot]", got)
+	}
+	if stream.tlsConfig.ServerName != "dns.example" {
+		t.Fatalf("DoT ServerName = %q", stream.tlsConfig.ServerName)
+	}
+}
+
+// TestUDPFactoryResolvesHostnameOnce covers the bootstrap lookup moving out of
+// the measured exchange. dns.Client.ExchangeContext dials whatever address it
+// is handed, so a hostname endpoint previously went through the system
+// resolver on every query, inside the timed region.
+func TestUDPFactoryResolvesHostnameOnce(t *testing.T) {
+	oldResolve := resolveUDPAddress
+	t.Cleanup(func() { resolveUDPAddress = oldResolve })
+	lookups := 0
+	resolveUDPAddress = func(context.Context, string) (string, error) {
+		lookups++
+		return "192.0.2.53", nil
+	}
+	factory, err := NewFactory(catalog.Target{
+		Protocol: catalog.UDP, Address: "dns.example", Spec: catalog.TransportSpec{Port: 53},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 1 {
+		t.Fatalf("lookups during Open = %d, want 1", lookups)
+	}
+	dialer, ok := session.(interface{ DialAddress() string })
+	if !ok {
+		t.Fatal("UDP session does not report a dial address")
+	}
+	if got := dialer.DialAddress(); got != "192.0.2.53:53" {
+		t.Fatalf("UDP dial address = %q, want %q", got, "192.0.2.53:53")
+	}
+
+	// A literal endpoint must not consult the resolver at all.
+	lookups = 0
+	literal, err := NewFactory(catalog.Target{
+		Protocol: catalog.UDP, Address: "192.0.2.1", Spec: catalog.TransportSpec{Port: 53},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := literal.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 0 {
+		t.Fatalf("lookups for a literal endpoint = %d, want 0", lookups)
+	}
+}
+
+// TestUDPFactoryReportsResolutionFailure keeps a failed bootstrap lookup a
+// session-open error rather than a per-query mystery.
+func TestUDPFactoryReportsResolutionFailure(t *testing.T) {
+	oldResolve := resolveUDPAddress
+	t.Cleanup(func() { resolveUDPAddress = oldResolve })
+	resolveUDPAddress = func(context.Context, string) (string, error) {
+		return "", errors.New("no such host")
+	}
+	factory, err := NewFactory(catalog.Target{
+		Protocol: catalog.UDP, Address: "dns.example", Spec: catalog.TransportSpec{Port: 53},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := factory.Open(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "resolve UDP endpoint") {
+		t.Fatalf("UDP resolution error = %v", err)
 	}
 }
