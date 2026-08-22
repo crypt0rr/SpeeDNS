@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,12 +16,8 @@ import (
 
 func TestDeterministicResolverFixtureCoversBenchmarkOutcomes(t *testing.T) {
 	oldFactory := newFactory
-	oldTarget := runTargetFunc
-	t.Cleanup(func() {
-		newFactory = oldFactory
-		runTargetFunc = oldTarget
-	})
-	runTargetFunc = runTarget
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 
 	newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
 		if target.Resolver.ID == "fixture-open-failure" {
@@ -109,6 +106,127 @@ func TestDeterministicResolverFixtureCoversBenchmarkOutcomes(t *testing.T) {
 	if !ok || failed.OpenError == "" || failed.Stats.Failures != failed.Stats.Total {
 		t.Fatalf("open failure fixture result = %#v/%v", failed, ok)
 	}
+}
+
+// TestFairSchedulerRunCancellationIsCompleteAndUnranked pins the cancellation
+// contract of the scheduler the binary actually ships. A cancelled run keeps
+// every target it started preparing, marks each of them incomplete, and ranks
+// none of them. The legacy target-level scheduler instead drops targets it
+// never dispatched, so assertions made through the runTargetFunc seam do not
+// describe the shipped result set.
+func TestFairSchedulerRunCancellationIsCompleteAndUnranked(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+
+	cancellationOptions := func() Options {
+		return Options{
+			Domains:     []string{"one.example", "two.example"},
+			QueryTypes:  []uint16{dns.TypeA},
+			Sample:      2,
+			Seed:        99,
+			Timeout:     time.Second,
+			Concurrency: 1,
+		}
+	}
+	// Targets are named so the fair scheduler's identity sort prepares and
+	// measures "alpha" before "beta".
+	targets := []catalog.Target{testTarget(catalog.UDP, "alpha"), testTarget(catalog.UDP, "beta")}
+
+	t.Run("cancelled while measuring", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		measuring := make(chan struct{})
+		var measuringOnce sync.Once
+		release := make(chan struct{})
+		blocking := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+			// Warm-up probes use example.com/.org/.net, so only a measured
+			// corpus query parks the single worker.
+			if strings.HasSuffix(name, ".example") {
+				measuringOnce.Do(func() { close(measuring) })
+				<-release
+			}
+			return replyFor(name, qtype), nil
+		}}
+		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+			warm := transport.Session(&fakeSession{})
+			if target.Address == "alpha" {
+				warm = blocking
+			}
+			return &fakeFactory{opens: []fakeOpen{
+				{session: &fakeSession{}},
+				{session: &fakeSession{}},
+				{session: &fakeSession{}},
+				{session: warm},
+			}}, nil
+		}
+
+		type outcome struct {
+			report Report
+			err    error
+		}
+		done := make(chan outcome, 1)
+		go func() {
+			report, err := Run(ctx, targets, cancellationOptions())
+			done <- outcome{report: report, err: err}
+		}()
+		<-measuring
+		cancel()
+		close(release)
+		got := <-done
+
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("cancelled fair Run error = %v, want context canceled", got.err)
+		}
+		if len(got.report.Targets) != len(targets) {
+			t.Fatalf("cancelled fair Run returned %d of %d prepared targets: %#v", len(got.report.Targets), len(targets), got.report.Targets)
+		}
+		for index, result := range got.report.Targets {
+			if result.Target.ID() != targets[index].ID() {
+				t.Fatalf("cancelled fair Run target[%d] = %q, want %q", index, result.Target.ID(), targets[index].ID())
+			}
+			if !result.Incomplete || result.OpenError != context.Canceled.Error() {
+				t.Fatalf("cancelled fair Run target[%d] = %#v, want an incomplete cancelled result", index, result)
+			}
+		}
+		if len(got.report.Rankings) != 0 {
+			t.Fatalf("cancelled fair Run rankings = %#v, want none", got.report.Rankings)
+		}
+		for _, target := range targets {
+			if !containsWarning(got.report.Warnings, target.Address+"/udp was incomplete and excluded from ranking") {
+				t.Fatalf("cancelled fair Run warnings = %#v", got.report.Warnings)
+			}
+		}
+	})
+
+	t.Run("cancelled while preparing", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+			if target.Address != "alpha" {
+				t.Errorf("target %q was prepared after cancellation", target.Address)
+			}
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index == 0 {
+					cancel()
+				}
+				return minimalSession{}, nil
+			}}, nil
+		}
+		report, err := Run(ctx, targets, cancellationOptions())
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled preparation Run error = %v, want context canceled", err)
+		}
+		if len(report.Targets) != 1 || report.Targets[0].Target.ID() != targets[0].ID() {
+			t.Fatalf("cancelled preparation Run targets = %#v, want only the prepared target", report.Targets)
+		}
+		if !report.Targets[0].Incomplete || len(report.Targets[0].Observations) != 0 {
+			t.Fatalf("cancelled preparation result = %#v, want incomplete with no samples", report.Targets[0])
+		}
+		if len(report.Rankings) != 0 {
+			t.Fatalf("cancelled preparation rankings = %#v, want none", report.Rankings)
+		}
+	})
 }
 
 func fixtureTarget(id, address, policy string) catalog.Target {

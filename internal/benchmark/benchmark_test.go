@@ -53,13 +53,11 @@ func TestStatisticsAndRanking(t *testing.T) {
 }
 
 func TestRunWarnsWhenSampleIsClamped(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
-	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{
 			Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 1,
 		}}}
-	}
+	})
 
 	opts := validBenchmarkOptions()
 	opts.Domains = []string{"Example.COM.", "example.com", "example.org"}
