@@ -16,6 +16,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/domains"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 	"github.com/crypt0rr/SpeeDNS/internal/transport"
 	"github.com/miekg/dns"
 )
@@ -1368,15 +1369,23 @@ func confidenceIntervalsOverlap(left, right Statistics) bool {
 	return leftLow <= rightHigh && rightLow <= leftHigh
 }
 
+// collectWarnings renders one warning per diagnostic. The resolver label and
+// the session error are escaped here, at the point they become report text:
+// the label carries locally configured resolver names and addresses, and the
+// session error carries transport and TLS diagnostics that quote strings the
+// remote endpoint chose, such as the subject alternative names in
+// "x509: certificate is valid for ...". Warnings are printed verbatim under
+// --details, so neither may reach a terminal with its control characters
+// intact.
 func collectWarnings(results []TargetResult) []string {
 	warnings := make([]string, 0)
 	for _, result := range results {
-		label := fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol)
+		label := safetext.Escape(fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol))
 		if result.Incomplete {
 			warnings = append(warnings, fmt.Sprintf("%s was incomplete and excluded from ranking", label))
 		}
 		if result.OpenError != "" {
-			warnings = append(warnings, fmt.Sprintf("%s could not open a session: %s", label, result.OpenError))
+			warnings = append(warnings, fmt.Sprintf("%s could not open a session: %s", label, safetext.Escape(result.OpenError)))
 		}
 		if result.Stats.Failures > 0 {
 			warnings = append(warnings, fmt.Sprintf("%s had %d/%d failed queries", label, result.Stats.Failures, result.Stats.Total))
