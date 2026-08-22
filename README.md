@@ -401,6 +401,14 @@ samples, transport failures, resolver-error counts and RCODEs, divergence,
 truncation, reconnects, incomplete targets, and the selected connection
 address.
 
+The recommendation summary and every per-protocol comparison include a `Tie`
+column. `TIED` means the 95% score confidence interval of that target overlaps
+another ranked target, so the rank order between them is not statistically
+distinguishable; `—` means it does not. A tied recommended or provisional
+winner is also called out by a `TIED:` note below the recommendation table, so
+a rank-one result is never presented as an unqualified winner. The same flag
+is available as the CSV `tie` column and the JSON `tie` fields.
+
 For scripts and other tools, use JSON or CSV:
 
 ```sh
