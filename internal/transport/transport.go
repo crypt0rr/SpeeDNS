@@ -294,7 +294,7 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 	if err != nil {
 		return nil, err
 	}
-	if len(packed) > 65535 {
+	if len(packed) > maxFramedMessage {
 		return nil, errors.New("DNS query exceeds TCP message limit")
 	}
 	reconnecting := s.conn == nil
@@ -303,33 +303,14 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 		return nil, err
 	}
 	s.lastReconnected = reconnecting
-	if err := setConnDeadline(s.conn, ctx, s.timeout); err != nil {
+	// The connection is reused across queries, so the deadline is set on the
+	// connection itself and the send side stays open.
+	if err := s.conn.SetDeadline(queryDeadline(ctx, s.timeout)); err != nil {
 		return nil, s.fatal(err)
 	}
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
-	if _, err := s.conn.Write(prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := s.conn.Write(packed); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := io.ReadFull(s.conn, prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	length := int(binary.BigEndian.Uint16(prefix[:]))
-	if length == 0 {
-		return nil, s.fatal(errors.New("empty DNS response"))
-	}
-	responseBytes := make([]byte, length)
-	if _, err := io.ReadFull(s.conn, responseBytes); err != nil {
-		return nil, s.fatal(err)
-	}
-	response := new(dns.Msg)
-	if err := response.Unpack(responseBytes); err != nil {
-		return nil, s.fatal(fmt.Errorf("unpack DNS response: %w", err))
-	}
-	if err := validateResponse(response, name, qtype, query.Id, false); err != nil {
+	framing := framedStream{stream: s.conn, label: "DNS"}
+	response, err := framing.query(packed, name, qtype, query.Id, false)
+	if err != nil {
 		return nil, s.fatal(err)
 	}
 	return response, nil
@@ -656,7 +637,7 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	if err != nil {
 		return nil, err
 	}
-	if len(packed) > 65535 {
+	if len(packed) > maxFramedMessage {
 		return nil, errors.New("DNS query exceeds DoQ message limit")
 	}
 	reconnecting := s.conn == nil
@@ -665,47 +646,19 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 		return nil, err
 	}
 	s.lastReconnected = reconnecting
+	// RFC 9250 gives every DoQ query its own stream, so the deadline belongs
+	// to the stream and the send side is closed once the request is written.
 	stream, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, s.fatal(err)
 	}
 	defer stream.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := stream.SetDeadline(deadline); err != nil {
-			return nil, s.fatal(err)
-		}
-	} else {
-		if err := stream.SetDeadline(time.Now().Add(s.timeout)); err != nil {
-			return nil, s.fatal(err)
-		}
-	}
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
-	if _, err := stream.Write(prefix[:]); err != nil {
+	if err := stream.SetDeadline(queryDeadline(ctx, s.timeout)); err != nil {
 		return nil, s.fatal(err)
 	}
-	if _, err := stream.Write(packed); err != nil {
-		return nil, s.fatal(err)
-	}
-	if err := stream.Close(); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := io.ReadFull(stream, prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	length := int(binary.BigEndian.Uint16(prefix[:]))
-	if length == 0 {
-		return nil, s.fatal(errors.New("empty DoQ response"))
-	}
-	responseBytes := make([]byte, length)
-	if _, err := io.ReadFull(stream, responseBytes); err != nil {
-		return nil, s.fatal(err)
-	}
-	response := new(dns.Msg)
-	if err := response.Unpack(responseBytes); err != nil {
-		return nil, s.fatal(fmt.Errorf("unpack DoQ response: %w", err))
-	}
-	if err := validateResponse(response, name, qtype, 0, true); err != nil {
+	framing := framedStream{stream: stream, closeSend: stream.Close, label: "DoQ"}
+	response, err := framing.query(packed, name, qtype, 0, true)
+	if err != nil {
 		return nil, s.fatal(err)
 	}
 	return response, nil
@@ -762,6 +715,70 @@ func (s *doqSession) Close() error {
 	return conn.CloseWithError(0, "")
 }
 
+// maxFramedMessage is the largest DNS message the two-byte length prefix can
+// describe, and therefore the size limit shared by TCP, DoT and DoQ framing.
+const maxFramedMessage = 65535
+
+// framedStream carries out the length-prefixed DNS exchange that TCP and DoT
+// (RFC 1035 section 4.2.2) and DoQ (RFC 9250 section 4.2) all use. Only the
+// framing lives here: connection lifecycle, deadlines and transaction ID
+// rules stay with the sessions, which handle them differently.
+type framedStream struct {
+	stream io.ReadWriter
+	// closeSend ends the client side of the stream once the request has been
+	// written. DoQ requires it; a reused TCP or DoT connection must leave the
+	// send side open for the next query, and so leaves this nil.
+	closeSend func() error
+	// label names the transport in framing errors.
+	label string
+}
+
+// query performs one framed exchange and returns the validated response.
+func (f framedStream) query(packed []byte, name string, qtype, queryID uint16, zeroID bool) (*dns.Msg, error) {
+	responseBytes, err := f.exchange(packed)
+	if err != nil {
+		return nil, err
+	}
+	response := new(dns.Msg)
+	if err := response.Unpack(responseBytes); err != nil {
+		return nil, fmt.Errorf("unpack %s response: %w", f.label, err)
+	}
+	if err := validateResponse(response, name, qtype, queryID, zeroID); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+// exchange writes one length-prefixed request and reads the length-prefixed
+// response bytes.
+func (f framedStream) exchange(packed []byte) ([]byte, error) {
+	var prefix [2]byte
+	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
+	if _, err := f.stream.Write(prefix[:]); err != nil {
+		return nil, err
+	}
+	if _, err := f.stream.Write(packed); err != nil {
+		return nil, err
+	}
+	if f.closeSend != nil {
+		if err := f.closeSend(); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := io.ReadFull(f.stream, prefix[:]); err != nil {
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(prefix[:]))
+	if length == 0 {
+		return nil, fmt.Errorf("empty %s response", f.label)
+	}
+	responseBytes := make([]byte, length)
+	if _, err := io.ReadFull(f.stream, responseBytes); err != nil {
+		return nil, err
+	}
+	return responseBytes, nil
+}
+
 func newQuery(name string, qtype, id uint16, padded bool) *dns.Msg {
 	query := &dns.Msg{
 		MsgHdr: dns.MsgHdr{
@@ -804,12 +821,15 @@ func packQuery(query *dns.Msg) ([]byte, error) {
 	return packed, nil
 }
 
-func setConnDeadline(conn net.Conn, ctx context.Context, timeout time.Duration) error {
+// queryDeadline bounds one framed exchange by the transport timeout, and by
+// the caller deadline when that is nearer. Stream and DoQ sessions share the
+// computation so a per-query budget cannot mean two different things.
+func queryDeadline(ctx context.Context, timeout time.Duration) time.Time {
 	deadline := time.Now().Add(timeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
-	return conn.SetDeadline(deadline)
+	return deadline
 }
 
 func validateResponse(response *dns.Msg, name string, qtype uint16, queryID uint16, zeroID bool) error {

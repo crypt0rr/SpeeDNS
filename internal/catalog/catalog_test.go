@@ -230,3 +230,57 @@ func TestParseResolverFlag(t *testing.T) {
 		t.Fatal("expected malformed resolver flag to fail")
 	}
 }
+
+// The --resolver flag and the YAML catalog must derive the same default port
+// for every protocol, so a changed or added default cannot leave one path
+// dialling the old port.
+func TestResolverFlagAndCatalogAgreeOnDefaultPorts(t *testing.T) {
+	schemes := map[Protocol]string{UDP: "udp", TCP: "tcp", DoH: "https", DoT: "tls", DoQ: "quic"}
+	for _, protocol := range AllProtocols {
+		t.Run(protocol.String(), func(t *testing.T) {
+			scheme, known := schemes[protocol]
+			if !known {
+				t.Fatalf("protocol %q has no --resolver URI scheme", protocol)
+			}
+			want := defaultPort(protocol)
+			if want == 0 {
+				t.Fatalf("defaultPort(%q) is unset", protocol)
+			}
+			uri := scheme + "://dns.example"
+			if protocol == DoH {
+				uri += "/dns-query"
+			}
+			flagProfile, err := ParseResolverFlag("custom=" + uri)
+			if err != nil {
+				t.Fatal(err)
+			}
+			flagSpec, supported := flagProfile.Transports[protocol]
+			if !supported {
+				t.Fatalf("--resolver %q produced transports %v", uri, flagProfile.Transports)
+			}
+			if flagSpec.Port != want {
+				t.Fatalf("--resolver %q port = %d, want defaultPort %d", uri, flagSpec.Port, want)
+			}
+
+			catalogSpec := TransportSpec{}
+			switch protocol {
+			case DoH:
+				catalogSpec.URL = "https://dns.example/dns-query"
+			case DoT, DoQ:
+				catalogSpec.ServerName = "dns.example"
+			}
+			profiles := []ResolverProfile{{
+				ID:         "custom",
+				Name:       "Custom",
+				Addresses:  []string{"192.0.2.1"},
+				Transports: map[Protocol]TransportSpec{protocol: catalogSpec},
+			}}
+			if err := Validate(profiles); err != nil {
+				t.Fatal(err)
+			}
+			if got := profiles[0].Transports[protocol].Port; got != want {
+				t.Fatalf("catalog default port = %d, want defaultPort %d", got, want)
+			}
+		})
+	}
+}

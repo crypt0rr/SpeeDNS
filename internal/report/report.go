@@ -217,11 +217,11 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 	}); err != nil {
 		return err
 	}
+	redactedIDs := redactedTargetIDs(report, options.RedactSystem)
 	for _, result := range report.Targets {
 		rank := rankFor(report, result.Target.ID())
 		stats := result.Stats
 		metadata := result.Target.EndpointMetadata()
-		redactedIDs := redactedTargetIDs(report, options.RedactSystem)
 		view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
 		dialAddress := result.DialAddress
 		if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
