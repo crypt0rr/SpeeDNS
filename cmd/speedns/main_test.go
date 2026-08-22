@@ -165,16 +165,22 @@ func TestMainAndCommands(t *testing.T) {
 		t.Fatalf("invalid completion shell error = %v", err)
 	}
 	root := newRootCommand()
-	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Flags().Lookup("assert") == nil || root.Flags().Lookup("family") == nil || root.Commands() == nil {
+	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Flags().Lookup("assert") == nil || root.Flags().Lookup("family") == nil {
 		t.Fatal("root command was not configured")
 	}
-	var runCommand *cobra.Command
+	// The full subcommand set is pinned so that adding or removing one is a
+	// deliberate test change rather than a silent change to the CLI surface.
+	names := make([]string, 0, len(root.Commands()))
+	commands := make(map[string]*cobra.Command, len(root.Commands()))
 	for _, command := range root.Commands() {
-		if command.Name() == "run" {
-			runCommand = command
-			break
-		}
+		names = append(names, command.Name())
+		commands[command.Name()] = command
 	}
+	sort.Strings(names)
+	if got, want := strings.Join(names, ","), "completion,corpus,resolvers,run,version"; got != want {
+		t.Fatalf("root subcommands = %q, want %q", got, want)
+	}
+	runCommand := commands["run"]
 	if runCommand == nil || runCommand.Flags().Lookup("protocol") == nil {
 		t.Fatal("explicit run command was not configured")
 	}
@@ -1123,5 +1129,11 @@ func TestCobraOutputErrorsAreIgnoredBySimpleCommands(t *testing.T) {
 	if err := resolvers.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	_ = newRootCommand()
+	root := newRootCommand()
+	root.SetOut(cliErrorWriter{})
+	root.SetErr(cliErrorWriter{})
+	root.SetArgs([]string{"version"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("root command must ignore output write errors: %v", err)
+	}
 }

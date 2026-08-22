@@ -1,0 +1,2 @@
+go test fuzz v1
+string("custom=udp://192.0.2.53:0")

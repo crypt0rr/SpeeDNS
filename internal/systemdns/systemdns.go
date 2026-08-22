@@ -24,12 +24,24 @@ var macOSInterface = regexp.MustCompile(`^\s*if_index\s*:\s*([0-9]+)(?:\s+\(([^)
 
 var currentOS = runtime.GOOS
 
+// resolvConfPath is the resolver configuration file read on every platform
+// that is not macOS. It is a variable so tests can exercise the real reader
+// against a fixture file instead of the host configuration.
+var resolvConfPath = "/etc/resolv.conf"
+
 var openResolvConf = func() (io.ReadCloser, error) {
-	return os.Open("/etc/resolv.conf")
+	return os.Open(resolvConfPath)
+}
+
+// scutilCommand builds the read-only macOS resolver query. It is separated
+// from runScutil so tests can assert the command name and arguments without
+// executing anything.
+var scutilCommand = func(ctx context.Context) *exec.Cmd {
+	return exec.CommandContext(ctx, "scutil", "--dns")
 }
 
 var runScutil = func(ctx context.Context) ([]byte, error) {
-	return exec.CommandContext(ctx, "scutil", "--dns").Output()
+	return scutilCommand(ctx).Output()
 }
 
 const defaultScutilTimeout = 2 * time.Second
@@ -262,7 +274,7 @@ func sanitizeAddress(address string) string {
 func discoverResolvConf() ([]string, error) {
 	file, err := openResolvConf()
 	if err != nil {
-		return nil, fmt.Errorf("open /etc/resolv.conf: %w", err)
+		return nil, fmt.Errorf("open %s: %w", resolvConfPath, err)
 	}
 	defer file.Close()
 	var addresses []string
@@ -274,7 +286,7 @@ func discoverResolvConf() ([]string, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read /etc/resolv.conf: %w", err)
+		return nil, fmt.Errorf("read %s: %w", resolvConfPath, err)
 	}
 	return addresses, nil
 }
