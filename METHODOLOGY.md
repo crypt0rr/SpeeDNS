@@ -140,8 +140,18 @@ do not appear in the report.
 
 JSON contains the structured result and optional raw observations. CSV keeps
 the aggregate schema and adds reconnect/incomplete diagnostics at the end.
-CSV cells beginning with `=`, `+`, `-`, `@`, tab, or carriage return are
-prefixed with an apostrophe to prevent spreadsheet formula interpretation.
+Text that SpeeDNS did not produce itself is escaped before it reaches a
+terminal or a CSV cell. Session errors quote strings chosen by the endpoint,
+such as the certificate names in an `x509` hostname mismatch, and resolver
+names, owners, and policies arrive from `--resolver`, `--resolver-file`, or
+the system resolver configuration; control characters in any of them are
+rendered as visible `\x1b`-style sequences, so neither a certificate field nor
+a configured name can rewrite the terminal. The status colours are the only
+escape sequences the table emits itself. CSV cells are escaped first and the
+formula guard runs afterwards on the escaped value: a cell beginning with
+`=`, `+`, `-`, `@`, or an escape sequence - which is how a leading tab,
+carriage return, or ESC is rendered - is prefixed with an apostrophe to
+prevent spreadsheet formula interpretation.
 For encrypted targets, these reports also expose the effective TLS server
 name, whether it was configured explicitly or derived from the endpoint,
 whether bootstrap came from explicit IP candidates, the target address, or
