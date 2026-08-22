@@ -70,6 +70,13 @@ such as `rcode-2` (SERVFAIL) or `rcode-5` (REFUSED). A successful observation
 whose class differs from a unique plurality baseline is divergent and is
 excluded from comparative latency scoring.
 
+A response is classified `answer` only when its answer section carries a record
+of the queried type. A NOERROR response without one is `nodata`, including the
+canonical form that carries an SOA in the authority section. Authority records
+are never read as an answer: doing so would make "this name has no such record"
+indistinguishable from "here is the address", which is the most common genuine
+difference between resolvers on the default `A,AAAA` query set.
+
 If two or more classes are tied for the plurality, the group is ambiguous:
 there is no defensible baseline, so every successful observation in that group
 is marked divergent and excluded from comparative latency scoring. SpeeDNS
