@@ -17,7 +17,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode"
 
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
@@ -25,10 +24,10 @@ import (
 	"github.com/crypt0rr/SpeeDNS/internal/domains"
 	"github.com/crypt0rr/SpeeDNS/internal/report"
 	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
+	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
 	"github.com/crypt0rr/SpeeDNS/internal/version"
 	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
-	"golang.org/x/text/width"
 )
 
 type cliConfig struct {
@@ -317,7 +316,7 @@ func (p *progressRenderer) renderUpdateLocked(update benchmark.Progress, now tim
 func (p *progressRenderer) renderLocked(now time.Time) {
 	line := p.progressLineLocked(now)
 	padding := ""
-	lineWidth := displayWidth(line)
+	lineWidth := textwidth.Display(line)
 	if p.lastLineWidth > lineWidth {
 		padding = strings.Repeat(" ", p.lastLineWidth-lineWidth)
 	}
@@ -376,26 +375,6 @@ func progressElapsed(started, now time.Time) string {
 		return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
 	}
 	return fmt.Sprintf("%02d:%02d", minutes, seconds)
-}
-
-// displayWidth returns the number of terminal cells used by a progress line.
-// Resolver metadata can contain Unicode, so byte length is not a safe measure
-// when erasing the previous line. Combining marks occupy no cells and common
-// wide/full-width characters occupy two.
-func displayWidth(value string) int {
-	result := 0
-	for _, character := range value {
-		if unicode.Is(unicode.Mn, character) || unicode.Is(unicode.Me, character) {
-			continue
-		}
-		switch width.LookupRune(character).Kind() {
-		case width.EastAsianWide, width.EastAsianFullwidth:
-			result += 2
-		default:
-			result++
-		}
-	}
-	return result
 }
 
 func (p *progressRenderer) Finish() {
