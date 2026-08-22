@@ -87,6 +87,10 @@ var interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
 
 var detectAddressFamiliesFunc = detectAddressFamilies
 
+// exitCodes lists every status the command can return, so documentation can be
+// checked against the contract rather than against a hand-kept list.
+func exitCodes() []int { return []int{0, 2, 3, 4, 130} }
+
 func exitCodeForError(err error) int {
 	switch {
 	case err == nil:
