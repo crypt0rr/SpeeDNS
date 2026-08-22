@@ -337,3 +337,39 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 		t.Fatal("paired bootstrap seed ignored target identity")
 	}
 }
+
+// slowBookkeepingSession delays the reconnect lookup that measure() performs
+// after a query returns, which is the work the warm-latency timer must not
+// charge to the resolver.
+type slowBookkeepingSession struct {
+	*fakeSession
+	delay time.Duration
+}
+
+func (s *slowBookkeepingSession) LastQueryReconnected() bool {
+	time.Sleep(s.delay)
+	return false
+}
+
+func TestMeasureTimesOnlyTheExchange(t *testing.T) {
+	const bookkeeping = 200 * time.Millisecond
+	runner := &targetRunner{
+		target:  testTarget(catalog.UDP, "192.0.2.1"),
+		opts:    Options{Timeout: time.Second, QueryTypes: []uint16{dns.TypeA}},
+		session: &slowBookkeepingSession{fakeSession: &fakeSession{}, delay: bookkeeping},
+		ready:   true,
+	}
+	if !runner.measure(context.Background(), Query{Name: "example.com", QType: dns.TypeA}) {
+		t.Fatal("measure did not record an observation")
+	}
+	observation := runner.result.Observations[0]
+	if !observation.Success {
+		t.Fatalf("measured observation = %#v", observation)
+	}
+	if observation.Latency >= bookkeeping {
+		t.Fatalf("warm latency %v included %v of post-query bookkeeping", observation.Latency, bookkeeping)
+	}
+	if observation.LatencyMS != durationMS(observation.Latency) {
+		t.Fatalf("latency milliseconds %v do not match %v", observation.LatencyMS, observation.Latency)
+	}
+}

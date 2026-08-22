@@ -83,7 +83,9 @@ Set the maximum number of measured exchanges in flight per transport.
 Choose human-readable, JSON, or CSV output.
 .TP
 .B --output PATH
-Write the report to a file instead of standard output.
+Write the report to a file instead of standard output. The file is replaced
+atomically and receives the same permissions an ordinary shell redirection
+would create, narrowed by the current umask.
 .TP
 .B --details
 Include cold latency, jitter, response outcomes, and expanded diagnostics.
@@ -128,7 +130,10 @@ Input or configuration was invalid.
 The run finished but produced no comparable DNS results.
 .TP
 .B 130
-The run was interrupted.
+The run was interrupted. SpeeDNS reports
+.B interrupted
+on standard error and writes the partial report; a second interrupt exits
+immediately.
 .SH FILES
 .TP
 .I /etc/resolv.conf

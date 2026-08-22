@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -99,6 +100,36 @@ func exitCodeForError(err error) int {
 		return 4
 	default:
 		return 2
+	}
+}
+
+// shutdownSignals ask a running benchmark to stop.
+var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
+
+var notifySignals = signal.Notify
+var stopSignals = signal.Stop
+
+// interruptContext cancels the returned context on the first shutdown signal
+// and releases the signal registration straight away, restoring the operating
+// system default. A second Ctrl-C therefore terminates SpeeDNS immediately
+// instead of being swallowed while the first one is still winding the run
+// down. The returned stop function releases the registration and cancels the
+// context; the exit status keeps coming from the cancelled run itself.
+func interruptContext(ctx context.Context) (context.Context, func()) {
+	runContext, cancel := context.WithCancel(ctx)
+	signals := make(chan os.Signal, 1)
+	notifySignals(signals, shutdownSignals...)
+	go func() {
+		select {
+		case <-signals:
+			stopSignals(signals)
+			cancel()
+		case <-runContext.Done():
+		}
+	}()
+	return runContext, func() {
+		stopSignals(signals)
+		cancel()
 	}
 }
 
@@ -496,9 +527,19 @@ func interfaceAddressIP(address net.Addr) (net.IP, bool) {
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, errorMessage(err))
 		exit(exitCodeForError(err))
 	}
+}
+
+// errorMessage renders err in user-facing language. A cancelled run means the
+// user or the operating system interrupted SpeeDNS, so report that instead of
+// the "context canceled" plumbing. Every other error keeps its own text.
+func errorMessage(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "interrupted"
+	}
+	return err.Error()
 }
 
 func newRootCommand() *cobra.Command {
@@ -746,7 +787,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		restoreLogOutput = func() { log.SetOutput(previousLogWriter) }
 	}
 	defer restoreLogOutput()
-	runContext, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	runContext, stop := interruptContext(ctx)
 	defer stop()
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
 		Domains: domainList, QueryTypes: queryTypes, Sample: config.sample, Full: config.full,
@@ -920,6 +961,38 @@ var createTempOutputFile = func(directory, pattern string) (outputFileHandle, er
 }
 var removeOutputFile = os.Remove
 var renameOutputFile = os.Rename
+var chmodOutputFile = os.Chmod
+var createOutputProbeFile = func(path string) (io.Closer, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, ordinaryFileMode)
+}
+
+// ordinaryFileMode is the permission set an ordinary file creation asks for
+// before the process umask narrows it. os.CreateTemp instead forces 0600, so a
+// report written with --output would stay unreadable to everyone but its owner
+// while the same bytes redirected by a shell would not.
+const ordinaryFileMode fs.FileMode = 0o666
+
+// outputProbeSuffix names the umask probe next to the temporary report file.
+const outputProbeSuffix = ".mode"
+
+// probeOrdinaryFileMode reports the permissions an ordinary file creation would
+// receive at path, which is ordinaryFileMode narrowed by the process umask. Go
+// exposes no portable way to read the umask, so create a throwaway file next to
+// the report and observe what the operating system granted. A failed probe
+// simply leaves the temporary file mode untouched.
+func probeOrdinaryFileMode(path string) (fs.FileMode, bool) {
+	probe, err := createOutputProbeFile(path)
+	if err != nil {
+		return 0, false
+	}
+	closeErr := probe.Close()
+	info, statErr := os.Stat(path)
+	_ = os.Remove(path)
+	if closeErr != nil || statErr != nil {
+		return 0, false
+	}
+	return info.Mode().Perm(), true
+}
 
 func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 	if strings.TrimSpace(path) == "" || path == "-" {
@@ -957,6 +1030,12 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 		if err := file.Close(); err != nil {
 			_ = removeOutputFile(temporaryPath)
 			return fmt.Errorf("close output file: %w", err)
+		}
+		// Permissions are best effort: a platform that refuses the change
+		// still leaves a complete report behind, just with the restrictive
+		// temporary-file mode.
+		if mode, ok := probeOrdinaryFileMode(temporaryPath + outputProbeSuffix); ok {
+			_ = chmodOutputFile(temporaryPath, mode)
 		}
 		if err := renameOutputFile(temporaryPath, path); err != nil {
 			_ = removeOutputFile(temporaryPath)

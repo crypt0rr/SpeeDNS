@@ -704,9 +704,13 @@ func (runner *targetRunner) measure(ctx context.Context, query Query) bool {
 		return false
 	}
 	observation := Observation{Name: query.Name, QType: query.QType}
-	started := time.Now()
 	queryCtx, cancel := context.WithTimeout(ctx, runner.opts.Timeout)
+	// Warm latency covers the DNS exchange alone: the clock starts immediately
+	// before the call and stops the moment it returns, so neither deadline
+	// setup nor the reconnect bookkeeping below is charged to the resolver.
+	started := time.Now()
 	message, queryErr := runner.session.Query(queryCtx, query.Name, query.QType)
+	elapsed := time.Since(started)
 	observation.Reconnected = sessionQueryReconnected(runner.session)
 	cancel()
 	if ctx.Err() != nil {
@@ -715,7 +719,7 @@ func (runner *targetRunner) measure(ctx context.Context, query Query) bool {
 		runner.abort(ctx.Err())
 		return false
 	}
-	observation.Latency = time.Since(started)
+	observation.Latency = elapsed
 	observation.LatencyMS = durationMS(observation.Latency)
 	if queryErr != nil {
 		observation.Error = queryErr.Error()

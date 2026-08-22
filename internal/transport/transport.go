@@ -403,6 +403,9 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 // endpoint cannot force an unnecessarily large header allocation per query.
 const doHMaxResponseHeaderBytes = 64 << 10
 
+// doHMaxResponseBodyBytes bounds every DoH body read, parsed or discarded.
+const doHMaxResponseBodyBytes = 1 << 20
+
 func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -545,12 +548,14 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH HTTP status %s", response.Status)
 	}
 	if contentType := response.Header.Get("Content-Type"); contentType != "" && !strings.Contains(strings.ToLower(contentType), "application/dns-message") {
+		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH returned content type %q", contentType)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(response.Body, doHMaxResponseBodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -562,6 +567,14 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 		return nil, err
 	}
 	return message, nil
+}
+
+// drainHTTPBody consumes a bounded amount of a response body that the caller
+// will not parse, so the keep-alive connection stays reusable instead of being
+// torn down after every rejected reply. The bound matches the parsed-body limit
+// so a hostile endpoint cannot make an error path read without end.
+func drainHTTPBody(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, doHMaxResponseBodyBytes))
 }
 
 func (s *doHSession) Close() error {
