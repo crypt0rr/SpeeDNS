@@ -362,7 +362,10 @@ zone mode:
 
 This generates 1–20 unique labels below the IANA-reserved `example.com` zone,
 caps measured concurrency at two, and records a random nonce in the report.
-It cannot be combined with `--domains` or `--full`. Cache-miss results are
+It cannot be combined with `--domains` or `--full`. The generated names are a
+corpus that `--sample` still draws from, so keep `--sample` at least as large
+as `--cache-miss-sample`; a smaller `--sample` measures only that many
+generated names and the report warns that the corpus was truncated. Cache-miss results are
 kept in their own run and ranking population; they are never mixed with the
 normal embedded warm-cache corpus. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
 using the mode, especially for ownership, traffic, and abuse limits.
@@ -409,6 +412,14 @@ For scripts and other tools, use JSON or CSV:
 ./speedns --format json --raw --output result-with-samples.json
 ```
 
+`--output` replaces a regular file atomically: the report is written next to
+the destination and renamed over it only when the run succeeds, so a failed
+run leaves the previous file untouched. Destinations that cannot be replaced
+that way are written in place instead, so `--output /dev/null`, a named pipe,
+`/proc/self/fd/1`, and a writable file in a directory that rejects new entries
+all work; an in-place destination can keep partial output after a failed run.
+A destination that is a directory is rejected.
+
 The versioned JSON contract is published as
 [`schema/report-v1.json`](schema/report-v1.json). It describes the current
 `schema_version: 1` output, including optional raw samples, profile
@@ -449,7 +460,7 @@ Useful flags include:
 --timeout 2s        per-endpoint timeout
 --concurrency 4    maximum measured DNS exchanges in flight per protocol
 --format table|json|csv
---output PATH       write output to a file
+--output PATH       write output to a file, /dev/null, or a pipe
 --no-color          disable terminal colors
 --redact-system     hide local system resolver details in reports
 --profile-view      show same-resolver transport costs and score confidence

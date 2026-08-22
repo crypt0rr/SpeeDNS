@@ -782,6 +782,11 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if concurrencyCapped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
 	}
+	if config.cacheMiss && config.sample < len(domainList) {
+		result.Warnings = append(result.Warnings, fmt.Sprintf(
+			"effective sample of %d truncated the generated cache-miss corpus of %d names; raise --sample or lower --cache-miss-sample to measure every generated name",
+			config.sample, len(domainList)))
+	}
 	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {
 		return err
@@ -918,22 +923,68 @@ var statOutputPath = os.Stat
 var createTempOutputFile = func(directory, pattern string) (outputFileHandle, error) {
 	return os.CreateTemp(directory, pattern)
 }
+var openOutputFile = func(path string) (outputFileHandle, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+}
 var removeOutputFile = os.Remove
 var renameOutputFile = os.Rename
 
+// directOutputWriter writes the report straight into the destination. It is
+// used for destinations that cannot be replaced atomically, so a failed run
+// can leave a partial report behind. Syncing is limited to regular files
+// because flushing a device or a pipe is not meaningful.
+func directOutputWriter(path string, syncOnCommit bool) (io.Writer, outputFinalizer, error) {
+	file, err := openOutputFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open output file: %w", err)
+	}
+	finalize := func(commit bool) error {
+		if !commit {
+			if err := file.Close(); err != nil {
+				return fmt.Errorf("discard output file: %w", err)
+			}
+			return nil
+		}
+		if syncOnCommit {
+			if err := file.Sync(); err != nil {
+				_ = file.Close()
+				return fmt.Errorf("flush output file: %w", err)
+			}
+		}
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("close output file: %w", err)
+		}
+		return nil
+	}
+	return file, finalize, nil
+}
+
+// outputWriter replaces a regular destination atomically: the report is
+// written to a temporary file in the destination directory and renamed over
+// the target only after a successful run. Destinations that cannot be
+// replaced that way are written in place instead. That covers non-regular
+// files such as /dev/null, named pipes, and /proc file descriptors, plus a
+// writable regular file inside a directory that rejects new entries.
 func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 	if strings.TrimSpace(path) == "" || path == "-" {
 		return os.Stdout, func(bool) error { return nil }, nil
 	}
-	if info, err := statOutputPath(path); err == nil && info.IsDir() {
+	info, err := statOutputPath(path)
+	switch {
+	case err == nil && info.IsDir():
 		return nil, nil, fmt.Errorf("output path is a directory: %s", path)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	case err == nil && !info.Mode().IsRegular():
+		return directOutputWriter(path, false)
+	case err != nil && !errors.Is(err, os.ErrNotExist):
 		return nil, nil, fmt.Errorf("inspect output path: %w", err)
 	}
 	directory := filepath.Dir(path)
 	base := filepath.Base(path)
 	file, err := createTempOutputFile(directory, "."+base+".speedns-*")
 	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return directOutputWriter(path, true)
+		}
 		return nil, nil, fmt.Errorf("create temporary output file: %w", err)
 	}
 	temporaryPath := file.Name()

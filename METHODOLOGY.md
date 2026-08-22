@@ -169,7 +169,12 @@ The normal run uses the embedded corpus and is treated as the warm-cache
 population. The opt-in `--cache-miss` mode instead generates a bounded set of
 unique labels below the IANA-reserved `example.com` zone. It allows at most 20
 names and two measured exchanges in flight, records a per-run random nonce,
-and rejects custom domain files and `--full`. The generated population is
+and rejects custom domain files and `--full`. `--sample` still selects the
+measured names from that generated corpus, so a `--sample` below
+`--cache-miss-sample` measures only part of it and the run reports a warning
+naming both sizes; `run.provenance.corpus_entries` and `corpus_sha256` keep
+describing the corpus the run drew from, as they do for warm-cache runs, while
+`sample_size` reports how many names were measured. The generated population is
 never appended to the normal corpus, and its results must not be interpreted
 as a warm-cache ranking. The ownership, traffic limits, and intended use are
 documented in [`CACHE_MISS.md`](CACHE_MISS.md).
