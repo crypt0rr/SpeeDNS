@@ -31,14 +31,18 @@ Use the `arm64` asset on a 64-bit ARM host. Package-manager signatures are
 not substituted for the release checksum and Sigstore verification described
 below.
 
-### Homebrew / Linuxbrew
+### Homebrew (macOS)
 
-Install the SpeeDNS cask from the tap on macOS or Debian/Linux with Linuxbrew:
+Install the SpeeDNS cask from the tap on macOS:
 
 ```sh
 brew tap crypt0rr/speedns
 brew install --cask speedns
 ```
+
+Homebrew casks are macOS-only, so `brew install --cask` does not work under
+Linuxbrew. On Linux, install the Debian, RPM, APK, or Arch package from the
+release assets instead; those also install the man page.
 
 After installation, verify the command and run a benchmark:
 
@@ -81,9 +85,9 @@ speedns completion fish >speedns.fish
 speedns completion powershell >speedns.ps1
 ```
 
-Release archives include `speedns.1`; Debian packages install it as
-`/usr/share/man/man1/speedns.1`. View it directly from an extracted archive
-with `man ./speedns.1`.
+Release archives include `docs/speedns.1`; Debian, RPM, APK, and Arch packages
+install it as `/usr/share/man/man1/speedns.1`. View it directly from an
+extracted archive with `man ./docs/speedns.1`.
 
 The canonical Go module path is `github.com/crypt0rr/SpeeDNS`. Install the
 latest published command directly with:
@@ -114,7 +118,7 @@ Release archives also carry a GitHub artifact attestation. With the GitHub CLI,
 verify an archive against this repository:
 
 ```sh
-gh attestation verify speedns_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS
+gh attestation verify SpeeDNS_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS
 ```
 
 Replace the archive name with the exact asset you downloaded. The release

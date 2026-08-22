@@ -46,7 +46,7 @@ Show the embedded domain corpus provenance and checksum.
 .TP
 .B speedns version
 Show version, commit, and build information.
-.SH IMPORTANT OPTIONS
+.SH OPTIONS
 .TP
 .B --protocol udp,tcp,doh,dot,doq
 Select the transports to benchmark.
@@ -57,6 +57,19 @@ Add a custom resolver endpoint. Repeat the option for multiple endpoints.
 .B --resolver-file PATH
 Load strict, versioned resolver profiles from YAML.
 .TP
+.B --no-defaults
+Do not include the bundled public resolver catalog. Use with
+.B --resolver
+or
+.B --resolver-file
+to benchmark only your own endpoints.
+.TP
+.B --family 4|6|both|auto
+Select the resolver address family. The default
+.B auto
+uses the local up-interface address inventory without performing DNS lookups or
+connection probes.
+.TP
 .B --domains PATH
 Read one domain per line from a custom list. Blank lines and comments are
 ignored.
@@ -66,6 +79,19 @@ Sample N domains from the selected corpus.
 .TP
 .B --full
 Use the complete selected domain list.
+.TP
+.B --cache-miss
+Opt in to bounded random names below the IANA-reserved
+.I example.com
+zone instead of the warm-cache corpus. Cannot be combined with
+.B --domains
+or
+.BR --full .
+.TP
+.B --cache-miss-sample N
+Number of unique reserved-zone names generated for
+.BR --cache-miss ,
+maximum 20.
 .TP
 .B --seed N
 Use a specific seed so the selected query order can be reproduced.
@@ -90,6 +116,31 @@ Include cold latency, jitter, response outcomes, and expanded diagnostics.
 .TP
 .B --raw
 Include per-query observations in JSON output.
+.TP
+.B --profile-view
+Show same-resolver transport comparisons with score confidence intervals.
+Requires table or JSON output.
+.TP
+.B --redact-system
+Redact local system resolver addresses and labels in reports.
+.TP
+.B --assert EXPRESSION
+Assert a winner metric or profile condition, and exit
+.B 4
+if it does not hold. Repeatable. Accepts
+.IR usable ,
+.IR success ,
+.IR median ,
+.IR p95 ,
+and
+.I score
+with
+.BR >= ", " > ", " <= ", " < ", or " = ,
+or
+.IR winner=PROFILE-ID .
+Rates are between 0 and 1; latencies accept a bare number of milliseconds or a
+Go duration such as
+.IR 50ms .
 .TP
 .B --include-system
 Include resolvers discovered from the operating system configuration.
@@ -127,12 +178,21 @@ Input or configuration was invalid.
 .B 3
 The run finished but produced no comparable DNS results.
 .TP
+.B 4
+A requested benchmark assertion did not hold. The ordinary report is written
+before this status is returned.
+.TP
 .B 130
 The run was interrupted.
 .SH FILES
 .TP
 .I /etc/resolv.conf
-Fallback system resolver configuration on macOS and Linux.
+System resolver configuration on Linux, and the fallback on macOS.
+.TP
+.I scutil --dns
+Queried on macOS for scoped resolver configuration before the
+.I /etc/resolv.conf
+fallback.
 .SH EXAMPLES
 .EX
 speedns --protocol udp --sample 25 --type A --seed 42
