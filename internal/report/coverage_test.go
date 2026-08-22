@@ -717,7 +717,7 @@ func TestProtocolMatrixAndTruthfulStatuses(t *testing.T) {
 	}
 	presentUnsupported := run
 	presentUnsupported.Targets = append(presentUnsupported.Targets, benchmark.TargetResult{Target: catalog.Target{Resolver: profile, Protocol: catalog.DoQ, Address: "192.0.2.1"}})
-	if rows := comparisonRowsForTable(presentUnsupported, catalog.DoQ, TableOptions{Details: true, Profiles: []catalog.ResolverProfile{profile}}); len(rows) != 1 || len(rows[0]) != len(comparisonHeaders(true)) {
+	if rows, hidden := comparisonRowsForTable(presentUnsupported, catalog.DoQ, TableOptions{Details: true, Profiles: []catalog.ResolverProfile{profile}}); len(rows) != 1 || len(rows[0]) != len(comparisonHeaders(true)) || hidden != 0 {
 		t.Fatalf("present unsupported rows = %#v", rows)
 	}
 

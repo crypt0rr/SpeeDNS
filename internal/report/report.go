@@ -794,15 +794,48 @@ func unsupportedComparisonRowWithOptions(target catalog.Target, details bool, re
 	return append(row, "—")
 }
 
-func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, options TableOptions) [][]string {
-	rows := comparisonRowsWithOptions(report, protocol, options.Details, options.Color, options.RedactSystem)
-	if len(options.Profiles) == 0 {
-		return rows
+// collapsedIPv6Targets returns the endpoints that the collapsed IPv6 warning
+// already summarizes. Partial IPv6 failures never reach this set, because
+// ipv6UnavailableWarning collapses only when every selected IPv6 endpoint
+// failed at the transport layer.
+func collapsedIPv6Targets(report benchmark.Report) map[string]bool {
+	warning, results := ipv6UnavailableWarning(report)
+	if warning == "" {
+		return nil
 	}
+	collapsed := make(map[string]bool, len(results))
+	for _, result := range results {
+		collapsed[result.Target.ID()] = true
+	}
+	return collapsed
+}
+
+// comparisonRowsForTable returns the comparison rows for one protocol and the
+// number of endpoints that were hidden because the collapsed IPv6 warning
+// already accounts for them. The detailed view keeps every row.
+func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, options TableOptions) ([][]string, int) {
 	present := make(map[string]bool, len(report.Targets))
 	for _, result := range report.Targets {
 		present[result.Target.ID()] = true
 	}
+	hidden := 0
+	if !options.Details {
+		collapsed := collapsedIPv6Targets(report)
+		if len(collapsed) > 0 {
+			visible := make([]benchmark.TargetResult, 0, len(report.Targets))
+			for _, result := range report.Targets {
+				if !collapsed[result.Target.ID()] {
+					visible = append(visible, result)
+					continue
+				}
+				if result.Target.Protocol == protocol {
+					hidden++
+				}
+			}
+			report.Targets = visible
+		}
+	}
+	rows := comparisonRowsWithOptions(report, protocol, options.Details, options.Color, options.RedactSystem)
 	for _, profile := range options.Profiles {
 		if _, supported := profile.Transports[protocol]; supported {
 			continue
@@ -815,7 +848,7 @@ func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, 
 			rows = append(rows, unsupportedComparisonRowWithOptions(target, options.Details, options.RedactSystem))
 		}
 	}
-	return rows
+	return rows, hidden
 }
 
 func pairedEffectTargetText(report benchmark.Report, targetID string, redactSystem bool) string {
@@ -857,7 +890,26 @@ func pairedInterpretation(effect benchmark.PairedEffect, color bool) string {
 	return "SLOWER"
 }
 
-func pairedEffectRows(report benchmark.Report, options TableOptions) [][]string {
+type pairedPolicyGroup struct {
+	protocol catalog.Protocol
+	policy   string
+}
+
+// pairedGroupSizes counts the effects in each protocol/policy group. A group
+// with a single member has no policy-comparable peer, so its only row is a
+// reference self-comparison that carries no information.
+func pairedGroupSizes(effects []benchmark.PairedEffect) map[pairedPolicyGroup]int {
+	sizes := make(map[pairedPolicyGroup]int, len(effects))
+	for _, effect := range effects {
+		sizes[pairedPolicyGroup{protocol: effect.Protocol, policy: effect.Policy}]++
+	}
+	return sizes
+}
+
+// pairedEffectRows returns the rendered paired-effect rows and the number of
+// targets that were omitted because they had no policy-comparable peer. The
+// detailed view keeps every row; the JSON section always keeps every entry.
+func pairedEffectRows(report benchmark.Report, options TableOptions) ([][]string, int) {
 	effects := append([]benchmark.PairedEffect(nil), report.PairedEffects...)
 	sort.SliceStable(effects, func(i, j int) bool {
 		if effects[i].Protocol != effects[j].Protocol {
@@ -868,8 +920,14 @@ func pairedEffectRows(report benchmark.Report, options TableOptions) [][]string 
 		}
 		return effects[i].TargetID < effects[j].TargetID
 	})
+	sizes := pairedGroupSizes(effects)
 	rows := make([][]string, 0, len(effects))
+	omitted := 0
 	for _, effect := range effects {
+		if !options.Details && sizes[pairedPolicyGroup{protocol: effect.Protocol, policy: effect.Policy}] == 1 {
+			omitted++
+			continue
+		}
 		rows = append(rows, []string{
 			string(effect.Protocol), effect.Policy,
 			pairedEffectTargetText(report, effect.TargetID, options.RedactSystem),
@@ -878,17 +936,28 @@ func pairedEffectRows(report benchmark.Report, options TableOptions) [][]string 
 			pairedInterpretation(effect, options.Color),
 		})
 	}
-	return rows
+	return rows, omitted
 }
 
 func writePairedEffects(writer io.Writer, report benchmark.Report, options TableOptions) error {
 	if len(report.PairedEffects) == 0 {
 		return nil
 	}
+	rows, omitted := pairedEffectRows(report, options)
 	if _, err := io.WriteString(writer, "\nPaired latency effects (target - reference; policy-local reference)\n"); err != nil {
 		return err
 	}
-	return writeAlignedTable(writer, []string{"Protocol", "Policy", "Target", "Reference", "Samples", "Median Δ", "95% CI", "Interpretation"}, pairedEffectRows(report, options))
+	if len(rows) > 0 {
+		if err := writeAlignedTable(writer, []string{"Protocol", "Policy", "Target", "Reference", "Samples", "Median Δ", "95% CI", "Interpretation"}, rows); err != nil {
+			return err
+		}
+	}
+	if omitted > 0 {
+		if _, err := fmt.Fprintf(writer, "  omitted %s without a policy-comparable peer (--details lists them)\n", targetCountText(omitted)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func profileGroupsForTable(report benchmark.Report, options TableOptions) map[string]profileGroup {
@@ -958,6 +1027,22 @@ func writeProfileView(writer io.Writer, report benchmark.Report, options TableOp
 		return err
 	}
 	return writeAlignedTable(writer, []string{"Profile", "Owner", "Address", "Protocol", "Median", "P95", "Cold", "Score", "Score 95% CI", "Success", "Status"}, rows)
+}
+
+// targetCountText and ipv6EndpointCountText keep the collapsed summary lines
+// grammatical for a single hidden row.
+func targetCountText(count int) string {
+	if count == 1 {
+		return "1 target"
+	}
+	return fmt.Sprintf("%d targets", count)
+}
+
+func ipv6EndpointCountText(count int) string {
+	if count == 1 {
+		return "1 IPv6 endpoint"
+	}
+	return fmt.Sprintf("%d IPv6 endpoints", count)
 }
 
 func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
@@ -1291,15 +1376,22 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 		if _, err := fmt.Fprintf(writer, "\nProtocol %s\n", strings.ToUpper(string(protocol))); err != nil {
 			return err
 		}
-		rows := comparisonRowsForTable(report, protocol, options)
-		if len(rows) == 0 {
+		rows, hiddenIPv6 := comparisonRowsForTable(report, protocol, options)
+		if len(rows) == 0 && hiddenIPv6 == 0 {
 			if _, err := io.WriteString(writer, "  no targets\n"); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := writeAlignedTable(writer, comparisonHeaders(options.Details), rows); err != nil {
-			return err
+		if len(rows) > 0 {
+			if err := writeAlignedTable(writer, comparisonHeaders(options.Details), rows); err != nil {
+				return err
+			}
+		}
+		if hiddenIPv6 > 0 {
+			if _, err := fmt.Fprintf(writer, "  %s hidden: no usable IPv6 path detected (--details lists them)\n", ipv6EndpointCountText(hiddenIPv6)); err != nil {
+				return err
+			}
 		}
 	}
 	if err := writePairedEffects(writer, report, options); err != nil {

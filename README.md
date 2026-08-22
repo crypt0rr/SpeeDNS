@@ -209,9 +209,11 @@ reference. The effect is the median per-name/type latency difference
 (`target - reference`) with a deterministic bootstrap 95% confidence interval.
 `NO CLEAR DIFFERENCE` means the interval includes zero, so the measured
 difference is not distinguishable from noise. These comparisons explain the
-ranking but do not replace the existing score or change rank order. JSON
-includes the same information in the additive `paired_effects` section; CSV
-keeps its aggregate schema.
+ranking but do not replace the existing score or change rank order. A target
+that is alone in its protocol and policy group has no peer to compare against,
+so the default table counts it below the block instead of printing a
+self-comparison row. JSON includes the same information in the additive
+`paired_effects` section; CSV keeps its aggregate schema.
 
 ## Choosing protocols
 
@@ -401,6 +403,15 @@ samples, transport failures, resolver-error counts and RCODEs, divergence,
 truncation, reconnects, incomplete targets, and the selected connection
 address.
 
+The default table leaves out rows that carry no information. When every
+selected IPv6 endpoint fails at the transport layer, each protocol comparison
+replaces those endpoint rows with one line naming how many IPv6 endpoints were
+hidden and why; partial IPv6 failures stay listed per endpoint. Paired latency
+effects leave out targets that are alone in their protocol and policy group,
+since such a row can only compare a target with itself, and count them in one
+line below the block. `--details` lists every row again, and JSON keeps every
+`paired_effects` entry in both views.
+
 For scripts and other tools, use JSON or CSV:
 
 ```sh
@@ -484,8 +495,9 @@ the same standard-error channel. Interactive progress briefly clears its
 status line, prints the diagnostic, and restores the status line so messages do
 not overwrite the report or become mixed into the progress text. When every
 selected IPv6 endpoint fails before receiving a usable DNS response, table
-warnings summarize the condition as an unavailable IPv6 path; partial IPv6
-failures remain visible per endpoint.
+warnings summarize the condition as an unavailable IPv6 path and the default
+protocol comparisons replace those endpoint rows with a hidden-endpoint count;
+partial IPv6 failures remain visible per endpoint.
 
 Cache-miss JSON and CSV reports carry the corpus mode, reserved zone, and
 per-run nonce. JSON with `--profile-view` additionally includes

@@ -86,7 +86,8 @@ Choose human-readable, JSON, or CSV output.
 Write the report to a file instead of standard output.
 .TP
 .B --details
-Include cold latency, jitter, response outcomes, and expanded diagnostics.
+Include cold latency, jitter, response outcomes, expanded diagnostics, and
+every row the default table collapses.
 .TP
 .B --raw
 Include per-query observations in JSON output.
@@ -111,8 +112,14 @@ not show an ETA or resolver addresses and does not change report contents.
 Transport-library diagnostics use the same standard-error channel. Interactive
 progress clears and restores its status line around such diagnostics. If all
 selected IPv6 endpoints fail before receiving a usable response, table output
-summarizes them as an unavailable IPv6 path; partial IPv6 failures remain
-visible per endpoint.
+summarizes them as an unavailable IPv6 path and the default protocol
+comparisons replace those endpoint rows with a hidden-endpoint count; partial
+IPv6 failures remain visible per endpoint.
+.PP
+The default table also omits paired latency effects for targets that are alone
+in their protocol and policy group, because such a row compares a target with
+itself, and counts them below the block instead. The --details view restores
+every hidden row, and JSON output is unchanged in both views.
 .PP
 A qualified recommendation requires at least 20 scored comparable samples and
 99 percent usable responses. A short run may show a provisional winner instead.
