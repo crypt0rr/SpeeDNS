@@ -333,7 +333,7 @@ func TestProgressRendererHandlesConcurrentCompletionStyles(t *testing.T) {
 	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressPreparing, TargetsCompleted: 0, TargetsTotal: 1})
 	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 2})
 	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 2})
-	want := "progress doq: preparing 0/1 targets\nprogress udp: preparing 0/1 targets\nprogress doq: measuring 0/2 exchanges\ntested doq 1/1 targets\nprogress udp: measuring 0/2 exchanges\ntested udp 1/1 targets\nprogress tcp: preparing 0/1 targets\nprogress tcp: measuring 0/2 exchanges\ntested tcp 1/1 targets\n"
+	want := "progress doq: preparing 0/1 targets\nprogress udp: preparing 0/1 targets\nprogress doq: preparing 1/1 targets\nprogress doq: measuring 0/2 exchanges\nprogress doq: measuring 2/2 exchanges\ntested doq 1/1 targets\nprogress udp: preparing 1/1 targets\nprogress udp: measuring 0/2 exchanges\nprogress udp: measuring 2/2 exchanges\ntested udp 1/1 targets\nprogress tcp: preparing 0/1 targets\nprogress tcp: preparing 1/1 targets\nprogress tcp: measuring 0/2 exchanges\nprogress tcp: measuring 1/2 exchanges\ntested tcp 1/1 targets\n"
 	if got := logOutput.String(); got != want {
 		t.Fatalf("non-TTY progress = %q, want %q", got, want)
 	}
@@ -406,6 +406,71 @@ func TestProgressRendererHandlesConcurrentUpdates(t *testing.T) {
 	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 32, ExchangesTotal: 32})
 	if !strings.Contains(output.String(), "progress udp: measuring") || !strings.Contains(output.String(), "tested udp 1/1 targets") {
 		t.Fatalf("concurrent progress output = %q", output.String())
+	}
+}
+
+func TestNonInteractiveProgressReportsMilestones(t *testing.T) {
+	var output bytes.Buffer
+	progress := newProgressRenderer(&output, false, []catalog.Protocol{catalog.UDP}, []catalog.Target{{Protocol: catalog.UDP, Address: "192.0.2.1"}})
+	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	for exchange := 0; exchange <= 20; exchange++ {
+		progress.Update(benchmark.Progress{
+			Protocol:           catalog.UDP,
+			Phase:              benchmark.ProgressMeasuring,
+			TargetsCompleted:   1,
+			TargetsTotal:       1,
+			ExchangesCompleted: exchange,
+			ExchangesTotal:     20,
+		})
+	}
+	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 20, ExchangesTotal: 20})
+
+	want := "progress udp: preparing 0/1 targets\n" +
+		"progress udp: preparing 1/1 targets\n" +
+		"progress udp: measuring 0/20 exchanges\n" +
+		"progress udp: measuring 5/20 exchanges\n" +
+		"progress udp: measuring 10/20 exchanges\n" +
+		"progress udp: measuring 15/20 exchanges\n" +
+		"progress udp: measuring 20/20 exchanges\n" +
+		"tested udp 1/1 targets\n"
+	if got := output.String(); got != want {
+		t.Fatalf("milestone progress = %q, want %q", got, want)
+	}
+	if strings.Contains(output.String(), "192.0.2.") || strings.Contains(output.String(), "elapsed") {
+		t.Fatalf("milestone progress leaked an address or an ETA: %q", output.String())
+	}
+}
+
+func TestNonInteractiveProgressReportsFinalStateForSmallAndEmptyTotals(t *testing.T) {
+	var small bytes.Buffer
+	smallProgress := newProgressRenderer(&small, false, []catalog.Protocol{catalog.TCP}, []catalog.Target{{Protocol: catalog.TCP}})
+	smallProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	smallProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 2})
+	smallProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 2, ExchangesTotal: 2})
+	wantSmall := "progress tcp: preparing 0/1 targets\n" +
+		"progress tcp: preparing 1/1 targets\n" +
+		"progress tcp: measuring 0/2 exchanges\n" +
+		"progress tcp: measuring 2/2 exchanges\n" +
+		"tested tcp 1/1 targets\n"
+	if got := small.String(); got != wantSmall {
+		t.Fatalf("small-total progress = %q, want %q", got, wantSmall)
+	}
+
+	var empty bytes.Buffer
+	emptyProgress := newProgressRenderer(&empty, false, []catalog.Protocol{catalog.DoH}, nil)
+	emptyProgress.Update(benchmark.Progress{Protocol: catalog.DoH, Phase: benchmark.ProgressMeasuring})
+	emptyProgress.Update(benchmark.Progress{Protocol: catalog.DoH, Phase: benchmark.ProgressMeasuring})
+	emptyProgress.Update(benchmark.Progress{Protocol: catalog.DoH, Phase: benchmark.ProgressComplete})
+	wantEmpty := "progress doh: measuring 0/0 exchanges\ntested doh 0/0 targets\n"
+	if got := empty.String(); got != wantEmpty {
+		t.Fatalf("zero-total progress = %q, want %q", got, wantEmpty)
+	}
+
+	var unknown bytes.Buffer
+	unknownProgress := newProgressRenderer(&unknown, false, []catalog.Protocol{catalog.DoT}, nil)
+	unknownProgress.Update(benchmark.Progress{Protocol: catalog.DoT, Phase: benchmark.ProgressPhase("unknown")})
+	if unknown.Len() != 0 {
+		t.Fatalf("unknown progress phase = %q", unknown.String())
 	}
 }
 
@@ -925,7 +990,7 @@ func TestRunBenchmarkProgressUsesStderrAndMachineFormatsStaySilent(t *testing.T)
 	if err := runBenchmark(context.Background(), tableConfig); err != nil {
 		t.Fatalf("table benchmark = %v", err)
 	}
-	if got := stderr.String(); got != "progress udp: preparing 0/1 targets\nprogress udp: measuring 0/1 exchanges\ntested udp 1/1 targets\n" {
+	if got := stderr.String(); got != "progress udp: preparing 0/1 targets\nprogress udp: preparing 1/1 targets\nprogress udp: measuring 0/1 exchanges\nprogress udp: measuring 1/1 exchanges\ntested udp 1/1 targets\n" {
 		t.Fatalf("table progress stderr = %q", got)
 	}
 	reportBytes, err := os.ReadFile(tableConfig.output)

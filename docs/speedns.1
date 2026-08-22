@@ -108,6 +108,12 @@ Preparation covers connection setup, cold probes, and warm-up queries.
 Measurement counts completed DNS exchanges, including failures. Progress does
 not show an ETA or resolver addresses and does not change report contents.
 .PP
+Redirected progress reports each phase when it starts, again after roughly
+every 25 percent of the work in that phase, and once more with its final
+counters before the next phase or the completion line. That bounds the log at
+five lines per phase and protocol. A phase whose total is small or zero still
+reports its final counters.
+.PP
 Transport-library diagnostics use the same standard-error channel. Interactive
 progress clears and restores its status line around such diagnostics. If all
 selected IPv6 endpoints fail before receiving a usable response, table output

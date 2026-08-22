@@ -468,13 +468,24 @@ testing | udp done | tcp done | doh queued | dot queued | doq preparing 2/10 | e
 Preparation covers connection setup, cold probes, and warm-ups. Measuring
 shows completed DNS exchanges, including failed exchanges; no ETA or resolver
 addresses are shown. When standard error is not a terminal, SpeeDNS prints
-deterministic phase-start and protocol-completion lines instead:
+deterministic milestone lines instead: each phase is reported when it starts,
+again roughly every 25 percent of its own work, and once more with its final
+counters, followed by the protocol-completion line:
 
 ```text
 progress doq: preparing 0/10 targets
+progress doq: preparing 10/10 targets
 progress doq: measuring 0/1000 exchanges
+progress doq: measuring 250/1000 exchanges
+progress doq: measuring 500/1000 exchanges
+progress doq: measuring 750/1000 exchanges
+progress doq: measuring 1000/1000 exchanges
 tested doq 10/10 targets
 ```
+
+That caps the log at five lines per phase and protocol. A phase whose totals
+are small or empty still reports its final counters once, and the lines carry
+counters only: no ETA and no resolver addresses.
 
 JSON and CSV runs remain completely silent on standard error. Progress never
 changes benchmark measurements or report contents.

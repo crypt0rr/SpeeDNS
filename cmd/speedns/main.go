@@ -107,7 +107,7 @@ type progressRenderer struct {
 	interactive     bool
 	protocols       []catalog.Protocol
 	states          map[catalog.Protocol]progressState
-	printedPhases   map[catalog.Protocol]map[benchmark.ProgressPhase]bool
+	phaseMilestones map[catalog.Protocol]map[benchmark.ProgressPhase]int
 	lastLineWidth   int
 	rendered        bool
 	started         time.Time
@@ -183,12 +183,12 @@ func newProgressRenderer(writer io.Writer, interactive bool, selected []catalog.
 		interactive:     interactive,
 		protocols:       canonicalProtocols(selected),
 		states:          make(map[catalog.Protocol]progressState),
-		printedPhases:   make(map[catalog.Protocol]map[benchmark.ProgressPhase]bool),
+		phaseMilestones: make(map[catalog.Protocol]map[benchmark.ProgressPhase]int),
 		refreshInterval: defaultProgressRefreshInterval,
 	}
 	for _, protocol := range progress.protocols {
 		progress.states[protocol] = progressState{}
-		progress.printedPhases[protocol] = make(map[benchmark.ProgressPhase]bool)
+		progress.phaseMilestones[protocol] = make(map[benchmark.ProgressPhase]int)
 	}
 	for _, target := range targets {
 		state := progress.states[target.Protocol]
@@ -289,29 +289,84 @@ func progressPhaseRank(phase benchmark.ProgressPhase) int {
 	}
 }
 
+// progressMilestoneSteps divides the work of a non-interactive phase into
+// equal milestones, so a redirected run reports roughly every 25 percent of
+// that phase instead of a single line that always reads zero. The step count
+// keeps the log low-volume: at most five lines per phase and protocol.
+const progressMilestoneSteps = 4
+
+// progressPhaseSequence lists the phases in the order they are reached, so a
+// superseded phase can be reported before the phase that replaced it.
+var progressPhaseSequence = []benchmark.ProgressPhase{
+	benchmark.ProgressPreparing,
+	benchmark.ProgressMeasuring,
+	benchmark.ProgressComplete,
+}
+
+// progressMilestone reports how many milestones of a phase are complete. A
+// phase whose total is still unknown stays at the first milestone so its
+// opening line is not mistaken for completion, and any progress at all past
+// the total counts as the final milestone.
+func progressMilestone(completed, total int) int {
+	if total <= 0 || completed <= 0 {
+		return 0
+	}
+	if completed >= total {
+		return progressMilestoneSteps
+	}
+	return completed * progressMilestoneSteps / total
+}
+
+// progressPhaseUnits reports the counters a phase advances: measurement counts
+// DNS exchanges, every other phase counts targets.
+func progressPhaseUnits(phase benchmark.ProgressPhase, state progressState) (int, int) {
+	if phase == benchmark.ProgressMeasuring {
+		return state.exchangesCompleted, state.exchangesTotal
+	}
+	return state.targetsCompleted, state.targetsTotal
+}
+
 func (p *progressRenderer) renderUpdateLocked(update benchmark.Progress, now time.Time) {
 	if p.interactive {
 		p.renderLocked(now)
 		return
 	}
-	if p.printedPhases[update.Protocol] == nil {
-		p.printedPhases[update.Protocol] = make(map[benchmark.ProgressPhase]bool)
+	if p.phaseMilestones[update.Protocol] == nil {
+		p.phaseMilestones[update.Protocol] = make(map[benchmark.ProgressPhase]int)
 	}
-	if p.printedPhases[update.Protocol][update.Phase] {
+	// A phase can finish between two updates, so report the final state of
+	// every phase this update supersedes before reporting the current one.
+	for _, phase := range progressPhaseSequence {
+		if progressPhaseRank(phase) >= progressPhaseRank(update.Phase) {
+			break
+		}
+		if _, started := p.phaseMilestones[update.Protocol][phase]; started {
+			p.emitPhaseLocked(update.Protocol, phase)
+		}
+	}
+	p.emitPhaseLocked(update.Protocol, update.Phase)
+}
+
+// emitPhaseLocked writes one deterministic line for a phase the first time it
+// is seen and again whenever it crosses a milestone. Lines carry counters
+// only: no ETA and no resolver addresses.
+func (p *progressRenderer) emitPhaseLocked(protocol catalog.Protocol, phase benchmark.ProgressPhase) {
+	completed, total := progressPhaseUnits(phase, p.states[protocol])
+	milestone := progressMilestone(completed, total)
+	if reached, started := p.phaseMilestones[protocol][phase]; started && milestone <= reached {
 		return
 	}
-	state := p.states[update.Protocol]
-	switch update.Phase {
+	switch phase {
 	case benchmark.ProgressPreparing:
-		_, _ = fmt.Fprintf(p.writer, "progress %s: preparing %d/%d targets\n", update.Protocol, state.targetsCompleted, state.targetsTotal)
+		_, _ = fmt.Fprintf(p.writer, "progress %s: preparing %d/%d targets\n", protocol, completed, total)
 	case benchmark.ProgressMeasuring:
-		_, _ = fmt.Fprintf(p.writer, "progress %s: measuring %d/%d exchanges\n", update.Protocol, state.exchangesCompleted, state.exchangesTotal)
+		_, _ = fmt.Fprintf(p.writer, "progress %s: measuring %d/%d exchanges\n", protocol, completed, total)
 	case benchmark.ProgressComplete:
-		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", update.Protocol, state.targetsCompleted, state.targetsTotal)
+		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", protocol, completed, total)
 	default:
 		return
 	}
-	p.printedPhases[update.Protocol][update.Phase] = true
+	p.phaseMilestones[protocol][phase] = milestone
 }
 
 func (p *progressRenderer) renderLocked(now time.Time) {
