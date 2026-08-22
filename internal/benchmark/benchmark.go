@@ -538,6 +538,7 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 			}
 		}()
 	}
+dispatch:
 	for index := range runners {
 		if ctx.Err() != nil {
 			break
@@ -546,10 +547,7 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 		case jobs <- index:
 			dispatched[index] = true
 		case <-ctx.Done():
-			break
-		}
-		if ctx.Err() != nil {
-			break
+			break dispatch
 		}
 	}
 	close(jobs)
