@@ -208,3 +208,22 @@ detected, both literal families are retained rather than silently claiming a
 route. Hostname-only custom endpoints remain available in `auto` and `both`,
 while explicit family selection requires literals so the benchmark does not
 include an unmeasured bootstrap lookup.
+
+Auto-detection treats the two families differently. An RFC 1918 IPv4 address
+counts as IPv4 availability because NAT makes a private v4 address an ordinary
+path to the Internet. A unique-local IPv6 address (`fc00::/7`, which covers
+Tailscale's `fd7a::/48` and the ULAs many home routers hand out) does not count
+as IPv6 availability: IPv6 has no NAT equivalent, so a ULA is not evidence of a
+public route, and treating it as one produced comparison tables where every
+IPv6 endpoint failed. Only global unicast IPv6 outside `fc00::/7` marks IPv6 as
+available.
+
+Auto-detection is a heuristic, so it prunes only the bundled catalog. Resolvers
+the operator named explicitly — `--resolver`, `--resolver-file`, and
+`--include-system` discovery — are never dropped by `auto`, because a resolver
+someone asked for by address should be measured and reported rather than
+silently removed. An explicit `--family 4`, `6`, or `both` is a deliberate
+instruction and still filters every profile, explicit ones included. When
+`auto` drops bundled addresses the run emits a warning naming the detected
+families and the number of addresses removed, so the reduced comparison table
+is visible rather than silent.
