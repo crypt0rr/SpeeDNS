@@ -68,8 +68,8 @@ var loadProfilesFunc = loadProfiles
 var verifyCorpusFunc = data.VerifyCorpus
 
 var writeTableReport = report.WriteTableWithOptions
-var writeJSONReport = report.WriteJSON
-var writeCSVReport = report.WriteCSV
+var writeJSONReport = report.WriteJSONWithOptions
+var writeCSVReport = report.WriteCSVWithOptions
 var outputWriterFunc = outputWriter
 
 var terminalDetector = fileIsTerminal
@@ -796,17 +796,15 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			Details: config.details, Color: tableColorEnabled(config), ProfileView: config.profileView, RedactSystem: config.redactSystem, Profiles: profiles, Protocols: selected,
 		})
 	case "json":
-		if config.redactSystem || config.profileView {
-			reportErr = report.WriteJSONWithOptions(writer, result, config.raw, report.JSONOptions{RedactSystem: config.redactSystem, ProfileView: config.profileView})
-		} else {
-			reportErr = writeJSONReport(writer, result, config.raw)
-		}
+		// One path, always through the seam. The former branch called the
+		// package directly for redacted and profile-view runs, so every CLI
+		// test that injects a report-write failure silently skipped those
+		// cases - including the finalizeOutput(false) discard path below.
+		reportErr = writeJSONReport(writer, result, config.raw, report.JSONOptions{
+			RedactSystem: config.redactSystem, ProfileView: config.profileView,
+		})
 	case "csv":
-		if config.redactSystem {
-			reportErr = report.WriteCSVWithOptions(writer, result, report.CSVOptions{RedactSystem: true})
-		} else {
-			reportErr = writeCSVReport(writer, result)
-		}
+		reportErr = writeCSVReport(writer, result, report.CSVOptions{RedactSystem: config.redactSystem})
 	}
 	if err := finalizeOutput(reportErr == nil); err != nil {
 		if reportErr != nil {

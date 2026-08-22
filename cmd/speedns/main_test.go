@@ -18,6 +18,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/report"
 	"github.com/spf13/cobra"
 )
 
@@ -855,7 +856,9 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 		t.Fatal("expected output writer error")
 	}
 
-	writeJSONReport = func(io.Writer, benchmark.Report, bool) error { return errors.New("report write failed") }
+	writeJSONReport = func(io.Writer, benchmark.Report, bool, report.JSONOptions) error {
+		return errors.New("report write failed")
+	}
 	config = cliConfigForTest(t)
 	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "report write failed") {
 		t.Fatalf("report writer error = %v", err)
@@ -867,7 +870,9 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "finalize failed") {
 		t.Fatalf("finalizer error = %v", err)
 	}
-	writeJSONReport = func(io.Writer, benchmark.Report, bool) error { return errors.New("report write failed") }
+	writeJSONReport = func(io.Writer, benchmark.Report, bool, report.JSONOptions) error {
+		return errors.New("report write failed")
+	}
 	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "report write failed") || !strings.Contains(err.Error(), "finalize failed") {
 		t.Fatalf("combined report/finalizer error = %v", err)
 	}
