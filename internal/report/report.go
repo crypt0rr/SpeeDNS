@@ -13,85 +13,21 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	publicreport "github.com/crypt0rr/SpeeDNS/report"
 )
 
-type JSONReport struct {
-	SchemaVersion      int                          `json:"schema_version"`
-	Run                JSONRun                      `json:"run"`
-	Results            []JSONResult                 `json:"results"`
-	Rankings           []benchmark.Ranking          `json:"rankings"`
-	PairedEffects      []benchmark.PairedEffect     `json:"paired_effects,omitempty"`
-	ProfileComparisons []JSONProfileComparison      `json:"profile_comparisons,omitempty"`
-	Divergence         []benchmark.DivergenceDetail `json:"divergence,omitempty"`
-	Warnings           []string                     `json:"warnings,omitempty"`
-}
-
-type JSONRun struct {
-	StartedAt   string          `json:"started_at"`
-	FinishedAt  string          `json:"finished_at"`
-	Seed        int64           `json:"seed"`
-	Provenance  *JSONProvenance `json:"provenance,omitempty"`
-	CorpusMode  string          `json:"corpus_mode,omitempty"`
-	CorpusZone  string          `json:"corpus_zone,omitempty"`
-	CorpusNonce string          `json:"corpus_nonce,omitempty"`
-	SampleSize  int             `json:"sample_size"`
-	Queries     int             `json:"queries_per_target"`
-	QueryTypes  []uint16        `json:"query_types"`
-}
-
-type JSONProvenance struct {
-	SpeeDNSVersion string             `json:"speedns_version"`
-	Commit         string             `json:"commit"`
-	BuildDate      string             `json:"build_date"`
-	OS             string             `json:"os"`
-	Architecture   string             `json:"architecture"`
-	Interfaces     []string           `json:"interfaces,omitempty"`
-	Protocols      []catalog.Protocol `json:"protocols"`
-	CorpusEntries  int                `json:"corpus_entries"`
-	CorpusSHA256   string             `json:"corpus_sha256"`
-	TimeoutMS      int64              `json:"timeout_ms"`
-	Concurrency    int                `json:"concurrency"`
-	DurationMS     float64            `json:"duration_ms"`
-}
-
-type JSONProfileComparison struct {
-	ID         string                 `json:"id"`
-	Name       string                 `json:"name"`
-	Owner      string                 `json:"owner"`
-	Address    string                 `json:"address"`
-	Transports []JSONProfileTransport `json:"transports"`
-}
-
-type JSONProfileTransport struct {
-	Protocol catalog.Protocol     `json:"protocol"`
-	TargetID string               `json:"target_id"`
-	Stats    benchmark.Statistics `json:"stats"`
-	Status   string               `json:"status"`
-}
-
-type JSONResult struct {
-	Target       JSONTarget                  `json:"target"`
-	Stats        benchmark.Statistics        `json:"stats"`
-	OpenError    string                      `json:"open_error,omitempty"`
-	Incomplete   bool                        `json:"incomplete,omitempty"`
-	Observations []benchmark.Observation     `json:"samples,omitempty"`
-	Cold         []benchmark.ColdObservation `json:"cold,omitempty"`
-}
-
-type JSONTarget struct {
-	ID                 string           `json:"id"`
-	Name               string           `json:"name"`
-	Owner              string           `json:"owner"`
-	Policy             string           `json:"policy"`
-	Address            string           `json:"address"`
-	Protocol           catalog.Protocol `json:"protocol"`
-	EndpointURL        string           `json:"endpoint_url,omitempty"`
-	TLSServerName      string           `json:"tls_server_name,omitempty"`
-	TLSIdentitySource  string           `json:"tls_identity_source,omitempty"`
-	BootstrapMode      string           `json:"bootstrap_mode"`
-	BootstrapAddresses []string         `json:"bootstrap_addresses,omitempty"`
-	DialAddress        string           `json:"dial_address,omitempty"`
-}
+// The emitted JSON document types are defined by the public report contract in
+// github.com/crypt0rr/SpeeDNS/report so that encoder and consumer cannot drift
+// apart. These aliases keep the internal names used by the writers below.
+type (
+	JSONReport            = publicreport.Report
+	JSONRun               = publicreport.Run
+	JSONProvenance        = publicreport.Provenance
+	JSONProfileComparison = publicreport.ProfileComparison
+	JSONProfileTransport  = publicreport.ProfileTransport
+	JSONResult            = publicreport.Result
+	JSONTarget            = publicreport.Target
+)
 
 type JSONOptions struct {
 	RedactSystem bool

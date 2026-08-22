@@ -40,7 +40,7 @@ func TestStatisticsAndRanking(t *testing.T) {
 	}
 	observations := make([]Observation, 0, 20)
 	for index := 0; index < 20; index++ {
-		observations = append(observations, Observation{Success: true, Latency: time.Duration(index+1) * time.Millisecond, LatencyMS: float64(index + 1), ResponseClass: "answer"})
+		observations = append(observations, Observation{Success: true, LatencyMS: float64(index + 1), ResponseClass: "answer"})
 	}
 	result := TargetResult{Target: target, Observations: observations}
 	stats := calculateStatistics(result, 2*time.Second, 1)

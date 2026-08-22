@@ -17,6 +17,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/domains"
 	"github.com/crypt0rr/SpeeDNS/internal/transport"
+	"github.com/crypt0rr/SpeeDNS/report"
 	"github.com/miekg/dns"
 )
 
@@ -80,59 +81,18 @@ type Query struct {
 	QType uint16
 }
 
-type Observation struct {
-	Name               string        `json:"name"`
-	QType              uint16        `json:"qtype"`
-	Latency            time.Duration `json:"-"`
-	LatencyMS          float64       `json:"latency_ms,omitempty"`
-	Success            bool          `json:"success"`
-	Usable             bool          `json:"usable"`
-	RCode              int           `json:"rcode,omitempty"`
-	Truncated          bool          `json:"truncated,omitempty"`
-	ResponseClass      string        `json:"response_class,omitempty"`
-	Divergent          bool          `json:"divergent,omitempty"`
-	DivergenceBaseline string        `json:"divergence_baseline,omitempty"`
-	Reconnected        bool          `json:"reconnected,omitempty"`
-	Error              string        `json:"error,omitempty"`
-}
-
-type ColdObservation struct {
-	Name      string        `json:"name"`
-	QType     uint16        `json:"qtype"`
-	Latency   time.Duration `json:"-"`
-	LatencyMS float64       `json:"latency_ms,omitempty"`
-	Success   bool          `json:"success"`
-	Error     string        `json:"error,omitempty"`
-}
-
-type Statistics struct {
-	Total               int            `json:"total"`
-	Successes           int            `json:"successes"`
-	Failures            int            `json:"failures"`
-	UsableResponses     int            `json:"usable_responses"`
-	ResolverFailures    int            `json:"resolver_failures"`
-	Scored              int            `json:"scored"`
-	Divergent           int            `json:"divergent"`
-	Truncated           int            `json:"truncated"`
-	Reconnects          int            `json:"reconnects"`
-	SuccessRate         float64        `json:"success_rate"`
-	FailureRate         float64        `json:"failure_rate"`
-	UsableRate          float64        `json:"usable_rate"`
-	ResolverFailureRate float64        `json:"resolver_failure_rate"`
-	ScoringFailureRate  float64        `json:"scoring_failure_rate"`
-	RCodeCounts         map[string]int `json:"rcode_counts,omitempty"`
-	MedianMS            float64        `json:"median_ms"`
-	P95MS               float64        `json:"p95_ms"`
-	MinMS               float64        `json:"min_ms"`
-	MaxMS               float64        `json:"max_ms"`
-	MADMS               float64        `json:"mad_ms"`
-	ColdMedianMS        float64        `json:"cold_median_ms,omitempty"`
-	ScoreMS             float64        `json:"score_ms"`
-	CILowMS             float64        `json:"ci_low_ms,omitempty"`
-	CIHighMS            float64        `json:"ci_high_ms,omitempty"`
-	Recommended         bool           `json:"recommended"`
-	Tie                 bool           `json:"tie,omitempty"`
-}
+// The record types below are emitted verbatim in JSON reports, so the public
+// report contract in github.com/crypt0rr/SpeeDNS/report owns their definitions
+// and documents their semantics.
+type (
+	Observation         = report.Observation
+	ColdObservation     = report.ColdObservation
+	Statistics          = report.Statistics
+	Ranking             = report.Ranking
+	PairedEffect        = report.PairedEffect
+	DivergenceExclusion = report.DivergenceExclusion
+	DivergenceDetail    = report.DivergenceDetail
+)
 
 type TargetResult struct {
 	Target       catalog.Target    `json:"-"`
@@ -142,13 +102,6 @@ type TargetResult struct {
 	OpenError    string            `json:"open_error,omitempty"`
 	Incomplete   bool              `json:"incomplete,omitempty"`
 	DialAddress  string            `json:"-"`
-}
-
-type Ranking struct {
-	Protocol catalog.Protocol `json:"protocol"`
-	TargetID string           `json:"target_id"`
-	Rank     int              `json:"rank"`
-	Tie      bool             `json:"tie"`
 }
 
 type Report struct {
@@ -185,51 +138,6 @@ type RunProvenance struct {
 	CorpusSHA256  string
 	Timeout       time.Duration
 	Concurrency   int
-}
-
-// PairedEffect describes the latency difference between a target and the
-// deterministic reference for its protocol and declared policy group. A
-// positive delta means that the target was slower than the reference.
-//
-// Only observations that are usable, non-divergent, non-reconnect samples are
-// paired. The existing composite score remains the ranking authority; these
-// values explain whether a ranked difference is distinguishable from noise.
-type PairedEffect struct {
-	Protocol          catalog.Protocol `json:"protocol"`
-	Policy            string           `json:"policy"`
-	TargetID          string           `json:"target_id"`
-	ReferenceTargetID string           `json:"reference_target_id"`
-	Samples           int              `json:"samples"`
-	MedianDeltaMS     float64          `json:"median_delta_ms"`
-	CILowMS           float64          `json:"ci_low_ms"`
-	CIHighMS          float64          `json:"ci_high_ms"`
-	Indistinguishable bool             `json:"indistinguishable"`
-	Reference         bool             `json:"reference,omitempty"`
-	Reason            string           `json:"reason,omitempty"`
-}
-
-// DivergenceExclusion identifies a successful response that differed from the
-// selected response-class baseline. Usable outliers are removed from the
-// latency sample; unusable outliers remain failure-penalized.
-type DivergenceExclusion struct {
-	TargetID      string `json:"target_id"`
-	ResponseClass string `json:"response_class"`
-	Treatment     string `json:"treatment"`
-}
-
-// DivergenceDetail records the deterministic baseline decision for one query
-// and policy group. A tied plurality has no safe baseline, so Ambiguous is
-// true and all successful observations in the group are excluded from
-// comparative latency scoring.
-type DivergenceDetail struct {
-	Name      string                `json:"name"`
-	QType     uint16                `json:"qtype"`
-	Policy    string                `json:"policy"`
-	Compared  int                   `json:"compared"`
-	Baseline  string                `json:"baseline,omitempty"`
-	Ambiguous bool                  `json:"ambiguous,omitempty"`
-	Classes   map[string]int        `json:"classes"`
-	Excluded  []DivergenceExclusion `json:"excluded,omitempty"`
 }
 
 func (r Report) ResultFor(id string) (TargetResult, bool) {
@@ -648,8 +556,7 @@ func (runner *targetRunner) prepare(ctx context.Context) bool {
 		_, queryErr := session.Query(queryCtx, probe, qtype)
 		// Cold latency ends when the DNS exchange returns. Session teardown is
 		// deliberately excluded because its cost differs by transport.
-		observation.Latency = time.Since(started)
-		observation.LatencyMS = durationMS(observation.Latency)
+		observation.LatencyMS = durationMS(time.Since(started))
 		cancel()
 		_ = session.Close()
 		if queryErr != nil {
@@ -715,8 +622,7 @@ func (runner *targetRunner) measure(ctx context.Context, query Query) bool {
 		runner.abort(ctx.Err())
 		return false
 	}
-	observation.Latency = time.Since(started)
-	observation.LatencyMS = durationMS(observation.Latency)
+	observation.LatencyMS = durationMS(time.Since(started))
 	if queryErr != nil {
 		observation.Error = queryErr.Error()
 	} else if message == nil {

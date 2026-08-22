@@ -10,23 +10,25 @@ import (
 	"strings"
 
 	"github.com/crypt0rr/SpeeDNS/data"
+	"github.com/crypt0rr/SpeeDNS/report"
 	"gopkg.in/yaml.v3"
 )
 
-// Protocol identifies a DNS wire transport.
-type Protocol string
+// Protocol identifies a DNS wire transport. The type and its values are
+// defined by the public report contract because they are emitted verbatim in
+// JSON reports; this alias keeps the catalog the single place that expands
+// them into targets.
+type Protocol = report.Protocol
 
 const (
-	UDP Protocol = "udp"
-	TCP Protocol = "tcp"
-	DoH Protocol = "doh"
-	DoT Protocol = "dot"
-	DoQ Protocol = "doq"
+	UDP = report.UDP
+	TCP = report.TCP
+	DoH = report.DoH
+	DoT = report.DoT
+	DoQ = report.DoQ
 )
 
 var AllProtocols = []Protocol{UDP, TCP, DoH, DoT, DoQ}
-
-func (p Protocol) String() string { return string(p) }
 
 // ParseProtocol parses a user-facing protocol name.
 func ParseProtocol(value string) (Protocol, error) {

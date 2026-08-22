@@ -425,6 +425,34 @@ cache-miss results auditable without downloading anything at runtime. The
 `--redact-system` option replaces interface names with `redacted` along with
 other local resolver details; CSV output is unchanged.
 
+### Decoding reports from Go
+
+Go programs can consume a report with
+[`github.com/crypt0rr/SpeeDNS/report`](report) instead of re-deriving the
+contract. The package exports only the report document: the decoded types plus
+`Decode`/`Parse`. The benchmark engine stays internal.
+
+```go
+import "github.com/crypt0rr/SpeeDNS/report"
+
+document, err := report.Decode(file) // or report.Parse(data)
+if err != nil {
+	return err
+}
+for _, result := range document.Results {
+	if result.Target.Protocol == report.DoT && result.Stats.MedianMS > 40 {
+		return fmt.Errorf("%s: DoT median is %.1f ms", result.Target.ID, result.Stats.MedianMS)
+	}
+}
+```
+
+`schema_version` 1 is the compatibility unit. `Decode` rejects any other
+version with `report.ErrUnsupportedSchemaVersion`, and ignores unknown keys so
+that an older consumer keeps working against a newer, additively extended
+version 1 report. The machine-readable form of the same contract remains
+available as `schema.ReportV1()` from
+[`github.com/crypt0rr/SpeeDNS/schema`](schema).
+
 ### Scheduled live results
 
 The project also runs a scheduled, non-blocking smoke check against one

@@ -869,7 +869,7 @@ func TestColdLatencyExcludesSessionTeardown(t *testing.T) {
 	}}
 	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
 	result := runTarget(context.Background(), testTarget(catalog.UDP, "cold-timing"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
-	if len(result.Cold) != 3 || result.Cold[0].Latency >= 80*time.Millisecond {
+	if len(result.Cold) != 3 || result.Cold[0].LatencyMS >= 80 {
 		t.Fatalf("cold latency included teardown: %#v", result.Cold)
 	}
 }
