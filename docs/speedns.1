@@ -59,7 +59,8 @@ Load strict, versioned resolver profiles from YAML.
 .TP
 .B --domains PATH
 Read one domain per line from a custom list. Blank lines and comments are
-ignored.
+ignored. Underscored service labels such as _dmarc.example.com are accepted;
+the underscore is only allowed as the first character of a label.
 .TP
 .B --sample N
 Sample N domains from the selected corpus.
