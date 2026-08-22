@@ -9,12 +9,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -533,6 +536,52 @@ func TestDoQFactoryRetriesAfterCandidateTimeout(t *testing.T) {
 		t.Fatalf("DoQ dial order = %#v", addresses)
 	}
 	_ = session.Close()
+}
+
+func TestDoHRedirectLoopStopsAtHopLimit(t *testing.T) {
+	const serverName = "dns.example"
+	certificate, roots := testServerCertificate(t, serverName)
+	var hits atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		hits.Add(1)
+		http.Redirect(writer, request, "/dns-query", http.StatusFound)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	oldTLSConfig := newDoHTLSConfig
+	newDoHTLSConfig = func(name string) *tls.Config {
+		return &tls.Config{MinVersion: tls.VersionTLS12, ServerName: name, RootCAs: roots}
+	}
+	t.Cleanup(func() { newDoHTLSConfig = oldTLSConfig })
+
+	factory, err := newDoHFactory(catalog.Target{Address: "192.0.2.53", Spec: catalog.TransportSpec{
+		URL:                "https://dns.example/dns-query",
+		Port:               server.Listener.Addr().(*net.TCPAddr).Port,
+		ServerName:         serverName,
+		BootstrapAddresses: []string{"127.0.0.1"},
+	}}, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	_, err = session.Query(context.Background(), "example.com", dns.TypeA)
+	if err == nil {
+		t.Fatal("redirect loop unexpectedly produced a response")
+	}
+	want := fmt.Sprintf("DoH stopped after %d redirects", doHMaxRedirects)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("redirect loop error = %v, want one containing %q", err, want)
+	}
+	if got := hits.Load(); got != int64(doHMaxRedirects) {
+		t.Fatalf("redirect loop server hits = %d, want %d", got, doHMaxRedirects)
+	}
 }
 
 func TestDoHRedirectRequiresHTTPSOrigin(t *testing.T) {
