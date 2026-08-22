@@ -182,6 +182,53 @@ combinations are shown as unavailable in the table; profile view is a view of
 the same run, not a new cross-transport ranking and not a replacement for the
 per-protocol score.
 
+## DNSSEC probing
+
+`--dnssec` is opt-in and changes the run in two ways. Every query of the run
+carries the EDNS(0) DO bit, and each prepared target answers two extra queries
+after all of its measured rounds have finished. The CD (checking disabled) bit
+is never set, because the point of the probe is to observe validation rather
+than to suppress it.
+
+The two probe names are pinned constants in `internal/benchmark/dnssec.go`:
+
+- `good-a.test.dnssec-tools.org` is a correctly signed control name. Every
+  resolver must answer it with NOERROR and at least one address record.
+- `dnssec-failed.org` is a deliberately mis-signed public test zone. A
+  resolver that validates DNSSEC must fail closed and answer SERVFAIL; a
+  resolver that does not validate returns the unverifiable address record.
+
+Changing the vectors is a two-line edit of those constants; the probe logic
+does not depend on the specific names.
+
+The per-target verdict is deliberately narrow:
+
+- `validating` means the control name resolved and the bogus name was refused
+  with SERVFAIL.
+- `not-validating` means the resolver returned answers for the bogus name, so
+  it did not fail closed.
+- `inconclusive` covers everything else, including a probe that did not
+  complete, a bogus response that was neither SERVFAIL nor an answer, and a
+  SERVFAIL for the bogus name while the signed control also failed to resolve.
+
+The AD (authentic data) and CD flags are recorded per measured observation and
+per probe, and are reported as raw evidence. AD is not required for the
+`validating` verdict, because forwarders may clear AD on responses they relay
+even when the upstream validated the data.
+
+This probe shows what a resolver did for these two names at this moment from
+this network path. It is not a DNSSEC audit: it does not cover algorithm
+support, negative-answer validation, NSEC/NSEC3 handling, key rollovers, or
+any other name. A SERVFAIL can also be produced by an outage, a blocklist, or
+a forwarder that never reached the authoritative servers, which is why those
+cases stay inconclusive.
+
+The probe never touches ranking, scoring, or divergence. Its queries are run
+on the already warm session after the measured rounds, are not part of the
+query matrix, and never enter the latency samples. A default run without
+`--dnssec` sends byte-identical queries to earlier releases and produces no
+probe traffic, so default results stay comparable with published reports.
+
 ## Assertions
 
 The repeatable `--assert` option provides a small automation gate without

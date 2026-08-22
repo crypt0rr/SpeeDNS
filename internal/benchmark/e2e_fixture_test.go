@@ -22,7 +22,7 @@ func TestDeterministicResolverFixtureCoversBenchmarkOutcomes(t *testing.T) {
 	})
 	runTargetFunc = runTarget
 
-	newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 		if target.Resolver.ID == "fixture-open-failure" {
 			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
 				return nil, errors.New("fixture connection failure")

@@ -96,6 +96,16 @@ Include resolvers discovered from the operating system configuration.
 .TP
 .B --no-color
 Disable ANSI styling in table output.
+.TP
+.B --dnssec
+Opt in to DNSSEC probing. Every query of the run carries the EDNS(0) DO bit
+and each prepared target answers two additional pinned probe queries after its
+measured rounds: a correctly signed control name that must resolve and a
+deliberately mis-signed name that a validating resolver must refuse with
+SERVFAIL. The report gains a per-target verdict of validating, not-validating,
+or inconclusive, together with the raw AD and CD flags. The probe describes
+those two names at that moment and is not a DNSSEC audit. Without this option
+SpeeDNS sends its unchanged default queries and contacts no probe names.
 .SH OUTPUT
 Table output is written to standard output by default. JSON output has a
 versioned schema and CSV output has one aggregate row per target. Table runs

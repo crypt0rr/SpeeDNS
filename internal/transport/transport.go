@@ -156,7 +156,24 @@ var dialDoQ = func(ctx context.Context, address string, tlsConfig *tls.Config, c
 
 var packSessionQuery = packQuery
 
+// QueryOptions carries per-run DNS query settings. The zero value reproduces
+// the queries SpeeDNS has always sent, so a default run stays byte-identical
+// on the wire and remains comparable with previously published reports.
+type QueryOptions struct {
+	// DNSSEC sets the EDNS(0) DO bit. It is opt-in because it changes the
+	// request the resolver sees. The CD (checking disabled) bit is never set:
+	// SpeeDNS wants the resolver to validate, not to skip validation.
+	DNSSEC bool
+}
+
+// NewFactory creates a factory that sends the default query form.
 func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
+	return NewFactoryWithOptions(target, timeout, QueryOptions{})
+}
+
+// NewFactoryWithOptions creates a factory whose sessions apply the supplied
+// per-run query options to every query they send.
+func NewFactoryWithOptions(target catalog.Target, timeout time.Duration, options QueryOptions) (Factory, error) {
 	if timeout <= 0 {
 		return nil, errors.New("transport timeout must be positive")
 	}
@@ -164,9 +181,9 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	address := firstAddress(connectionPlan)
 	switch target.Protocol {
 	case catalog.UDP:
-		return &udpFactory{address: joinAddress(target.Address, target.Spec.Port), timeout: timeout}, nil
+		return &udpFactory{address: joinAddress(target.Address, target.Spec.Port), timeout: timeout, queryOptions: options}, nil
 	case catalog.TCP:
-		return &streamFactory{address: address, connectionPlan: connectionPlan, timeout: timeout}, nil
+		return &streamFactory{address: address, connectionPlan: connectionPlan, timeout: timeout, queryOptions: options}, nil
 	case catalog.DoT:
 		serverName := target.Spec.ServerName
 		if serverName == "" {
@@ -176,13 +193,14 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			address:        address,
 			connectionPlan: connectionPlan,
 			timeout:        timeout,
+			queryOptions:   options,
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				ServerName: serverName,
 			},
 		}, nil
 	case catalog.DoH:
-		return newDoHFactory(target, timeout)
+		return newDoHFactory(target, timeout, options)
 	case catalog.DoQ:
 		serverName := target.Spec.ServerName
 		if serverName == "" {
@@ -192,6 +210,7 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			address:        address,
 			connectionPlan: connectionPlan,
 			timeout:        timeout,
+			queryOptions:   options,
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS13,
 				ServerName: serverName,
@@ -204,12 +223,13 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 }
 
 type udpFactory struct {
-	address string
-	timeout time.Duration
+	address      string
+	timeout      time.Duration
+	queryOptions QueryOptions
 }
 
 func (f *udpFactory) Open(context.Context) (Session, error) {
-	return &udpSession{address: f.address, timeout: f.timeout}, nil
+	return &udpSession{address: f.address, timeout: f.timeout, queryOptions: f.queryOptions}, nil
 }
 
 type streamFactory struct {
@@ -217,6 +237,7 @@ type streamFactory struct {
 	connectionPlan dialPlan
 	timeout        time.Duration
 	tlsConfig      *tls.Config
+	queryOptions   QueryOptions
 }
 
 func (f *streamFactory) Open(ctx context.Context) (Session, error) {
@@ -229,21 +250,23 @@ func (f *streamFactory) Open(ctx context.Context) (Session, error) {
 		return nil, err
 	}
 	return &streamSession{
-		conn:        conn,
-		reopen:      func(ctx context.Context) (net.Conn, string, error) { return plan.openStream(ctx, f.tlsConfig) },
-		timeout:     f.timeout,
-		secure:      f.tlsConfig != nil,
-		dialAddress: dialAddress,
+		conn:         conn,
+		reopen:       func(ctx context.Context) (net.Conn, string, error) { return plan.openStream(ctx, f.tlsConfig) },
+		timeout:      f.timeout,
+		secure:       f.tlsConfig != nil,
+		dialAddress:  dialAddress,
+		queryOptions: f.queryOptions,
 	}, nil
 }
 
 type udpSession struct {
-	address string
-	timeout time.Duration
+	address      string
+	timeout      time.Duration
+	queryOptions QueryOptions
 }
 
 func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
-	query := newQuery(name, qtype, dns.Id(), false)
+	query := newQuery(name, qtype, dns.Id(), false, s.queryOptions)
 	client := &dns.Client{Net: "udp", Timeout: s.timeout}
 	response, _, err := client.ExchangeContext(ctx, query, s.address)
 	if err != nil {
@@ -264,6 +287,7 @@ type streamSession struct {
 	timeout         time.Duration
 	secure          bool
 	dialAddress     string
+	queryOptions    QueryOptions
 	lastReconnected bool
 	closed          bool
 }
@@ -289,7 +313,7 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 	if s.closed {
 		return nil, errors.New("stream session is closed")
 	}
-	query := newQuery(name, qtype, dns.Id(), s.secure)
+	query := newQuery(name, qtype, dns.Id(), s.secure, s.queryOptions)
 	packed, err := packSessionQuery(query)
 	if err != nil {
 		return nil, err
@@ -392,6 +416,7 @@ type doHFactory struct {
 	connectionPlan dialPlan
 	serverName     string
 	timeout        time.Duration
+	queryOptions   QueryOptions
 }
 
 var newDoHTLSConfig = func(serverName string) *tls.Config {
@@ -403,7 +428,7 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 // endpoint cannot force an unnecessarily large header allocation per query.
 const doHMaxResponseHeaderBytes = 64 << 10
 
-func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
+func newDoHFactory(target catalog.Target, timeout time.Duration, options QueryOptions) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, fmt.Errorf("invalid DoH URL %q", target.Spec.URL)
@@ -436,6 +461,7 @@ func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error
 		connectionPlan: connectionPlan,
 		serverName:     serverName,
 		timeout:        timeout,
+		queryOptions:   options,
 	}, nil
 }
 
@@ -444,7 +470,7 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 	if len(plan.addresses) == 0 {
 		plan = singleDialPlan(f.dialAddr, f.timeout)
 	}
-	session := &doHSession{endpoint: f.url}
+	session := &doHSession{endpoint: f.url, queryOptions: f.queryOptions}
 	tlsConfig := newDoHTLSConfig(f.serverName)
 	if len(tlsConfig.NextProtos) == 0 {
 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
@@ -508,11 +534,12 @@ func joinAddress(host string, port int) string {
 }
 
 type doHSession struct {
-	client    *http.Client
-	transport *http.Transport
-	endpoint  string
-	mu        sync.RWMutex
-	dialAddr  string
+	client       *http.Client
+	transport    *http.Transport
+	endpoint     string
+	queryOptions QueryOptions
+	mu           sync.RWMutex
+	dialAddr     string
 }
 
 func (s *doHSession) setDialAddress(address string) {
@@ -528,7 +555,7 @@ func (s *doHSession) DialAddress() string {
 }
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
-	query := newQuery(name, qtype, 0, true)
+	query := newQuery(name, qtype, 0, true, s.queryOptions)
 	packed, err := packSessionQuery(query)
 	if err != nil {
 		return nil, err
@@ -574,6 +601,7 @@ type doqFactory struct {
 	connectionPlan dialPlan
 	timeout        time.Duration
 	tlsConfig      *tls.Config
+	queryOptions   QueryOptions
 }
 
 func (f *doqFactory) dialConfig() *quic.Config {
@@ -613,10 +641,11 @@ func (f *doqFactory) Open(ctx context.Context) (Session, error) {
 		return nil, err
 	}
 	return &doqSession{
-		conn:        conn,
-		reopen:      f.open,
-		timeout:     f.timeout,
-		dialAddress: dialAddress,
+		conn:         conn,
+		reopen:       f.open,
+		timeout:      f.timeout,
+		dialAddress:  dialAddress,
+		queryOptions: f.queryOptions,
 	}, nil
 }
 
@@ -626,6 +655,7 @@ type doqSession struct {
 	mu              sync.Mutex
 	timeout         time.Duration
 	dialAddress     string
+	queryOptions    QueryOptions
 	lastReconnected bool
 	closed          bool
 }
@@ -651,7 +681,7 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	if s.closed {
 		return nil, errors.New("DoQ session is closed")
 	}
-	query := newQuery(name, qtype, 0, true)
+	query := newQuery(name, qtype, 0, true, s.queryOptions)
 	packed, err := packSessionQuery(query)
 	if err != nil {
 		return nil, err
@@ -762,7 +792,7 @@ func (s *doqSession) Close() error {
 	return conn.CloseWithError(0, "")
 }
 
-func newQuery(name string, qtype, id uint16, padded bool) *dns.Msg {
+func newQuery(name string, qtype, id uint16, padded bool, options QueryOptions) *dns.Msg {
 	query := &dns.Msg{
 		MsgHdr: dns.MsgHdr{
 			Id:               id,
@@ -772,6 +802,13 @@ func newQuery(name string, qtype, id uint16, padded bool) *dns.Msg {
 		Question: []dns.Question{{Name: dns.Fqdn(name), Qtype: qtype, Qclass: dns.ClassINET}},
 	}
 	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 1232}}
+	if options.DNSSEC {
+		// RFC 4035: the DO bit asks the resolver for DNSSEC records and, for a
+		// validating resolver, for validated answers with the AD flag. It is
+		// set only for an opt-in --dnssec run; the default query form is
+		// unchanged so default results stay comparable across releases.
+		opt.SetDo()
+	}
 	if padded {
 		// RFC 9250 requires padding when the QUIC implementation does not
 		// provide a packet-padding policy. The same stable padding policy is

@@ -376,11 +376,11 @@ func TestDeadlineAndResponseValidation(t *testing.T) {
 
 func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	for _, raw := range []string{"https://", "http://dns.example/dns-query", "https:///dns-query"} {
-		if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: raw}}, time.Second); err == nil {
+		if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: raw}}, time.Second, QueryOptions{}); err == nil {
 			t.Fatalf("expected invalid DoH URL %q", raw)
 		}
 	}
-	factory, err := newDoHFactory(catalog.Target{Address: "192.0.2.53", Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query", Port: 8443, ServerName: "tls.example"}}, time.Second)
+	factory, err := newDoHFactory(catalog.Target{Address: "192.0.2.53", Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query", Port: 8443, ServerName: "tls.example"}}, time.Second, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,20 +391,20 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	urlPortFactory, err := newDoHFactory(catalog.Target{
 		Address: "192.0.2.53",
 		Spec:    catalog.TransportSpec{URL: "https://dns.example:9443/dns-query"},
-	}, time.Second)
+	}, time.Second, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := urlPortFactory.(*doHFactory).dialAddr; got != "192.0.2.53:9443" {
 		t.Fatalf("DoH URL port dial address = %q, want 192.0.2.53:9443", got)
 	}
-	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:99999/dns-query"}}, time.Second); err == nil {
+	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:99999/dns-query"}}, time.Second, QueryOptions{}); err == nil {
 		t.Fatal("invalid DoH URL port unexpectedly succeeded")
 	}
-	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:0/dns-query"}}, time.Second); err == nil {
+	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:0/dns-query"}}, time.Second, QueryOptions{}); err == nil {
 		t.Fatal("zero DoH URL port unexpectedly succeeded")
 	}
-	fallback, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second)
+	fallback, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second, QueryOptions{})
 	if err != nil || fallback.(*doHFactory).dialAddr != "dns.example:443" || fallback.(*doHFactory).serverName != "dns.example" {
 		t.Fatalf("DoH fallback factory = %#v/%v", fallback, err)
 	}
@@ -695,7 +695,7 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 }
 
 func TestQueryPackingAndClassification(t *testing.T) {
-	plain := newQuery("example.com", dns.TypeA, 7, false)
+	plain := newQuery("example.com", dns.TypeA, 7, false, QueryOptions{})
 	if plain.Id != 7 || !plain.RecursionDesired || len(plain.Question) != 1 || len(plain.Extra) != 1 {
 		t.Fatalf("plain query = %#v", plain)
 	}
@@ -706,12 +706,12 @@ func TestQueryPackingAndClassification(t *testing.T) {
 	if _, err := packQuery(bad); err == nil {
 		t.Fatal("expected DNS packing error")
 	}
-	withExtra := newQuery("example.com", dns.TypeA, 1, false)
+	withExtra := newQuery("example.com", dns.TypeA, 1, false, QueryOptions{})
 	withExtra.Extra = append(withExtra.Extra, &dns.TXT{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET}})
 	if _, err := packQuery(withExtra); err != nil {
 		t.Fatal(err)
 	}
-	withOption := newQuery("example.com", dns.TypeA, 1, false)
+	withOption := newQuery("example.com", dns.TypeA, 1, false, QueryOptions{})
 	withOption.Extra[0].(*dns.OPT).Option = []dns.EDNS0{&dns.EDNS0_NSID{}}
 	if _, err := packQuery(withOption); err != nil {
 		t.Fatal(err)

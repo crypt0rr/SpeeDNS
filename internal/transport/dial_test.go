@@ -280,7 +280,7 @@ func TestDoHFactoryUsesBootstrapCandidates(t *testing.T) {
 			ServerName:         "dns.example",
 			BootstrapAddresses: []string{"127.0.0.2", "127.0.0.1"},
 		},
-	}, time.Second)
+	}, time.Second, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestDoHQueryUsesBootstrapIPWithHostnameTLSIdentity(t *testing.T) {
 		Port:               port,
 		ServerName:         serverName,
 		BootstrapAddresses: []string{"127.0.0.1"},
-	}}, time.Second)
+	}}, time.Second, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +536,7 @@ func TestDoQFactoryRetriesAfterCandidateTimeout(t *testing.T) {
 }
 
 func TestDoHRedirectRequiresHTTPSOrigin(t *testing.T) {
-	factory, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second)
+	factory, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

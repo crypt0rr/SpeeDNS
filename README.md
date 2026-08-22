@@ -393,6 +393,38 @@ opt-in; local diagnostics are shown by default.
 
 System resolvers are tested only over transports discoverable from the operating system configuration, normally UDP and TCP.
 
+## DNSSEC probing
+
+The bundled catalog records each resolver's published policy, which may claim
+DNSSEC validation. `--dnssec` checks that claim instead of repeating it. It is
+opt-in and off by default.
+
+With `--dnssec`, every query of the run sets the EDNS(0) DO bit, and each
+prepared target answers two extra queries after all of its measured rounds:
+
+- `good-a.test.dnssec-tools.org`, a correctly signed control name that any
+  resolver must answer, and
+- `dnssec-failed.org`, a deliberately mis-signed public test zone that a
+  validating resolver must refuse with SERVFAIL.
+
+Each target then receives a verdict of `validating`, `not-validating`, or
+`inconclusive`, shown in a separate table section and emitted as a `dnssec`
+object in JSON and a `dnssec_verdict` column in CSV. The raw response codes and
+the AD (authentic data) and CD (checking disabled) flags are reported next to
+the verdict so the conclusion can be checked.
+
+```sh
+./speedns --dnssec --protocol udp,dot
+```
+
+The probe describes what those two names did at that moment over that network
+path. It is not a DNSSEC audit, it never sets the CD bit, and its queries stay
+out of the latency samples, rankings, and divergence analysis. A run without
+`--dnssec` sends byte-identical queries to earlier releases and contacts no
+probe names, so default reports remain comparable.
+[`METHODOLOGY.md`](METHODOLOGY.md) documents the verdict rules and their
+limits.
+
 ## Output
 
 Human-readable table output is the default. It shows both transport success and
@@ -412,7 +444,8 @@ For scripts and other tools, use JSON or CSV:
 The versioned JSON contract is published as
 [`schema/report-v1.json`](schema/report-v1.json). It describes the current
 `schema_version: 1` output, including optional raw samples, profile
-comparisons, paired effects, divergence details, and warnings. Consumers
+comparisons, paired effects, divergence details, the optional per-target
+`dnssec` assessment, and warnings. Consumers
 should select their parser and validation rules from the reported schema
 version rather than assuming that table or CSV output has the same shape.
 
@@ -452,6 +485,7 @@ Useful flags include:
 --output PATH       write output to a file
 --no-color          disable terminal colors
 --redact-system     hide local system resolver details in reports
+--dnssec            opt in to DNSSEC probing (DO bit plus two pinned probes)
 --profile-view      show same-resolver transport costs and score confidence
 --assert EXPR       enforce a benchmark condition (repeatable)
 --family 4|6|both|auto  choose resolver address family (default: auto)

@@ -55,6 +55,7 @@ type cliConfig struct {
 	redactSystem    bool
 	assertions      []string
 	family          string
+	dnssec          bool
 }
 
 var exit = os.Exit
@@ -546,6 +547,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
 	flags.StringArrayVar(&config.assertions, "assert", nil, "assert a winner metric or profile condition (repeatable)")
 	flags.StringVar(&config.family, "family", "auto", "resolver address family: 4, 6, both, or auto")
+	flags.BoolVar(&config.dnssec, "dnssec", false, "opt in to DNSSEC probing: set the EDNS(0) DO bit and run two pinned validation probes per target")
 }
 
 func newRunCommand(config *cliConfig) *cobra.Command {
@@ -751,7 +753,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
 		Domains: domainList, QueryTypes: queryTypes, Sample: config.sample, Full: config.full,
 		Seed: seed, Timeout: config.timeout, Concurrency: effectiveConcurrency, Protocols: selected,
-		OnProgress: onProgress,
+		OnProgress: onProgress, DNSSEC: config.dnssec,
 	})
 	if progressView != nil {
 		progressView.Finish()

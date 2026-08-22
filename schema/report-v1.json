@@ -122,6 +122,7 @@
         "stats": {"$ref": "#/$defs/statistics"},
         "open_error": {"type": "string"},
         "incomplete": {"type": "boolean"},
+        "dnssec": {"$ref": "#/$defs/dnssec_assessment"},
         "samples": {"type": "array", "items": {"$ref": "#/$defs/observation"}},
         "cold": {"type": "array", "items": {"$ref": "#/$defs/cold_observation"}}
       }
@@ -138,11 +139,41 @@
         "usable": {"type": "boolean"},
         "rcode": {"type": "integer"},
         "truncated": {"type": "boolean"},
+        "authenticated_data": {"type": "boolean"},
+        "checking_disabled": {"type": "boolean"},
         "response_class": {"type": "string"},
         "divergent": {"type": "boolean"},
         "divergence_baseline": {"type": "string"},
         "reconnected": {"type": "boolean"},
         "error": {"type": "string"}
+      }
+    },
+    "dnssec_probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "name", "qtype", "success", "answers"],
+      "properties": {
+        "role": {"type": "string", "enum": ["signed", "bogus"]},
+        "name": {"type": "string"},
+        "qtype": {"type": "integer", "minimum": 0, "maximum": 65535},
+        "latency_ms": {"type": "number", "minimum": 0},
+        "success": {"type": "boolean"},
+        "rcode": {"type": "integer"},
+        "response_code": {"type": "string"},
+        "answers": {"type": "integer", "minimum": 0},
+        "authenticated_data": {"type": "boolean"},
+        "checking_disabled": {"type": "boolean"},
+        "error": {"type": "string"}
+      }
+    },
+    "dnssec_assessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "reason"],
+      "properties": {
+        "verdict": {"type": "string", "enum": ["validating", "not-validating", "inconclusive"]},
+        "reason": {"type": "string"},
+        "probes": {"type": "array", "items": {"$ref": "#/$defs/dnssec_probe"}}
       }
     },
     "cold_observation": {

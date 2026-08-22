@@ -7,7 +7,7 @@ import (
 )
 
 func FuzzValidateResponseNeverPanics(f *testing.F) {
-	query := newQuery("example.com", dns.TypeA, 1, false)
+	query := newQuery("example.com", dns.TypeA, 1, false, QueryOptions{})
 	response := new(dns.Msg)
 	response.SetReply(query)
 	packed, err := response.Pack()
