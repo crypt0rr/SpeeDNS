@@ -205,6 +205,9 @@ Bundled resolver profiles carry the provider-published IPv4 and IPv6 literals.
 The default `--family auto` uses the up-interface address inventory without
 performing DNS lookups or connection probes; when no usable family can be
 detected, both literal families are retained rather than silently claiming a
-route. Hostname-only custom endpoints remain available in `auto` and `both`,
-while explicit family selection requires literals so the benchmark does not
-include an unmeasured bootstrap lookup.
+route. Loopback literals are exempt from the `auto` filter, because a local
+stub resolver is answered by the host's own stack regardless of which families
+have external routes. Hostname-only custom endpoints remain available in
+`auto` and `both`, while explicit family selection requires literals so the
+benchmark does not include an unmeasured bootstrap lookup. Explicit `4`, `6`,
+and `both` stay exact filters, loopback included.

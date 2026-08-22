@@ -18,6 +18,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
 	"github.com/spf13/cobra"
 )
 
@@ -645,6 +646,34 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 	}
 	if _, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true, includeSystem: true}); err == nil {
 		t.Fatal("expected system discovery error")
+	}
+}
+
+// Discovery can fail for reasons the rest of the run does not depend on, such
+// as an unsupported platform. That must not discard the resolvers the user
+// selected explicitly.
+func TestLoadProfilesWarnsWhenSystemDiscoveryFails(t *testing.T) {
+	oldDiscover := discoverSystemResolvers
+	oldWarningWriter := warningWriterFunc
+	t.Cleanup(func() {
+		discoverSystemResolvers = oldDiscover
+		warningWriterFunc = oldWarningWriter
+	})
+	if oldWarningWriter() != os.Stderr {
+		t.Fatal("warnings must default to stderr")
+	}
+	discoverSystemResolvers = func(context.Context) ([]catalog.ResolverProfile, error) {
+		return nil, &systemdns.UnsupportedPlatformError{OS: "windows"}
+	}
+	var warnings bytes.Buffer
+	warningWriterFunc = func() io.Writer { return &warnings }
+
+	profiles, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true, includeSystem: true, resolverFlags: []string{"lab=udp://127.0.0.1:5300"}})
+	if err != nil || len(profiles) != 1 || profiles[0].ID != "custom-lab" {
+		t.Fatalf("profiles with failed system discovery = %#v/%v", profiles, err)
+	}
+	if !strings.Contains(warnings.String(), "system resolver discovery failed") || !strings.Contains(warnings.String(), "windows") {
+		t.Fatalf("discovery warning = %q", warnings.String())
 	}
 }
 

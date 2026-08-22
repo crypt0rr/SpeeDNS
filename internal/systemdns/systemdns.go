@@ -3,9 +3,10 @@ package systemdns
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"regexp"
@@ -23,6 +24,42 @@ var macOSScope = regexp.MustCompile(`^\s*(?:domain|search\s+domain\[[0-9]+\])\s*
 var macOSInterface = regexp.MustCompile(`^\s*if_index\s*:\s*([0-9]+)(?:\s+\(([^)]+)\))?\s*$`)
 
 var currentOS = runtime.GOOS
+
+// resolvConfPlatforms lists the operating systems that publish the active
+// resolver set through /etc/resolv.conf. Anything outside this set (Windows
+// above all) has no discovery implementation here, and opening a Unix path
+// there would report a missing file rather than the real limitation.
+var resolvConfPlatforms = map[string]bool{
+	"aix":       true,
+	"android":   true,
+	"darwin":    true,
+	"dragonfly": true,
+	"freebsd":   true,
+	"illumos":   true,
+	"ios":       true,
+	"linux":     true,
+	"netbsd":    true,
+	"openbsd":   true,
+	"solaris":   true,
+}
+
+// ErrUnsupportedPlatform reports that system resolver discovery has no
+// implementation for the running operating system. Callers that selected
+// other resolvers can treat it as a warning instead of a fatal error.
+var ErrUnsupportedPlatform = errors.New("system resolver discovery is not supported on this platform")
+
+// UnsupportedPlatformError names the platform that cannot be inspected.
+// Windows would need GetAdaptersAddresses, which this build does not
+// implement.
+type UnsupportedPlatformError struct {
+	OS string
+}
+
+func (e *UnsupportedPlatformError) Error() string {
+	return fmt.Sprintf("system resolver discovery is not supported on %s; pass --resolver to benchmark a specific address", e.OS)
+}
+
+func (e *UnsupportedPlatformError) Unwrap() error { return ErrUnsupportedPlatform }
 
 var openResolvConf = func() (io.ReadCloser, error) {
 	return os.Open("/etc/resolv.conf")
@@ -58,12 +95,15 @@ type macOSResolverBlock struct {
 func Discover(ctx context.Context) ([]catalog.ResolverProfile, error) {
 	var sources []resolverSource
 	var err error
-	if currentOS == "darwin" {
+	switch {
+	case currentOS == "darwin":
 		sources, err = discoverMacOSSources(ctx)
-	} else {
+	case resolvConfPlatforms[currentOS]:
 		var addresses []string
 		addresses, err = discoverResolvConf()
 		sources = plainSources(addresses)
+	default:
+		return nil, &UnsupportedPlatformError{OS: currentOS}
 	}
 	if err != nil {
 		return nil, err
@@ -164,13 +204,17 @@ func plainSources(addresses []string) []resolverSource {
 	return sources
 }
 
+// normalizeAddress canonicalizes a configured nameserver literal. netip
+// parsing is required because a link-local IPv6 nameserver carries a zone
+// ("fe80::1%en0") that net.ParseIP rejects; dropping it would hide the only
+// resolver on a host whose router advertises a link-local address.
 func normalizeAddress(address string) (string, bool) {
 	address = strings.TrimSpace(address)
-	ip := net.ParseIP(address)
-	if ip == nil {
+	parsed, err := netip.ParseAddr(address)
+	if err != nil {
 		return "", false
 	}
-	return ip.String(), true
+	return parsed.Unmap().String(), true
 }
 
 func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
@@ -220,8 +264,8 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 }
 
 func isLocalStub(address string) bool {
-	ip := net.ParseIP(address)
-	return ip != nil && ip.IsLoopback()
+	parsed, err := netip.ParseAddr(address)
+	return err == nil && parsed.IsLoopback()
 }
 
 func sourceLabel(source resolverSource) string {
@@ -256,7 +300,7 @@ func uniqueStrings(values []string) []string {
 }
 
 func sanitizeAddress(address string) string {
-	return strings.NewReplacer(":", "-", ".", "-").Replace(address)
+	return strings.NewReplacer(":", "-", ".", "-", "%", "-").Replace(address)
 }
 
 func discoverResolvConf() ([]string, error) {

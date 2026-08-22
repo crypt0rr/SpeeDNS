@@ -34,6 +34,48 @@ func TestAddressFamilyParsingAndClassification(t *testing.T) {
 	if family, ok := AddressFamilyForAddress("dns.example"); ok || family != "" {
 		t.Fatalf("hostname classification = %q/%v", family, ok)
 	}
+	if family, ok := AddressFamilyForAddress(" fe80::1%en0 "); !ok || family != Family6 {
+		t.Fatalf("zoned IPv6 family = %q/%v", family, ok)
+	}
+	if family, ok := AddressFamilyForAddress("[fe80::1%en0]"); !ok || family != Family6 {
+		t.Fatalf("bracketed zoned IPv6 family = %q/%v", family, ok)
+	}
+	if family, ok := AddressFamilyForAddress("::ffff:192.0.2.1"); !ok || family != Family4 {
+		t.Fatalf("IPv4-mapped IPv6 family = %q/%v", family, ok)
+	}
+}
+
+// A loopback stub is answered by the host's own stack, so auto detection of
+// external routes must not filter it out.
+func TestFilterProfilesByFamilyKeepsLoopbackUnderAuto(t *testing.T) {
+	stub := ResolverProfile{
+		ID: "system-stub", Name: "System DNS stub", Owner: "local stub/forwarder",
+		Addresses:  []string{"::1"},
+		Transports: map[Protocol]TransportSpec{UDP: {Port: 53}},
+	}
+	profiles, err := FilterProfilesByFamily([]ResolverProfile{stub}, FamilyAuto, map[AddressFamily]bool{Family4: true})
+	if err != nil || len(profiles) != 1 || profiles[0].Addresses[0] != "::1" {
+		t.Fatalf("IPv6 loopback under auto = %#v/%v", profiles, err)
+	}
+
+	stub.ID = "system-stub-v4"
+	stub.Addresses = []string{"127.0.0.53"}
+	profiles, err = FilterProfilesByFamily([]ResolverProfile{stub}, FamilyAuto, map[AddressFamily]bool{Family6: true})
+	if err != nil || len(profiles) != 1 || profiles[0].Addresses[0] != "127.0.0.53" {
+		t.Fatalf("IPv4 loopback under auto = %#v/%v", profiles, err)
+	}
+
+	// A routable address of an undetected family is still filtered, and an
+	// explicit family selection stays an exact filter for loopback too.
+	routable := stub
+	routable.ID = "routable"
+	routable.Addresses = []string{"192.0.2.1"}
+	if profiles, err := FilterProfilesByFamily([]ResolverProfile{routable}, FamilyAuto, map[AddressFamily]bool{Family6: true}); err != nil || len(profiles) != 0 {
+		t.Fatalf("routable address under auto = %#v/%v", profiles, err)
+	}
+	if profiles, err := FilterProfilesByFamily([]ResolverProfile{stub}, Family6, nil); err != nil || len(profiles) != 0 {
+		t.Fatalf("IPv4 loopback under --family 6 = %#v/%v", profiles, err)
+	}
 }
 
 func TestFilterProfilesByFamily(t *testing.T) {

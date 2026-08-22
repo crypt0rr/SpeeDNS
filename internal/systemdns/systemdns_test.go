@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 )
 
 type testReadCloser struct {
@@ -195,6 +197,15 @@ func TestSystemSourceHelpers(t *testing.T) {
 	if got, ok := normalizeAddress("not-an-ip"); ok || got != "" {
 		t.Fatalf("invalid IP = %q/%v", got, ok)
 	}
+	if got, ok := normalizeAddress(" FE80::1%en0 "); !ok || got != "fe80::1%en0" {
+		t.Fatalf("normalized zoned IPv6 = %q/%v", got, ok)
+	}
+	if got, ok := normalizeAddress("::ffff:192.0.2.1"); !ok || got != "192.0.2.1" {
+		t.Fatalf("normalized IPv4-mapped IPv6 = %q/%v", got, ok)
+	}
+	if isLocalStub("fe80::1%en0") {
+		t.Fatal("link-local nameserver must not be labeled a local stub")
+	}
 	if got := uniqueStrings([]string{"", "scope", "scope", "other"}); strings.Join(got, ",") != "scope,other" {
 		t.Fatalf("unique strings = %#v", got)
 	}
@@ -239,3 +250,75 @@ func TestDiscoverResolvConfReaderErrors(t *testing.T) {
 type errorReader struct{}
 
 func (errorReader) Read([]byte) (int, error) { return 0, errors.New("read failed") }
+
+// A link-local nameserver is the only resolver on a host whose router
+// advertises one, so discovery must keep the zone instead of parsing the
+// literal away.
+func TestDiscoverKeepsZonedIPv6Nameserver(t *testing.T) {
+	oldOS := currentOS
+	oldOpen := openResolvConf
+	oldScutil := runScutil
+	t.Cleanup(func() {
+		currentOS = oldOS
+		openResolvConf = oldOpen
+		runScutil = oldScutil
+	})
+
+	currentOS = "linux"
+	openResolvConf = func() (io.ReadCloser, error) {
+		return &testReadCloser{Reader: strings.NewReader("nameserver fe80::1%en0\n")}, nil
+	}
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("zoned discovery = %#v/%v", profiles, err)
+	}
+	if profiles[0].Addresses[0] != "fe80::1%en0" {
+		t.Fatalf("zoned address = %#v", profiles[0].Addresses)
+	}
+	if profiles[0].ID != "system-fe80--1-en0" {
+		t.Fatalf("zoned profile ID = %q", profiles[0].ID)
+	}
+	if family, ok := catalog.AddressFamilyForAddress(profiles[0].Addresses[0]); !ok || family != catalog.Family6 {
+		t.Fatalf("zoned address family = %q/%v", family, ok)
+	}
+
+	currentOS = "darwin"
+	runScutil = func(context.Context) ([]byte, error) {
+		return []byte("resolver #1\n  nameserver[0] : fe80::1%en0\n  if_index : 4 (en0)\n"), nil
+	}
+	macProfiles, err := Discover(context.Background())
+	if err != nil || len(macProfiles) != 1 || macProfiles[0].Addresses[0] != "fe80::1%en0" {
+		t.Fatalf("macOS zoned discovery = %#v/%v", macProfiles, err)
+	}
+}
+
+// Windows has no discovery implementation here, so the caller must be told
+// which platform is unsupported instead of being handed a missing Unix path.
+func TestDiscoverUnsupportedPlatform(t *testing.T) {
+	oldOS := currentOS
+	oldOpen := openResolvConf
+	t.Cleanup(func() {
+		currentOS = oldOS
+		openResolvConf = oldOpen
+	})
+	currentOS = "windows"
+	openResolvConf = func() (io.ReadCloser, error) {
+		t.Error("resolv.conf must not be opened on an unsupported platform")
+		return nil, errors.New("unexpected open")
+	}
+
+	profiles, err := Discover(context.Background())
+	if profiles != nil || err == nil {
+		t.Fatalf("unsupported discovery = %#v/%v", profiles, err)
+	}
+	if !errors.Is(err, ErrUnsupportedPlatform) {
+		t.Fatalf("unsupported sentinel = %v", err)
+	}
+	var unsupported *UnsupportedPlatformError
+	if !errors.As(err, &unsupported) || unsupported.OS != "windows" {
+		t.Fatalf("unsupported platform error = %v", err)
+	}
+	if !strings.Contains(err.Error(), "windows") || strings.Contains(err.Error(), "resolv.conf") {
+		t.Fatalf("unsupported platform message = %q", err.Error())
+	}
+}

@@ -76,6 +76,8 @@ var terminalDetector = fileIsTerminal
 
 var progressWriterFunc = func() io.Writer { return os.Stderr }
 
+var warningWriterFunc = func() io.Writer { return os.Stderr }
+
 var newCacheMissNonceFunc = domains.NewCacheMissNonce
 
 var listProvenanceInterfacesFunc = net.Interfaces
@@ -849,10 +851,17 @@ func loadProfiles(ctx context.Context, config *cliConfig) ([]catalog.ResolverPro
 	}
 	if config.includeSystem {
 		fromSystem, err := discoverSystemResolvers(ctx)
-		if err != nil {
+		switch {
+		case err == nil:
+			profiles = append(profiles, fromSystem...)
+		case len(profiles) == 0:
 			return nil, err
+		default:
+			// Discovery can fail for reasons the run does not depend on, such
+			// as an unsupported platform. Aborting would discard every other
+			// selected resolver, so report it and continue.
+			fmt.Fprintf(warningWriterFunc(), "warning: system resolver discovery failed: %v\n", err)
 		}
-		profiles = append(profiles, fromSystem...)
 	}
 	if len(profiles) == 0 {
 		return nil, errors.New("no resolver profiles selected")
