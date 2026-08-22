@@ -126,12 +126,12 @@ type Statistics struct {
 	MinMS               float64        `json:"min_ms"`
 	MaxMS               float64        `json:"max_ms"`
 	MADMS               float64        `json:"mad_ms"`
-	ColdMedianMS        float64        `json:"cold_median_ms,omitempty"`
+	ColdMedianMS        float64        `json:"cold_median_ms"`
 	ScoreMS             float64        `json:"score_ms"`
-	CILowMS             float64        `json:"ci_low_ms,omitempty"`
-	CIHighMS            float64        `json:"ci_high_ms,omitempty"`
+	CILowMS             float64        `json:"ci_low_ms"`
+	CIHighMS            float64        `json:"ci_high_ms"`
 	Recommended         bool           `json:"recommended"`
-	Tie                 bool           `json:"tie,omitempty"`
+	Tie                 bool           `json:"tie"`
 }
 
 type TargetResult struct {
