@@ -170,6 +170,68 @@ func TestValidateRejectsDuplicateAddresses(t *testing.T) {
 	}
 }
 
+func TestValidateAddressSyntax(t *testing.T) {
+	accepted := []struct {
+		name    string
+		address string
+	}{
+		{name: "IPv4 literal", address: "192.0.2.53"},
+		{name: "IPv6 literal", address: "2001:db8::53"},
+		{name: "bracketed IPv6 literal", address: "[2001:db8::53]"},
+		{name: "zoned link-local literal", address: "fe80::1%eth0"},
+		{name: "bracketed zoned link-local literal", address: "[fe80::1%eth0]"},
+		{name: "hostname", address: "dns.example"},
+		{name: "hostname with trailing dot", address: "DNS.Example."},
+		{name: "single label hostname", address: "localhost"},
+		{name: "hostname with hyphen", address: "dns-1.example"},
+		{name: "surrounding whitespace", address: " 192.0.2.53 "},
+	}
+	for _, test := range accepted {
+		t.Run("accept "+test.name, func(t *testing.T) {
+			profile := minimalProfile("accept")
+			profile.Addresses = []string{test.address}
+			if err := Validate([]ResolverProfile{profile}); err != nil {
+				t.Fatalf("Validate(%q) = %v, want accepted", test.address, err)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name    string
+		address string
+		want    string
+	}{
+		{name: "IPv4 with port", address: "192.0.2.53:5353", want: "set the port in the transport spec"},
+		{name: "bracketed IPv6 with port", address: "[2001:db8::53]:853", want: "set the port in the transport spec"},
+		{name: "hostname with port", address: "dns.example:53", want: "set the port in the transport spec"},
+		{name: "hostname with empty port", address: "dns.example:", want: "set the port in the transport spec"},
+		{name: "empty", address: "   ", want: "is empty"},
+		{name: "bracketed hostname", address: "[dns.example]", want: "not an IPv6 literal"},
+		{name: "unterminated bracket", address: "[2001:db8::53", want: "not an IP literal or a valid hostname"},
+		{name: "truncated IPv4", address: "192.0.2", want: "not an IP literal or a valid hostname"},
+		{name: "out of range IPv4", address: "10.0.0.256", want: "not an IP literal or a valid hostname"},
+		{name: "malformed IPv6", address: "2001:db8::zz", want: "not an IP literal or a valid hostname"},
+		{name: "empty label", address: "dns..example", want: "not an IP literal or a valid hostname"},
+		{name: "root only", address: ".", want: "not an IP literal or a valid hostname"},
+		{name: "leading hyphen label", address: "-dns.example", want: "not an IP literal or a valid hostname"},
+		{name: "trailing hyphen label", address: "dns-.example", want: "not an IP literal or a valid hostname"},
+		{name: "underscore label", address: "dns_1.example", want: "not an IP literal or a valid hostname"},
+		{name: "space inside hostname", address: "dns example", want: "not an IP literal or a valid hostname"},
+		{name: "oversized label", address: strings.Repeat("a", 64) + ".example", want: "not an IP literal or a valid hostname"},
+		{name: "oversized hostname", address: strings.TrimSuffix(strings.Repeat(strings.Repeat("a", 63)+".", 5), ".") + ".example", want: "not an IP literal or a valid hostname"},
+	}
+	for _, test := range rejected {
+		t.Run("reject "+test.name, func(t *testing.T) {
+			profile := minimalProfile("reject")
+			profile.Addresses = []string{test.address}
+			err := Validate([]ResolverProfile{profile})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate(%q) = %v, want error containing %q", test.address, err, test.want)
+			}
+		})
+	}
+}
+
 func TestYAMLDoHPortInheritance(t *testing.T) {
 	tests := []struct {
 		name     string

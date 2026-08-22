@@ -309,6 +309,12 @@ resolvers:
           - 192.0.2.53
 ```
 
+Each entry in `addresses` must be an IP literal (`192.0.2.53`,
+`2001:db8::53`, `[2001:db8::53]`, or a zoned link-local such as
+`fe80::1%eth0`) or a hostname (`dns.example`). Do not append a port: the port
+belongs in the transport spec's `port:` field, and an address such as
+`192.0.2.53:5353` is rejected before the benchmark starts.
+
 Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order. TLS certificate validation is always enabled.
 
 For a hostname-only custom encrypted endpoint, SpeeDNS uses the operating
@@ -517,11 +523,13 @@ Supported metrics are `usable` and `success` (rates from `0` to `1`) plus
 `median`, `p95`, and `score` (milliseconds). Bare latency numbers are treated
 as milliseconds; duration suffixes such as `50ms` and `1.5s` are also
 accepted. Operators are `>=`, `>`, `<=`, `<`, and `=`. `winner=` accepts a
-resolver profile ID or a complete target ID. A tied rank-one result satisfies
-the winner assertion. Invalid expressions return status `2`; failed
-assertions return status `4` after the normal report has been written. Status
-`3` for no comparable results and status `130` for interruption take
-precedence.
+resolver profile ID or a complete target ID, and is checked against the
+targets actually selected for the run before any query is sent: a `winner=`
+value that matches no selected resolver is invalid input (status `2`), not a
+lost comparison. A tied rank-one result satisfies the winner assertion.
+Invalid expressions return status `2`; failed assertions return status `4`
+after the normal report has been written. Status `3` for no comparable results
+and status `130` for interruption take precedence.
 
 ## Troubleshooting
 
