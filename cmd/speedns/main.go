@@ -177,6 +177,18 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 	return protocols
 }
 
+// measuredProtocols returns the protocol groups the benchmark will actually
+// run, in the documented measurement order. It is derived from the expanded
+// targets rather than from --protocol so a selected protocol that no resolver
+// supports is not counted.
+func measuredProtocols(targets []catalog.Target) []catalog.Protocol {
+	protocols := make([]catalog.Protocol, 0, len(targets))
+	for _, target := range targets {
+		protocols = append(protocols, target.Protocol)
+	}
+	return canonicalProtocols(protocols)
+}
+
 func newProgressRenderer(writer io.Writer, interactive bool, selected []catalog.Protocol, targets []catalog.Target) *progressRenderer {
 	progress := &progressRenderer{
 		writer:          writer,
@@ -781,6 +793,21 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	if concurrencyCapped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
+	}
+	if config.cacheMiss {
+		// Every protocol group replays the same generated names against the
+		// same resolver cache, so only the first group measured observes a
+		// genuine miss; the rest measure a warm cache. Removing the bias,
+		// rather than only disclosing it, is tracked as issue #108.
+		if measured := measuredProtocols(targets); len(measured) > 1 {
+			remaining := make([]string, 0, len(measured)-1)
+			for _, protocol := range measured[1:] {
+				remaining = append(remaining, protocol.String())
+			}
+			result.Warnings = append(result.Warnings, fmt.Sprintf(
+				"cache-miss mode replays one generated name set across every protocol; only the first measured protocol (%s) observes a true cache miss, and later protocols (%s) run against an already warm resolver cache",
+				measured[0], strings.Join(remaining, ", ")))
+		}
 	}
 	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {

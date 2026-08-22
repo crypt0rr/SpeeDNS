@@ -278,7 +278,11 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 	for protocol := range byProtocol {
 		protocols = append(protocols, protocol)
 	}
-	sort.Slice(protocols, func(i, j int) bool { return protocols[i] < protocols[j] })
+	// Measure protocol groups in the documented order (udp, tcp, doh, dot,
+	// doq) rather than the lexicographic order of the Protocol string type.
+	sort.Slice(protocols, func(i, j int) bool {
+		return catalog.CompareProtocols(protocols[i], protocols[j]) < 0
+	})
 
 	for _, protocol := range protocols {
 		groupResults := runProtocol(ctx, byProtocol[protocol], queries, opts)

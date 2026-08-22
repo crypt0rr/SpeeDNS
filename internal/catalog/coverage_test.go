@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"sort"
 	"strings"
 	"testing"
 )
@@ -231,7 +232,7 @@ func TestExpandUsesSelectionAndSortsTargets(t *testing.T) {
 	if len(targets) != 5 {
 		t.Fatalf("all-protocol expansion count = %d", len(targets))
 	}
-	if targets[0].Protocol != TCP || targets[0].Resolver.ID != "b" || targets[2].Protocol != UDP || targets[2].Resolver.ID != "a" {
+	if targets[0].Protocol != UDP || targets[0].Resolver.ID != "a" || targets[3].Protocol != TCP || targets[3].Resolver.ID != "b" {
 		t.Fatalf("sorted expansion = %#v", targets)
 	}
 	if got := Expand(profiles, []Protocol{DoH}); len(got) != 0 {
@@ -278,5 +279,27 @@ func TestParseResolverFlagAllSchemesAndErrors(t *testing.T) {
 		if _, err := ParseResolverFlag(value); err == nil {
 			t.Fatalf("expected resolver flag error for %q", value)
 		}
+	}
+}
+
+func TestCompareProtocolsFollowsAllProtocols(t *testing.T) {
+	sorted := []Protocol{DoH, DoQ, DoT, TCP, UDP}
+	sort.Slice(sorted, func(i, j int) bool { return CompareProtocols(sorted[i], sorted[j]) < 0 })
+	for index, want := range AllProtocols {
+		if sorted[index] != want {
+			t.Fatalf("sorted protocols = %#v, want %#v", sorted, AllProtocols)
+		}
+	}
+	if CompareProtocols(UDP, UDP) != 0 || CompareProtocols(UDP, DoQ) >= 0 || CompareProtocols(DoQ, UDP) <= 0 {
+		t.Fatal("known protocols must order by AllProtocols position")
+	}
+	if protocolRank("unknown") != len(AllProtocols) {
+		t.Fatalf("unknown protocol rank = %d, want %d", protocolRank("unknown"), len(AllProtocols))
+	}
+	if CompareProtocols("aaa", "bbb") >= 0 || CompareProtocols("bbb", "aaa") <= 0 || CompareProtocols("aaa", "aaa") != 0 {
+		t.Fatal("unknown protocols must order deterministically by name")
+	}
+	if CompareProtocols(DoQ, "aaa") >= 0 {
+		t.Fatal("unknown protocols must sort after every known protocol")
 	}
 }

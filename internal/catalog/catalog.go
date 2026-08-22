@@ -28,6 +28,31 @@ var AllProtocols = []Protocol{UDP, TCP, DoH, DoT, DoQ}
 
 func (p Protocol) String() string { return string(p) }
 
+// protocolRank returns the index of protocol in AllProtocols. Unknown
+// protocols rank after every known one.
+func protocolRank(protocol Protocol) int {
+	for index, known := range AllProtocols {
+		if protocol == known {
+			return index
+		}
+	}
+	return len(AllProtocols)
+}
+
+// CompareProtocols orders protocols by their position in AllProtocols, which
+// is the documented benchmark and display order udp, tcp, doh, dot, doq.
+// Protocol is a string type, so comparing the values directly sorts them
+// lexicographically (doh, doq, dot, tcp, udp) and silently disagrees with the
+// documented and reported order. Unknown protocols sort after every known one,
+// by name, so the result stays deterministic.
+func CompareProtocols(a, b Protocol) int {
+	rankA, rankB := protocolRank(a), protocolRank(b)
+	if rankA == rankB {
+		return strings.Compare(string(a), string(b))
+	}
+	return rankA - rankB
+}
+
 // ParseProtocol parses a user-facing protocol name.
 func ParseProtocol(value string) (Protocol, error) {
 	p := Protocol(strings.ToLower(strings.TrimSpace(value)))
@@ -361,8 +386,8 @@ func Expand(profiles []ResolverProfile, selected []Protocol) []Target {
 		}
 	}
 	sort.Slice(targets, func(i, j int) bool {
-		if targets[i].Protocol != targets[j].Protocol {
-			return targets[i].Protocol < targets[j].Protocol
+		if order := CompareProtocols(targets[i].Protocol, targets[j].Protocol); order != 0 {
+			return order < 0
 		}
 		return targets[i].ID() < targets[j].ID()
 	})
