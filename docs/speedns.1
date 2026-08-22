@@ -77,7 +77,8 @@ Select DNS record types.
 Set the per-query and connection timeout, for example 2s.
 .TP
 .B --concurrency N
-Set the maximum number of measured exchanges in flight per transport.
+Set the maximum number of targets prepared at once, and of measured exchanges
+in flight, per transport.
 .TP
 .B --format table|json|csv
 Choose human-readable, JSON, or CSV output.
@@ -104,7 +105,8 @@ while redirected standard error receives deterministic preparation,
 measurement, and completion lines. JSON and CSV runs are silent on standard
 error.
 .PP
-Preparation covers connection setup, cold probes, and warm-up queries.
+Preparation covers connection setup, cold probes, and warm-up queries, and
+runs with the same bounded concurrency as measurement.
 Measurement counts completed DNS exchanges, including failures. Progress does
 not show an ETA or resolver addresses and does not change report contents.
 .PP

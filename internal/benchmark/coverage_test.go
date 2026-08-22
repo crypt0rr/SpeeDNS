@@ -842,8 +842,10 @@ func TestBootstrapUsesCompleteOutcomesAndTargetIdentity(t *testing.T) {
 	if bootstrapSeed(42, "one@192.0.2.1/udp") == bootstrapSeed(42, "two@192.0.2.2/udp") {
 		t.Fatal("distinct target identities reused a bootstrap seed")
 	}
-	if got := scoreFromSamples([]scoreSample{{success: false}}, 2000); got != 4000 {
-		t.Fatalf("all-failure bootstrap score = %v, want 4000", got)
+	// An all-failure replicate scores the timeout penalty itself, which is
+	// exactly scoreFromLatencies with no latency term and a failure rate of 1.
+	if got := scoreFromSamples([]scoreSample{{success: false}}, 2000); got != 2000 {
+		t.Fatalf("all-failure bootstrap score = %v, want 2000", got)
 	}
 }
 
@@ -1198,3 +1200,168 @@ type reportedSession struct {
 }
 
 func (s *reportedSession) DialAddress() string { return s.address }
+
+func TestBootstrapUpperBoundStaysInsideScoreRange(t *testing.T) {
+	timeout := 2 * time.Second
+	timeoutMS := durationMS(timeout)
+	// One success and four scoring failures. Roughly a third of the bootstrap
+	// replicates draw no success at all, so an out-of-range all-failure
+	// sentinel would surface directly in the reported upper bound.
+	samples := []scoreSample{
+		{latencyMS: 10, success: true},
+		{success: false},
+		{success: false},
+		{success: false},
+		{success: false},
+	}
+	seed := bootstrapSeed(42, "failing@192.0.2.9/udp")
+	low, high := bootstrapCI(samples, timeout, seed)
+	// The score function cannot exceed the worst observed latency plus the
+	// full timeout penalty, so no replicate of it may either.
+	maxScore := 10 + timeoutMS
+	if low < 0 || high > maxScore {
+		t.Fatalf("bootstrap interval [%v, %v] left the score range [0, %v]", low, high, maxScore)
+	}
+	if high != timeoutMS {
+		t.Fatalf("all-failure replicates scored %v, want the timeout penalty %v", high, timeoutMS)
+	}
+	repeatLow, repeatHigh := bootstrapCI(samples, timeout, seed)
+	if repeatLow != low || repeatHigh != high {
+		t.Fatalf("seeded bootstrap bounds changed between runs: %v/%v != %v/%v", repeatLow, repeatHigh, low, high)
+	}
+}
+
+func TestPrepareTargetsEdges(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+
+	// An unset concurrency still prepares one target at a time.
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		return nil, errors.New("fixture open failed")
+	}
+	runners, dispatched := prepareTargets(context.Background(), []catalog.Target{testTarget(catalog.UDP, "solo")}, nil, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(runners) != 1 || !dispatched[0] || runners[0].result.OpenError == "" {
+		t.Fatalf("unbounded-concurrency preparation = %#v/%#v", runners, dispatched)
+	}
+
+	// Cancelling while the only worker is still opening a session stops
+	// dispatching, so later targets never get a runner at all.
+	released := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
+			once.Do(func() { close(started) })
+			<-released
+			return nil, errors.New("preparation interrupted")
+		}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocked := []catalog.Target{testTarget(catalog.UDP, "blocked-first"), testTarget(catalog.UDP, "never-dispatched")}
+	go func() {
+		<-started
+		cancel()
+		time.Sleep(10 * time.Millisecond)
+		close(released)
+	}()
+	runners, dispatched = prepareTargets(ctx, blocked, nil, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1})
+	if !dispatched[0] || dispatched[1] || runners[1] != nil {
+		t.Fatalf("cancelled preparation dispatched too much: %#v/%#v", runners, dispatched)
+	}
+}
+
+func TestPreparationIsConcurrentBoundedAndDeterministic(t *testing.T) {
+	oldTarget := runTargetFunc
+	oldFactory := newFactory
+	t.Cleanup(func() {
+		runTargetFunc = oldTarget
+		newFactory = oldFactory
+	})
+	runTargetFunc = runTarget
+
+	targets := []catalog.Target{
+		testTarget(catalog.UDP, "one"),
+		testTarget(catalog.UDP, "two"),
+		testTarget(catalog.UDP, "three"),
+		testTarget(catalog.UDP, "four"),
+	}
+	opts := validBenchmarkOptions()
+	opts.Domains = []string{"a.example", "b.example"}
+	opts.QueryTypes = []uint16{dns.TypeA}
+	opts.Sample = 2
+	opts.Concurrency = 2
+	opts.Seed = 99
+
+	run := func() (Report, int) {
+		var mu sync.Mutex
+		active := 0
+		maxActive := 0
+		// Cold probes and warm-ups use warmupNames; the measured matrix uses
+		// ".example" names. Counting only the former measures how many targets
+		// are being prepared at the same instant.
+		preparationSession := func() *fakeSession {
+			return &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+				if !strings.HasSuffix(name, ".example") {
+					mu.Lock()
+					active++
+					if active > maxActive {
+						maxActive = active
+					}
+					mu.Unlock()
+					time.Sleep(5 * time.Millisecond)
+					mu.Lock()
+					active--
+					mu.Unlock()
+				}
+				return replyFor(name, qtype), nil
+			}}
+		}
+		factories := make(map[string]transport.Factory, len(targets))
+		for _, target := range targets {
+			factories[target.Address] = &fakeFactory{opens: []fakeOpen{
+				{session: preparationSession()},
+				{session: preparationSession()},
+				{session: preparationSession()},
+				{session: preparationSession()},
+			}}
+		}
+		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+			return factories[target.Address], nil
+		}
+		report, err := Run(context.Background(), targets, opts)
+		if err != nil {
+			t.Fatalf("prepared run failed: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return report, maxActive
+	}
+
+	shape := func(report Report) []string {
+		lines := make([]string, 0, len(report.Targets))
+		for _, result := range report.Targets {
+			parts := []string{result.Target.ID()}
+			for _, observation := range result.Observations {
+				parts = append(parts, observation.Name+"/"+QueryTypeName(observation.QType))
+			}
+			lines = append(lines, strings.Join(parts, " "))
+		}
+		return lines
+	}
+
+	first, firstMax := run()
+	second, secondMax := run()
+	if firstMax > opts.Concurrency || secondMax > opts.Concurrency {
+		t.Fatalf("preparation concurrency exceeded limit: %d/%d > %d", firstMax, secondMax, opts.Concurrency)
+	}
+	if firstMax < 2 || secondMax < 2 {
+		t.Fatalf("preparation stayed sequential: %d/%d, want up to %d targets prepared at once", firstMax, secondMax, opts.Concurrency)
+	}
+	if len(first.Targets) != len(targets) {
+		t.Fatalf("prepared results = %d, want %d", len(first.Targets), len(targets))
+	}
+	if !reflect.DeepEqual(shape(first), shape(second)) {
+		t.Fatalf("seeded run was not deterministic: %#v != %#v", shape(first), shape(second))
+	}
+}

@@ -439,28 +439,19 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 		TargetsTotal: len(orderedTargets),
 	})
 
+	prepared, dispatched := prepareTargets(ctx, orderedTargets, queries, opts)
 	runners := make([]*targetRunner, 0, len(orderedTargets))
 	ready := make([]*targetRunner, 0, len(orderedTargets))
-	for _, target := range orderedTargets {
-		if ctx.Err() != nil {
-			break
-		}
-		runner := newTargetRunner(ctx, target, queries, opts)
-		runners = append(runners, runner)
-		prepared := runner.prepare(ctx)
-		preparedTargets := len(runners)
-		emitProgress(opts, Progress{
-			Protocol:         target.Protocol,
-			Phase:            ProgressPreparing,
-			TargetsCompleted: preparedTargets,
-			TargetsTotal:     len(orderedTargets),
-		})
-		if prepared {
-			ready = append(ready, runner)
+	for index, runner := range prepared {
+		// Preparation runs concurrently, but the scheduler's view of the
+		// targets stays in target-ID order so results and rankings never
+		// depend on which preparation happened to finish first.
+		if !dispatched[index] || runner == nil {
 			continue
 		}
-		if ctx.Err() != nil {
-			break
+		runners = append(runners, runner)
+		if runner.ready {
+			ready = append(ready, runner)
 		}
 	}
 
@@ -511,6 +502,65 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 		ExchangesTotal:     exchangesTotal,
 	})
 	return results
+}
+
+// prepareTargets opens and warms every dispatched target with the same
+// bounded concurrency as the measured rounds. Strictly sequential preparation
+// made a target's cold probes and its warm session's idle age depend on the
+// target's position in the ordered catalog; preparing with bounded
+// concurrency shrinks that positional bias by the concurrency factor. Each
+// runner is still prepared by exactly one goroutine, so a session is never
+// used concurrently. The returned slices are indexed by ordered-target
+// position, which keeps result ordering deterministic regardless of the order
+// in which preparations finish.
+func prepareTargets(ctx context.Context, orderedTargets []catalog.Target, queries []Query, opts Options) ([]*targetRunner, []bool) {
+	runners := make([]*targetRunner, len(orderedTargets))
+	dispatched := make([]bool, len(orderedTargets))
+	workers := opts.Concurrency
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(orderedTargets) {
+		workers = len(orderedTargets)
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	// Preparation progress counts finished attempts, successful or not, in
+	// completion order. That is the meaning the sequential loop already had.
+	var preparedTargets atomic.Int32
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				target := orderedTargets[index]
+				runner := newTargetRunner(ctx, target, queries, opts)
+				runners[index] = runner
+				runner.prepare(ctx)
+				emitProgress(opts, Progress{
+					Protocol:         target.Protocol,
+					Phase:            ProgressPreparing,
+					TargetsCompleted: int(preparedTargets.Add(1)),
+					TargetsTotal:     len(orderedTargets),
+				})
+			}
+		}()
+	}
+dispatch:
+	for index := range orderedTargets {
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case jobs <- index:
+			dispatched[index] = true
+		case <-ctx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return runners, dispatched
 }
 
 func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, concurrency int) int {
@@ -1123,11 +1173,11 @@ func scoreFromSamples(samples []scoreSample, timeoutMS float64) float64 {
 		}
 	}
 	failureRate := float64(failures) / float64(len(samples))
-	if len(latencies) == 0 {
-		// This value is used only for confidence intervals because targets
-		// without scored samples are never ranked.
-		return 2 * timeoutMS
-	}
+	// A replicate that draws only failures has no latency term, so its score
+	// is scoreFromLatencies with an empty latency set and a failure rate of
+	// 1, which is exactly the timeout penalty. Deliberately no sentinel: a
+	// value outside the score function's range would inflate the bootstrap
+	// upper bound and distort tie membership.
 	sort.Float64s(latencies)
 	return scoreFromLatencies(latencies, failureRate, timeoutMS)
 }
