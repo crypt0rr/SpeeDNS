@@ -7,7 +7,6 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/domains"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 	"github.com/crypt0rr/SpeeDNS/internal/transport"
 	"github.com/miekg/dns"
 )
@@ -41,6 +41,17 @@ var warmupNames = []string{"example.com", "example.org", "example.net"}
 // statistics engine can be tested without contacting a real resolver.
 var newFactory = transport.NewFactory
 
+// protocolScheduler measures one protocol group of targets and returns their
+// results.
+type protocolScheduler func(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult
+
+// runProtocol is the scheduler every protocol group is measured with. It is a
+// variable purely so a test can select runProtocolLegacy deliberately; the
+// production choice is never inferred from the state of a test hook.
+var runProtocol protocolScheduler = runProtocolFair
+
+// runTargetFunc is the target-level seam used by runProtocolLegacy. Replacing
+// it has no effect unless runProtocolLegacy is also selected explicitly.
 var runTargetFunc = runTarget
 
 type Options struct {
@@ -126,12 +137,12 @@ type Statistics struct {
 	MinMS               float64        `json:"min_ms"`
 	MaxMS               float64        `json:"max_ms"`
 	MADMS               float64        `json:"mad_ms"`
-	ColdMedianMS        float64        `json:"cold_median_ms,omitempty"`
+	ColdMedianMS        float64        `json:"cold_median_ms"`
 	ScoreMS             float64        `json:"score_ms"`
-	CILowMS             float64        `json:"ci_low_ms,omitempty"`
-	CIHighMS            float64        `json:"ci_high_ms,omitempty"`
+	CILowMS             float64        `json:"ci_low_ms"`
+	CIHighMS            float64        `json:"ci_high_ms"`
 	Recommended         bool           `json:"recommended"`
-	Tie                 bool           `json:"tie,omitempty"`
+	Tie                 bool           `json:"tie"`
 }
 
 type TargetResult struct {
@@ -192,8 +203,11 @@ type RunProvenance struct {
 // positive delta means that the target was slower than the reference.
 //
 // Only observations that are usable, non-divergent, non-reconnect samples are
-// paired. The existing composite score remains the ranking authority; these
-// values explain whether a ranked difference is distinguishable from noise.
+// paired. A comparison needs at least MinimumRecommendedSamples paired
+// observations, the same floor the recommendation gate uses; below that the
+// delta and interval stay zero and Reason explains why. The existing composite
+// score remains the ranking authority; these values explain whether a ranked
+// difference is distinguishable from noise.
 type PairedEffect struct {
 	Protocol          catalog.Protocol `json:"protocol"`
 	Policy            string           `json:"policy"`
@@ -278,7 +292,11 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 	for protocol := range byProtocol {
 		protocols = append(protocols, protocol)
 	}
-	sort.Slice(protocols, func(i, j int) bool { return protocols[i] < protocols[j] })
+	// Measure protocol groups in the documented order (udp, tcp, doh, dot,
+	// doq) rather than the lexicographic order of the Protocol string type.
+	sort.Slice(protocols, func(i, j int) bool {
+		return catalog.CompareProtocols(protocols[i], protocols[j]) < 0
+	})
 
 	for _, protocol := range protocols {
 		groupResults := runProtocol(ctx, byProtocol[protocol], queries, opts)
@@ -345,15 +363,10 @@ func buildQueries(opts Options) ([]Query, error) {
 	return queries, nil
 }
 
-func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
-	// Existing tests and internal callers can replace runTargetFunc as a
-	// lightweight target-level seam. Production uses the fair scheduler below.
-	if reflect.ValueOf(runTargetFunc).Pointer() != reflect.ValueOf(runTarget).Pointer() {
-		return runProtocolLegacy(ctx, targets, queries, opts)
-	}
-	return runProtocolFair(ctx, targets, queries, opts)
-}
-
+// runProtocolLegacy dispatches whole targets to a worker pool through the
+// runTargetFunc seam and returns only the targets it managed to dispatch. It
+// is never selected by production code; tests that fake whole targets select
+// it explicitly.
 func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
 	if len(targets) == 0 {
 		return nil
@@ -538,6 +551,7 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 			}
 		}()
 	}
+dispatch:
 	for index := range runners {
 		if ctx.Err() != nil {
 			break
@@ -546,10 +560,7 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 		case jobs <- index:
 			dispatched[index] = true
 		case <-ctx.Done():
-			break
-		}
-		if ctx.Err() != nil {
-			break
+			break dispatch
 		}
 	}
 	close(jobs)
@@ -1054,7 +1065,7 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		sort.Float64s(cold)
 		stats.ColdMedianMS = percentile(cold, 0.5)
 	}
-	stats.Recommended = !result.Incomplete && stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
+	stats.Recommended = !result.Target.Resolver.Local && !result.Incomplete && stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
 	return stats
 }
 
@@ -1232,6 +1243,11 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 				effects = append(effects, effect)
 				continue
 			}
+			if len(deltas) < MinimumRecommendedSamples {
+				effect.Reason = fmt.Sprintf("insufficient paired samples (minimum %d)", MinimumRecommendedSamples)
+				effects = append(effects, effect)
+				continue
+			}
 			sort.Float64s(deltas)
 			effect.MedianDeltaMS = percentile(deltas, 0.5)
 			effect.CILowMS, effect.CIHighMS = bootstrapPairedCI(deltas, pairedBootstrapSeed(seed, key.protocol, key.policy, reference.Target.ID(), target.Target.ID()))
@@ -1299,9 +1315,6 @@ func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 	if len(deltas) == 0 {
 		return 0, 0
 	}
-	if len(deltas) == 1 {
-		return deltas[0], deltas[0]
-	}
 	rng := rand.New(rand.NewSource(seed))
 	scores := make([]float64, BootstrapIterations)
 	resample := make([]float64, len(deltas))
@@ -1316,10 +1329,15 @@ func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 	return percentile(scores, 0.025), percentile(scores, 0.975)
 }
 
+// makeRankings orders the comparable targets of each protocol. A resolver on
+// the local host is measured and reported, but never ranked: its latency is a
+// local cache lookup that excludes the upstream resolution it forwards to, so
+// placing it in the same order as a network resolver would compare two
+// different quantities.
 func makeRankings(results []TargetResult) []Ranking {
 	byProtocol := make(map[catalog.Protocol][]int)
 	for index, result := range results {
-		if result.Stats.Scored > 0 && !result.Incomplete {
+		if result.Stats.Scored > 0 && !result.Incomplete && !result.Target.Resolver.Local {
 			byProtocol[result.Target.Protocol] = append(byProtocol[result.Target.Protocol], index)
 		}
 	}
@@ -1368,15 +1386,23 @@ func confidenceIntervalsOverlap(left, right Statistics) bool {
 	return leftLow <= rightHigh && rightLow <= leftHigh
 }
 
+// collectWarnings renders one warning per diagnostic. The resolver label and
+// the session error are escaped here, at the point they become report text:
+// the label carries locally configured resolver names and addresses, and the
+// session error carries transport and TLS diagnostics that quote strings the
+// remote endpoint chose, such as the subject alternative names in
+// "x509: certificate is valid for ...". Warnings are printed verbatim under
+// --details, so neither may reach a terminal with its control characters
+// intact.
 func collectWarnings(results []TargetResult) []string {
 	warnings := make([]string, 0)
 	for _, result := range results {
-		label := fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol)
+		label := safetext.Escape(fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol))
 		if result.Incomplete {
 			warnings = append(warnings, fmt.Sprintf("%s was incomplete and excluded from ranking", label))
 		}
 		if result.OpenError != "" {
-			warnings = append(warnings, fmt.Sprintf("%s could not open a session: %s", label, result.OpenError))
+			warnings = append(warnings, fmt.Sprintf("%s could not open a session: %s", label, safetext.Escape(result.OpenError)))
 		}
 		if result.Stats.Failures > 0 {
 			warnings = append(warnings, fmt.Sprintf("%s had %d/%d failed queries", label, result.Stats.Failures, result.Stats.Total))
@@ -1394,7 +1420,9 @@ func collectWarnings(results []TargetResult) []string {
 			}
 			warnings = append(warnings, warning)
 		}
-		if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
+		if result.Target.Resolver.Local {
+			warnings = append(warnings, fmt.Sprintf("%s runs on the local host: it measures cache-hit latency and excludes the upstream resolution cost, so its result is not comparable with a network resolver and is reported without a rank or recommendation", label))
+		} else if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
 			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
 		}
 	}
