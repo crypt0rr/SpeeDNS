@@ -650,8 +650,10 @@ partial report. A second interrupt exits immediately.
 ### Assertions for automation
 
 Use repeatable `--assert` flags when a benchmark should act as a CI or
-monitoring gate. Numeric assertions are checked for every qualified or
-provisional winner in every protocol that produced a ranking:
+monitoring gate. Numeric assertions are checked against the rank-one target of
+every protocol that produced a ranking — one target per protocol, so the gate
+does not change strictness with network noise. `winner=` keeps the wider
+meaning and accepts any confidence-interval tie-group member:
 
 ```sh
 ./speedns --protocol doh --assert 'usable>=0.99' --assert 'p95<50ms'
