@@ -138,7 +138,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 		}
 		results = append(results, jsonResult)
 	}
-	rankings := append([]benchmark.Ranking(nil), report.Rankings...)
+	rankings := append(make([]benchmark.Ranking, 0, len(report.Rankings)), report.Rankings...)
 	for index := range rankings {
 		if redactedID, ok := redactedIDs[rankings[index].TargetID]; ok {
 			rankings[index].TargetID = redactedID
