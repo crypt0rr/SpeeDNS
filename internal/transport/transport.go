@@ -179,6 +179,12 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				ServerName: serverName,
+				// RFC 7858 registers the "dot" ALPN token and RFC 8310 says a
+				// DNS-over-TLS client SHOULD offer it. DoQ and DoH already
+				// negotiate their own tokens here; without one, a server or
+				// middlebox that routes by ALPN cannot tell what this
+				// connection carries.
+				NextProtos: []string{"dot"},
 			},
 		}, nil
 	case catalog.DoH:
@@ -208,8 +214,40 @@ type udpFactory struct {
 	timeout time.Duration
 }
 
-func (f *udpFactory) Open(context.Context) (Session, error) {
-	return &udpSession{address: f.address, timeout: f.timeout}, nil
+// resolveUDPAddress is a seam so the bootstrap lookup can be exercised without
+// a real system resolver.
+var resolveUDPAddress = func(ctx context.Context, address string) (string, error) {
+	resolved, err := net.DefaultResolver.LookupNetIP(ctx, "ip", address)
+	if err != nil {
+		return "", err
+	}
+	if len(resolved) == 0 {
+		return "", fmt.Errorf("no addresses for %q", address)
+	}
+	return resolved[0].String(), nil
+}
+
+// Open resolves a hostname endpoint once, here, rather than leaving it to every
+// exchange. dns.Client.ExchangeContext dials the address it is given, so a
+// hostname target sent the benchmark through the system resolver inside the
+// timed region on every single query, measuring the local resolver's latency
+// as if it were the target's. METHODOLOGY.md states that UDP reports the DNS
+// transaction time only, and a bootstrap lookup is not part of that
+// transaction. An address that is already a literal costs nothing here.
+func (f *udpFactory) Open(ctx context.Context) (Session, error) {
+	address := f.address
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid UDP endpoint %q: %w", address, err)
+	}
+	if net.ParseIP(host) == nil {
+		resolvedHost, resolveErr := resolveUDPAddress(ctx, host)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve UDP endpoint %q: %w", host, resolveErr)
+		}
+		address = net.JoinHostPort(resolvedHost, port)
+	}
+	return &udpSession{address: address, timeout: f.timeout}, nil
 }
 
 type streamFactory struct {
@@ -241,6 +279,10 @@ type udpSession struct {
 	address string
 	timeout time.Duration
 }
+
+// DialAddress reports the literal endpoint the session exchanges with, which
+// for a hostname target is the address resolved once when the session opened.
+func (s *udpSession) DialAddress() string { return s.address }
 
 func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	query := newQuery(name, qtype, dns.Id(), false)
@@ -403,6 +445,15 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 // endpoint cannot force an unnecessarily large header allocation per query.
 const doHMaxResponseHeaderBytes = 64 << 10
 
+// Go applies its ten hop redirect cap inside net/http's own CheckRedirect,
+// so installing a custom callback removes the cap entirely. A legitimate DoH
+// endpoint needs at most one or two hops, so keep a small budget of our own
+// to stop a hostile or misconfigured endpoint from expanding a single query
+// into an unbounded request burst. Like the net/http default, the budget
+// counts the requests in one chain, so at most doHMaxRedirects requests are
+// issued per query.
+const doHMaxRedirects = 5
+
 func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -456,7 +507,10 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			conn, address, err := plan.openStream(ctx, tlsConfig)
 			if err == nil {
-				session.setDialAddress(address)
+				// http.Transport re-dials transparently when a pooled
+				// connection is gone, so this hook is the only place a new
+				// TCP+TLS(+HTTP/2) handshake becomes observable.
+				session.recordConnection(address)
 			}
 			return conn, err
 		},
@@ -465,6 +519,9 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		Transport: transport,
 		Timeout:   f.timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= doHMaxRedirects {
+				return fmt.Errorf("DoH stopped after %d redirects", doHMaxRedirects)
+			}
 			if len(via) > 0 && !sameHTTPSOrigin(via[0].URL, req.URL) {
 				return errors.New("DoH redirect changed HTTPS origin")
 			}
@@ -508,17 +565,49 @@ func joinAddress(host string, port int) string {
 }
 
 type doHSession struct {
-	client    *http.Client
-	transport *http.Transport
-	endpoint  string
-	mu        sync.RWMutex
-	dialAddr  string
+	client          *http.Client
+	transport       *http.Transport
+	endpoint        string
+	mu              sync.RWMutex
+	dialAddr        string
+	connections     uint64
+	lastReconnected bool
 }
 
-func (s *doHSession) setDialAddress(address string) {
+// recordConnection is called from the transport dial hook, which runs on the
+// http.Transport's own goroutines, once per newly opened HTTPS connection.
+func (s *doHSession) recordConnection(address string) {
 	s.mu.Lock()
 	s.dialAddr = address
+	s.connections++
 	s.mu.Unlock()
+}
+
+// beginQuery resets the per-query reconnect state and returns the number of
+// connections opened so far, so the query can tell whether it had to open one.
+func (s *doHSession) beginQuery() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReconnected = false
+	return s.connections
+}
+
+// endQuery records whether the exchange had to replace a connection that the
+// session had already established. The very first connection is opened lazily
+// by the first exchange and is the DoH analogue of the dial the stream
+// transports perform in Open, so it is not counted as a reconnect.
+func (s *doHSession) endQuery(connectionsBefore uint64) {
+	s.mu.Lock()
+	s.lastReconnected = connectionsBefore > 0 && s.connections > connectionsBefore
+	s.mu.Unlock()
+}
+
+// LastQueryReconnected reports whether the most recent Query had to open a
+// fresh HTTPS connection after the previous one was dropped.
+func (s *doHSession) LastQueryReconnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastReconnected
 }
 
 func (s *doHSession) DialAddress() string {
@@ -528,6 +617,7 @@ func (s *doHSession) DialAddress() string {
 }
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	connectionsBefore := s.beginQuery()
 	query := newQuery(name, qtype, 0, true)
 	packed, err := packSessionQuery(query)
 	if err != nil {
@@ -540,6 +630,7 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	request.Header.Set("Accept", "application/dns-message")
 	request.Header.Set("Content-Type", "application/dns-message")
 	response, err := s.client.Do(request)
+	s.endQuery(connectionsBefore)
 	if err != nil {
 		return nil, err
 	}
@@ -844,7 +935,7 @@ func ResponseClass(message *dns.Msg) string {
 	}
 	switch message.Rcode {
 	case dns.RcodeSuccess:
-		if len(message.Answer) == 0 && len(message.Ns) == 0 {
+		if !answersQuestion(message) {
 			return "nodata"
 		}
 		return "answer"
@@ -853,6 +944,26 @@ func ResponseClass(message *dns.Msg) string {
 	default:
 		return fmt.Sprintf("rcode-%d", message.Rcode)
 	}
+}
+
+// answersQuestion reports whether the answer section carries a record of the
+// requested type. A canonical NODATA response is NOERROR with an empty answer
+// section and an SOA in the authority section, so authority records must never
+// be read as an answer: doing so collapses "this name has no such record" and
+// "here is the address" into one response class.
+func answersQuestion(message *dns.Msg) bool {
+	if len(message.Question) != 1 {
+		// validateResponse rejects any other shape before scoring, so this is
+		// only reachable for synthetic messages; fall back to answer presence.
+		return len(message.Answer) > 0
+	}
+	qtype := message.Question[0].Qtype
+	for _, answer := range message.Answer {
+		if answer.Header().Rrtype == qtype {
+			return true
+		}
+	}
+	return false
 }
 
 // ResponseCodeName returns the conventional DNS response-code name used in

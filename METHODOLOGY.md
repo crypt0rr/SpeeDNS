@@ -34,11 +34,16 @@ reports the DNS transaction time only.
 Warm latency is measured from immediately before a DNS exchange until the
 validated response or error returns. TCP, DoT, and any recovered stream
 connection are not closed before the timer stops. A query that follows a TCP,
-DoT, or DoQ reconnect is recorded as a reconnect sample and excluded from
+DoT, DoH, or DoQ reconnect is recorded as a reconnect sample and excluded from
 ordinary warm-latency scoring; its reconnect count and selected dial address
-remain visible in detailed output and machine-readable results. DoQ sessions
-use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to the
-configured timeout, and a maximum idle timeout of twice that timeout. The
+remain visible in detailed output and machine-readable results. A DoH session
+reuses one pooled HTTPS connection; when that connection is gone, the HTTP
+client opens a new one transparently, so the query that pays for the new TCP,
+TLS, and HTTP handshake is the reconnect sample. The connection the session
+opens for its first exchange is the DoH equivalent of the dial the stream
+transports perform when the session is opened, and is not a reconnect. DoQ
+sessions use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to
+the configured timeout, and a maximum idle timeout of twice that timeout. The
 failed exchange that caused the reconnect is counted once and is never
 retried.
 
@@ -69,6 +74,13 @@ The classes are `answer`, `nodata`, `nxdomain`, and DNS response-code classes
 such as `rcode-2` (SERVFAIL) or `rcode-5` (REFUSED). A successful observation
 whose class differs from a unique plurality baseline is divergent and is
 excluded from comparative latency scoring.
+
+A response is classified `answer` only when its answer section carries a record
+of the queried type. A NOERROR response without one is `nodata`, including the
+canonical form that carries an SOA in the authority section. Authority records
+are never read as an answer: doing so would make "this name has no such record"
+indistinguishable from "here is the address", which is the most common genuine
+difference between resolvers on the default `A,AAAA` query set.
 
 If two or more classes are tied for the plurality, the group is ambiguous:
 there is no defensible baseline, so every successful observation in that group
@@ -116,6 +128,15 @@ leader's tie group when its 95% bootstrap interval overlaps the leader's
 interval. The leader is marked as tied too, so the tie is visible from either
 row.
 
+Every output surfaces that flag. The human table has a `Tie` column in the
+recommendation summary and in each per-protocol comparison; a tied row reads
+`TIED`, an untied row reads `—`. When a recommended or provisional winner is
+tied, the recommendation block also carries a `TIED:` note stating that the
+ordering is not statistically distinguishable, so a rank-one row is never
+presented as an unqualified winner. CSV keeps its `tie` column and JSON keeps
+`tie` on both `rankings[]` and `results[].stats`. The strict `1..N` rank is
+still reported: a tie qualifies the ordering, it does not remove it.
+
 The report also includes paired latency effects. For each protocol and
 normalized declared policy, the best-ranked target in that group is the local
 reference. Each other target is paired with that reference by normalized query
@@ -125,7 +146,15 @@ median of `target latency - reference latency`, so a positive value means the
 target was slower. A deterministic bootstrap of those paired deltas provides
 the 95% confidence interval. When the interval contains zero, the report says
 `NO CLEAR DIFFERENCE`: the observed ranking difference is not distinguishable
-from noise in this run. These effects explain the existing score and never
+from noise in this run.
+
+A paired comparison requires at least 20 paired observations, the same minimum
+sample count the recommendation gate uses. Below that floor no delta and no
+interval are reported: the effect keeps its paired sample count, records the
+reason `insufficient paired samples`, and the report says `NOT COMPARABLE`.
+A one-sample or few-sample run measures cold-path noise, so it must not be
+presented as a directional `FASTER` or `SLOWER` verdict under a 95% confidence
+interval heading. These effects explain the existing score and never
 change ranking order. JSON exposes them in the additive `paired_effects`
 section; the human table shows them below the protocol comparisons, while CSV
 retains its aggregate one-row-per-target schema.
@@ -204,11 +233,21 @@ Numeric assertions are evaluated against every qualified or provisional
 winner for every protocol that produced a ranking. `winner=PROFILE-ID` or
 `winner=TARGET-ID` requires the requested profile or target to be among the
 rank-one winners for every such protocol. Confidence-interval ties therefore
-count as winner membership. The ordinary report is emitted before an
-assertion failure; invalid expressions return status 2 and failed assertions
-return status 4. No-comparable and interruption statuses retain precedence.
+count as winner membership. The requested winner is checked against the
+targets selected for the run before any query is sent, so an ID that no
+selected profile or target carries is invalid input (status 2) rather than a
+lost comparison; a benchmark never reports that a resolver failed to win when
+it was never measured. The ordinary report is emitted before an assertion
+failure; invalid expressions return status 2 and failed assertions return
+status 4. No-comparable and interruption statuses retain precedence.
 
 ## Address-family selection
+
+Every resolver address is syntax-checked before the run starts: an entry must
+be an IP literal (bare, bracketed, or zoned) or a syntactically valid
+hostname. Ports are configured per transport, so an address carrying one is
+rejected as invalid input instead of producing a run in which every query
+fails with a dial error attributed to the resolver.
 
 Bundled resolver profiles carry the provider-published IPv4 and IPv6 literals.
 `--family 4`, `--family 6`, and `--family both` are deterministic filters.
@@ -218,3 +257,22 @@ detected, both literal families are retained rather than silently claiming a
 route. Hostname-only custom endpoints remain available in `auto` and `both`,
 while explicit family selection requires literals so the benchmark does not
 include an unmeasured bootstrap lookup.
+
+Auto-detection treats the two families differently. An RFC 1918 IPv4 address
+counts as IPv4 availability because NAT makes a private v4 address an ordinary
+path to the Internet. A unique-local IPv6 address (`fc00::/7`, which covers
+Tailscale's `fd7a::/48` and the ULAs many home routers hand out) does not count
+as IPv6 availability: IPv6 has no NAT equivalent, so a ULA is not evidence of a
+public route, and treating it as one produced comparison tables where every
+IPv6 endpoint failed. Only global unicast IPv6 outside `fc00::/7` marks IPv6 as
+available.
+
+Auto-detection is a heuristic, so it prunes only the bundled catalog. Resolvers
+the operator named explicitly — `--resolver`, `--resolver-file`, and
+`--include-system` discovery — are never dropped by `auto`, because a resolver
+someone asked for by address should be measured and reported rather than
+silently removed. An explicit `--family 4`, `6`, or `both` is a deliberate
+instruction and still filters every profile, explicit ones included. When
+`auto` drops bundled addresses the run emits a warning naming the detected
+families and the number of addresses removed, so the reduced comparison table
+is visible rather than silent.
