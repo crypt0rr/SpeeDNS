@@ -7,7 +7,6 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -41,6 +40,17 @@ var warmupNames = []string{"example.com", "example.org", "example.net"}
 // statistics engine can be tested without contacting a real resolver.
 var newFactory = transport.NewFactory
 
+// protocolScheduler measures one protocol group of targets and returns their
+// results.
+type protocolScheduler func(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult
+
+// runProtocol is the scheduler every protocol group is measured with. It is a
+// variable purely so a test can select runProtocolLegacy deliberately; the
+// production choice is never inferred from the state of a test hook.
+var runProtocol protocolScheduler = runProtocolFair
+
+// runTargetFunc is the target-level seam used by runProtocolLegacy. Replacing
+// it has no effect unless runProtocolLegacy is also selected explicitly.
 var runTargetFunc = runTarget
 
 type Options struct {
@@ -348,15 +358,10 @@ func buildQueries(opts Options) ([]Query, error) {
 	return queries, nil
 }
 
-func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
-	// Existing tests and internal callers can replace runTargetFunc as a
-	// lightweight target-level seam. Production uses the fair scheduler below.
-	if reflect.ValueOf(runTargetFunc).Pointer() != reflect.ValueOf(runTarget).Pointer() {
-		return runProtocolLegacy(ctx, targets, queries, opts)
-	}
-	return runProtocolFair(ctx, targets, queries, opts)
-}
-
+// runProtocolLegacy dispatches whole targets to a worker pool through the
+// runTargetFunc seam and returns only the targets it managed to dispatch. It
+// is never selected by production code; tests that fake whole targets select
+// it explicitly.
 func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
 	if len(targets) == 0 {
 		return nil
