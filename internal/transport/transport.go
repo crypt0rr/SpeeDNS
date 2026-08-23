@@ -197,6 +197,12 @@ func NewFactoryWithOptions(target catalog.Target, timeout time.Duration, options
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				ServerName: serverName,
+				// RFC 7858 registers the "dot" ALPN token and RFC 8310 says a
+				// DNS-over-TLS client SHOULD offer it. DoQ and DoH already
+				// negotiate their own tokens here; without one, a server or
+				// middlebox that routes by ALPN cannot tell what this
+				// connection carries.
+				NextProtos: []string{"dot"},
 			},
 		}, nil
 	case catalog.DoH:
@@ -228,8 +234,40 @@ type udpFactory struct {
 	queryOptions QueryOptions
 }
 
-func (f *udpFactory) Open(context.Context) (Session, error) {
-	return &udpSession{address: f.address, timeout: f.timeout, queryOptions: f.queryOptions}, nil
+// resolveUDPAddress is a seam so the bootstrap lookup can be exercised without
+// a real system resolver.
+var resolveUDPAddress = func(ctx context.Context, address string) (string, error) {
+	resolved, err := net.DefaultResolver.LookupNetIP(ctx, "ip", address)
+	if err != nil {
+		return "", err
+	}
+	if len(resolved) == 0 {
+		return "", fmt.Errorf("no addresses for %q", address)
+	}
+	return resolved[0].String(), nil
+}
+
+// Open resolves a hostname endpoint once, here, rather than leaving it to every
+// exchange. dns.Client.ExchangeContext dials the address it is given, so a
+// hostname target sent the benchmark through the system resolver inside the
+// timed region on every single query, measuring the local resolver's latency
+// as if it were the target's. METHODOLOGY.md states that UDP reports the DNS
+// transaction time only, and a bootstrap lookup is not part of that
+// transaction. An address that is already a literal costs nothing here.
+func (f *udpFactory) Open(ctx context.Context) (Session, error) {
+	address := f.address
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid UDP endpoint %q: %w", address, err)
+	}
+	if net.ParseIP(host) == nil {
+		resolvedHost, resolveErr := resolveUDPAddress(ctx, host)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve UDP endpoint %q: %w", host, resolveErr)
+		}
+		address = net.JoinHostPort(resolvedHost, port)
+	}
+	return &udpSession{address: address, timeout: f.timeout, queryOptions: f.queryOptions}, nil
 }
 
 type streamFactory struct {
@@ -264,6 +302,10 @@ type udpSession struct {
 	timeout      time.Duration
 	queryOptions QueryOptions
 }
+
+// DialAddress reports the literal endpoint the session exchanges with, which
+// for a hostname target is the address resolved once when the session opened.
+func (s *udpSession) DialAddress() string { return s.address }
 
 func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	query := newQuery(name, qtype, dns.Id(), false, s.queryOptions)
@@ -318,7 +360,7 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 	if err != nil {
 		return nil, err
 	}
-	if len(packed) > 65535 {
+	if len(packed) > maxFramedMessage {
 		return nil, errors.New("DNS query exceeds TCP message limit")
 	}
 	reconnecting := s.conn == nil
@@ -327,33 +369,14 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 		return nil, err
 	}
 	s.lastReconnected = reconnecting
-	if err := setConnDeadline(s.conn, ctx, s.timeout); err != nil {
+	// The connection is reused across queries, so the deadline is set on the
+	// connection itself and the send side stays open.
+	if err := s.conn.SetDeadline(queryDeadline(ctx, s.timeout)); err != nil {
 		return nil, s.fatal(err)
 	}
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
-	if _, err := s.conn.Write(prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := s.conn.Write(packed); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := io.ReadFull(s.conn, prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	length := int(binary.BigEndian.Uint16(prefix[:]))
-	if length == 0 {
-		return nil, s.fatal(errors.New("empty DNS response"))
-	}
-	responseBytes := make([]byte, length)
-	if _, err := io.ReadFull(s.conn, responseBytes); err != nil {
-		return nil, s.fatal(err)
-	}
-	response := new(dns.Msg)
-	if err := response.Unpack(responseBytes); err != nil {
-		return nil, s.fatal(fmt.Errorf("unpack DNS response: %w", err))
-	}
-	if err := validateResponse(response, name, qtype, query.Id, false); err != nil {
+	framing := framedStream{stream: s.conn, label: "DNS"}
+	response, err := framing.query(packed, name, qtype, query.Id, false)
+	if err != nil {
 		return nil, s.fatal(err)
 	}
 	return response, nil
@@ -428,6 +451,18 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 // endpoint cannot force an unnecessarily large header allocation per query.
 const doHMaxResponseHeaderBytes = 64 << 10
 
+// doHMaxResponseBodyBytes bounds every DoH body read, parsed or discarded.
+const doHMaxResponseBodyBytes = 1 << 20
+
+// Go applies its ten hop redirect cap inside net/http's own CheckRedirect,
+// so installing a custom callback removes the cap entirely. A legitimate DoH
+// endpoint needs at most one or two hops, so keep a small budget of our own
+// to stop a hostile or misconfigured endpoint from expanding a single query
+// into an unbounded request burst. Like the net/http default, the budget
+// counts the requests in one chain, so at most doHMaxRedirects requests are
+// issued per query.
+const doHMaxRedirects = 5
+
 func newDoHFactory(target catalog.Target, timeout time.Duration, options QueryOptions) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -482,7 +517,10 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			conn, address, err := plan.openStream(ctx, tlsConfig)
 			if err == nil {
-				session.setDialAddress(address)
+				// http.Transport re-dials transparently when a pooled
+				// connection is gone, so this hook is the only place a new
+				// TCP+TLS(+HTTP/2) handshake becomes observable.
+				session.recordConnection(address)
 			}
 			return conn, err
 		},
@@ -491,6 +529,9 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		Transport: transport,
 		Timeout:   f.timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= doHMaxRedirects {
+				return fmt.Errorf("DoH stopped after %d redirects", doHMaxRedirects)
+			}
 			if len(via) > 0 && !sameHTTPSOrigin(via[0].URL, req.URL) {
 				return errors.New("DoH redirect changed HTTPS origin")
 			}
@@ -534,18 +575,50 @@ func joinAddress(host string, port int) string {
 }
 
 type doHSession struct {
-	client       *http.Client
-	transport    *http.Transport
-	endpoint     string
-	queryOptions QueryOptions
-	mu           sync.RWMutex
-	dialAddr     string
+	client          *http.Client
+	transport       *http.Transport
+	endpoint        string
+	queryOptions    QueryOptions
+	mu              sync.RWMutex
+	dialAddr        string
+	connections     uint64
+	lastReconnected bool
 }
 
-func (s *doHSession) setDialAddress(address string) {
+// recordConnection is called from the transport dial hook, which runs on the
+// http.Transport's own goroutines, once per newly opened HTTPS connection.
+func (s *doHSession) recordConnection(address string) {
 	s.mu.Lock()
 	s.dialAddr = address
+	s.connections++
 	s.mu.Unlock()
+}
+
+// beginQuery resets the per-query reconnect state and returns the number of
+// connections opened so far, so the query can tell whether it had to open one.
+func (s *doHSession) beginQuery() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReconnected = false
+	return s.connections
+}
+
+// endQuery records whether the exchange had to replace a connection that the
+// session had already established. The very first connection is opened lazily
+// by the first exchange and is the DoH analogue of the dial the stream
+// transports perform in Open, so it is not counted as a reconnect.
+func (s *doHSession) endQuery(connectionsBefore uint64) {
+	s.mu.Lock()
+	s.lastReconnected = connectionsBefore > 0 && s.connections > connectionsBefore
+	s.mu.Unlock()
+}
+
+// LastQueryReconnected reports whether the most recent Query had to open a
+// fresh HTTPS connection after the previous one was dropped.
+func (s *doHSession) LastQueryReconnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastReconnected
 }
 
 func (s *doHSession) DialAddress() string {
@@ -555,6 +628,7 @@ func (s *doHSession) DialAddress() string {
 }
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	connectionsBefore := s.beginQuery()
 	query := newQuery(name, qtype, 0, true, s.queryOptions)
 	packed, err := packSessionQuery(query)
 	if err != nil {
@@ -567,17 +641,20 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	request.Header.Set("Accept", "application/dns-message")
 	request.Header.Set("Content-Type", "application/dns-message")
 	response, err := s.client.Do(request)
+	s.endQuery(connectionsBefore)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH HTTP status %s", response.Status)
 	}
 	if contentType := response.Header.Get("Content-Type"); contentType != "" && !strings.Contains(strings.ToLower(contentType), "application/dns-message") {
+		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH returned content type %q", contentType)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(response.Body, doHMaxResponseBodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -589,6 +666,14 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 		return nil, err
 	}
 	return message, nil
+}
+
+// drainHTTPBody consumes a bounded amount of a response body that the caller
+// will not parse, so the keep-alive connection stays reusable instead of being
+// torn down after every rejected reply. The bound matches the parsed-body limit
+// so a hostile endpoint cannot make an error path read without end.
+func drainHTTPBody(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, doHMaxResponseBodyBytes))
 }
 
 func (s *doHSession) Close() error {
@@ -686,7 +771,7 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	if err != nil {
 		return nil, err
 	}
-	if len(packed) > 65535 {
+	if len(packed) > maxFramedMessage {
 		return nil, errors.New("DNS query exceeds DoQ message limit")
 	}
 	reconnecting := s.conn == nil
@@ -695,47 +780,19 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 		return nil, err
 	}
 	s.lastReconnected = reconnecting
+	// RFC 9250 gives every DoQ query its own stream, so the deadline belongs
+	// to the stream and the send side is closed once the request is written.
 	stream, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, s.fatal(err)
 	}
 	defer stream.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := stream.SetDeadline(deadline); err != nil {
-			return nil, s.fatal(err)
-		}
-	} else {
-		if err := stream.SetDeadline(time.Now().Add(s.timeout)); err != nil {
-			return nil, s.fatal(err)
-		}
-	}
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
-	if _, err := stream.Write(prefix[:]); err != nil {
+	if err := stream.SetDeadline(queryDeadline(ctx, s.timeout)); err != nil {
 		return nil, s.fatal(err)
 	}
-	if _, err := stream.Write(packed); err != nil {
-		return nil, s.fatal(err)
-	}
-	if err := stream.Close(); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := io.ReadFull(stream, prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	length := int(binary.BigEndian.Uint16(prefix[:]))
-	if length == 0 {
-		return nil, s.fatal(errors.New("empty DoQ response"))
-	}
-	responseBytes := make([]byte, length)
-	if _, err := io.ReadFull(stream, responseBytes); err != nil {
-		return nil, s.fatal(err)
-	}
-	response := new(dns.Msg)
-	if err := response.Unpack(responseBytes); err != nil {
-		return nil, s.fatal(fmt.Errorf("unpack DoQ response: %w", err))
-	}
-	if err := validateResponse(response, name, qtype, 0, true); err != nil {
+	framing := framedStream{stream: stream, closeSend: stream.Close, label: "DoQ"}
+	response, err := framing.query(packed, name, qtype, 0, true)
+	if err != nil {
 		return nil, s.fatal(err)
 	}
 	return response, nil
@@ -792,6 +849,70 @@ func (s *doqSession) Close() error {
 	return conn.CloseWithError(0, "")
 }
 
+// maxFramedMessage is the largest DNS message the two-byte length prefix can
+// describe, and therefore the size limit shared by TCP, DoT and DoQ framing.
+const maxFramedMessage = 65535
+
+// framedStream carries out the length-prefixed DNS exchange that TCP and DoT
+// (RFC 1035 section 4.2.2) and DoQ (RFC 9250 section 4.2) all use. Only the
+// framing lives here: connection lifecycle, deadlines and transaction ID
+// rules stay with the sessions, which handle them differently.
+type framedStream struct {
+	stream io.ReadWriter
+	// closeSend ends the client side of the stream once the request has been
+	// written. DoQ requires it; a reused TCP or DoT connection must leave the
+	// send side open for the next query, and so leaves this nil.
+	closeSend func() error
+	// label names the transport in framing errors.
+	label string
+}
+
+// query performs one framed exchange and returns the validated response.
+func (f framedStream) query(packed []byte, name string, qtype, queryID uint16, zeroID bool) (*dns.Msg, error) {
+	responseBytes, err := f.exchange(packed)
+	if err != nil {
+		return nil, err
+	}
+	response := new(dns.Msg)
+	if err := response.Unpack(responseBytes); err != nil {
+		return nil, fmt.Errorf("unpack %s response: %w", f.label, err)
+	}
+	if err := validateResponse(response, name, qtype, queryID, zeroID); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+// exchange writes one length-prefixed request and reads the length-prefixed
+// response bytes.
+func (f framedStream) exchange(packed []byte) ([]byte, error) {
+	var prefix [2]byte
+	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
+	if _, err := f.stream.Write(prefix[:]); err != nil {
+		return nil, err
+	}
+	if _, err := f.stream.Write(packed); err != nil {
+		return nil, err
+	}
+	if f.closeSend != nil {
+		if err := f.closeSend(); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := io.ReadFull(f.stream, prefix[:]); err != nil {
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(prefix[:]))
+	if length == 0 {
+		return nil, fmt.Errorf("empty %s response", f.label)
+	}
+	responseBytes := make([]byte, length)
+	if _, err := io.ReadFull(f.stream, responseBytes); err != nil {
+		return nil, err
+	}
+	return responseBytes, nil
+}
+
 func newQuery(name string, qtype, id uint16, padded bool, options QueryOptions) *dns.Msg {
 	query := &dns.Msg{
 		MsgHdr: dns.MsgHdr{
@@ -841,12 +962,15 @@ func packQuery(query *dns.Msg) ([]byte, error) {
 	return packed, nil
 }
 
-func setConnDeadline(conn net.Conn, ctx context.Context, timeout time.Duration) error {
+// queryDeadline bounds one framed exchange by the transport timeout, and by
+// the caller deadline when that is nearer. Stream and DoQ sessions share the
+// computation so a per-query budget cannot mean two different things.
+func queryDeadline(ctx context.Context, timeout time.Duration) time.Time {
 	deadline := time.Now().Add(timeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
-	return conn.SetDeadline(deadline)
+	return deadline
 }
 
 func validateResponse(response *dns.Msg, name string, qtype uint16, queryID uint16, zeroID bool) error {
@@ -881,7 +1005,7 @@ func ResponseClass(message *dns.Msg) string {
 	}
 	switch message.Rcode {
 	case dns.RcodeSuccess:
-		if len(message.Answer) == 0 && len(message.Ns) == 0 {
+		if !answersQuestion(message) {
 			return "nodata"
 		}
 		return "answer"
@@ -890,6 +1014,26 @@ func ResponseClass(message *dns.Msg) string {
 	default:
 		return fmt.Sprintf("rcode-%d", message.Rcode)
 	}
+}
+
+// answersQuestion reports whether the answer section carries a record of the
+// requested type. A canonical NODATA response is NOERROR with an empty answer
+// section and an SOA in the authority section, so authority records must never
+// be read as an answer: doing so collapses "this name has no such record" and
+// "here is the address" into one response class.
+func answersQuestion(message *dns.Msg) bool {
+	if len(message.Question) != 1 {
+		// validateResponse rejects any other shape before scoring, so this is
+		// only reachable for synthetic messages; fall back to answer presence.
+		return len(message.Answer) > 0
+	}
+	qtype := message.Question[0].Qtype
+	for _, answer := range message.Answer {
+		if answer.Header().Rrtype == qtype {
+			return true
+		}
+	}
+	return false
 }
 
 // ResponseCodeName returns the conventional DNS response-code name used in

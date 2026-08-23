@@ -100,7 +100,7 @@ resolvers:
         port: 53
       doh:
         port: 443
-        server_name: one.one.one.one
+        server_name: cloudflare-dns.com
         url: https://cloudflare-dns.com/dns-query
       dot:
         port: 853

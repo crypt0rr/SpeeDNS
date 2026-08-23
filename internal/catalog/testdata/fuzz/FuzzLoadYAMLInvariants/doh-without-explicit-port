@@ -1,0 +1,2 @@
+go test fuzz v1
+string("version: 1\nresolvers:\n  - id: doh\n    name: DoH\n    owner: Example\n    policy: unfiltered\n    addresses: [192.0.2.53]\n    transports:\n      doh:\n        url: https://dns.example/dns-query\n")

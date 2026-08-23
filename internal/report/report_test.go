@@ -8,6 +8,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
 )
 
 func TestJSONAndCSVExposeTargetMetadata(t *testing.T) {
@@ -71,11 +72,256 @@ func TestJSONIncludesAndRedactsRunProvenance(t *testing.T) {
 	}
 }
 
+// TestLocalResolverIsReportedAsNotComparable checks that every output surface
+// keeps the local stub's measurement while saying, in the same place, that the
+// number cannot be compared with a network resolver.
+func TestLocalResolverIsReportedAsNotComparable(t *testing.T) {
+	stub := reportTarget("53", catalog.UDP, 2, false)
+	stub.Target.Resolver.ID = "system-stub-127-0-0-53"
+	stub.Target.Resolver.Name = "System DNS stub"
+	stub.Target.Resolver.Owner = "local stub/forwarder"
+	stub.Target.Resolver.Policy = "local forwarding (upstream unknown)"
+	stub.Target.Resolver.Local = true
+	stub.Target.Address = "127.0.0.53"
+	stub.Stats.MedianMS = 0.2
+	network := reportTarget("1", catalog.UDP, 2, true)
+
+	run := benchmark.Report{
+		StartedAt: time.Unix(0, 0), FinishedAt: time.Unix(1, 0), Seed: 5, SampleSize: 1, Queries: 1,
+		QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{stub, network},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: network.Target.ID(), Rank: 1}},
+	}
+
+	if status := resultStatus(stub); status != "NOT COMPARABLE" {
+		t.Fatalf("local stub status = %q", status)
+	}
+	if status := resultStatus(network); status != "QUALIFIED" {
+		t.Fatalf("network resolver status = %q", status)
+	}
+	if rank := rankText(run, stub.Target.ID()); rank != "—" {
+		t.Fatalf("local stub rank = %q, want no rank", rank)
+	}
+
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	text := table.String()
+	if !strings.Contains(text, "NOT COMPARABLE") || !strings.Contains(text, "0.20 ms") {
+		t.Fatalf("table hid the local stub measurement or caveat: %s", text)
+	}
+	if !strings.Contains(text, "cache-hit latency excludes the upstream cost") {
+		t.Fatalf("table warnings missing the non-comparability reason: %s", text)
+	}
+	recommended, ok := recommendedResult(run, catalog.UDP)
+	if !ok || recommended.Target.ID() != network.Target.ID() {
+		t.Fatalf("recommendation = %#v/%v", recommended.Target, ok)
+	}
+
+	var jsonOutput bytes.Buffer
+	if err := WriteJSON(&jsonOutput, run, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jsonOutput.String(), "\"local\": true") {
+		t.Fatalf("JSON target missing the local flag: %s", jsonOutput.String())
+	}
+	if strings.Count(jsonOutput.String(), "\"local\":") != 1 {
+		t.Fatalf("network target should omit the local flag: %s", jsonOutput.String())
+	}
+
+	var csvOutput bytes.Buffer
+	if err := WriteCSV(&csvOutput, run); err != nil {
+		t.Fatal(err)
+	}
+	rows := strings.Split(strings.TrimSpace(csvOutput.String()), "\n")
+	if len(rows) != 3 {
+		t.Fatalf("CSV rows = %d, want 3: %s", len(rows), csvOutput.String())
+	}
+	// Locate the column by name: new columns are appended over time, so an
+	// assertion tied to the last position breaks for unrelated reasons.
+	header := strings.Split(rows[0], ",")
+	local := -1
+	for index, name := range header {
+		if name == "local" {
+			local = index
+		}
+	}
+	if local < 0 {
+		t.Fatalf("CSV header missing the local column: %s", rows[0])
+	}
+	for row, want := range map[int]string{1: "true", 2: "false"} {
+		fields := strings.Split(rows[row], ",")
+		if len(fields) <= local || fields[local] != want {
+			t.Fatalf("CSV local column in row %d = %#v, want %q", row, fields, want)
+		}
+	}
+}
+
 func TestDurationMillisecondsRejectsInvalidRanges(t *testing.T) {
 	if got := durationMilliseconds(time.Time{}, time.Now()); got != 0 {
 		t.Fatalf("zero start duration = %v, want zero", got)
 	}
 	if got := durationMilliseconds(time.Unix(2, 0), time.Unix(1, 0)); got != 0 {
 		t.Fatalf("reverse duration = %v, want zero", got)
+	}
+}
+
+// Columns are padded by terminal cells, so every column following a wide, a
+// fullwidth or a combining-mark owner name must still start at one offset.
+func TestAlignedTableAlignsByDisplayWidth(t *testing.T) {
+	headers := []string{"Owner", "Address", "Status"}
+	rows := [][]string{
+		{"東京", "192.0.2.1", "QUALIFIED"},
+		{"ＡＢＣ", "192.0.2.2", "FAILED"},
+		{"e\u0301clair", "192.0.2.3", "INELIGIBLE"},
+		{"plain-ascii", "192.0.2.4", "QUALIFIED"},
+	}
+	var output bytes.Buffer
+	if err := writeAlignedTable(&output, headers, rows); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != len(rows)+1 {
+		t.Fatalf("table lines = %d, want %d: %q", len(lines), len(rows)+1, output.String())
+	}
+	offset := -1
+	for _, line := range lines {
+		column := strings.Index(line, "192.0.2.")
+		if column < 0 {
+			column = strings.Index(line, "Address")
+		}
+		cells := textwidth.Display(line[:column])
+		if offset < 0 {
+			offset = cells
+		}
+		if cells != offset {
+			t.Fatalf("address column starts at cell %d, want %d: %q", cells, offset, line)
+		}
+		if strings.HasSuffix(line, " ") {
+			t.Fatalf("trailing column was padded: %q", line)
+		}
+	}
+	// "plain-ascii" is the widest owner at eleven cells, so the two-cell
+	// margin plus the owner plus two padding cells start addresses at cell 15.
+	if offset != 15 {
+		t.Fatalf("address column offset = %d, want 15", offset)
+	}
+}
+
+// styledStatus cells carry zero-width ANSI codes; they must not widen a column.
+func TestAlignedTableIgnoresColourCodesInWidths(t *testing.T) {
+	var plain, coloured bytes.Buffer
+	headers := []string{"Status", "Owner", "Note"}
+	if err := writeAlignedTable(&plain, headers, [][]string{{styledStatus("FAILED", false), "owner", "note"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAlignedTable(&coloured, headers, [][]string{{styledStatus("FAILED", true), "owner", "note"}}); err != nil {
+		t.Fatal(err)
+	}
+	stripped := strings.ReplaceAll(coloured.String(), ansiRed, "")
+	stripped = strings.ReplaceAll(stripped, ansiReset, "")
+	if stripped != plain.String() {
+		t.Fatalf("coloured table = %q, want %q once the codes are removed", stripped, plain.String())
+	}
+}
+
+func lineContaining(t *testing.T, text string, needle string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	t.Fatalf("no line containing %q in:\n%s", needle, text)
+	return ""
+}
+
+func tieTableReport() benchmark.Report {
+	leader := reportTarget("tie-leader", catalog.UDP, 25, true)
+	leader.Stats.Tie = true
+	challenger := reportTarget("tie-challenger", catalog.UDP, 25, true)
+	challenger.Stats.Tie = true
+	distinct := reportTarget("distinct", catalog.TCP, 25, true)
+	return benchmark.Report{
+		Seed: 42, SampleSize: 2, Queries: 2, QueryTypes: []uint16{1},
+		Targets: []benchmark.TargetResult{leader, challenger, distinct},
+		Rankings: []benchmark.Ranking{
+			{Protocol: catalog.UDP, TargetID: leader.Target.ID(), Rank: 1, Tie: true},
+			{Protocol: catalog.UDP, TargetID: challenger.Target.ID(), Rank: 2, Tie: true},
+			{Protocol: catalog.TCP, TargetID: distinct.Target.ID(), Rank: 1},
+		},
+	}
+}
+
+func TestTableSurfacesConfidenceIntervalTies(t *testing.T) {
+	var output bytes.Buffer
+	if err := WriteTableWithOptions(&output, tieTableReport(), TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(lineContaining(t, text, "Rank"), "Tie") {
+		t.Fatalf("comparison header lost the Tie column:\n%s", text)
+	}
+	if recommendation := lineContaining(t, text, "RECOMMENDED"); !strings.Contains(recommendation, "TIED") {
+		t.Fatalf("tied recommended winner is presented as unqualified: %q", recommendation)
+	}
+	if !strings.Contains(text, "TIED: the 95% score confidence interval overlaps another ranked target") {
+		t.Fatalf("tie explanation missing from recommendation block:\n%s", text)
+	}
+	for _, owner := range []string{"Owner tie-leader", "Owner tie-challenger"} {
+		if row := lineContaining(t, text, owner); !strings.Contains(row, "TIED") {
+			t.Fatalf("comparison row for %s hides the tie: %q", owner, row)
+		}
+	}
+	if row := lineContaining(t, text, "Owner distinct"); strings.Contains(row, "TIED") {
+		t.Fatalf("untied target marked as tied: %q", row)
+	}
+}
+
+func TestTableTieMarkerIsColoredAndOmittedWhenAbsent(t *testing.T) {
+	var colored bytes.Buffer
+	if err := WriteTableWithOptions(&colored, tieTableReport(), TableOptions{Color: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(colored.String(), ansiYellow+"TIED"+ansiReset) {
+		t.Fatalf("TIED rendered without color emphasis:\n%s", colored.String())
+	}
+
+	untied := tieTableReport()
+	for index := range untied.Targets {
+		untied.Targets[index].Stats.Tie = false
+	}
+	for index := range untied.Rankings {
+		untied.Rankings[index].Tie = false
+	}
+	var plain bytes.Buffer
+	if err := WriteTableWithOptions(&plain, untied, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plain.String(), "TIED") {
+		t.Fatalf("untied report claims a tie:\n%s", plain.String())
+	}
+}
+
+func TestTableFlagsTiedProvisionalWinnerAndPropagatesNoteError(t *testing.T) {
+	provisional := reportTarget("tie-provisional", catalog.UDP, 1, false)
+	provisional.Stats.Tie = true
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{provisional},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: provisional.Target.ID(), Rank: 1, Tie: true}},
+	}
+	var output bytes.Buffer
+	if err := WriteTableWithOptions(&output, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if provisionalRow := lineContaining(t, output.String(), "PROVISIONAL"); !strings.Contains(provisionalRow, "TIED") {
+		t.Fatalf("tied provisional winner hides the tie: %q", provisionalRow)
+	}
+	if !strings.Contains(output.String(), "TIED: the 95% score confidence interval") {
+		t.Fatalf("tie explanation missing for provisional winner:\n%s", output.String())
+	}
+	if err := WriteTableWithOptions(contentFailWriter{needle: "TIED: the"}, run, TableOptions{}); err == nil {
+		t.Fatal("tie note write failure was not returned")
 	}
 }

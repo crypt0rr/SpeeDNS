@@ -119,6 +119,30 @@ func validBenchmarkOptions() Options {
 	}
 }
 
+// useTargetSeam selects the legacy target-level scheduler and installs seam as
+// its runTargetFunc hook. Selecting the scheduler explicitly keeps a
+// whole-target fake from silently deciding which scheduler is measured.
+func useTargetSeam(t *testing.T, seam func(context.Context, catalog.Target, []Query, Options) TargetResult) {
+	t.Helper()
+	oldScheduler := runProtocol
+	oldTarget := runTargetFunc
+	t.Cleanup(func() {
+		runProtocol = oldScheduler
+		runTargetFunc = oldTarget
+	})
+	runProtocol = runProtocolLegacy
+	runTargetFunc = seam
+}
+
+// useFairScheduler selects the scheduler the binary ships, so a test asserts
+// production behaviour rather than the legacy target-level path.
+func useFairScheduler(t *testing.T) {
+	t.Helper()
+	oldScheduler := runProtocol
+	t.Cleanup(func() { runProtocol = oldScheduler })
+	runProtocol = runProtocolFair
+}
+
 func TestRunValidationAndQueryConstruction(t *testing.T) {
 	base := validBenchmarkOptions()
 	cases := []struct {
@@ -172,12 +196,10 @@ func TestRunValidationAndQueryConstruction(t *testing.T) {
 }
 
 func TestRunAndProtocolScheduling(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
 	var progress []Progress
-	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 2, ResponseClass: "answer"}}}
-	}
+	})
 	opts := validBenchmarkOptions()
 	opts.OnProgress = func(p Progress) { progress = append(progress, p) }
 	targets := []catalog.Target{testTarget(catalog.TCP, "two"), testTarget(catalog.UDP, "one")}
@@ -197,8 +219,8 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 			t.Fatalf("progress[%d] phase = %q, want %q", index, progress[index].Phase, want)
 		}
 	}
-	if progress[0].Protocol != catalog.TCP || progress[3].Protocol != catalog.UDP {
-		t.Fatalf("progress protocol order = %#v/%#v, want tcp then udp", progress[0].Protocol, progress[3].Protocol)
+	if progress[0].Protocol != catalog.UDP || progress[3].Protocol != catalog.TCP {
+		t.Fatalf("progress protocol order = %#v/%#v, want udp then tcp", progress[0].Protocol, progress[3].Protocol)
 	}
 	if _, ok := report.ResultFor(report.Targets[0].Target.ID()); !ok {
 		t.Fatal("ResultFor did not find an existing result")
@@ -247,7 +269,7 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 		cancel()
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1}}}
 	}
-	cancelledTargets := []catalog.Target{testTarget(catalog.TCP, "cancel-first"), testTarget(catalog.UDP, "not-dispatched")}
+	cancelledTargets := []catalog.Target{testTarget(catalog.UDP, "cancel-first"), testTarget(catalog.TCP, "not-dispatched")}
 	cancelledReport, err := Run(ctx, cancelledTargets, opts)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
@@ -266,12 +288,8 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 
 func TestFairProgressEventsCoverPreparationAndFailedExchanges(t *testing.T) {
 	oldFactory := newFactory
-	oldTarget := runTargetFunc
-	t.Cleanup(func() {
-		newFactory = oldFactory
-		runTargetFunc = oldTarget
-	})
-	runTargetFunc = runTarget
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 	var opens int
 	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		opens++
@@ -319,12 +337,8 @@ func TestFairProgressEventsCoverPreparationAndFailedExchanges(t *testing.T) {
 
 func TestFairProgressEventsReportOpenFailures(t *testing.T) {
 	oldFactory := newFactory
-	oldTarget := runTargetFunc
-	t.Cleanup(func() {
-		newFactory = oldFactory
-		runTargetFunc = oldTarget
-	})
-	runTargetFunc = runTarget
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		return nil, errors.New("fixture open failed")
 	}
@@ -354,13 +368,9 @@ func TestFairProgressEventsReportOpenFailures(t *testing.T) {
 }
 
 func TestFairProtocolSchedulingIsOrderIndependent(t *testing.T) {
-	oldTarget := runTargetFunc
 	oldFactory := newFactory
-	t.Cleanup(func() {
-		runTargetFunc = oldTarget
-		newFactory = oldFactory
-	})
-	runTargetFunc = runTarget
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 
 	targets := []catalog.Target{
 		testTarget(catalog.UDP, "one"),
@@ -478,12 +488,9 @@ func TestFairProtocolSchedulingIsOrderIndependent(t *testing.T) {
 }
 
 func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
-	oldTarget := runTargetFunc
 	oldFactory := newFactory
-	t.Cleanup(func() {
-		runTargetFunc = oldTarget
-		newFactory = oldFactory
-	})
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 	target := testTarget(catalog.UDP, "edge")
 	query := Query{Name: "edge.example", QType: dns.TypeA}
 	opts := Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1}
@@ -494,11 +501,12 @@ func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
 		t.Fatalf("empty fair protocol results = %#v", got)
 	}
 
-	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+	// The legacy scheduler clamps its worker pool to the target count.
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1, ResponseClass: "answer"}}}
-	}
+	})
 	runProtocol(context.Background(), []catalog.Target{target}, []Query{query}, Options{Concurrency: 5})
-	runTargetFunc = runTarget
+	useFairScheduler(t)
 
 	runQueryRound(context.Background(), nil, query, 1)
 	readyRunner := &targetRunner{
@@ -583,14 +591,12 @@ func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
 }
 
 func TestRunNoComparableReportsRetainUnavailableTargets(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
-	runTargetFunc = func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
 		return TargetResult{
 			Target: target, OpenError: "connection refused",
 			Observations: failedObservations(queries, errors.New("connection refused")),
 		}
-	}
+	})
 	opts := validBenchmarkOptions()
 	opts.Domains = []string{"example.com"}
 	opts.QueryTypes = []uint16{dns.TypeA}
@@ -602,16 +608,14 @@ func TestRunNoComparableReportsRetainUnavailableTargets(t *testing.T) {
 	if report.FinishedAt.IsZero() || len(report.Targets) != len(targets) || len(report.Rankings) != 0 {
 		t.Fatalf("unavailable report metadata/results = %#v", report)
 	}
-	joined := strings.Join(report.Warnings, "\n")
+	joined := warningText(report.Warnings)
 	if !strings.Contains(joined, "connection refused") || !strings.Contains(joined, "failed queries") {
 		t.Fatalf("unavailable report warnings = %#v", report.Warnings)
 	}
 }
 
 func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
-	runTargetFunc = func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
 		observations := make([]Observation, 0, len(queries))
 		for _, query := range queries {
 			observations = append(observations, Observation{
@@ -620,7 +624,7 @@ func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
 			})
 		}
 		return TargetResult{Target: target, Observations: observations}
-	}
+	})
 	opts := validBenchmarkOptions()
 	opts.Domains = []string{"example.com"}
 	opts.QueryTypes = []uint16{dns.TypeA}
@@ -632,15 +636,14 @@ func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
 	if report.FinishedAt.IsZero() || len(report.Targets) != len(targets) || len(report.Rankings) != 0 {
 		t.Fatalf("unusable-response report metadata/results = %#v", report)
 	}
-	joined := strings.Join(report.Warnings, "\n")
+	joined := warningText(report.Warnings)
 	if !strings.Contains(joined, "unusable DNS responses") || !strings.Contains(joined, "SERVFAIL:1") {
 		t.Fatalf("unusable-response report warnings = %#v", report.Warnings)
 	}
 }
 
 func TestRunProtocolCancellationBeforeDispatch(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
+	useFairScheduler(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	results := runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "one")}, nil, Options{Concurrency: 5})
@@ -854,8 +857,10 @@ func TestBootstrapUsesCompleteOutcomesAndTargetIdentity(t *testing.T) {
 	if bootstrapSeed(42, "one@192.0.2.1/udp") == bootstrapSeed(42, "two@192.0.2.2/udp") {
 		t.Fatal("distinct target identities reused a bootstrap seed")
 	}
-	if got := scoreFromSamples([]scoreSample{{success: false}}, 2000); got != 4000 {
-		t.Fatalf("all-failure bootstrap score = %v, want 4000", got)
+	// An all-failure replicate scores the timeout penalty itself, which is
+	// exactly scoreFromLatencies with no latency term and a failure rate of 1.
+	if got := scoreFromSamples([]scoreSample{{success: false}}, 2000); got != 2000 {
+		t.Fatalf("all-failure bootstrap score = %v, want 2000", got)
 	}
 }
 
@@ -865,7 +870,7 @@ func TestIncompleteTargetsAreExcludedFromRankings(t *testing.T) {
 	if rankings := makeRankings([]TargetResult{result}); len(rankings) != 0 {
 		t.Fatalf("incomplete target was ranked: %#v", rankings)
 	}
-	if warnings := collectWarnings([]TargetResult{result}); len(warnings) != 1 || !strings.Contains(warnings[0], "excluded from ranking") {
+	if warnings := collectWarnings([]TargetResult{result}); len(warnings) != 1 || !strings.Contains(warnings[0].String(), "excluded from ranking") {
 		t.Fatalf("incomplete target warnings = %#v", warnings)
 	}
 }
@@ -903,6 +908,32 @@ func TestRunTargetRecordsReconnectDiagnostics(t *testing.T) {
 	stats := calculateStatistics(result, time.Second, 42)
 	if stats.Reconnects != 1 || stats.Scored != 0 {
 		t.Fatalf("reconnect statistics = %#v", stats)
+	}
+}
+
+// TestRunTargetExcludesDoHReconnectFromWarmScoring covers the DoH session
+// shape: the flag is reported per query, so only the query that paid for a
+// fresh HTTPS connection is excluded from warm-latency scoring.
+func TestRunTargetExcludesDoHReconnectFromWarmScoring(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	warm := &fakeSession{}
+	warm.query = func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		warm.reconnected = name == "dropped.example"
+		return replyFor(name, qtype), nil
+	}
+	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
+	queries := []Query{{Name: "kept.example", QType: dns.TypeA}, {Name: "dropped.example", QType: dns.TypeA}}
+	result := runTarget(context.Background(), testTarget(catalog.DoH, "doh-reconnect"), queries, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(result.Observations) != 2 || result.Observations[0].Reconnected || !result.Observations[1].Reconnected {
+		t.Fatalf("DoH reconnect observations = %#v", result.Observations)
+	}
+	stats := calculateStatistics(result, time.Second, 42)
+	if stats.Reconnects != 1 || stats.Scored != 1 {
+		t.Fatalf("DoH reconnect statistics = %#v", stats)
 	}
 }
 
@@ -1214,3 +1245,178 @@ type reportedSession struct {
 }
 
 func (s *reportedSession) DialAddress() string { return s.address }
+
+// warningText renders warnings for substring assertions in tests that only care
+// about the message content.
+func warningText(warnings []Warning) string {
+	lines := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		lines = append(lines, warning.String())
+	}
+	return strings.Join(lines, "\n")
+}
+
+func TestBootstrapUpperBoundStaysInsideScoreRange(t *testing.T) {
+	timeout := 2 * time.Second
+	timeoutMS := durationMS(timeout)
+	// One success and four scoring failures. Roughly a third of the bootstrap
+	// replicates draw no success at all, so an out-of-range all-failure
+	// sentinel would surface directly in the reported upper bound.
+	samples := []scoreSample{
+		{latencyMS: 10, success: true},
+		{success: false},
+		{success: false},
+		{success: false},
+		{success: false},
+	}
+	seed := bootstrapSeed(42, "failing@192.0.2.9/udp")
+	low, high := bootstrapCI(samples, timeout, seed)
+	// The score function cannot exceed the worst observed latency plus the
+	// full timeout penalty, so no replicate of it may either.
+	maxScore := 10 + timeoutMS
+	if low < 0 || high > maxScore {
+		t.Fatalf("bootstrap interval [%v, %v] left the score range [0, %v]", low, high, maxScore)
+	}
+	if high != timeoutMS {
+		t.Fatalf("all-failure replicates scored %v, want the timeout penalty %v", high, timeoutMS)
+	}
+	repeatLow, repeatHigh := bootstrapCI(samples, timeout, seed)
+	if repeatLow != low || repeatHigh != high {
+		t.Fatalf("seeded bootstrap bounds changed between runs: %v/%v != %v/%v", repeatLow, repeatHigh, low, high)
+	}
+}
+
+func TestPrepareTargetsEdges(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+
+	// An unset concurrency still prepares one target at a time.
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return nil, errors.New("fixture open failed")
+	}
+	runners, dispatched := prepareTargets(context.Background(), []catalog.Target{testTarget(catalog.UDP, "solo")}, nil, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(runners) != 1 || !dispatched[0] || runners[0].result.OpenError == "" {
+		t.Fatalf("unbounded-concurrency preparation = %#v/%#v", runners, dispatched)
+	}
+
+	// Cancelling while the only worker is still opening a session stops
+	// dispatching, so later targets never get a runner at all.
+	released := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
+			once.Do(func() { close(started) })
+			<-released
+			return nil, errors.New("preparation interrupted")
+		}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocked := []catalog.Target{testTarget(catalog.UDP, "blocked-first"), testTarget(catalog.UDP, "never-dispatched")}
+	go func() {
+		<-started
+		cancel()
+		time.Sleep(10 * time.Millisecond)
+		close(released)
+	}()
+	runners, dispatched = prepareTargets(ctx, blocked, nil, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1})
+	if !dispatched[0] || dispatched[1] || runners[1] != nil {
+		t.Fatalf("cancelled preparation dispatched too much: %#v/%#v", runners, dispatched)
+	}
+}
+
+func TestPreparationIsConcurrentBoundedAndDeterministic(t *testing.T) {
+	oldTarget := runTargetFunc
+	oldFactory := newFactory
+	t.Cleanup(func() {
+		runTargetFunc = oldTarget
+		newFactory = oldFactory
+	})
+	runTargetFunc = runTarget
+
+	targets := []catalog.Target{
+		testTarget(catalog.UDP, "one"),
+		testTarget(catalog.UDP, "two"),
+		testTarget(catalog.UDP, "three"),
+		testTarget(catalog.UDP, "four"),
+	}
+	opts := validBenchmarkOptions()
+	opts.Domains = []string{"a.example", "b.example"}
+	opts.QueryTypes = []uint16{dns.TypeA}
+	opts.Sample = 2
+	opts.Concurrency = 2
+	opts.Seed = 99
+
+	run := func() (Report, int) {
+		var mu sync.Mutex
+		active := 0
+		maxActive := 0
+		// Cold probes and warm-ups use warmupNames; the measured matrix uses
+		// ".example" names. Counting only the former measures how many targets
+		// are being prepared at the same instant.
+		preparationSession := func() *fakeSession {
+			return &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+				if !strings.HasSuffix(name, ".example") {
+					mu.Lock()
+					active++
+					if active > maxActive {
+						maxActive = active
+					}
+					mu.Unlock()
+					time.Sleep(5 * time.Millisecond)
+					mu.Lock()
+					active--
+					mu.Unlock()
+				}
+				return replyFor(name, qtype), nil
+			}}
+		}
+		factories := make(map[string]transport.Factory, len(targets))
+		for _, target := range targets {
+			factories[target.Address] = &fakeFactory{opens: []fakeOpen{
+				{session: preparationSession()},
+				{session: preparationSession()},
+				{session: preparationSession()},
+				{session: preparationSession()},
+			}}
+		}
+		newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+			return factories[target.Address], nil
+		}
+		report, err := Run(context.Background(), targets, opts)
+		if err != nil {
+			t.Fatalf("prepared run failed: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return report, maxActive
+	}
+
+	shape := func(report Report) []string {
+		lines := make([]string, 0, len(report.Targets))
+		for _, result := range report.Targets {
+			parts := []string{result.Target.ID()}
+			for _, observation := range result.Observations {
+				parts = append(parts, observation.Name+"/"+QueryTypeName(observation.QType))
+			}
+			lines = append(lines, strings.Join(parts, " "))
+		}
+		return lines
+	}
+
+	first, firstMax := run()
+	second, secondMax := run()
+	if firstMax > opts.Concurrency || secondMax > opts.Concurrency {
+		t.Fatalf("preparation concurrency exceeded limit: %d/%d > %d", firstMax, secondMax, opts.Concurrency)
+	}
+	if firstMax < 2 || secondMax < 2 {
+		t.Fatalf("preparation stayed sequential: %d/%d, want up to %d targets prepared at once", firstMax, secondMax, opts.Concurrency)
+	}
+	if len(first.Targets) != len(targets) {
+		t.Fatalf("prepared results = %d, want %d", len(first.Targets), len(targets))
+	}
+	if !reflect.DeepEqual(shape(first), shape(second)) {
+		t.Fatalf("seeded run was not deterministic: %#v != %#v", shape(first), shape(second))
+	}
+}

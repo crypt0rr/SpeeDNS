@@ -118,13 +118,36 @@ func parseLatencyMilliseconds(value string) (float64, error) {
 	return threshold, nil
 }
 
+// validateAssertionTargets rejects a winner assertion whose ID matches none of
+// the targets selected for the run. Without this check a mistyped profile or
+// target ID is reported as a lost benchmark instead of the invalid input it
+// is, telling the user their resolver did not win when it was never measured.
+func validateAssertionTargets(assertions []assertion, targets []catalog.Target) error {
+	for _, check := range assertions {
+		if check.kind != winnerAssertion {
+			continue
+		}
+		matched := false
+		for _, target := range targets {
+			if targetMatchesID(target, check.winner) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("invalid --assert %q: no selected resolver matches %q; use a profile id such as the ones listed by \"speedns resolvers\" or a target id", check.raw, check.winner)
+		}
+	}
+	return nil
+}
+
 func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 	if len(assertions) == 0 {
 		return nil
 	}
 	reasons := make([]string, 0)
+	winners := reportWinners(report)
 	for _, check := range assertions {
-		winners := reportWinners(report)
 		if len(winners) == 0 {
 			reasons = append(reasons, fmt.Sprintf("%s has no ranked protocol winners", check.raw))
 			continue
@@ -188,7 +211,11 @@ func winnerProtocols(winners map[catalog.Protocol][]benchmark.TargetResult) []ca
 }
 
 func winnerMatches(result benchmark.TargetResult, expected string) bool {
-	return result.Target.ID() == expected || result.Target.Resolver.ID == expected
+	return targetMatchesID(result.Target, expected)
+}
+
+func targetMatchesID(target catalog.Target, expected string) bool {
+	return target.ID() == expected || target.Resolver.ID == expected
 }
 
 func assertionMetricValue(result benchmark.TargetResult, metric string) (float64, bool) {

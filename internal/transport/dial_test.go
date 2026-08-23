@@ -9,12 +9,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -535,6 +538,52 @@ func TestDoQFactoryRetriesAfterCandidateTimeout(t *testing.T) {
 	_ = session.Close()
 }
 
+func TestDoHRedirectLoopStopsAtHopLimit(t *testing.T) {
+	const serverName = "dns.example"
+	certificate, roots := testServerCertificate(t, serverName)
+	var hits atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		hits.Add(1)
+		http.Redirect(writer, request, "/dns-query", http.StatusFound)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	oldTLSConfig := newDoHTLSConfig
+	newDoHTLSConfig = func(name string) *tls.Config {
+		return &tls.Config{MinVersion: tls.VersionTLS12, ServerName: name, RootCAs: roots}
+	}
+	t.Cleanup(func() { newDoHTLSConfig = oldTLSConfig })
+
+	factory, err := newDoHFactory(catalog.Target{Address: "192.0.2.53", Spec: catalog.TransportSpec{
+		URL:                "https://dns.example/dns-query",
+		Port:               server.Listener.Addr().(*net.TCPAddr).Port,
+		ServerName:         serverName,
+		BootstrapAddresses: []string{"127.0.0.1"},
+	}}, 10*time.Second, QueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	_, err = session.Query(context.Background(), "example.com", dns.TypeA)
+	if err == nil {
+		t.Fatal("redirect loop unexpectedly produced a response")
+	}
+	want := fmt.Sprintf("DoH stopped after %d redirects", doHMaxRedirects)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("redirect loop error = %v, want one containing %q", err, want)
+	}
+	if got := hits.Load(); got != int64(doHMaxRedirects) {
+		t.Fatalf("redirect loop server hits = %d, want %d", got, doHMaxRedirects)
+	}
+}
+
 func TestDoHRedirectRequiresHTTPSOrigin(t *testing.T) {
 	factory, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second, QueryOptions{})
 	if err != nil {
@@ -566,5 +615,120 @@ func TestDoHRedirectRequiresHTTPSOrigin(t *testing.T) {
 				t.Fatalf("redirect %s error = %v", tc.url, err)
 			}
 		})
+	}
+}
+
+// TestDoHSessionReportsReconnectPerQuery pins the DoH reconnect semantics to
+// the stream and DoQ ones: the session's first connection is not a reconnect,
+// a connection that replaces a dropped one is, and the flag is per query.
+func TestDoHSessionReportsReconnectPerQuery(t *testing.T) {
+	const serverName = "dns.example"
+	certificate, roots := testServerCertificate(t, serverName)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsListener := tls.NewListener(listener, &tls.Config{Certificates: []tls.Certificate{certificate}})
+	requests := 0
+	server := &http.Server{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(body); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		response, err := replyFor(query.Question[0].Name, query.Question[0].Qtype, 0).Pack()
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		requests++
+		if requests == 1 {
+			// Drop the connection the way an idle-timing-out endpoint does, so
+			// the next query pays a fresh TCP and TLS handshake.
+			writer.Header().Set("Connection", "close")
+		}
+		writer.Header().Set("Content-Type", "application/dns-message")
+		_, _ = writer.Write(response)
+	})}
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Serve(tlsListener) }()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = tlsListener.Close()
+		select {
+		case <-serverDone:
+		case <-time.After(time.Second):
+			t.Error("DoH TLS fixture did not stop")
+		}
+	})
+
+	oldTLSConfig := newDoHTLSConfig
+	newDoHTLSConfig = func(name string) *tls.Config {
+		return &tls.Config{MinVersion: tls.VersionTLS12, ServerName: name, RootCAs: roots}
+	}
+	t.Cleanup(func() { newDoHTLSConfig = oldTLSConfig })
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	factory, err := newDoHFactory(catalog.Target{Address: "192.0.2.53", Spec: catalog.TransportSpec{
+		URL:                "https://dns.example/dns-query",
+		Port:               port,
+		ServerName:         serverName,
+		BootstrapAddresses: []string{"127.0.0.1"},
+	}}, 5*time.Second, QueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	dohSession := session.(*doHSession)
+	if dohSession.LastQueryReconnected() {
+		t.Fatal("unused DoH session reported a reconnect")
+	}
+
+	if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err != nil {
+		t.Fatal(err)
+	}
+	if dohSession.LastQueryReconnected() {
+		t.Fatal("first DoH query was marked as a reconnect")
+	}
+	if got := dohSession.DialAddress(); got != listener.Addr().String() {
+		t.Fatalf("DoH dial address = %q, want %q", got, listener.Addr().String())
+	}
+
+	if _, err := session.Query(context.Background(), "example.org", dns.TypeA); err != nil {
+		t.Fatal(err)
+	}
+	if !dohSession.LastQueryReconnected() {
+		t.Fatal("DoH query after a dropped connection did not report a reconnect")
+	}
+
+	if _, err := session.Query(context.Background(), "example.net", dns.TypeA); err != nil {
+		t.Fatal(err)
+	}
+	if dohSession.LastQueryReconnected() {
+		t.Fatal("DoH query on the reused connection reported a reconnect")
+	}
+}
+
+// TestDoHSessionQueryFailureBeforeDialClearsReconnect keeps the reconnect flag
+// per query even when the exchange never reaches the network.
+func TestDoHSessionQueryFailureBeforeDialClearsReconnect(t *testing.T) {
+	session := &doHSession{endpoint: "https://dns.example/dns-query", lastReconnected: true}
+	oldPack := packSessionQuery
+	packSessionQuery = func(*dns.Msg) ([]byte, error) { return nil, errors.New("pack failed") }
+	t.Cleanup(func() { packSessionQuery = oldPack })
+	if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err == nil {
+		t.Fatal("expected DoH pack failure")
+	}
+	if session.LastQueryReconnected() {
+		t.Fatal("DoH query that never dialed kept a stale reconnect flag")
 	}
 }

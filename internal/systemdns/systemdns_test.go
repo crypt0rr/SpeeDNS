@@ -4,9 +4,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 )
 
 type testReadCloser struct {
@@ -181,19 +187,91 @@ func TestDiscoverMacOSScutilTimeoutFallsBack(t *testing.T) {
 	}
 }
 
-func TestSystemSourceHelpers(t *testing.T) {
-	if reader, err := originalOpenResolvConf(); err == nil {
-		_ = reader.Close()
+func TestOpenResolvConfReadsTheConfiguredPath(t *testing.T) {
+	oldPath := resolvConfPath
+	oldOpen := openResolvConf
+	t.Cleanup(func() {
+		resolvConfPath = oldPath
+		openResolvConf = oldOpen
+	})
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	contents := "# fixture\nnameserver 192.0.2.42\nnameserver 2001:db8::42\noptions edns0\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, _ = originalRunScutil(ctx)
+	resolvConfPath = path
 
+	reader, err := originalOpenResolvConf()
+	if err != nil {
+		t.Fatalf("open fixture resolv.conf = %v", err)
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read fixture resolv.conf = %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close fixture resolv.conf = %v", err)
+	}
+	if string(raw) != contents {
+		t.Fatalf("fixture resolv.conf contents = %q", string(raw))
+	}
+
+	openResolvConf = originalOpenResolvConf
+	addresses, err := discoverResolvConf()
+	if err != nil || len(addresses) != 2 || addresses[0] != "192.0.2.42" || addresses[1] != "2001:db8::42" {
+		t.Fatalf("discoverResolvConf over the fixture = %#v/%v", addresses, err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "absent.conf")
+	resolvConfPath = missing
+	if _, err := discoverResolvConf(); err == nil || !strings.Contains(err.Error(), "open "+missing) {
+		t.Fatalf("missing resolv.conf error = %v", err)
+	}
+}
+
+func TestScutilCommandQueriesDNSConfiguration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	command := scutilCommand(ctx)
+	if base := filepath.Base(command.Path); base != "scutil" {
+		t.Fatalf("scutil command path = %q", command.Path)
+	}
+	if len(command.Args) != 2 || command.Args[0] != "scutil" || command.Args[1] != "--dns" {
+		t.Fatalf("scutil command args = %#v", command.Args)
+	}
+}
+
+func TestRunScutilReportsCommandFailures(t *testing.T) {
+	oldCommand := scutilCommand
+	t.Cleanup(func() { scutilCommand = oldCommand })
+	absent := filepath.Join(t.TempDir(), "absent-scutil")
+	scutilCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, absent, "--dns")
+	}
+	output, err := originalRunScutil(context.Background())
+	if err == nil || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("runScutil over a missing binary = %q/%v", output, err)
+	}
+	if output != nil {
+		t.Fatalf("runScutil output on failure = %q", output)
+	}
+}
+
+func TestSystemSourceHelpers(t *testing.T) {
 	if got, ok := normalizeAddress(" 192.0.2.1 "); !ok || got != "192.0.2.1" {
 		t.Fatalf("normalized IPv4 = %q/%v", got, ok)
 	}
 	if got, ok := normalizeAddress("not-an-ip"); ok || got != "" {
 		t.Fatalf("invalid IP = %q/%v", got, ok)
+	}
+	if got, ok := normalizeAddress(" FE80::1%en0 "); !ok || got != "fe80::1%en0" {
+		t.Fatalf("normalized zoned IPv6 = %q/%v", got, ok)
+	}
+	if got, ok := normalizeAddress("::ffff:192.0.2.1"); !ok || got != "192.0.2.1" {
+		t.Fatalf("normalized IPv4-mapped IPv6 = %q/%v", got, ok)
+	}
+	if isLocalStub("fe80::1%en0") {
+		t.Fatal("link-local nameserver must not be labeled a local stub")
 	}
 	if got := uniqueStrings([]string{"", "scope", "scope", "other"}); strings.Join(got, ",") != "scope,other" {
 		t.Fatalf("unique strings = %#v", got)
@@ -221,6 +299,29 @@ func TestSystemSourceHelpers(t *testing.T) {
 	}
 }
 
+// TestLoopbackSourcesAreMarkedLocal keeps the stub classification available to
+// the reporting layer. Without the flag the loopback stub is only labeled in
+// prose, and ranking cannot tell it apart from a network resolver.
+func TestLoopbackSourcesAreMarkedLocal(t *testing.T) {
+	profiles := profilesFromSources([]resolverSource{
+		{Address: "127.0.0.53"},
+		{Address: "::1"},
+		{Address: "192.0.2.1"},
+		{Address: "127.0.0.1", Block: 3, Scope: "vpn", Interface: "utun0"},
+	})
+	if len(profiles) != 4 {
+		t.Fatalf("profiles = %#v", profiles)
+	}
+	for index, wantLocal := range []bool{true, true, false, true} {
+		if profiles[index].Local != wantLocal {
+			t.Fatalf("profile %d (%s) Local = %v, want %v", index, profiles[index].ID, profiles[index].Local, wantLocal)
+		}
+	}
+	if profiles[3].ID != "system-resolver-3-127-0-0-1" {
+		t.Fatalf("scoped loopback profile ID = %q", profiles[3].ID)
+	}
+}
+
 func TestDiscoverResolvConfReaderErrors(t *testing.T) {
 	oldOpen := openResolvConf
 	t.Cleanup(func() { openResolvConf = oldOpen })
@@ -239,3 +340,75 @@ func TestDiscoverResolvConfReaderErrors(t *testing.T) {
 type errorReader struct{}
 
 func (errorReader) Read([]byte) (int, error) { return 0, errors.New("read failed") }
+
+// A link-local nameserver is the only resolver on a host whose router
+// advertises one, so discovery must keep the zone instead of parsing the
+// literal away.
+func TestDiscoverKeepsZonedIPv6Nameserver(t *testing.T) {
+	oldOS := currentOS
+	oldOpen := openResolvConf
+	oldScutil := runScutil
+	t.Cleanup(func() {
+		currentOS = oldOS
+		openResolvConf = oldOpen
+		runScutil = oldScutil
+	})
+
+	currentOS = "linux"
+	openResolvConf = func() (io.ReadCloser, error) {
+		return &testReadCloser{Reader: strings.NewReader("nameserver fe80::1%en0\n")}, nil
+	}
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("zoned discovery = %#v/%v", profiles, err)
+	}
+	if profiles[0].Addresses[0] != "fe80::1%en0" {
+		t.Fatalf("zoned address = %#v", profiles[0].Addresses)
+	}
+	if profiles[0].ID != "system-fe80--1-en0" {
+		t.Fatalf("zoned profile ID = %q", profiles[0].ID)
+	}
+	if family, ok := catalog.AddressFamilyForAddress(profiles[0].Addresses[0]); !ok || family != catalog.Family6 {
+		t.Fatalf("zoned address family = %q/%v", family, ok)
+	}
+
+	currentOS = "darwin"
+	runScutil = func(context.Context) ([]byte, error) {
+		return []byte("resolver #1\n  nameserver[0] : fe80::1%en0\n  if_index : 4 (en0)\n"), nil
+	}
+	macProfiles, err := Discover(context.Background())
+	if err != nil || len(macProfiles) != 1 || macProfiles[0].Addresses[0] != "fe80::1%en0" {
+		t.Fatalf("macOS zoned discovery = %#v/%v", macProfiles, err)
+	}
+}
+
+// Windows has no discovery implementation here, so the caller must be told
+// which platform is unsupported instead of being handed a missing Unix path.
+func TestDiscoverUnsupportedPlatform(t *testing.T) {
+	oldOS := currentOS
+	oldOpen := openResolvConf
+	t.Cleanup(func() {
+		currentOS = oldOS
+		openResolvConf = oldOpen
+	})
+	currentOS = "windows"
+	openResolvConf = func() (io.ReadCloser, error) {
+		t.Error("resolv.conf must not be opened on an unsupported platform")
+		return nil, errors.New("unexpected open")
+	}
+
+	profiles, err := Discover(context.Background())
+	if profiles != nil || err == nil {
+		t.Fatalf("unsupported discovery = %#v/%v", profiles, err)
+	}
+	if !errors.Is(err, ErrUnsupportedPlatform) {
+		t.Fatalf("unsupported sentinel = %v", err)
+	}
+	var unsupported *UnsupportedPlatformError
+	if !errors.As(err, &unsupported) || unsupported.OS != "windows" {
+		t.Fatalf("unsupported platform error = %v", err)
+	}
+	if !strings.Contains(err.Error(), "windows") || strings.Contains(err.Error(), "resolv.conf") {
+		t.Fatalf("unsupported platform message = %q", err.Error())
+	}
+}

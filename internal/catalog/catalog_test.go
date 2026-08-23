@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -44,16 +45,22 @@ func TestDefaultResolversAreCorrectedAndProfiled(t *testing.T) {
 }
 
 func TestDefaultResolverTransportMetadata(t *testing.T) {
+	// DoH and DoT identities are tracked separately: a provider may publish a
+	// different TLS name for each. Cloudflare authenticates DoT as
+	// one.one.one.one while its DoH endpoint is cloudflare-dns.com, and the
+	// DoH handshake must match the URL authority the request is addressed to.
+	// dotServer defaults to dohServer when a provider uses one name for both.
 	expected := map[string]struct {
-		server string
-		dohURL string
-		doq    bool
+		server    string
+		dotServer string
+		dohURL    string
+		doq       bool
 	}{
 		"google-8888":     {server: "dns.google", dohURL: "https://dns.google/dns-query"},
 		"google-8844":     {server: "dns.google", dohURL: "https://dns.google/dns-query"},
 		"quad9-9999":      {server: "dns.quad9.net", dohURL: "https://dns.quad9.net/dns-query", doq: true},
 		"quad9-99910":     {server: "dns10.quad9.net", dohURL: "https://dns10.quad9.net/dns-query", doq: true},
-		"cloudflare-1111": {server: "one.one.one.one", dohURL: "https://cloudflare-dns.com/dns-query"},
+		"cloudflare-1111": {server: "cloudflare-dns.com", dotServer: "one.one.one.one", dohURL: "https://cloudflare-dns.com/dns-query"},
 		"cloudflare-1112": {server: "security.cloudflare-dns.com", dohURL: "https://security.cloudflare-dns.com/dns-query"},
 		"dns4eu-111":      {server: "protective.joindns4.eu", dohURL: "https://protective.joindns4.eu/dns-query"},
 		"dns4eu-1112":     {server: "child.joindns4.eu", dohURL: "https://child.joindns4.eu/dns-query"},
@@ -74,9 +81,13 @@ func TestDefaultResolverTransportMetadata(t *testing.T) {
 		if doh.Port != 443 || doh.ServerName != want.server || doh.URL != want.dohURL {
 			t.Fatalf("%s DoH metadata = %#v, want server=%q URL=%q", resolver.ID, doh, want.server, want.dohURL)
 		}
+		wantDoT := want.dotServer
+		if wantDoT == "" {
+			wantDoT = want.server
+		}
 		for _, protocol := range []Protocol{DoT} {
-			if resolver.Transports[protocol].Port != 853 || resolver.Transports[protocol].ServerName != want.server {
-				t.Fatalf("%s %s metadata = %#v", resolver.ID, protocol, resolver.Transports[protocol])
+			if resolver.Transports[protocol].Port != 853 || resolver.Transports[protocol].ServerName != wantDoT {
+				t.Fatalf("%s %s metadata = %#v, want server=%q", resolver.ID, protocol, resolver.Transports[protocol], wantDoT)
 			}
 		}
 		_, hasDoQ := resolver.Transports[DoQ]
@@ -170,6 +181,68 @@ func TestValidateRejectsDuplicateAddresses(t *testing.T) {
 	}
 }
 
+func TestValidateAddressSyntax(t *testing.T) {
+	accepted := []struct {
+		name    string
+		address string
+	}{
+		{name: "IPv4 literal", address: "192.0.2.53"},
+		{name: "IPv6 literal", address: "2001:db8::53"},
+		{name: "bracketed IPv6 literal", address: "[2001:db8::53]"},
+		{name: "zoned link-local literal", address: "fe80::1%eth0"},
+		{name: "bracketed zoned link-local literal", address: "[fe80::1%eth0]"},
+		{name: "hostname", address: "dns.example"},
+		{name: "hostname with trailing dot", address: "DNS.Example."},
+		{name: "single label hostname", address: "localhost"},
+		{name: "hostname with hyphen", address: "dns-1.example"},
+		{name: "surrounding whitespace", address: " 192.0.2.53 "},
+	}
+	for _, test := range accepted {
+		t.Run("accept "+test.name, func(t *testing.T) {
+			profile := minimalProfile("accept")
+			profile.Addresses = []string{test.address}
+			if err := Validate([]ResolverProfile{profile}); err != nil {
+				t.Fatalf("Validate(%q) = %v, want accepted", test.address, err)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name    string
+		address string
+		want    string
+	}{
+		{name: "IPv4 with port", address: "192.0.2.53:5353", want: "set the port in the transport spec"},
+		{name: "bracketed IPv6 with port", address: "[2001:db8::53]:853", want: "set the port in the transport spec"},
+		{name: "hostname with port", address: "dns.example:53", want: "set the port in the transport spec"},
+		{name: "hostname with empty port", address: "dns.example:", want: "set the port in the transport spec"},
+		{name: "empty", address: "   ", want: "is empty"},
+		{name: "bracketed hostname", address: "[dns.example]", want: "not an IPv6 literal"},
+		{name: "unterminated bracket", address: "[2001:db8::53", want: "not an IP literal or a valid hostname"},
+		{name: "truncated IPv4", address: "192.0.2", want: "not an IP literal or a valid hostname"},
+		{name: "out of range IPv4", address: "10.0.0.256", want: "not an IP literal or a valid hostname"},
+		{name: "malformed IPv6", address: "2001:db8::zz", want: "not an IP literal or a valid hostname"},
+		{name: "empty label", address: "dns..example", want: "not an IP literal or a valid hostname"},
+		{name: "root only", address: ".", want: "not an IP literal or a valid hostname"},
+		{name: "leading hyphen label", address: "-dns.example", want: "not an IP literal or a valid hostname"},
+		{name: "trailing hyphen label", address: "dns-.example", want: "not an IP literal or a valid hostname"},
+		{name: "underscore label", address: "dns_1.example", want: "not an IP literal or a valid hostname"},
+		{name: "space inside hostname", address: "dns example", want: "not an IP literal or a valid hostname"},
+		{name: "oversized label", address: strings.Repeat("a", 64) + ".example", want: "not an IP literal or a valid hostname"},
+		{name: "oversized hostname", address: strings.TrimSuffix(strings.Repeat(strings.Repeat("a", 63)+".", 5), ".") + ".example", want: "not an IP literal or a valid hostname"},
+	}
+	for _, test := range rejected {
+		t.Run("reject "+test.name, func(t *testing.T) {
+			profile := minimalProfile("reject")
+			profile.Addresses = []string{test.address}
+			err := Validate([]ResolverProfile{profile})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate(%q) = %v, want error containing %q", test.address, err, test.want)
+			}
+		})
+	}
+}
+
 func TestYAMLDoHPortInheritance(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -228,5 +301,87 @@ func TestParseResolverFlag(t *testing.T) {
 	}
 	if _, err := ParseResolverFlag("invalid"); err == nil {
 		t.Fatal("expected malformed resolver flag to fail")
+	}
+}
+
+// The --resolver flag and the YAML catalog must derive the same default port
+// for every protocol, so a changed or added default cannot leave one path
+// dialling the old port.
+func TestResolverFlagAndCatalogAgreeOnDefaultPorts(t *testing.T) {
+	schemes := map[Protocol]string{UDP: "udp", TCP: "tcp", DoH: "https", DoT: "tls", DoQ: "quic"}
+	for _, protocol := range AllProtocols {
+		t.Run(protocol.String(), func(t *testing.T) {
+			scheme, known := schemes[protocol]
+			if !known {
+				t.Fatalf("protocol %q has no --resolver URI scheme", protocol)
+			}
+			want := defaultPort(protocol)
+			if want == 0 {
+				t.Fatalf("defaultPort(%q) is unset", protocol)
+			}
+			uri := scheme + "://dns.example"
+			if protocol == DoH {
+				uri += "/dns-query"
+			}
+			flagProfile, err := ParseResolverFlag("custom=" + uri)
+			if err != nil {
+				t.Fatal(err)
+			}
+			flagSpec, supported := flagProfile.Transports[protocol]
+			if !supported {
+				t.Fatalf("--resolver %q produced transports %v", uri, flagProfile.Transports)
+			}
+			if flagSpec.Port != want {
+				t.Fatalf("--resolver %q port = %d, want defaultPort %d", uri, flagSpec.Port, want)
+			}
+
+			catalogSpec := TransportSpec{}
+			switch protocol {
+			case DoH:
+				catalogSpec.URL = "https://dns.example/dns-query"
+			case DoT, DoQ:
+				catalogSpec.ServerName = "dns.example"
+			}
+			profiles := []ResolverProfile{{
+				ID:         "custom",
+				Name:       "Custom",
+				Addresses:  []string{"192.0.2.1"},
+				Transports: map[Protocol]TransportSpec{protocol: catalogSpec},
+			}}
+			if err := Validate(profiles); err != nil {
+				t.Fatal(err)
+			}
+			if got := profiles[0].Transports[protocol].Port; got != want {
+				t.Fatalf("catalog default port = %d, want defaultPort %d", got, want)
+			}
+		})
+	}
+}
+
+// TestBundledDoHServerNamesMatchTheirURLHost guards the TLS identity of the
+// bundled DoH endpoints. Because doHFactory.Open supplies its own
+// DialTLSContext, http.Transport performs no verification of its own and the
+// handshake is checked solely against server_name. A server_name that differs
+// from the URL authority therefore authenticates a different name than the one
+// the request is addressed to, which is not what RFC 8484 expects.
+//
+// A custom resolver file may still set a different server_name deliberately -
+// METHODOLOGY.md documents that as the supported way to opt into another TLS
+// identity - so this is a property of the bundled catalog, not a validation
+// rule imposed on user configuration.
+func TestBundledDoHServerNamesMatchTheirURLHost(t *testing.T) {
+	for _, profile := range DefaultResolvers() {
+		spec, ok := profile.Transports[DoH]
+		if !ok {
+			continue
+		}
+		endpoint, err := url.Parse(spec.URL)
+		if err != nil {
+			t.Fatalf("resolver %q has an unparsable DoH URL %q: %v", profile.ID, spec.URL, err)
+		}
+		if spec.ServerName != endpoint.Hostname() {
+			t.Errorf("resolver %q DoH server_name = %q, want the URL host %q",
+				profile.ID, spec.ServerName, endpoint.Hostname())
+		}
 	}
 }

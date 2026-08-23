@@ -3,8 +3,11 @@ package transport
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,7 +52,8 @@ func TestTCPSessionReusesConnection(t *testing.T) {
 	defer listener.Close()
 	stop := make(chan struct{})
 	defer close(stop)
-	go serveTCP(listener, stop)
+	var accepts atomic.Int32
+	go serveTCPCounting(listener, stop, &accepts)
 
 	port := listener.Addr().(*net.TCPAddr).Port
 	target := catalog.Target{Protocol: catalog.TCP, Address: "127.0.0.1", Spec: catalog.TransportSpec{Port: port}}
@@ -66,6 +70,16 @@ func TestTCPSessionReusesConnection(t *testing.T) {
 		if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err != nil {
 			t.Fatal(err)
 		}
+		// The observable the test name promises. streamSession exposes it and
+		// every other reconnect test asserts it; without this the test passed
+		// on a session that reconnected before each exchange, which would
+		// turn every warm sample into a cold one.
+		if session.(*streamSession).LastQueryReconnected() {
+			t.Fatalf("query %d reconnected instead of reusing the session", index+1)
+		}
+	}
+	if got := accepts.Load(); got != 1 {
+		t.Fatalf("listener accepted %d connections, want 1", got)
 	}
 }
 
@@ -122,7 +136,10 @@ func serveUDP(conn *net.UDPConn, stop <-chan struct{}) {
 	}
 }
 
-func serveTCP(listener net.Listener, stop <-chan struct{}) {
+// serveTCPCounting answers framed DNS queries and counts accepted
+// connections, so a test can assert that a session reused one connection
+// rather than opening a new one per query. accepts may be nil.
+func serveTCPCounting(listener net.Listener, stop <-chan struct{}, accepts *atomic.Int32) {
 	for {
 		_ = listener.(*net.TCPListener).SetDeadline(time.Now().Add(50 * time.Millisecond))
 		conn, err := listener.Accept()
@@ -133,6 +150,9 @@ func serveTCP(listener net.Listener, stop <-chan struct{}) {
 			default:
 				continue
 			}
+		}
+		if accepts != nil {
+			accepts.Add(1)
 		}
 		go func() {
 			defer conn.Close()
@@ -163,5 +183,158 @@ func serveTCP(listener net.Listener, stop <-chan struct{}) {
 				}
 			}
 		}()
+	}
+}
+
+// TestDoTOffersTheALPNToken pins the ALPN token on DNS-over-TLS. RFC 7858
+// registers "dot" and RFC 8310 says a client SHOULD offer it; DoQ and DoH
+// already negotiate their own tokens, so DoT was the one transport that
+// presented an unlabelled connection.
+func TestDoTOffersTheALPNToken(t *testing.T) {
+	factory, err := NewFactory(catalog.Target{
+		Protocol: catalog.DoT, Address: "192.0.2.1",
+		Spec: catalog.TransportSpec{Port: 853, ServerName: "dns.example"},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, ok := factory.(*streamFactory)
+	if !ok {
+		t.Fatalf("DoT factory type = %T", factory)
+	}
+	if got := stream.tlsConfig.NextProtos; len(got) != 1 || got[0] != "dot" {
+		t.Fatalf("DoT NextProtos = %#v, want [dot]", got)
+	}
+	if stream.tlsConfig.ServerName != "dns.example" {
+		t.Fatalf("DoT ServerName = %q", stream.tlsConfig.ServerName)
+	}
+}
+
+// TestUDPFactoryResolvesHostnameOnce covers the bootstrap lookup moving out of
+// the measured exchange. dns.Client.ExchangeContext dials whatever address it
+// is handed, so a hostname endpoint previously went through the system
+// resolver on every query, inside the timed region.
+func TestUDPFactoryResolvesHostnameOnce(t *testing.T) {
+	oldResolve := resolveUDPAddress
+	t.Cleanup(func() { resolveUDPAddress = oldResolve })
+	lookups := 0
+	resolveUDPAddress = func(context.Context, string) (string, error) {
+		lookups++
+		return "192.0.2.53", nil
+	}
+	factory, err := NewFactory(catalog.Target{
+		Protocol: catalog.UDP, Address: "dns.example", Spec: catalog.TransportSpec{Port: 53},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 1 {
+		t.Fatalf("lookups during Open = %d, want 1", lookups)
+	}
+	dialer, ok := session.(interface{ DialAddress() string })
+	if !ok {
+		t.Fatal("UDP session does not report a dial address")
+	}
+	if got := dialer.DialAddress(); got != "192.0.2.53:53" {
+		t.Fatalf("UDP dial address = %q, want %q", got, "192.0.2.53:53")
+	}
+
+	// A literal endpoint must not consult the resolver at all.
+	lookups = 0
+	literal, err := NewFactory(catalog.Target{
+		Protocol: catalog.UDP, Address: "192.0.2.1", Spec: catalog.TransportSpec{Port: 53},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := literal.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 0 {
+		t.Fatalf("lookups for a literal endpoint = %d, want 0", lookups)
+	}
+}
+
+// TestUDPFactoryReportsResolutionFailure keeps a failed bootstrap lookup a
+// session-open error rather than a per-query mystery.
+func TestUDPFactoryReportsResolutionFailure(t *testing.T) {
+	oldResolve := resolveUDPAddress
+	t.Cleanup(func() { resolveUDPAddress = oldResolve })
+	resolveUDPAddress = func(context.Context, string) (string, error) {
+		return "", errors.New("no such host")
+	}
+	factory, err := NewFactory(catalog.Target{
+		Protocol: catalog.UDP, Address: "dns.example", Spec: catalog.TransportSpec{Port: 53},
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := factory.Open(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "resolve UDP endpoint") {
+		t.Fatalf("UDP resolution error = %v", err)
+	}
+}
+
+// TestResponseClassSeparatesAnswersFromNodata pins the distinction the
+// divergence engine depends on. A canonical NODATA response carries an SOA in
+// the authority section, so classifying on answer-or-authority presence made
+// "no such record" indistinguishable from a real answer.
+func TestResponseClassSeparatesAnswersFromNodata(t *testing.T) {
+	message := func(rcode int, qtype uint16, answer []dns.RR, authority []dns.RR) *dns.Msg {
+		return &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Rcode: rcode, Response: true},
+			Question: []dns.Question{{Name: "example.com.", Qtype: qtype, Qclass: dns.ClassINET}},
+			Answer:   answer,
+			Ns:       authority,
+		}
+	}
+	aRecord := &dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA}}
+	soa := &dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA}}
+	cname := &dns.CNAME{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeCNAME}}
+
+	cases := []struct {
+		name    string
+		message *dns.Msg
+		want    string
+	}{
+		{"answer for the requested type", message(dns.RcodeSuccess, dns.TypeA, []dns.RR{aRecord}, nil), "answer"},
+		{"canonical nodata with an SOA", message(dns.RcodeSuccess, dns.TypeAAAA, nil, []dns.RR{soa}), "nodata"},
+		{"bare nodata", message(dns.RcodeSuccess, dns.TypeAAAA, nil, nil), "nodata"},
+		{"chain without the requested type", message(dns.RcodeSuccess, dns.TypeAAAA, []dns.RR{cname}, []dns.RR{soa}), "nodata"},
+		{"chain completed to the requested type", message(dns.RcodeSuccess, dns.TypeA, []dns.RR{cname, aRecord}, nil), "answer"},
+		{"nxdomain", message(dns.RcodeNameError, dns.TypeA, nil, []dns.RR{soa}), "nxdomain"},
+		{"servfail", message(dns.RcodeServerFailure, dns.TypeA, nil, nil), "rcode-2"},
+	}
+	for _, tc := range cases {
+		if got := ResponseClass(tc.message); got != tc.want {
+			t.Fatalf("ResponseClass(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
+	// validateResponse rejects other question shapes before scoring, so the
+	// fallback is defensive only; keep it pinned so it stays predictable.
+	malformed := &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeSuccess, Response: true}}
+	if got := ResponseClass(malformed); got != "nodata" {
+		t.Fatalf("ResponseClass(no question, no answer) = %q, want %q", got, "nodata")
+	}
+	malformed.Answer = []dns.RR{aRecord}
+	if got := ResponseClass(malformed); got != "answer" {
+		t.Fatalf("ResponseClass(no question, one answer) = %q, want %q", got, "answer")
+	}
+}
+
+// TestUDPFactoryRejectsMalformedEndpoint covers the endpoint-parse guard added
+// when the bootstrap lookup moved into Open. A target whose address and port
+// cannot be split has no dialable endpoint, so it must fail when the session
+// opens rather than on every query.
+func TestUDPFactoryRejectsMalformedEndpoint(t *testing.T) {
+	factory := &udpFactory{address: "dns.example:53:53", timeout: time.Second}
+	if _, err := factory.Open(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "invalid UDP endpoint") {
+		t.Fatalf("malformed UDP endpoint error = %v", err)
 	}
 }
