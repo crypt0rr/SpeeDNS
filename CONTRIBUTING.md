@@ -9,11 +9,32 @@ Install Go 1.25 or newer, then run the local quality gates from the repository
 root:
 
 ```sh
+gofmt -l .
+go vet ./...
 go test -count=1 ./...
 go test -count=1 -race ./...
-go vet ./...
 bash scripts/coverage.sh
 ```
+
+CI enforces four more that are easy to miss locally, and each of them has
+failed a pull request that passed the list above:
+
+```sh
+staticcheck ./...
+shellcheck --severity=style scripts/*.sh
+go mod tidy && git diff --exit-code -- go.mod go.sum
+GOOS=windows go vet ./...
+```
+
+`go mod tidy` matters more than it looks: importing a package in a *test* can
+promote an indirect dependency to direct, and CI fails on the resulting
+`go.mod` diff even though every other gate is green. `GOOS=windows` covers the
+resolver-discovery path that only compiles on Windows.
+
+`scripts/coverage.sh` requires **100.0%** statement coverage, counted from the
+merged profile rather than from `go tool cover -func` — the latter cannot see
+the body of a package-level `var x = func(...)`, which is how test seams are
+written throughout this repository.
 
 For changes that affect packaging or platform behavior, also run pure-Go builds
 for all supported targets:
