@@ -194,11 +194,21 @@ Numeric assertions are evaluated against every qualified or provisional
 winner for every protocol that produced a ranking. `winner=PROFILE-ID` or
 `winner=TARGET-ID` requires the requested profile or target to be among the
 rank-one winners for every such protocol. Confidence-interval ties therefore
-count as winner membership. The ordinary report is emitted before an
-assertion failure; invalid expressions return status 2 and failed assertions
-return status 4. No-comparable and interruption statuses retain precedence.
+count as winner membership. The requested winner is checked against the
+targets selected for the run before any query is sent, so an ID that no
+selected profile or target carries is invalid input (status 2) rather than a
+lost comparison; a benchmark never reports that a resolver failed to win when
+it was never measured. The ordinary report is emitted before an assertion
+failure; invalid expressions return status 2 and failed assertions return
+status 4. No-comparable and interruption statuses retain precedence.
 
 ## Address-family selection
+
+Every resolver address is syntax-checked before the run starts: an entry must
+be an IP literal (bare, bracketed, or zoned) or a syntactically valid
+hostname. Ports are configured per transport, so an address carrying one is
+rejected as invalid input instead of producing a run in which every query
+fails with a dial error attributed to the resolver.
 
 Bundled resolver profiles carry the provider-published IPv4 and IPv6 literals.
 `--family 4`, `--family 6`, and `--family both` are deterministic filters.
