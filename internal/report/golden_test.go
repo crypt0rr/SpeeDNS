@@ -2,12 +2,18 @@ package report
 
 import (
 	"bytes"
+	"flag"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 )
+
+// updateGolden rewrites internal/report/testdata/golden from the current
+// renderers. Regenerating is deliberate: run the suite once without the flag,
+// inspect the reported diff, and only then rerun with -update.
+var updateGolden = flag.Bool("update", false, "rewrite testdata/golden fixtures")
 
 func goldenReport() benchmark.Report {
 	winner := reportTarget("10", "udp", 2, true)
@@ -19,7 +25,7 @@ func goldenReport() benchmark.Report {
 		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
 		Targets:  []benchmark.TargetResult{failed, winner},
 		Rankings: []benchmark.Ranking{{Protocol: "udp", TargetID: winner.Target.ID(), Rank: 1}},
-		Warnings: []string{"fixture warning"},
+		Warnings: []benchmark.Warning{benchmark.RunWarning("fixture warning")},
 	}
 	run.Divergence = []benchmark.DivergenceDetail{
 		{
@@ -59,13 +65,20 @@ func TestGoldenReports(t *testing.T) {
 				t.Fatal(err)
 			}
 			path := filepath.Join("testdata", "golden", tc.name)
+			if *updateGolden {
+				if err := os.WriteFile(path, output.Bytes(), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			want, err := os.ReadFile(path)
 			if err != nil {
 				t.Logf("generated %s:\n%s", path, output.String())
 				t.Fatal(err)
 			}
 			if output.String() != string(want) {
-				t.Fatalf("%s changed; regenerate the fixture intentionally\nwant:\n%s\ngot:\n%s", path, want, output.String())
+				t.Fatalf("%s changed; review the diff and regenerate deliberately with\n"+
+					"\tgo test ./internal/report -run TestGoldenReports -update\nwant:\n%s\ngot:\n%s",
+					path, want, output.String())
 			}
 		})
 	}

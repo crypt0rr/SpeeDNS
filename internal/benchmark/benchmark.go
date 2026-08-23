@@ -7,7 +7,6 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/domains"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 	"github.com/crypt0rr/SpeeDNS/internal/transport"
 	"github.com/miekg/dns"
 )
@@ -41,6 +41,17 @@ var warmupNames = []string{"example.com", "example.org", "example.net"}
 // statistics engine can be tested without contacting a real resolver.
 var newFactory = transport.NewFactory
 
+// protocolScheduler measures one protocol group of targets and returns their
+// results.
+type protocolScheduler func(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult
+
+// runProtocol is the scheduler every protocol group is measured with. It is a
+// variable purely so a test can select runProtocolLegacy deliberately; the
+// production choice is never inferred from the state of a test hook.
+var runProtocol protocolScheduler = runProtocolFair
+
+// runTargetFunc is the target-level seam used by runProtocolLegacy. Replacing
+// it has no effect unless runProtocolLegacy is also selected explicitly.
 var runTargetFunc = runTarget
 
 type Options struct {
@@ -126,12 +137,12 @@ type Statistics struct {
 	MinMS               float64        `json:"min_ms"`
 	MaxMS               float64        `json:"max_ms"`
 	MADMS               float64        `json:"mad_ms"`
-	ColdMedianMS        float64        `json:"cold_median_ms,omitempty"`
+	ColdMedianMS        float64        `json:"cold_median_ms"`
 	ScoreMS             float64        `json:"score_ms"`
-	CILowMS             float64        `json:"ci_low_ms,omitempty"`
-	CIHighMS            float64        `json:"ci_high_ms,omitempty"`
+	CILowMS             float64        `json:"ci_low_ms"`
+	CIHighMS            float64        `json:"ci_high_ms"`
 	Recommended         bool           `json:"recommended"`
-	Tie                 bool           `json:"tie,omitempty"`
+	Tie                 bool           `json:"tie"`
 }
 
 type TargetResult struct {
@@ -166,7 +177,7 @@ type Report struct {
 	Rankings      []Ranking          `json:"rankings"`
 	PairedEffects []PairedEffect     `json:"paired_effects,omitempty"`
 	Divergence    []DivergenceDetail `json:"divergence,omitempty"`
-	Warnings      []string           `json:"warnings,omitempty"`
+	Warnings      []Warning          `json:"warnings,omitempty"`
 }
 
 // RunProvenance records the local build, platform, corpus, and effective
@@ -192,8 +203,11 @@ type RunProvenance struct {
 // positive delta means that the target was slower than the reference.
 //
 // Only observations that are usable, non-divergent, non-reconnect samples are
-// paired. The existing composite score remains the ranking authority; these
-// values explain whether a ranked difference is distinguishable from noise.
+// paired. A comparison needs at least MinimumRecommendedSamples paired
+// observations, the same floor the recommendation gate uses; below that the
+// delta and interval stay zero and Reason explains why. The existing composite
+// score remains the ranking authority; these values explain whether a ranked
+// difference is distinguishable from noise.
 type PairedEffect struct {
 	Protocol          catalog.Protocol `json:"protocol"`
 	Policy            string           `json:"policy"`
@@ -264,10 +278,10 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 		QueryTypes: append([]uint16(nil), opts.QueryTypes...),
 	}
 	if !opts.Full && opts.Sample > report.SampleSize {
-		report.Warnings = append(report.Warnings, fmt.Sprintf(
+		report.Warnings = append(report.Warnings, RunWarning(fmt.Sprintf(
 			"requested sample of %d domains exceeds the normalized corpus size; using all %d domains",
 			opts.Sample, report.SampleSize,
-		))
+		)))
 	}
 
 	byProtocol := make(map[catalog.Protocol][]catalog.Target)
@@ -278,7 +292,11 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 	for protocol := range byProtocol {
 		protocols = append(protocols, protocol)
 	}
-	sort.Slice(protocols, func(i, j int) bool { return protocols[i] < protocols[j] })
+	// Measure protocol groups in the documented order (udp, tcp, doh, dot,
+	// doq) rather than the lexicographic order of the Protocol string type.
+	sort.Slice(protocols, func(i, j int) bool {
+		return catalog.CompareProtocols(protocols[i], protocols[j]) < 0
+	})
 
 	for _, protocol := range protocols {
 		groupResults := runProtocol(ctx, byProtocol[protocol], queries, opts)
@@ -345,15 +363,10 @@ func buildQueries(opts Options) ([]Query, error) {
 	return queries, nil
 }
 
-func runProtocol(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
-	// Existing tests and internal callers can replace runTargetFunc as a
-	// lightweight target-level seam. Production uses the fair scheduler below.
-	if reflect.ValueOf(runTargetFunc).Pointer() != reflect.ValueOf(runTarget).Pointer() {
-		return runProtocolLegacy(ctx, targets, queries, opts)
-	}
-	return runProtocolFair(ctx, targets, queries, opts)
-}
-
+// runProtocolLegacy dispatches whole targets to a worker pool through the
+// runTargetFunc seam and returns only the targets it managed to dispatch. It
+// is never selected by production code; tests that fake whole targets select
+// it explicitly.
 func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
 	if len(targets) == 0 {
 		return nil
@@ -439,28 +452,19 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 		TargetsTotal: len(orderedTargets),
 	})
 
+	prepared, dispatched := prepareTargets(ctx, orderedTargets, queries, opts)
 	runners := make([]*targetRunner, 0, len(orderedTargets))
 	ready := make([]*targetRunner, 0, len(orderedTargets))
-	for _, target := range orderedTargets {
-		if ctx.Err() != nil {
-			break
-		}
-		runner := newTargetRunner(ctx, target, queries, opts)
-		runners = append(runners, runner)
-		prepared := runner.prepare(ctx)
-		preparedTargets := len(runners)
-		emitProgress(opts, Progress{
-			Protocol:         target.Protocol,
-			Phase:            ProgressPreparing,
-			TargetsCompleted: preparedTargets,
-			TargetsTotal:     len(orderedTargets),
-		})
-		if prepared {
-			ready = append(ready, runner)
+	for index, runner := range prepared {
+		// Preparation runs concurrently, but the scheduler's view of the
+		// targets stays in target-ID order so results and rankings never
+		// depend on which preparation happened to finish first.
+		if !dispatched[index] || runner == nil {
 			continue
 		}
-		if ctx.Err() != nil {
-			break
+		runners = append(runners, runner)
+		if runner.ready {
+			ready = append(ready, runner)
 		}
 	}
 
@@ -513,6 +517,65 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 	return results
 }
 
+// prepareTargets opens and warms every dispatched target with the same
+// bounded concurrency as the measured rounds. Strictly sequential preparation
+// made a target's cold probes and its warm session's idle age depend on the
+// target's position in the ordered catalog; preparing with bounded
+// concurrency shrinks that positional bias by the concurrency factor. Each
+// runner is still prepared by exactly one goroutine, so a session is never
+// used concurrently. The returned slices are indexed by ordered-target
+// position, which keeps result ordering deterministic regardless of the order
+// in which preparations finish.
+func prepareTargets(ctx context.Context, orderedTargets []catalog.Target, queries []Query, opts Options) ([]*targetRunner, []bool) {
+	runners := make([]*targetRunner, len(orderedTargets))
+	dispatched := make([]bool, len(orderedTargets))
+	workers := opts.Concurrency
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(orderedTargets) {
+		workers = len(orderedTargets)
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	// Preparation progress counts finished attempts, successful or not, in
+	// completion order. That is the meaning the sequential loop already had.
+	var preparedTargets atomic.Int32
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				target := orderedTargets[index]
+				runner := newTargetRunner(ctx, target, queries, opts)
+				runners[index] = runner
+				runner.prepare(ctx)
+				emitProgress(opts, Progress{
+					Protocol:         target.Protocol,
+					Phase:            ProgressPreparing,
+					TargetsCompleted: int(preparedTargets.Add(1)),
+					TargetsTotal:     len(orderedTargets),
+				})
+			}
+		}()
+	}
+dispatch:
+	for index := range orderedTargets {
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case jobs <- index:
+			dispatched[index] = true
+		case <-ctx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return runners, dispatched
+}
+
 func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, concurrency int) int {
 	if len(runners) == 0 {
 		return 0
@@ -538,6 +601,7 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 			}
 		}()
 	}
+dispatch:
 	for index := range runners {
 		if ctx.Err() != nil {
 			break
@@ -546,10 +610,7 @@ func runQueryRound(ctx context.Context, runners []*targetRunner, query Query, co
 		case jobs <- index:
 			dispatched[index] = true
 		case <-ctx.Done():
-			break
-		}
-		if ctx.Err() != nil {
-			break
+			break dispatch
 		}
 	}
 	close(jobs)
@@ -704,9 +765,13 @@ func (runner *targetRunner) measure(ctx context.Context, query Query) bool {
 		return false
 	}
 	observation := Observation{Name: query.Name, QType: query.QType}
-	started := time.Now()
 	queryCtx, cancel := context.WithTimeout(ctx, runner.opts.Timeout)
+	// Warm latency covers the DNS exchange alone: the clock starts immediately
+	// before the call and stops the moment it returns, so neither deadline
+	// setup nor the reconnect bookkeeping below is charged to the resolver.
+	started := time.Now()
 	message, queryErr := runner.session.Query(queryCtx, query.Name, query.QType)
+	elapsed := time.Since(started)
 	observation.Reconnected = sessionQueryReconnected(runner.session)
 	cancel()
 	if ctx.Err() != nil {
@@ -715,7 +780,7 @@ func (runner *targetRunner) measure(ctx context.Context, query Query) bool {
 		runner.abort(ctx.Err())
 		return false
 	}
-	observation.Latency = time.Since(started)
+	observation.Latency = elapsed
 	observation.LatencyMS = durationMS(observation.Latency)
 	if queryErr != nil {
 		observation.Error = queryErr.Error()
@@ -1054,7 +1119,7 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		sort.Float64s(cold)
 		stats.ColdMedianMS = percentile(cold, 0.5)
 	}
-	stats.Recommended = !result.Incomplete && stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
+	stats.Recommended = !result.Target.Resolver.Local && !result.Incomplete && stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
 	return stats
 }
 
@@ -1123,11 +1188,11 @@ func scoreFromSamples(samples []scoreSample, timeoutMS float64) float64 {
 		}
 	}
 	failureRate := float64(failures) / float64(len(samples))
-	if len(latencies) == 0 {
-		// This value is used only for confidence intervals because targets
-		// without scored samples are never ranked.
-		return 2 * timeoutMS
-	}
+	// A replicate that draws only failures has no latency term, so its score
+	// is scoreFromLatencies with an empty latency set and a failure rate of
+	// 1, which is exactly the timeout penalty. Deliberately no sentinel: a
+	// value outside the score function's range would inflate the bootstrap
+	// upper bound and distort tie membership.
 	sort.Float64s(latencies)
 	return scoreFromLatencies(latencies, failureRate, timeoutMS)
 }
@@ -1232,6 +1297,11 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 				effects = append(effects, effect)
 				continue
 			}
+			if len(deltas) < MinimumRecommendedSamples {
+				effect.Reason = fmt.Sprintf("insufficient paired samples (minimum %d)", MinimumRecommendedSamples)
+				effects = append(effects, effect)
+				continue
+			}
 			sort.Float64s(deltas)
 			effect.MedianDeltaMS = percentile(deltas, 0.5)
 			effect.CILowMS, effect.CIHighMS = bootstrapPairedCI(deltas, pairedBootstrapSeed(seed, key.protocol, key.policy, reference.Target.ID(), target.Target.ID()))
@@ -1299,9 +1369,6 @@ func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 	if len(deltas) == 0 {
 		return 0, 0
 	}
-	if len(deltas) == 1 {
-		return deltas[0], deltas[0]
-	}
 	rng := rand.New(rand.NewSource(seed))
 	scores := make([]float64, BootstrapIterations)
 	resample := make([]float64, len(deltas))
@@ -1316,10 +1383,15 @@ func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 	return percentile(scores, 0.025), percentile(scores, 0.975)
 }
 
+// makeRankings orders the comparable targets of each protocol. A resolver on
+// the local host is measured and reported, but never ranked: its latency is a
+// local cache lookup that excludes the upstream resolution it forwards to, so
+// placing it in the same order as a network resolver would compare two
+// different quantities.
 func makeRankings(results []TargetResult) []Ranking {
 	byProtocol := make(map[catalog.Protocol][]int)
 	for index, result := range results {
-		if result.Stats.Scored > 0 && !result.Incomplete {
+		if result.Stats.Scored > 0 && !result.Incomplete && !result.Target.Resolver.Local {
 			byProtocol[result.Target.Protocol] = append(byProtocol[result.Target.Protocol], index)
 		}
 	}
@@ -1368,34 +1440,43 @@ func confidenceIntervalsOverlap(left, right Statistics) bool {
 	return leftLow <= rightHigh && rightLow <= leftHigh
 }
 
-func collectWarnings(results []TargetResult) []string {
-	warnings := make([]string, 0)
+// collectWarnings produces one warning per diagnostic, attributed to its
+// target rather than prefixed with a rendered label. Message text that came
+// from outside SpeeDNS is escaped here, at the point it becomes report text:
+// a session error quotes transport and TLS diagnostics containing strings the
+// remote endpoint chose, such as the subject alternative names in
+// "x509: certificate is valid for ...", and warnings are printed verbatim
+// under --details. The target identity is escaped by the presenter that
+// renders it.
+func collectWarnings(results []TargetResult) []Warning {
+	warnings := make([]Warning, 0)
 	for _, result := range results {
-		label := fmt.Sprintf("%s %s/%s", result.Target.DisplayName(), result.Target.Address, result.Target.Protocol)
 		if result.Incomplete {
-			warnings = append(warnings, fmt.Sprintf("%s was incomplete and excluded from ranking", label))
+			warnings = append(warnings, TargetWarning(result.Target, "was incomplete and excluded from ranking"))
 		}
 		if result.OpenError != "" {
-			warnings = append(warnings, fmt.Sprintf("%s could not open a session: %s", label, result.OpenError))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("could not open a session: %s", safetext.Escape(result.OpenError))))
 		}
 		if result.Stats.Failures > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s had %d/%d failed queries", label, result.Stats.Failures, result.Stats.Total))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("had %d/%d failed queries", result.Stats.Failures, result.Stats.Total)))
 		}
 		if result.Stats.Divergent > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s had %d divergent responses excluded from latency scoring", label, result.Stats.Divergent))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("had %d divergent responses excluded from latency scoring", result.Stats.Divergent)))
 		}
 		if result.Stats.Truncated > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s returned %d truncated responses; SpeeDNS did not fall back to another transport", label, result.Stats.Truncated))
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("returned %d truncated responses; SpeeDNS did not fall back to another transport", result.Stats.Truncated)))
 		}
 		if result.Stats.ResolverFailures > 0 {
-			warning := fmt.Sprintf("%s returned %d unusable DNS responses", label, result.Stats.ResolverFailures)
+			message := fmt.Sprintf("returned %d unusable DNS responses", result.Stats.ResolverFailures)
 			if codes := formatRCodeCounts(result.Stats.RCodeCounts); codes != "" {
-				warning += " (" + codes + ")"
+				message += " (" + codes + ")"
 			}
-			warnings = append(warnings, warning)
+			warnings = append(warnings, TargetWarning(result.Target, message))
 		}
-		if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
-			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
+		if result.Target.Resolver.Local {
+			warnings = append(warnings, TargetWarning(result.Target, "runs on the local host: it measures cache-hit latency and excludes the upstream resolution cost, so its result is not comparable with a network resolver and is reported without a rank or recommendation"))
+		} else if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
+			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100)))
 		}
 	}
 	return warnings
