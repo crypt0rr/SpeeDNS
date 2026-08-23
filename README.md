@@ -276,6 +276,12 @@ not download or read a resolver catalog at runtime.
 The bundled catalog includes the provider-published IPv4 and IPv6 addresses.
 Use `--family 4`, `--family 6`, or `--family both` to choose deterministically.
 The default `--family auto` keeps literal address families visible on usable
+local interfaces, plus loopback addresses, which stay reachable through the
+host itself no matter which families have external routes. Hostname-only
+custom encrypted endpoints remain available in `auto` and `both`; explicit `4`
+or `6` requires IP literals so SpeeDNS does not perform an unmeasured
+bootstrap lookup to guess a family.
+
 local interfaces. Unique-local IPv6 (`fc00::/7`, including Tailscale and
 router-issued ULAs) does not count as IPv6 availability, because IPv6 has no
 NAT equivalent and a ULA is not evidence of a public route; private IPv4 still
@@ -396,7 +402,13 @@ Use `--include-system` to include the resolver configured by the operating syste
 ./speedns --include-system
 ```
 
-This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. Separate macOS scopes remain separate targets even when they use the same address.
+This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. Separate macOS scopes remain separate targets even when they use the same address. Link-local IPv6 nameservers keep their zone (`fe80::1%en0`) so they stay dialable.
+
+Windows has no system resolver discovery yet, and `--include-system` reports
+it as an unsupported platform. Discovery failures do not abort a run: when
+other resolvers are selected, SpeeDNS prints a warning on stderr and
+benchmarks the rest. `--include-system` on its own still fails, because the
+run would have no resolver left.
 
 macOS discovery gives `scutil --dns` a two-second independent timeout. If it
 times out or returns no usable nameservers, SpeeDNS falls back to
