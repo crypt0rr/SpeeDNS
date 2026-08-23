@@ -34,11 +34,16 @@ reports the DNS transaction time only.
 Warm latency is measured from immediately before a DNS exchange until the
 validated response or error returns. TCP, DoT, and any recovered stream
 connection are not closed before the timer stops. A query that follows a TCP,
-DoT, or DoQ reconnect is recorded as a reconnect sample and excluded from
+DoT, DoH, or DoQ reconnect is recorded as a reconnect sample and excluded from
 ordinary warm-latency scoring; its reconnect count and selected dial address
-remain visible in detailed output and machine-readable results. DoQ sessions
-use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to the
-configured timeout, and a maximum idle timeout of twice that timeout. The
+remain visible in detailed output and machine-readable results. A DoH session
+reuses one pooled HTTPS connection; when that connection is gone, the HTTP
+client opens a new one transparently, so the query that pays for the new TCP,
+TLS, and HTTP handshake is the reconnect sample. The connection the session
+opens for its first exchange is the DoH equivalent of the dial the stream
+transports perform when the session is opened, and is not a reconnect. DoQ
+sessions use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to
+the configured timeout, and a maximum idle timeout of twice that timeout. The
 failed exchange that caused the reconnect is counted once and is never
 retried.
 
