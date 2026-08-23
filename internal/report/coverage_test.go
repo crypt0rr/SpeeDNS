@@ -850,7 +850,7 @@ func TestReportFormattingBranchesAndWriteErrors(t *testing.T) {
 func TestPairedEffectsBelowMinimumSamplesAreNotComparable(t *testing.T) {
 	first := reportTarget("first", catalog.UDP, 1, false)
 	second := reportTarget("second", catalog.UDP, 1, false)
-	reason := "insufficient paired samples (minimum 20)"
+	reason := "insufficient paired samples"
 	run := benchmark.Report{
 		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
 		Targets:  []benchmark.TargetResult{first, second},

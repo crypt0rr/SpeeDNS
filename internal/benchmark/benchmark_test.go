@@ -309,7 +309,7 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 		t.Fatalf("noise effect = %#v", noiseEffect)
 	}
 	fewEffect := find(few.ID())
-	wantReason := fmt.Sprintf("insufficient paired samples (minimum %d)", MinimumRecommendedSamples)
+	const wantReason = "insufficient paired samples"
 	if fewEffect.Samples != MinimumRecommendedSamples-1 || fewEffect.Reason != wantReason {
 		t.Fatalf("below-minimum effect = %#v", fewEffect)
 	}
