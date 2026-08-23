@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1419,6 +1421,80 @@ func TestPreparationIsConcurrentBoundedAndDeterministic(t *testing.T) {
 	}
 	if !reflect.DeepEqual(shape(first), shape(second)) {
 		t.Fatalf("seeded run was not deterministic: %#v != %#v", shape(first), shape(second))
+	}
+}
+
+// TestPrepareTargetsStopsDispatchingWhenCancelledMidSend covers the dispatch
+// loop's ctx.Done() arm deterministically.
+//
+// That arm was previously reached only by luck. The loop guards with
+// `if ctx.Err() != nil { break }` before the select, so a context already
+// cancelled takes the guard, and when the send is ready Go picks between the
+// two ready select cases pseudo-randomly. Coverage of the arm therefore
+// depended on goroutine scheduling -- it held on Linux and failed on macOS,
+// where the guard won the race.
+//
+// Making it deterministic needs the send to be unable to proceed at the moment
+// of cancellation. One worker, an unbuffered job channel, and a worker that
+// blocks inside prepare guarantee exactly that: the worker takes target 0 and
+// parks, so the dispatcher blocks sending target 1 and the only case that can
+// ever become ready is ctx.Done().
+func TestPrepareTargetsStopsDispatchingWhenCancelledMidSend(t *testing.T) {
+	restore := newFactory
+	t.Cleanup(func() { newFactory = restore })
+
+	preparing := make(chan struct{})
+	release := make(chan struct{})
+	var opened atomic.Int32
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
+			if opened.Add(1) == 1 {
+				close(preparing)
+				<-release
+			}
+			return minimalSession{}, nil
+		}}, nil
+	}
+
+	targets := []catalog.Target{
+		{Resolver: catalog.ResolverProfile{ID: "a", Policy: "unfiltered"}, Protocol: catalog.UDP, Address: "192.0.2.1", Spec: catalog.TransportSpec{Port: 53}},
+		{Resolver: catalog.ResolverProfile{ID: "b", Policy: "unfiltered"}, Protocol: catalog.UDP, Address: "192.0.2.2", Spec: catalog.TransportSpec{Port: 53}},
+		{Resolver: catalog.ResolverProfile{ID: "c", Policy: "unfiltered"}, Protocol: catalog.UDP, Address: "192.0.2.3", Spec: catalog.TransportSpec{Port: 53}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan []bool, 1)
+	go func() {
+		_, dispatched := prepareTargets(ctx, targets, []Query{{Name: "example.com.", QType: 1}}, Options{Concurrency: 1, QueryTypes: []uint16{1}, Timeout: time.Second})
+		done <- dispatched
+	}()
+
+	// The single worker is now parked inside prepare for target 0, so the
+	// dispatcher is blocked sending target 1 and no receive can complete.
+	<-preparing
+
+	// Cancelling here would be too early: the dispatcher may still be at the
+	// ctx.Err() guard that precedes the select, in which case the guard breaks
+	// the loop and the select arm is never evaluated -- which is how coverage
+	// of this arm came to depend on the host's scheduler. Waiting until the
+	// dispatcher has been blocked on the send for a while puts it provably
+	// inside the select, so ctx.Done() is the only case that can ever fire.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	// The worker stays parked until the dispatcher has acted on the
+	// cancellation. Releasing it first would make a receive ready again and
+	// reintroduce the two-ready-cases coin flip.
+	for attempt := 0; attempt < 1000; attempt++ {
+		runtime.Gosched()
+	}
+	close(release)
+
+	dispatched := <-done
+	if !dispatched[0] {
+		t.Fatal("the target taken by the worker must be reported as dispatched")
+	}
+	if dispatched[2] {
+		t.Fatal("dispatching must stop at cancellation, not run to completion")
 	}
 }
 

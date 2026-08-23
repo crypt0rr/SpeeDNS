@@ -277,3 +277,78 @@ func TestEvaluateAssertionsReportsDeadTransportsFirst(t *testing.T) {
 		t.Fatalf("the structural failure must lead the message: %q", message)
 	}
 }
+
+// TestNumericAssertionsTargetRankOneOnly pins #107. A numeric threshold must
+// apply to one deterministic target per protocol, not to the whole
+// confidence-interval tie group whose size is decided by network noise.
+//
+// `winner=` deliberately keeps tie-group membership: it asks whether a resolver
+// won, and a tie means the run cannot say it did not. The two questions differ,
+// so the two assertion kinds differ.
+func TestNumericAssertionsTargetRankOneOnly(t *testing.T) {
+	leader := assertTarget("leader", catalog.UDP, false, benchmark.Statistics{
+		Total: 30, Successes: 30, UsableResponses: 30, Scored: 30, SuccessRate: 1, UsableRate: 1, P95MS: 10,
+	})
+	// Statistically tied with the leader, but far slower. Under the old
+	// semantics this target alone decided whether p95<50ms held.
+	tied := assertTarget("tied", catalog.UDP, false, benchmark.Statistics{
+		Total: 30, Successes: 30, UsableResponses: 30, Scored: 30, SuccessRate: 1, UsableRate: 1, P95MS: 900,
+	})
+	report := benchmark.Report{
+		Targets: []benchmark.TargetResult{leader, tied},
+		Rankings: []benchmark.Ranking{
+			{Protocol: catalog.UDP, TargetID: leader.Target.ID(), Rank: 1},
+			{Protocol: catalog.UDP, TargetID: tied.Target.ID(), Rank: 2, Tie: true},
+		},
+	}
+
+	numeric, err := parseAssertions([]string{"p95<50ms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := evaluateAssertions(report, numeric); err != nil {
+		t.Fatalf("a numeric assertion must hold for the rank-one target only: %v", err)
+	}
+
+	// The rank-one target failing still fails, so this is not simply leniency.
+	slowLeader := report
+	slowLeader.Targets = []benchmark.TargetResult{
+		assertTarget("leader", catalog.UDP, false, benchmark.Statistics{
+			Total: 30, Successes: 30, UsableResponses: 30, Scored: 30, SuccessRate: 1, UsableRate: 1, P95MS: 900,
+		}),
+		tied,
+	}
+	if err := evaluateAssertions(slowLeader, numeric); err == nil ||
+		!strings.Contains(err.Error(), "winner leader") {
+		t.Fatalf("a failing rank-one target must fail the gate: %v", err)
+	}
+
+	// winner= still accepts any tie-group member, as METHODOLOGY documents.
+	tieWinner, err := parseAssertions([]string{"winner=tied"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := evaluateAssertions(report, tieWinner); err != nil {
+		t.Fatalf("winner= must still accept a tie-group member: %v", err)
+	}
+
+	// A ranking set with tie members but no rank-one entry cannot come from
+	// makeRankings, but a numeric threshold must never be silently skipped, so
+	// the malformed report is reported rather than passed over.
+	malformed := report
+	malformed.Rankings = []benchmark.Ranking{
+		{Protocol: catalog.UDP, TargetID: tied.Target.ID(), Rank: 2, Tie: true},
+	}
+	if err := evaluateAssertions(malformed, numeric); err == nil ||
+		!strings.Contains(err.Error(), "produced no rank-one target to check") {
+		t.Fatalf("malformed ranking set = %v", err)
+	}
+
+	// A protocol that ranked nothing contributes no numeric reason; the dead
+	// transport rule from #106 owns that case.
+	unranked := benchmark.Report{Targets: []benchmark.TargetResult{leader}}
+	if err := evaluateAssertions(unranked, numeric); err == nil ||
+		!strings.Contains(err.Error(), "has no ranked protocol winners") {
+		t.Fatalf("unranked report = %v", err)
+	}
+}
