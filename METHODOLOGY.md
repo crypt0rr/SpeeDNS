@@ -137,7 +137,15 @@ median of `target latency - reference latency`, so a positive value means the
 target was slower. A deterministic bootstrap of those paired deltas provides
 the 95% confidence interval. When the interval contains zero, the report says
 `NO CLEAR DIFFERENCE`: the observed ranking difference is not distinguishable
-from noise in this run. These effects explain the existing score and never
+from noise in this run.
+
+A paired comparison requires at least 20 paired observations, the same minimum
+sample count the recommendation gate uses. Below that floor no delta and no
+interval are reported: the effect keeps its paired sample count, records the
+reason `insufficient paired samples`, and the report says `NOT COMPARABLE`.
+A one-sample or few-sample run measures cold-path noise, so it must not be
+presented as a directional `FASTER` or `SLOWER` verdict under a 95% confidence
+interval heading. These effects explain the existing score and never
 change ranking order. JSON exposes them in the additive `paired_effects`
 section; the human table shows them below the protocol comparisons, while CSV
 retains its aggregate one-row-per-target schema.

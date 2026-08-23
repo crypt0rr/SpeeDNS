@@ -212,7 +212,9 @@ tables. Within each protocol and policy group, the best-ranked target is the
 reference. The effect is the median per-name/type latency difference
 (`target - reference`) with a deterministic bootstrap 95% confidence interval.
 `NO CLEAR DIFFERENCE` means the interval includes zero, so the measured
-difference is not distinguishable from noise. These comparisons explain the
+difference is not distinguishable from noise. A comparison needs at least 20
+paired observations; below that the row reports `NOT COMPARABLE` instead of a
+delta and interval. These comparisons explain the
 ranking but do not replace the existing score or change rank order. JSON
 includes the same information in the additive `paired_effects` section; CSV
 keeps its aggregate schema.

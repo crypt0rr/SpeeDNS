@@ -192,8 +192,11 @@ type RunProvenance struct {
 // positive delta means that the target was slower than the reference.
 //
 // Only observations that are usable, non-divergent, non-reconnect samples are
-// paired. The existing composite score remains the ranking authority; these
-// values explain whether a ranked difference is distinguishable from noise.
+// paired. A comparison needs at least MinimumRecommendedSamples paired
+// observations, the same floor the recommendation gate uses; below that the
+// delta and interval stay zero and Reason explains why. The existing composite
+// score remains the ranking authority; these values explain whether a ranked
+// difference is distinguishable from noise.
 type PairedEffect struct {
 	Protocol          catalog.Protocol `json:"protocol"`
 	Policy            string           `json:"policy"`
@@ -1230,6 +1233,11 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 				effects = append(effects, effect)
 				continue
 			}
+			if len(deltas) < MinimumRecommendedSamples {
+				effect.Reason = fmt.Sprintf("insufficient paired samples (minimum %d)", MinimumRecommendedSamples)
+				effects = append(effects, effect)
+				continue
+			}
 			sort.Float64s(deltas)
 			effect.MedianDeltaMS = percentile(deltas, 0.5)
 			effect.CILowMS, effect.CIHighMS = bootstrapPairedCI(deltas, pairedBootstrapSeed(seed, key.protocol, key.policy, reference.Target.ID(), target.Target.ID()))
@@ -1296,9 +1304,6 @@ func pairedBootstrapSeed(seed int64, protocol catalog.Protocol, policy, referenc
 func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 	if len(deltas) == 0 {
 		return 0, 0
-	}
-	if len(deltas) == 1 {
-		return deltas[0], deltas[0]
 	}
 	rng := rand.New(rand.NewSource(seed))
 	scores := make([]float64, BootstrapIterations)
