@@ -704,6 +704,42 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 	}
 }
 
+func TestRunBenchmarkRejectsUnknownAssertionWinner(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		result := benchmark.TargetResult{Target: targets[0], Stats: benchmark.Statistics{Total: 1, Successes: 1, Scored: 1, SuccessRate: 1, UsableRate: 1, MedianMS: 1, P95MS: 1, ScoreMS: 1}}
+		return benchmark.Report{
+			StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0), Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+			Targets:  []benchmark.TargetResult{result},
+			Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: targets[0].ID(), Rank: 1}},
+		}, nil
+	}
+
+	unknown := cliConfigForTest(t)
+	unknown.output = filepath.Join(t.TempDir(), "unknown.json")
+	unknown.assertions = []string{"winner=custom-labb"}
+	err := runBenchmark(context.Background(), unknown)
+	if err == nil || !strings.Contains(err.Error(), "no selected resolver matches") {
+		t.Fatalf("unknown winner error = %v", err)
+	}
+	if code := exitCodeForError(err); code != 2 {
+		t.Fatalf("unknown winner exit code = %d, want 2 (invalid input) rather than 4", code)
+	}
+	if _, statErr := os.Stat(unknown.output); !os.IsNotExist(statErr) {
+		t.Fatalf("unknown winner must fail before the report is written: %v", statErr)
+	}
+
+	for _, winner := range []string{"custom-lab", "custom-lab@127.0.0.1/udp"} {
+		known := cliConfigForTest(t)
+		known.output = filepath.Join(t.TempDir(), "known.json")
+		known.assertions = []string{"winner=" + winner}
+		if err := runBenchmark(context.Background(), known); err != nil {
+			t.Fatalf("winner=%s run = %v", winner, err)
+		}
+	}
+}
+
 func TestRunBenchmarkFamilySelection(t *testing.T) {
 	oldEngine := runBenchmarkEngine
 	oldDetector := detectAddressFamiliesFunc

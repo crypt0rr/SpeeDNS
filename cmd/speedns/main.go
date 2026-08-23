@@ -87,6 +87,10 @@ var interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
 
 var detectAddressFamiliesFunc = detectAddressFamilies
 
+// exitCodes lists every status the command can return, so documentation can be
+// checked against the contract rather than against a hand-kept list.
+func exitCodes() []int { return []int{0, 2, 3, 4, 130} }
+
 func exitCodeForError(err error) int {
 	switch {
 	case err == nil:
@@ -719,6 +723,9 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	targets := catalog.Expand(profiles, selected)
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
+	}
+	if err := validateAssertionTargets(assertions, targets); err != nil {
+		return err
 	}
 	seed := config.seed
 	if seed == 0 {
