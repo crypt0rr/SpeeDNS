@@ -844,7 +844,7 @@ func ResponseClass(message *dns.Msg) string {
 	}
 	switch message.Rcode {
 	case dns.RcodeSuccess:
-		if len(message.Answer) == 0 && len(message.Ns) == 0 {
+		if !answersQuestion(message) {
 			return "nodata"
 		}
 		return "answer"
@@ -853,6 +853,26 @@ func ResponseClass(message *dns.Msg) string {
 	default:
 		return fmt.Sprintf("rcode-%d", message.Rcode)
 	}
+}
+
+// answersQuestion reports whether the answer section carries a record of the
+// requested type. A canonical NODATA response is NOERROR with an empty answer
+// section and an SOA in the authority section, so authority records must never
+// be read as an answer: doing so collapses "this name has no such record" and
+// "here is the address" into one response class.
+func answersQuestion(message *dns.Msg) bool {
+	if len(message.Question) != 1 {
+		// validateResponse rejects any other shape before scoring, so this is
+		// only reachable for synthetic messages; fall back to answer presence.
+		return len(message.Answer) > 0
+	}
+	qtype := message.Question[0].Qtype
+	for _, answer := range message.Answer {
+		if answer.Header().Rrtype == qtype {
+			return true
+		}
+	}
+	return false
 }
 
 // ResponseCodeName returns the conventional DNS response-code name used in
