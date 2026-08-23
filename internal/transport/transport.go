@@ -403,6 +403,15 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 // endpoint cannot force an unnecessarily large header allocation per query.
 const doHMaxResponseHeaderBytes = 64 << 10
 
+// Go applies its ten hop redirect cap inside net/http's own CheckRedirect,
+// so installing a custom callback removes the cap entirely. A legitimate DoH
+// endpoint needs at most one or two hops, so keep a small budget of our own
+// to stop a hostile or misconfigured endpoint from expanding a single query
+// into an unbounded request burst. Like the net/http default, the budget
+// counts the requests in one chain, so at most doHMaxRedirects requests are
+// issued per query.
+const doHMaxRedirects = 5
+
 func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -465,6 +474,9 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		Transport: transport,
 		Timeout:   f.timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= doHMaxRedirects {
+				return fmt.Errorf("DoH stopped after %d redirects", doHMaxRedirects)
+			}
 			if len(via) > 0 && !sameHTTPSOrigin(via[0].URL, req.URL) {
 				return errors.New("DoH redirect changed HTTPS origin")
 			}
