@@ -42,8 +42,12 @@
         "min_ms": 0,
         "max_ms": 0,
         "mad_ms": 0,
+        "cold_median_ms": 0,
         "score_ms": 0,
-        "recommended": false
+        "ci_low_ms": 0,
+        "ci_high_ms": 0,
+        "recommended": false,
+        "tie": false
       },
       "open_error": "fixture connection failed"
     },
@@ -82,7 +86,8 @@
         "score_ms": 2.4,
         "ci_low_ms": 1,
         "ci_high_ms": 4,
-        "recommended": true
+        "recommended": true,
+        "tie": false
       }
     }
   ],
