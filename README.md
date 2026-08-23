@@ -16,6 +16,10 @@ The package files are independent release assets. Verify the release
 checksums and Sigstore signature before installing. For example:
 
 ```sh
+# Debian and Ubuntu. Prefer apt over `dpkg -i`: it resolves dependencies and
+# runs with a login environment, which dpkg requires (see the note below).
+sudo apt install ./speedns_VERSION_linux_amd64.deb
+
 # Fedora/RHEL and compatible distributions
 sudo rpm -Uvh ./speedns_VERSION_linux_amd64.rpm
 
@@ -30,6 +34,26 @@ sudo pacman -U ./speedns_VERSION_linux_amd64.pkg.tar.zst
 Use the `arm64` asset on a 64-bit ARM host. Package-manager signatures are
 not substituted for the release checksum and Sigstore verification described
 below.
+
+If you install the Debian package with `dpkg -i` and it stops with:
+
+```
+dpkg: warning: 'ldconfig' not found in PATH or not executable
+dpkg: warning: 'start-stop-daemon' not found in PATH or not executable
+dpkg: error: 2 expected programs not found in PATH or not executable
+```
+
+that is dpkg checking its own environment before it opens the package, not
+anything about this one — the SpeeDNS package ships no maintainer scripts and
+calls neither program. The root shell simply has a `PATH` without `/usr/sbin`
+and `/sbin`, which is what plain `su` gives you because it keeps the calling
+user's `PATH`. Use `sudo apt install ./...deb`, or `su -` with the dash for a
+real login shell, or set the path for the one command:
+
+```sh
+sudo env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  dpkg -i ./speedns_VERSION_linux_amd64.deb
+```
 
 ### Homebrew (macOS)
 
@@ -58,7 +82,7 @@ brew upgrade --cask speedns
 brew uninstall --cask speedns
 ```
 
-The current prerelease macOS binaries are not Apple-signed or notarized. On
+The macOS binaries are not yet Apple-signed or notarized. On
 first use, macOS may show a Gatekeeper warning. If you trust the release,
 open **System Settings → Privacy & Security**, select **Open Anyway**, and
 then run `speedns` again. Do not disable Gatekeeper globally.
