@@ -1,0 +1,2 @@
+go test fuzz v1
+string("version: 1\nresolvers:\n  - id: dot\n    name: DoT\n    addresses: [192.0.2.53]\n    transports:\n      dot: {port: 853}\n")

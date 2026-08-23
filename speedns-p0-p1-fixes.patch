@@ -1,0 +1,207 @@
+diff --git a/cmd/speedns/main.go b/cmd/speedns/main.go
+index 95f9931..1e21b61 100644
+--- a/cmd/speedns/main.go
++++ b/cmd/speedns/main.go
+@@ -474,8 +474,12 @@ func detectAddressFamilies() (map[catalog.AddressFamily]bool, error) {
+ 				continue
+ 			}
+ 			if ip.To4() != nil {
++				// RFC 1918 IPv4 still reaches the Internet through NAT.
+ 				available[catalog.Family4] = true
+-			} else {
++			} else if !ip.IsPrivate() {
++				// A unique-local IPv6 address (fc00::/7, which covers
++				// Tailscale's fd7a::/48) is not evidence of a public IPv6
++				// route, and IPv6 has no NAT equivalent.
+ 				available[catalog.Family6] = true
+ 			}
+ 		}
+diff --git a/internal/benchmark/benchmark.go b/internal/benchmark/benchmark.go
+index 670a069..da0150c 100644
+--- a/internal/benchmark/benchmark.go
++++ b/internal/benchmark/benchmark.go
+@@ -126,12 +126,12 @@ type Statistics struct {
+ 	MinMS               float64        `json:"min_ms"`
+ 	MaxMS               float64        `json:"max_ms"`
+ 	MADMS               float64        `json:"mad_ms"`
+-	ColdMedianMS        float64        `json:"cold_median_ms,omitempty"`
++	ColdMedianMS        float64        `json:"cold_median_ms"`
+ 	ScoreMS             float64        `json:"score_ms"`
+-	CILowMS             float64        `json:"ci_low_ms,omitempty"`
+-	CIHighMS            float64        `json:"ci_high_ms,omitempty"`
++	CILowMS             float64        `json:"ci_low_ms"`
++	CIHighMS            float64        `json:"ci_high_ms"`
+ 	Recommended         bool           `json:"recommended"`
+-	Tie                 bool           `json:"tie,omitempty"`
++	Tie                 bool           `json:"tie"`
+ }
+ 
+ type TargetResult struct {
+@@ -278,7 +278,11 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
+ 	for protocol := range byProtocol {
+ 		protocols = append(protocols, protocol)
+ 	}
+-	sort.Slice(protocols, func(i, j int) bool { return protocols[i] < protocols[j] })
++	// Run in the canonical catalog order documented in METHODOLOGY.md rather
++	// than lexicographic order of the protocol strings.
++	sort.Slice(protocols, func(i, j int) bool {
++		return protocolOrder(protocols[i]) < protocolOrder(protocols[j])
++	})
+ 
+ 	for _, protocol := range protocols {
+ 		groupResults := runProtocol(ctx, byProtocol[protocol], queries, opts)
+@@ -304,6 +308,17 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
+ 	return report, nil
+ }
+ 
++// protocolOrder ranks a protocol by its position in catalog.AllProtocols so
++// the measured order matches the documented and displayed order.
++func protocolOrder(protocol catalog.Protocol) int {
++	for index, candidate := range catalog.AllProtocols {
++		if candidate == protocol {
++			return index
++		}
++	}
++	return len(catalog.AllProtocols)
++}
++
+ func validateOptions(opts Options) error {
+ 	if len(opts.Domains) == 0 {
+ 		return errors.New("domain corpus is empty")
+diff --git a/internal/benchmark/coverage_test.go b/internal/benchmark/coverage_test.go
+index 26243aa..1b1aa12 100644
+--- a/internal/benchmark/coverage_test.go
++++ b/internal/benchmark/coverage_test.go
+@@ -197,8 +197,8 @@ func TestRunAndProtocolScheduling(t *testing.T) {
+ 			t.Fatalf("progress[%d] phase = %q, want %q", index, progress[index].Phase, want)
+ 		}
+ 	}
+-	if progress[0].Protocol != catalog.TCP || progress[3].Protocol != catalog.UDP {
+-		t.Fatalf("progress protocol order = %#v/%#v, want tcp then udp", progress[0].Protocol, progress[3].Protocol)
++	if progress[0].Protocol != catalog.UDP || progress[3].Protocol != catalog.TCP {
++		t.Fatalf("progress protocol order = %#v/%#v, want udp then tcp", progress[0].Protocol, progress[3].Protocol)
+ 	}
+ 	if _, ok := report.ResultFor(report.Targets[0].Target.ID()); !ok {
+ 		t.Fatal("ResultFor did not find an existing result")
+@@ -247,7 +247,7 @@ func TestRunAndProtocolScheduling(t *testing.T) {
+ 		cancel()
+ 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1}}}
+ 	}
+-	cancelledTargets := []catalog.Target{testTarget(catalog.TCP, "cancel-first"), testTarget(catalog.UDP, "not-dispatched")}
++	cancelledTargets := []catalog.Target{testTarget(catalog.UDP, "cancel-first"), testTarget(catalog.TCP, "not-dispatched")}
+ 	cancelledReport, err := Run(ctx, cancelledTargets, opts)
+ 	if !errors.Is(err, context.Canceled) {
+ 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
+diff --git a/internal/domains/domains.go b/internal/domains/domains.go
+index ac9eeaa..9f77348 100644
+--- a/internal/domains/domains.go
++++ b/internal/domains/domains.go
+@@ -19,6 +19,11 @@ import (
+ 
+ const maxDomainLineSize = 64 * 1024
+ 
++// rootLabelSeparators lists every code point UTS-46 maps onto the DNS label
++// separator: FULL STOP, IDEOGRAPHIC FULL STOP, FULLWIDTH FULL STOP and
++// HALFWIDTH IDEOGRAPHIC FULL STOP.
++const rootLabelSeparators = ".\u3002\uff0e\uff61"
++
+ // CacheMissZone is the IANA-reserved example zone used only by the explicit
+ // cache-miss mode. SpeeDNS never sends these names unless the user opts in.
+ const CacheMissZone = "example.com"
+@@ -184,10 +189,18 @@ func normalize(value string) (string, error) {
+ 		return "", errors.New("empty labels are not allowed")
+ 	}
+ 
++	// The root label must be trimmed before IDNA processing. UTS-46 ToASCII
++	// with VerifyDNSLength rejects a trailing empty label, and which inputs it
++	// rejects depends on the Unicode tables the building Go toolchain selects.
++	// UTS-46 maps the ideographic and fullwidth stops onto the ASCII label
++	// separator, so all four forms have to be trimmed here.
++	value = strings.TrimRight(value, rootLabelSeparators)
++	if value == "" {
++		return "", nil
++	}
+ 	name, err := lookupProfile.ToASCII(value)
+ 	if err != nil {
+ 		return "", err
+ 	}
+-	name = strings.TrimSuffix(name, ".")
+ 	return strings.ToLower(name), nil
+ }
+diff --git a/internal/report/report.go b/internal/report/report.go
+index 39b0a5f..be5ee20 100644
+--- a/internal/report/report.go
++++ b/internal/report/report.go
+@@ -138,7 +138,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
+ 		}
+ 		results = append(results, jsonResult)
+ 	}
+-	rankings := append([]benchmark.Ranking(nil), report.Rankings...)
++	rankings := append(make([]benchmark.Ranking, 0, len(report.Rankings)), report.Rankings...)
+ 	for index := range rankings {
+ 		if redactedID, ok := redactedIDs[rankings[index].TargetID]; ok {
+ 			rankings[index].TargetID = redactedID
+diff --git a/internal/report/testdata/golden/report.json b/internal/report/testdata/golden/report.json
+index 456e27c..c1d8500 100644
+--- a/internal/report/testdata/golden/report.json
++++ b/internal/report/testdata/golden/report.json
+@@ -42,8 +42,12 @@
+         "min_ms": 0,
+         "max_ms": 0,
+         "mad_ms": 0,
++        "cold_median_ms": 0,
+         "score_ms": 0,
+-        "recommended": false
++        "ci_low_ms": 0,
++        "ci_high_ms": 0,
++        "recommended": false,
++        "tie": false
+       },
+       "open_error": "fixture connection failed"
+     },
+@@ -82,7 +86,8 @@
+         "score_ms": 2.4,
+         "ci_low_ms": 1,
+         "ci_high_ms": 4,
+-        "recommended": true
++        "recommended": true,
++        "tie": false
+       }
+     }
+   ],
+diff --git a/internal/transport/transport.go b/internal/transport/transport.go
+index 886801e..c06b459 100644
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -844,7 +844,7 @@ func ResponseClass(message *dns.Msg) string {
+ 	}
+ 	switch message.Rcode {
+ 	case dns.RcodeSuccess:
+-		if len(message.Answer) == 0 && len(message.Ns) == 0 {
++		if !answersQuestion(message) {
+ 			return "nodata"
+ 		}
+ 		return "answer"
+@@ -855,6 +855,22 @@ func ResponseClass(message *dns.Msg) string {
+ 	}
+ }
+ 
++// answersQuestion reports whether the answer section carries a record of the
++// requested type. A canonical NODATA response carries an SOA in the authority
++// section, so authority records must not be read as an answer.
++func answersQuestion(message *dns.Msg) bool {
++	if len(message.Question) != 1 {
++		return len(message.Answer) > 0
++	}
++	qtype := message.Question[0].Qtype
++	for _, rr := range message.Answer {
++		if rr.Header().Rrtype == qtype {
++			return true
++		}
++	}
++	return false
++}
++
+ // ResponseCodeName returns the conventional DNS response-code name used in
+ // reports. Unknown extended or future codes retain their numeric value.
+ func ResponseCodeName(rcode int) string {

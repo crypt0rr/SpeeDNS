@@ -120,6 +120,45 @@ func TestEvaluateAssertionsAcceptsTiedWinners(t *testing.T) {
 	}
 }
 
+func TestValidateAssertionTargetsRejectsUnknownWinners(t *testing.T) {
+	targets := []catalog.Target{
+		assertionTarget("first", catalog.UDP, "192.0.2.1"),
+		assertionTarget("second", catalog.TCP, "192.0.2.2"),
+	}
+	accepted, err := parseAssertions([]string{"p95<50ms", "winner=second", "winner=" + targets[0].ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAssertionTargets(accepted, targets); err != nil {
+		t.Fatalf("validateAssertionTargets() = %v", err)
+	}
+
+	rejected, err := parseAssertions([]string{"winner=secnod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateAssertionTargets(rejected, targets)
+	if err == nil || !strings.Contains(err.Error(), "no selected resolver matches") || !strings.Contains(err.Error(), "secnod") {
+		t.Fatalf("unknown winner error = %v", err)
+	}
+	if errors.Is(err, ErrAssertionsFailed) {
+		t.Fatal("an unknown winner is invalid input, not a failed assertion")
+	}
+
+	// A profile that is filtered out of the run, for example by --protocol,
+	// must be rejected rather than silently reported as a loser.
+	if err := validateAssertionTargets(rejected, targets[:1]); err == nil {
+		t.Fatal("expected unknown winner error against the reduced target set")
+	}
+	unselected, err := parseAssertions([]string{"winner=second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAssertionTargets(unselected, targets[:1]); err == nil {
+		t.Fatal("expected error for a profile that is not part of the run")
+	}
+}
+
 func assertionTarget(id string, protocol catalog.Protocol, address string) catalog.Target {
 	return catalog.Target{
 		Resolver: catalog.ResolverProfile{ID: id, Name: id, Owner: "Test", Policy: "unfiltered"},
