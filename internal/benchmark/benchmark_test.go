@@ -108,9 +108,9 @@ func TestRunWarnsWhenSampleIsClamped(t *testing.T) {
 	}
 }
 
-func containsWarning(warnings []string, fragment string) bool {
+func containsWarning(warnings []Warning, fragment string) bool {
 	for _, warning := range warnings {
-		if strings.Contains(warning, fragment) {
+		if strings.Contains(warning.String(), fragment) {
 			return true
 		}
 	}
@@ -204,7 +204,7 @@ func TestRecommendationRequiresUsableResponses(t *testing.T) {
 		Target: target,
 		Stats:  Statistics{Total: 2, Scored: 1, ResolverFailures: 1, RCodeCounts: map[string]int{"SERVFAIL": 1}},
 	}})
-	if len(warnings) != 2 || !strings.Contains(strings.Join(warnings, "\n"), "SERVFAIL:1") {
+	if len(warnings) != 2 || !strings.Contains(warningText(warnings), "SERVFAIL:1") {
 		t.Fatalf("resolver-error warnings = %#v", warnings)
 	}
 }
@@ -449,11 +449,11 @@ func TestLocalResolverIsMeasuredButNeverRankedOrRecommended(t *testing.T) {
 		t.Fatalf("warnings = %#v", warnings)
 	}
 	for _, expected := range []string{"System DNS stub 127.0.0.53/udp", "cache-hit latency", "upstream resolution cost", "not comparable"} {
-		if !strings.Contains(warnings[0], expected) {
-			t.Fatalf("non-comparability warning missing %q: %q", expected, warnings[0])
+		if !strings.Contains(warnings[0].String(), expected) {
+			t.Fatalf("non-comparability warning missing %q: %q", expected, warnings[0].String())
 		}
 	}
-	if strings.Contains(warnings[0], "recommendation-eligible yet") {
+	if strings.Contains(warnings[0].String(), "recommendation-eligible yet") {
 		t.Fatalf("local stub reported as a quality problem: %q", warnings[0])
 	}
 

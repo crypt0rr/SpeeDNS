@@ -1375,7 +1375,10 @@ func TestRunBenchmarkEmitsNoComparableReports(t *testing.T) {
 				Target: catalog.Target{Resolver: catalog.ResolverProfile{ID: "dead", Name: "Dead", Owner: "Test owner", Policy: "unfiltered"}, Protocol: catalog.UDP, Address: "192.0.2.1", Spec: catalog.TransportSpec{Port: 53}},
 				Stats:  benchmark.Statistics{Total: 1, Failures: 1, SuccessRate: 0, FailureRate: 1}, OpenError: "connection refused",
 			}},
-			Warnings: []string{"Dead 192.0.2.1/udp could not open a session: connection refused"},
+			Warnings: []benchmark.Warning{benchmark.TargetWarning(
+				catalog.Target{Resolver: catalog.ResolverProfile{ID: "dead", Name: "Dead", Owner: "Test owner", Policy: "unfiltered"}, Protocol: catalog.UDP, Address: "192.0.2.1", Spec: catalog.TransportSpec{Port: 53}},
+				"could not open a session: connection refused",
+			)},
 		}, benchmark.ErrNoComparableResults
 	}
 	for _, format := range []string{"table", "json", "csv"} {

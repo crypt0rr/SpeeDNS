@@ -25,7 +25,7 @@ func goldenReport() benchmark.Report {
 		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
 		Targets:  []benchmark.TargetResult{failed, winner},
 		Rankings: []benchmark.Ranking{{Protocol: "udp", TargetID: winner.Target.ID(), Rank: 1}},
-		Warnings: []string{"fixture warning"},
+		Warnings: []benchmark.Warning{benchmark.RunWarning("fixture warning")},
 	}
 	run.Divergence = []benchmark.DivergenceDetail{
 		{

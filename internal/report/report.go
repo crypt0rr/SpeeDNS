@@ -146,10 +146,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 			rankings[index].TargetID = redactedID
 		}
 	}
-	warnings := append([]string(nil), report.Warnings...)
-	if options.RedactSystem {
-		warnings = redactWarnings(report, redactedIDs)
-	}
+	warnings := renderWarnings(report, options.RedactSystem, redactedIDs)
 	var profileComparisons []JSONProfileComparison
 	if options.ProfileView {
 		profileComparisons = profileComparisonsForJSON(report, redactedIDs)
@@ -441,19 +438,54 @@ func redactColdObservations(result benchmark.TargetResult, redact bool, redacted
 	return observations
 }
 
-func redactWarningValue(report benchmark.Report, warning string, redactedIDs map[string]string) string {
+// redactRunWarningText scrubs system resolver identities from a run-level
+// warning. A run-level warning carries no endpoint, so scanning its text is the
+// only way to catch an identity that a producer embedded in the message.
+func redactRunWarningText(report benchmark.Report, message string, redactedIDs map[string]string) string {
 	for _, result := range report.Targets {
 		if isSystemTarget(result.Target) {
-			warning = redactResultText(result, warning, true, redactedIDs[result.Target.ID()])
+			message = redactResultText(result, message, true, redactedIDs[result.Target.ID()])
 		}
 	}
-	return warning
+	return message
 }
 
-func redactWarnings(report benchmark.Report, redactedIDs map[string]string) []string {
-	warnings := append([]string(nil), report.Warnings...)
-	for index := range warnings {
-		warnings[index] = redactWarningValue(report, warnings[index], redactedIDs)
+// warningTargetResult returns the measured result for the endpoint a warning is
+// attributed to, so redaction can also scrub the dial address. The zero result
+// keeps rendering correct when the warning outlives its target result.
+func warningTargetResult(report benchmark.Report, target catalog.Target) benchmark.TargetResult {
+	for _, result := range report.Targets {
+		if result.Target.ID() == target.ID() {
+			return result
+		}
+	}
+	return benchmark.TargetResult{Target: target}
+}
+
+// renderWarning renders one structured warning. Attribution comes from the
+// warning itself, never from the rendered text, so the label format can change
+// on either side without a view losing warnings.
+func renderWarning(report benchmark.Report, warning benchmark.Warning, redactSystem bool, redactedIDs map[string]string) string {
+	if !warning.Targeted() {
+		if redactSystem {
+			return redactRunWarningText(report, warning.Message, redactedIDs)
+		}
+		return warning.Message
+	}
+	if !redactSystem || !isSystemTarget(*warning.Target) {
+		return warning.String()
+	}
+	redactedID := redactedIDs[warning.Target.ID()]
+	redacted := warning
+	redacted.Message = redactResultText(warningTargetResult(report, *warning.Target), warning.Message, true, redactedID)
+	view := targetViewFor(*warning.Target, true, redactedID)
+	return redacted.RenderWith(view.Name, view.Address)
+}
+
+func renderWarnings(report benchmark.Report, redactSystem bool, redactedIDs map[string]string) []string {
+	warnings := make([]string, 0, len(report.Warnings))
+	for _, warning := range report.Warnings {
+		warnings = append(warnings, safetext.Escape(renderWarning(report, warning, redactSystem, redactedIDs)))
 	}
 	return warnings
 }
@@ -1181,22 +1213,9 @@ func comparisonHeaders(details bool) []string {
 	return append(headers, "Tie", "Status")
 }
 
-func targetWarningLabel(result benchmark.TargetResult) string {
-	return targetWarningLabelWithOptions(result, false)
-}
-
 func targetWarningLabelWithOptions(result benchmark.TargetResult, redactSystem bool) string {
 	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	return fmt.Sprintf("%s %s/%s", view.Name, view.Address, result.Target.Protocol)
-}
-
-func isTargetWarningWithOptions(warning string, results []benchmark.TargetResult, redactSystem bool) bool {
-	for _, result := range results {
-		if strings.HasPrefix(warning, targetWarningLabel(result)) || strings.HasPrefix(warning, targetWarningLabelWithOptions(result, redactSystem)) {
-			return true
-		}
-	}
-	return false
 }
 
 func compactWarnings(report benchmark.Report) []string {
@@ -1292,13 +1311,14 @@ func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []st
 			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabelWithOptions(result, redactSystem), strings.Join(parts, "; ")))
 		}
 	}
+	redactedIDs := redactedTargetIDs(report, redactSystem)
 	for _, warning := range report.Warnings {
-		if !isTargetWarningWithOptions(warning, report.Targets, redactSystem) {
-			if redactSystem {
-				warning = redactWarningValue(report, warning, redactedTargetIDs(report, true))
-			}
-			warnings = append(warnings, safetext.Escape(warning))
+		// Per-target warnings are rebuilt above as one compact line per
+		// endpoint; only run-level warnings are carried through verbatim.
+		if warning.Targeted() {
+			continue
 		}
+		warnings = append(warnings, safetext.Escape(renderWarning(report, warning, redactSystem, redactedIDs)))
 	}
 	return warnings
 }
@@ -1359,19 +1379,15 @@ func writeWarnings(writer io.Writer, report benchmark.Report, details bool) erro
 
 // detailWarnings returns the full warning list rendered under --details.
 //
-// Warnings arrive as free text that embeds the session error of a target, and
-// that error quotes strings the endpoint chose - a certificate SAN reaches it
-// through "x509: certificate is valid for ...", and ESC survives the IA5String
-// check that x509 applies to those fields. The benchmark escapes the warnings
-// it builds, but the report does not depend on that: the list is escaped here,
-// where the report takes ownership of it, rather than in the writer, so every
-// producer of a warning is covered. Escaping is idempotent, so a warning that
-// was already escaped is unchanged.
+// A message can quote strings the endpoint chose: a certificate SAN reaches a
+// session error through "x509: certificate is valid for ...", and ESC survives
+// the IA5String check x509 applies to those fields. The benchmark escapes the
+// messages it builds, but the report does not depend on that - the rendered
+// list is escaped here, where the report takes ownership of it, rather than in
+// the writer, so every producer is covered. Escaping is idempotent, so an
+// already-escaped warning is unchanged.
 func detailWarnings(report benchmark.Report, redactSystem bool) []string {
-	warnings := report.Warnings
-	if redactSystem {
-		warnings = redactWarnings(report, redactedTargetIDs(report, true))
-	}
+	warnings := renderWarnings(report, redactSystem, redactedTargetIDs(report, redactSystem))
 	escaped := make([]string, 0, len(warnings))
 	for _, warning := range warnings {
 		escaped = append(escaped, safetext.Escape(warning))

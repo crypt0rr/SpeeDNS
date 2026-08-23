@@ -43,8 +43,8 @@ func hostileReport() benchmark.Report {
 	return benchmark.Report{
 		Seed: 1, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
 		Targets: []benchmark.TargetResult{result},
-		Warnings: []string{
-			"Hostile\x1b[2K resolver 192.0.2.10/dot could not open a session: " + result.OpenError,
+		Warnings: []benchmark.Warning{
+			benchmark.TargetWarning(result.Target, "could not open a session: "+result.OpenError),
 		},
 	}
 }
@@ -65,7 +65,7 @@ func TestDetailsWarningsEscapeControlCharacters(t *testing.T) {
 
 func TestCompactWarningsEscapeControlCharacters(t *testing.T) {
 	run := hostileReport()
-	run.Warnings = append(run.Warnings, "global diagnostic \x1b[2K\rhidden")
+	run.Warnings = append(run.Warnings, benchmark.RunWarning("global diagnostic \x1b[2K\rhidden"))
 	var output bytes.Buffer
 	if err := WriteTableWithOptions(&output, run, TableOptions{}); err != nil {
 		t.Fatal(err)
@@ -147,7 +147,12 @@ func TestCSVEscapesControlCharactersBeforeTheFormulaGuard(t *testing.T) {
 	}
 }
 
-func TestRedactionMatchesEscapedSystemResolverText(t *testing.T) {
+// TestRedactionUsesStructuredTargetIdentity covers redaction of a local
+// resolver's identity. A warning carries its target rather than a rendered
+// label, so redaction reads the attribution directly instead of matching a
+// rebuilt - and possibly escaped - label against the message text. A control
+// character in the resolver name therefore cannot defeat it.
+func TestRedactionUsesStructuredTargetIdentity(t *testing.T) {
 	systemTarget := catalog.Target{
 		Resolver: catalog.ResolverProfile{
 			ID: "system-stub-127-0-0-53", Name: "System DNS stub (scope: corp\x1b[2K.example)",
@@ -162,10 +167,8 @@ func TestRedactionMatchesEscapedSystemResolverText(t *testing.T) {
 	run := benchmark.Report{
 		Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
 		Targets: []benchmark.TargetResult{system},
-		Warnings: []string{
-			// The benchmark escapes the labels it builds, so redaction must
-			// recognise the escaped spelling of a local resolver name.
-			`System DNS stub (scope: corp\x1b[2K.example) 127.0.0.53/udp could not open a session: timeout`,
+		Warnings: []benchmark.Warning{
+			benchmark.TargetWarning(systemTarget, "could not open a session: timeout"),
 		},
 	}
 	var output bytes.Buffer

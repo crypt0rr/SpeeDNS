@@ -901,12 +901,12 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		Concurrency:   effectiveConcurrency,
 	}
 	if concurrencyCapped {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency)))
 	}
 	if config.cacheMiss && config.sample < len(domainList) {
-		result.Warnings = append(result.Warnings, fmt.Sprintf(
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
 			"effective sample of %d truncated the generated cache-miss corpus of %d names; raise --sample or lower --cache-miss-sample to measure every generated name",
-			config.sample, len(domainList)))
+			config.sample, len(domainList))))
 	}
 	if config.cacheMiss {
 		// Every protocol group replays the same generated names against the
@@ -918,9 +918,9 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			for _, protocol := range measured[1:] {
 				remaining = append(remaining, protocol.String())
 			}
-			result.Warnings = append(result.Warnings, fmt.Sprintf(
+			result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
 				"cache-miss mode replays one generated name set across every protocol; only the first measured protocol (%s) observes a true cache miss, and later protocols (%s) run against an already warm resolver cache",
-				measured[0], strings.Join(remaining, ", ")))
+				measured[0], strings.Join(remaining, ", "))))
 		}
 	}
 	result.Warnings = append(result.Warnings, familyWarnings...)
@@ -929,7 +929,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		return err
 	}
 	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
-		result.Warnings = append(result.Warnings, "benchmark interrupted before all targets completed")
+		result.Warnings = append(result.Warnings, benchmark.RunWarning("benchmark interrupted before all targets completed"))
 	}
 	var reportErr error
 	switch strings.ToLower(config.format) {
@@ -1044,7 +1044,7 @@ func loadProfiles(ctx context.Context, config *cliConfig) (profileSelection, err
 
 // autoFamilyWarnings reports what --family auto pruned from the bundled
 // catalog so the reduced comparison table is visible rather than silent.
-func autoFamilyWarnings(family catalog.AddressFamily, available map[catalog.AddressFamily]bool, before, after []catalog.ResolverProfile) []string {
+func autoFamilyWarnings(family catalog.AddressFamily, available map[catalog.AddressFamily]bool, before, after []catalog.ResolverProfile) []benchmark.Warning {
 	if family != catalog.FamilyAuto {
 		return nil
 	}
@@ -1052,7 +1052,7 @@ func autoFamilyWarnings(family catalog.AddressFamily, available map[catalog.Addr
 	if dropped <= 0 {
 		return nil
 	}
-	return []string{fmt.Sprintf("--family auto detected %s on local interfaces and dropped %d bundled resolver address(es) from other families", describeFamilies(available), dropped)}
+	return []benchmark.Warning{benchmark.RunWarning(fmt.Sprintf("--family auto detected %s on local interfaces and dropped %d bundled resolver address(es) from other families", describeFamilies(available), dropped))}
 }
 
 func countProfileAddresses(profiles []catalog.ResolverProfile) int {

@@ -608,7 +608,7 @@ func TestRunNoComparableReportsRetainUnavailableTargets(t *testing.T) {
 	if report.FinishedAt.IsZero() || len(report.Targets) != len(targets) || len(report.Rankings) != 0 {
 		t.Fatalf("unavailable report metadata/results = %#v", report)
 	}
-	joined := strings.Join(report.Warnings, "\n")
+	joined := warningText(report.Warnings)
 	if !strings.Contains(joined, "connection refused") || !strings.Contains(joined, "failed queries") {
 		t.Fatalf("unavailable report warnings = %#v", report.Warnings)
 	}
@@ -636,7 +636,7 @@ func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
 	if report.FinishedAt.IsZero() || len(report.Targets) != len(targets) || len(report.Rankings) != 0 {
 		t.Fatalf("unusable-response report metadata/results = %#v", report)
 	}
-	joined := strings.Join(report.Warnings, "\n")
+	joined := warningText(report.Warnings)
 	if !strings.Contains(joined, "unusable DNS responses") || !strings.Contains(joined, "SERVFAIL:1") {
 		t.Fatalf("unusable-response report warnings = %#v", report.Warnings)
 	}
@@ -858,7 +858,7 @@ func TestIncompleteTargetsAreExcludedFromRankings(t *testing.T) {
 	if rankings := makeRankings([]TargetResult{result}); len(rankings) != 0 {
 		t.Fatalf("incomplete target was ranked: %#v", rankings)
 	}
-	if warnings := collectWarnings([]TargetResult{result}); len(warnings) != 1 || !strings.Contains(warnings[0], "excluded from ranking") {
+	if warnings := collectWarnings([]TargetResult{result}); len(warnings) != 1 || !strings.Contains(warnings[0].String(), "excluded from ranking") {
 		t.Fatalf("incomplete target warnings = %#v", warnings)
 	}
 }
@@ -1227,6 +1227,16 @@ type reportedSession struct {
 }
 
 func (s *reportedSession) DialAddress() string { return s.address }
+
+// warningText renders warnings for substring assertions in tests that only care
+// about the message content.
+func warningText(warnings []Warning) string {
+	lines := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		lines = append(lines, warning.String())
+	}
+	return strings.Join(lines, "\n")
+}
 
 func TestBootstrapUpperBoundStaysInsideScoreRange(t *testing.T) {
 	timeout := 2 * time.Second
