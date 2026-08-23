@@ -34,7 +34,17 @@ const (
 	CacheMissMaxConcurrency = 2
 )
 
-var lookupProfile = idna.New(idna.MapForLookup(), idna.VerifyDNSLength(true), idna.BidiRule())
+// lookupProfile keeps the full UTS #46 lookup mapping, the RFC 5891 label
+// validation, the DNS length limits, and the Bidi rule. STD3 ASCII rules are
+// disabled because they reject the underscore that RFC 8552 service labels
+// require; checkLabelSyntax below restores the letter-digit-hyphen restriction
+// STD3 provided, with a single leading underscore as the only exception.
+var lookupProfile = idna.New(
+	idna.MapForLookup(),
+	idna.StrictDomainName(false),
+	idna.VerifyDNSLength(true),
+	idna.BidiRule(),
+)
 
 var verifyEmbeddedCorpus = data.VerifyCorpus
 var randomRead = rand.Read
@@ -203,5 +213,36 @@ func normalize(value string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.ToLower(name), nil
+	// main now trims the root label before ToASCII, so no trailing dot can
+	// survive to here; only case folding remains.
+	name = strings.ToLower(name)
+	if err := checkLabelSyntax(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// checkLabelSyntax re-applies the RFC 1034 letter-digit-hyphen rule that the
+// IDNA profile no longer enforces. One leading underscore per label is allowed
+// so the underscored service names of RFC 8552 round-trip unchanged: SRV
+// (RFC 2782), TLSA (RFC 6698), DMARC (RFC 7489) and DKIM all address an
+// attribute leaf such as "_dmarc" or "_sip._tcp". Those specifications only
+// ever place the underscore first, so an underscore elsewhere in a label stays
+// rejected along with every other non-LDH ASCII character.
+func checkLabelSyntax(name string) error {
+	for _, label := range strings.Split(name, ".") {
+		body := strings.TrimPrefix(label, "_")
+		if body == "" {
+			return fmt.Errorf("label %q must name a host or service", label)
+		}
+		for _, character := range body {
+			allowed := (character >= 'a' && character <= 'z') ||
+				(character >= '0' && character <= '9') ||
+				character == '-'
+			if !allowed {
+				return fmt.Errorf("label %q may only contain letters, digits, hyphens, and a leading underscore", label)
+			}
+		}
+	}
+	return nil
 }

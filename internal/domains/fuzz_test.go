@@ -10,6 +10,8 @@ func FuzzNormalizeNeverPanics(f *testing.F) {
 		"example.com\nExample.ORG.",
 		"BÜCHER.example\n*.invalid.example",
 		"example..com\n",
+		"_sip._tcp.example.com\n_dmarc.example.com",
+		"__dmarc.example\n_.example\nunder_score.example",
 		string([]byte{0xff, '.', 'c', 'o', 'm'}),
 	} {
 		f.Add(seed)
