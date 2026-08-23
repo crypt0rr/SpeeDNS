@@ -445,6 +445,15 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 // endpoint cannot force an unnecessarily large header allocation per query.
 const doHMaxResponseHeaderBytes = 64 << 10
 
+// Go applies its ten hop redirect cap inside net/http's own CheckRedirect,
+// so installing a custom callback removes the cap entirely. A legitimate DoH
+// endpoint needs at most one or two hops, so keep a small budget of our own
+// to stop a hostile or misconfigured endpoint from expanding a single query
+// into an unbounded request burst. Like the net/http default, the budget
+// counts the requests in one chain, so at most doHMaxRedirects requests are
+// issued per query.
+const doHMaxRedirects = 5
+
 func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -498,7 +507,10 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			conn, address, err := plan.openStream(ctx, tlsConfig)
 			if err == nil {
-				session.setDialAddress(address)
+				// http.Transport re-dials transparently when a pooled
+				// connection is gone, so this hook is the only place a new
+				// TCP+TLS(+HTTP/2) handshake becomes observable.
+				session.recordConnection(address)
 			}
 			return conn, err
 		},
@@ -507,6 +519,9 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 		Transport: transport,
 		Timeout:   f.timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= doHMaxRedirects {
+				return fmt.Errorf("DoH stopped after %d redirects", doHMaxRedirects)
+			}
 			if len(via) > 0 && !sameHTTPSOrigin(via[0].URL, req.URL) {
 				return errors.New("DoH redirect changed HTTPS origin")
 			}
@@ -550,17 +565,49 @@ func joinAddress(host string, port int) string {
 }
 
 type doHSession struct {
-	client    *http.Client
-	transport *http.Transport
-	endpoint  string
-	mu        sync.RWMutex
-	dialAddr  string
+	client          *http.Client
+	transport       *http.Transport
+	endpoint        string
+	mu              sync.RWMutex
+	dialAddr        string
+	connections     uint64
+	lastReconnected bool
 }
 
-func (s *doHSession) setDialAddress(address string) {
+// recordConnection is called from the transport dial hook, which runs on the
+// http.Transport's own goroutines, once per newly opened HTTPS connection.
+func (s *doHSession) recordConnection(address string) {
 	s.mu.Lock()
 	s.dialAddr = address
+	s.connections++
 	s.mu.Unlock()
+}
+
+// beginQuery resets the per-query reconnect state and returns the number of
+// connections opened so far, so the query can tell whether it had to open one.
+func (s *doHSession) beginQuery() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReconnected = false
+	return s.connections
+}
+
+// endQuery records whether the exchange had to replace a connection that the
+// session had already established. The very first connection is opened lazily
+// by the first exchange and is the DoH analogue of the dial the stream
+// transports perform in Open, so it is not counted as a reconnect.
+func (s *doHSession) endQuery(connectionsBefore uint64) {
+	s.mu.Lock()
+	s.lastReconnected = connectionsBefore > 0 && s.connections > connectionsBefore
+	s.mu.Unlock()
+}
+
+// LastQueryReconnected reports whether the most recent Query had to open a
+// fresh HTTPS connection after the previous one was dropped.
+func (s *doHSession) LastQueryReconnected() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastReconnected
 }
 
 func (s *doHSession) DialAddress() string {
@@ -570,6 +617,7 @@ func (s *doHSession) DialAddress() string {
 }
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	connectionsBefore := s.beginQuery()
 	query := newQuery(name, qtype, 0, true)
 	packed, err := packSessionQuery(query)
 	if err != nil {
@@ -582,6 +630,7 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	request.Header.Set("Accept", "application/dns-message")
 	request.Header.Set("Content-Type", "application/dns-message")
 	response, err := s.client.Do(request)
+	s.endQuery(connectionsBefore)
 	if err != nil {
 		return nil, err
 	}
@@ -886,7 +935,7 @@ func ResponseClass(message *dns.Msg) string {
 	}
 	switch message.Rcode {
 	case dns.RcodeSuccess:
-		if len(message.Answer) == 0 && len(message.Ns) == 0 {
+		if !answersQuestion(message) {
 			return "nodata"
 		}
 		return "answer"
@@ -895,6 +944,26 @@ func ResponseClass(message *dns.Msg) string {
 	default:
 		return fmt.Sprintf("rcode-%d", message.Rcode)
 	}
+}
+
+// answersQuestion reports whether the answer section carries a record of the
+// requested type. A canonical NODATA response is NOERROR with an empty answer
+// section and an SOA in the authority section, so authority records must never
+// be read as an answer: doing so collapses "this name has no such record" and
+// "here is the address" into one response class.
+func answersQuestion(message *dns.Msg) bool {
+	if len(message.Question) != 1 {
+		// validateResponse rejects any other shape before scoring, so this is
+		// only reachable for synthetic messages; fall back to answer presence.
+		return len(message.Answer) > 0
+	}
+	qtype := message.Question[0].Qtype
+	for _, answer := range message.Answer {
+		if answer.Header().Rrtype == qtype {
+			return true
+		}
+	}
+	return false
 }
 
 // ResponseCodeName returns the conventional DNS response-code name used in

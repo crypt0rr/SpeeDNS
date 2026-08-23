@@ -720,6 +720,9 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
 	}
+	if err := validateAssertionTargets(assertions, targets); err != nil {
+		return err
+	}
 	seed := config.seed
 	if seed == 0 {
 		seed = time.Now().UnixNano()

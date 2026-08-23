@@ -260,3 +260,51 @@ func TestUDPFactoryReportsResolutionFailure(t *testing.T) {
 		t.Fatalf("UDP resolution error = %v", err)
 	}
 }
+
+// TestResponseClassSeparatesAnswersFromNodata pins the distinction the
+// divergence engine depends on. A canonical NODATA response carries an SOA in
+// the authority section, so classifying on answer-or-authority presence made
+// "no such record" indistinguishable from a real answer.
+func TestResponseClassSeparatesAnswersFromNodata(t *testing.T) {
+	message := func(rcode int, qtype uint16, answer []dns.RR, authority []dns.RR) *dns.Msg {
+		return &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Rcode: rcode, Response: true},
+			Question: []dns.Question{{Name: "example.com.", Qtype: qtype, Qclass: dns.ClassINET}},
+			Answer:   answer,
+			Ns:       authority,
+		}
+	}
+	aRecord := &dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA}}
+	soa := &dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA}}
+	cname := &dns.CNAME{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeCNAME}}
+
+	cases := []struct {
+		name    string
+		message *dns.Msg
+		want    string
+	}{
+		{"answer for the requested type", message(dns.RcodeSuccess, dns.TypeA, []dns.RR{aRecord}, nil), "answer"},
+		{"canonical nodata with an SOA", message(dns.RcodeSuccess, dns.TypeAAAA, nil, []dns.RR{soa}), "nodata"},
+		{"bare nodata", message(dns.RcodeSuccess, dns.TypeAAAA, nil, nil), "nodata"},
+		{"chain without the requested type", message(dns.RcodeSuccess, dns.TypeAAAA, []dns.RR{cname}, []dns.RR{soa}), "nodata"},
+		{"chain completed to the requested type", message(dns.RcodeSuccess, dns.TypeA, []dns.RR{cname, aRecord}, nil), "answer"},
+		{"nxdomain", message(dns.RcodeNameError, dns.TypeA, nil, []dns.RR{soa}), "nxdomain"},
+		{"servfail", message(dns.RcodeServerFailure, dns.TypeA, nil, nil), "rcode-2"},
+	}
+	for _, tc := range cases {
+		if got := ResponseClass(tc.message); got != tc.want {
+			t.Fatalf("ResponseClass(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+
+	// validateResponse rejects other question shapes before scoring, so the
+	// fallback is defensive only; keep it pinned so it stays predictable.
+	malformed := &dns.Msg{MsgHdr: dns.MsgHdr{Rcode: dns.RcodeSuccess, Response: true}}
+	if got := ResponseClass(malformed); got != "nodata" {
+		t.Fatalf("ResponseClass(no question, no answer) = %q, want %q", got, "nodata")
+	}
+	malformed.Answer = []dns.RR{aRecord}
+	if got := ResponseClass(malformed); got != "answer" {
+		t.Fatalf("ResponseClass(no question, one answer) = %q, want %q", got, "answer")
+	}
+}
