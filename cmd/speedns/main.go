@@ -215,16 +215,36 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 	return protocols
 }
 
-// measuredProtocols returns the protocol groups the benchmark will actually
-// run, in the documented measurement order. It is derived from the expanded
-// targets rather than from --protocol so a selected protocol that no resolver
-// supports is not counted.
-func measuredProtocols(targets []catalog.Target) []catalog.Protocol {
-	protocols := make([]catalog.Protocol, 0, len(targets))
+// cacheMissTargets keeps one endpoint per resolver profile and reports the
+// endpoints it dropped.
+//
+// A resolver holds one cache, shared across every transport it offers and every
+// address it answers on. So the first measurement of a generated name at a
+// resolver is a genuine miss and every later measurement of that name at that
+// resolver is a warm read, no matter which transport or address reaches it.
+// Measuring a resolver once is what makes "cache miss" true of every query
+// rather than only of whichever group happened to run first.
+//
+// catalog.Expand returns targets in documented protocol order, then by target
+// ID, so the endpoint kept for a profile is its earliest declared transport at
+// its lowest-sorting address -- deterministic across runs.
+//
+// The consequence is deliberate: a cache-miss run does not compare transports.
+// Comparing transports needs the same name measured twice, which is exactly
+// what makes the second measurement warm.
+func cacheMissTargets(targets []catalog.Target) ([]catalog.Target, []string) {
+	kept := make([]catalog.Target, 0, len(targets))
+	dropped := make([]string, 0)
+	measured := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
-		protocols = append(protocols, target.Protocol)
+		if _, seen := measured[target.Resolver.ID]; seen {
+			dropped = append(dropped, target.ID())
+			continue
+		}
+		measured[target.Resolver.ID] = struct{}{}
+		kept = append(kept, target)
 	}
-	return canonicalProtocols(protocols)
+	return kept, dropped
 }
 
 func newProgressRenderer(writer io.Writer, interactive bool, selected []catalog.Protocol, targets []catalog.Target) *progressRenderer {
@@ -848,6 +868,10 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
 	}
+	var cacheMissDropped []string
+	if config.cacheMiss {
+		targets, cacheMissDropped = cacheMissTargets(targets)
+	}
 	if err := validateAssertionTargets(assertions, targets); err != nil {
 		return err
 	}
@@ -882,7 +906,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
 		Domains: domainList, QueryTypes: queryTypes, Sample: config.sample, Full: config.full,
 		Seed: seed, Timeout: config.timeout, Concurrency: effectiveConcurrency, Protocols: selected,
-		OnProgress: onProgress, DNSSEC: config.dnssec,
+		OnProgress: onProgress, DNSSEC: config.dnssec, CacheMiss: config.cacheMiss,
 	})
 	if progressView != nil {
 		progressView.Finish()
@@ -925,20 +949,10 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			"effective sample of %d truncated the generated cache-miss corpus of %d names; raise --sample or lower --cache-miss-sample to measure every generated name",
 			config.sample, len(domainList))))
 	}
-	if config.cacheMiss {
-		// Every protocol group replays the same generated names against the
-		// same resolver cache, so only the first group measured observes a
-		// genuine miss; the rest measure a warm cache. Removing the bias,
-		// rather than only disclosing it, is tracked as issue #108.
-		if measured := measuredProtocols(targets); len(measured) > 1 {
-			remaining := make([]string, 0, len(measured)-1)
-			for _, protocol := range measured[1:] {
-				remaining = append(remaining, protocol.String())
-			}
-			result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
-				"cache-miss mode replays one generated name set across every protocol; only the first measured protocol (%s) observes a true cache miss, and later protocols (%s) run against an already warm resolver cache",
-				measured[0], strings.Join(remaining, ", "))))
-		}
+	if len(cacheMissDropped) > 0 {
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
+			"cache-miss mode measures each resolver once so every query is a genuine miss; it dropped %d endpoint(s) that share a cache with one already selected: %s",
+			len(cacheMissDropped), strings.Join(cacheMissDropped, ", "))))
 	}
 	result.Warnings = append(result.Warnings, familyWarnings...)
 	writer, finalizeOutput, err := outputWriterFunc(config.output)

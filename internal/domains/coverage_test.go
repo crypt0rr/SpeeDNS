@@ -58,7 +58,7 @@ func TestNormalizeIgnoresEmptyInputsAndRequiresAName(t *testing.T) {
 
 func TestCacheMissNamesAreBoundedAndUnique(t *testing.T) {
 	names, err := CacheMissNames("ABCDEF0123456789", CacheMissDefaultSample)
-	if err != nil || len(names) != CacheMissDefaultSample || names[0] != "speedns-abcdef0123456789-0001.example.com" || names[len(names)-1] != "speedns-abcdef0123456789-0010.example.com" {
+	if err != nil || len(names) != CacheMissDefaultSample || names[0] != "speedns-abcdef0123456789-0001.example.com" || names[len(names)-1] != "speedns-abcdef0123456789-0020.example.com" {
 		t.Fatalf("cache-miss names = %#v/%v", names, err)
 	}
 	seen := make(map[string]bool, len(names))
@@ -109,5 +109,25 @@ func TestLoadReaderSkippingHandlesReadErrorsAndIgnorableLines(t *testing.T) {
 	}
 	if len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0], "wildcards are not allowed") {
 		t.Fatalf("tolerant skipped = %#v", result.Skipped)
+	}
+}
+
+// TestCacheMissDefaultKeepsScoredSamplesAtTheRecommendedMinimum ties the
+// default corpus size to the statistics that consume it. Cache-miss mode asks
+// each generated name exactly one question, because the first question caches
+// the negative answer for that name, so the corpus size IS the scored sample
+// count. Below benchmark.MinimumRecommendedSamples the paired confidence
+// intervals report NOT COMPARABLE and the mode measures nothing usable.
+func TestCacheMissDefaultKeepsScoredSamplesAtTheRecommendedMinimum(t *testing.T) {
+	// Kept as a literal rather than importing internal/benchmark, which would
+	// be an import cycle; benchmark.MinimumRecommendedSamples is 20.
+	const minimumRecommendedSamples = 20
+	if CacheMissDefaultSample < minimumRecommendedSamples {
+		t.Fatalf("default cache-miss corpus of %d yields fewer than %d scored samples",
+			CacheMissDefaultSample, minimumRecommendedSamples)
+	}
+	if CacheMissDefaultSample > CacheMissMaxSample {
+		t.Fatalf("default cache-miss corpus %d exceeds the reserved-zone cap %d",
+			CacheMissDefaultSample, CacheMissMaxSample)
 	}
 }

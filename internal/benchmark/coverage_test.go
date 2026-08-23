@@ -3,6 +3,7 @@ package benchmark
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -1418,5 +1419,57 @@ func TestPreparationIsConcurrentBoundedAndDeterministic(t *testing.T) {
 	}
 	if !reflect.DeepEqual(shape(first), shape(second)) {
 		t.Fatalf("seeded run was not deterministic: %#v != %#v", shape(first), shape(second))
+	}
+}
+
+// TestCacheMissQueriesAskEachGeneratedNameOnce is the heart of the #108 fix.
+// A resolver that answers speedns-<nonce>-0001.example.com/A with NXDOMAIN
+// caches that negative answer for the whole name, so asking the same name for
+// AAAA measures the cache rather than a miss. Under the default --type A,AAAA
+// that made half of every cache-miss run a warm read.
+//
+// Queries per target are unchanged, which is what keeps the reserved-zone
+// traffic budget intact: the corpus doubled and the per-name question count
+// halved.
+func TestCacheMissQueriesAskEachGeneratedNameOnce(t *testing.T) {
+	names := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		names = append(names, fmt.Sprintf("speedns-test-%04d.example.com", i))
+	}
+	options := Options{Domains: names, QueryTypes: []uint16{1, 28}, Sample: 20, Seed: 7, CacheMiss: true}
+
+	queries, err := buildQueries(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 20 {
+		t.Fatalf("cache-miss produced %d queries for 20 names", len(queries))
+	}
+	perName := make(map[string]int, len(queries))
+	perType := make(map[uint16]int, 2)
+	for _, query := range queries {
+		perName[query.Name]++
+		perType[query.QType]++
+	}
+	for name, count := range perName {
+		if count != 1 {
+			t.Fatalf("%s was asked %d times; every later question is a warm read", name, count)
+		}
+	}
+	// Types still rotate across the corpus, so a multi-type selection is
+	// represented -- just never twice for one name.
+	if perType[1] != 10 || perType[28] != 10 {
+		t.Fatalf("query types did not rotate evenly: A=%d AAAA=%d", perType[1], perType[28])
+	}
+
+	// A warm-cache run keeps the cross-product: repeating a name there is the
+	// point, because it measures a cache hit.
+	options.CacheMiss = false
+	warm, err := buildQueries(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warm) != 40 {
+		t.Fatalf("warm-cache produced %d queries, want the 20x2 cross-product", len(warm))
 	}
 }
