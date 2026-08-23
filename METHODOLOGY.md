@@ -128,6 +128,15 @@ leader's tie group when its 95% bootstrap interval overlaps the leader's
 interval. The leader is marked as tied too, so the tie is visible from either
 row.
 
+Every output surfaces that flag. The human table has a `Tie` column in the
+recommendation summary and in each per-protocol comparison; a tied row reads
+`TIED`, an untied row reads `—`. When a recommended or provisional winner is
+tied, the recommendation block also carries a `TIED:` note stating that the
+ordering is not statistically distinguishable, so a rank-one row is never
+presented as an unqualified winner. CSV keeps its `tie` column and JSON keeps
+`tie` on both `rankings[]` and `results[].stats`. The strict `1..N` rank is
+still reported: a tie qualifies the ordering, it does not remove it.
+
 The report also includes paired latency effects. For each protocol and
 normalized declared policy, the best-ranked target in that group is the local
 reference. Each other target is paired with that reference by normalized query
