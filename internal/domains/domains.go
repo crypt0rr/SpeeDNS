@@ -19,6 +19,10 @@ import (
 
 const maxDomainLineSize = 64 * 1024
 
+// maxReportedInvalidNames bounds the error text for a badly wrong list, so a
+// thousand-line file cannot produce a thousand-line error.
+const maxReportedInvalidNames = 10
+
 // rootLabelSeparators lists every code point UTS-46 maps onto the DNS label
 // separator: FULL STOP, IDEOGRAPHIC FULL STOP, FULLWIDTH FULL STOP, and
 // HALFWIDTH IDEOGRAPHIC FULL STOP.
@@ -150,13 +154,20 @@ func CacheMissNames(nonce string, count int) ([]string, error) {
 func validateInputs(inputs []domainInput) ([]string, error) {
 	seen := make(map[string]struct{}, len(inputs))
 	domains := make([]string, 0, len(inputs))
+	// Every invalid entry is collected before failing. Returning on the first
+	// one made fixing a large list an edit-and-retry loop, one line per run.
+	var invalid []string
 	for _, input := range inputs {
 		name, err := normalize(input.value)
 		if err != nil {
-			if input.line > 0 {
-				return nil, fmt.Errorf("invalid domain name on line %d %q: %w", input.line, input.value, err)
+			if len(invalid) < maxReportedInvalidNames {
+				if input.line > 0 {
+					invalid = append(invalid, fmt.Sprintf("line %d %q: %v", input.line, input.value, err))
+				} else {
+					invalid = append(invalid, fmt.Sprintf("%q: %v", input.value, err))
+				}
 			}
-			return nil, fmt.Errorf("invalid domain name %q: %w", input.value, err)
+			continue
 		}
 		if name == "" {
 			continue
@@ -166,6 +177,13 @@ func validateInputs(inputs []domainInput) ([]string, error) {
 		}
 		seen[name] = struct{}{}
 		domains = append(domains, name)
+	}
+	if len(invalid) > 0 {
+		suffix := ""
+		if len(invalid) == maxReportedInvalidNames {
+			suffix = ", and possibly more"
+		}
+		return nil, fmt.Errorf("invalid domain names: %s%s", strings.Join(invalid, "; "), suffix)
 	}
 	if len(domains) == 0 {
 		return nil, errors.New("domain list is empty")

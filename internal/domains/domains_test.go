@@ -2,6 +2,7 @@ package domains
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -187,5 +188,25 @@ func TestNormalizeSkipsBareRootLabels(t *testing.T) {
 	}
 	if _, err := Normalize([]string{"。"}); err == nil {
 		t.Fatal("expected a list of only root labels to be empty")
+	}
+}
+
+// TestValidateInputsCapsReportedInvalidNames keeps the error readable for a
+// list that is wrong throughout: every invalid entry is collected, but a
+// thousand-line file must not produce a thousand-line error.
+func TestValidateInputsCapsReportedInvalidNames(t *testing.T) {
+	lines := make([]string, 0, maxReportedInvalidNames+5)
+	for index := 0; index < maxReportedInvalidNames+5; index++ {
+		lines = append(lines, fmt.Sprintf("bad %d.example", index))
+	}
+	_, err := Normalize(lines)
+	if err == nil {
+		t.Fatal("expected an invalid domain list to fail")
+	}
+	if !strings.Contains(err.Error(), "and possibly more") {
+		t.Fatalf("capped error missing the truncation note: %v", err)
+	}
+	if got := strings.Count(err.Error(), "whitespace is not allowed"); got != maxReportedInvalidNames {
+		t.Fatalf("reported %d invalid names, want %d: %v", got, maxReportedInvalidNames, err)
 	}
 }

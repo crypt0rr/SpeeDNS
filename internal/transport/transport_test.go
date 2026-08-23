@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,7 +52,8 @@ func TestTCPSessionReusesConnection(t *testing.T) {
 	defer listener.Close()
 	stop := make(chan struct{})
 	defer close(stop)
-	go serveTCP(listener, stop)
+	var accepts atomic.Int32
+	go serveTCPCounting(listener, stop, &accepts)
 
 	port := listener.Addr().(*net.TCPAddr).Port
 	target := catalog.Target{Protocol: catalog.TCP, Address: "127.0.0.1", Spec: catalog.TransportSpec{Port: port}}
@@ -68,6 +70,16 @@ func TestTCPSessionReusesConnection(t *testing.T) {
 		if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err != nil {
 			t.Fatal(err)
 		}
+		// The observable the test name promises. streamSession exposes it and
+		// every other reconnect test asserts it; without this the test passed
+		// on a session that reconnected before each exchange, which would
+		// turn every warm sample into a cold one.
+		if session.(*streamSession).LastQueryReconnected() {
+			t.Fatalf("query %d reconnected instead of reusing the session", index+1)
+		}
+	}
+	if got := accepts.Load(); got != 1 {
+		t.Fatalf("listener accepted %d connections, want 1", got)
 	}
 }
 
@@ -124,7 +136,10 @@ func serveUDP(conn *net.UDPConn, stop <-chan struct{}) {
 	}
 }
 
-func serveTCP(listener net.Listener, stop <-chan struct{}) {
+// serveTCPCounting answers framed DNS queries and counts accepted
+// connections, so a test can assert that a session reused one connection
+// rather than opening a new one per query. accepts may be nil.
+func serveTCPCounting(listener net.Listener, stop <-chan struct{}, accepts *atomic.Int32) {
 	for {
 		_ = listener.(*net.TCPListener).SetDeadline(time.Now().Add(50 * time.Millisecond))
 		conn, err := listener.Accept()
@@ -135,6 +150,9 @@ func serveTCP(listener net.Listener, stop <-chan struct{}) {
 			default:
 				continue
 			}
+		}
+		if accepts != nil {
+			accepts.Add(1)
 		}
 		go func() {
 			defer conn.Close()

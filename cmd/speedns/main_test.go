@@ -23,6 +23,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/report"
 	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
 	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
 
@@ -1065,11 +1066,13 @@ func TestRunBenchmarkFamilySelection(t *testing.T) {
 	oldLoad := loadProfilesFunc
 	t.Cleanup(func() { loadProfilesFunc = oldLoad })
 	loadProfilesFunc = func(context.Context, *cliConfig) (profileSelection, error) {
+		// explicitFrom past the end makes this a bundled profile, so the
+		// filter that prunes the catalog is the one that reports the error.
 		return profileSelection{profiles: []catalog.ResolverProfile{{
 			ID: "hostname", Name: "Hostname", Owner: "Test", Policy: "unfiltered",
 			Addresses:  []string{"dns.example"},
 			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}},
-		}}}, nil
+		}}, explicitFrom: 1}, nil
 	}
 	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "not an IP literal") {
 		t.Fatalf("bundled hostname family error = %v", err)
@@ -1166,7 +1169,9 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 		t.Fatal("expected output writer error")
 	}
 
-	writeJSONReport = func(io.Writer, benchmark.Report, bool) error { return errors.New("report write failed") }
+	writeJSONReport = func(io.Writer, benchmark.Report, bool, report.JSONOptions) error {
+		return errors.New("report write failed")
+	}
 	config = cliConfigForTest(t)
 	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "report write failed") {
 		t.Fatalf("report writer error = %v", err)
@@ -1178,7 +1183,9 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "finalize failed") {
 		t.Fatalf("finalizer error = %v", err)
 	}
-	writeJSONReport = func(io.Writer, benchmark.Report, bool) error { return errors.New("report write failed") }
+	writeJSONReport = func(io.Writer, benchmark.Report, bool, report.JSONOptions) error {
+		return errors.New("report write failed")
+	}
 	if err := runBenchmark(context.Background(), cliConfigForTest(t)); err == nil || !strings.Contains(err.Error(), "report write failed") || !strings.Contains(err.Error(), "finalize failed") {
 		t.Fatalf("combined report/finalizer error = %v", err)
 	}
