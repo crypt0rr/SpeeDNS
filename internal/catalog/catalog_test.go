@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -44,16 +45,22 @@ func TestDefaultResolversAreCorrectedAndProfiled(t *testing.T) {
 }
 
 func TestDefaultResolverTransportMetadata(t *testing.T) {
+	// DoH and DoT identities are tracked separately: a provider may publish a
+	// different TLS name for each. Cloudflare authenticates DoT as
+	// one.one.one.one while its DoH endpoint is cloudflare-dns.com, and the
+	// DoH handshake must match the URL authority the request is addressed to.
+	// dotServer defaults to dohServer when a provider uses one name for both.
 	expected := map[string]struct {
-		server string
-		dohURL string
-		doq    bool
+		server    string
+		dotServer string
+		dohURL    string
+		doq       bool
 	}{
 		"google-8888":     {server: "dns.google", dohURL: "https://dns.google/dns-query"},
 		"google-8844":     {server: "dns.google", dohURL: "https://dns.google/dns-query"},
 		"quad9-9999":      {server: "dns.quad9.net", dohURL: "https://dns.quad9.net/dns-query", doq: true},
 		"quad9-99910":     {server: "dns10.quad9.net", dohURL: "https://dns10.quad9.net/dns-query", doq: true},
-		"cloudflare-1111": {server: "one.one.one.one", dohURL: "https://cloudflare-dns.com/dns-query"},
+		"cloudflare-1111": {server: "cloudflare-dns.com", dotServer: "one.one.one.one", dohURL: "https://cloudflare-dns.com/dns-query"},
 		"cloudflare-1112": {server: "security.cloudflare-dns.com", dohURL: "https://security.cloudflare-dns.com/dns-query"},
 		"dns4eu-111":      {server: "protective.joindns4.eu", dohURL: "https://protective.joindns4.eu/dns-query"},
 		"dns4eu-1112":     {server: "child.joindns4.eu", dohURL: "https://child.joindns4.eu/dns-query"},
@@ -74,9 +81,13 @@ func TestDefaultResolverTransportMetadata(t *testing.T) {
 		if doh.Port != 443 || doh.ServerName != want.server || doh.URL != want.dohURL {
 			t.Fatalf("%s DoH metadata = %#v, want server=%q URL=%q", resolver.ID, doh, want.server, want.dohURL)
 		}
+		wantDoT := want.dotServer
+		if wantDoT == "" {
+			wantDoT = want.server
+		}
 		for _, protocol := range []Protocol{DoT} {
-			if resolver.Transports[protocol].Port != 853 || resolver.Transports[protocol].ServerName != want.server {
-				t.Fatalf("%s %s metadata = %#v", resolver.ID, protocol, resolver.Transports[protocol])
+			if resolver.Transports[protocol].Port != 853 || resolver.Transports[protocol].ServerName != wantDoT {
+				t.Fatalf("%s %s metadata = %#v, want server=%q", resolver.ID, protocol, resolver.Transports[protocol], wantDoT)
 			}
 		}
 		_, hasDoQ := resolver.Transports[DoQ]
@@ -228,5 +239,33 @@ func TestParseResolverFlag(t *testing.T) {
 	}
 	if _, err := ParseResolverFlag("invalid"); err == nil {
 		t.Fatal("expected malformed resolver flag to fail")
+	}
+}
+
+// TestBundledDoHServerNamesMatchTheirURLHost guards the TLS identity of the
+// bundled DoH endpoints. Because doHFactory.Open supplies its own
+// DialTLSContext, http.Transport performs no verification of its own and the
+// handshake is checked solely against server_name. A server_name that differs
+// from the URL authority therefore authenticates a different name than the one
+// the request is addressed to, which is not what RFC 8484 expects.
+//
+// A custom resolver file may still set a different server_name deliberately -
+// METHODOLOGY.md documents that as the supported way to opt into another TLS
+// identity - so this is a property of the bundled catalog, not a validation
+// rule imposed on user configuration.
+func TestBundledDoHServerNamesMatchTheirURLHost(t *testing.T) {
+	for _, profile := range DefaultResolvers() {
+		spec, ok := profile.Transports[DoH]
+		if !ok {
+			continue
+		}
+		endpoint, err := url.Parse(spec.URL)
+		if err != nil {
+			t.Fatalf("resolver %q has an unparsable DoH URL %q: %v", profile.ID, spec.URL, err)
+		}
+		if spec.ServerName != endpoint.Hostname() {
+			t.Errorf("resolver %q DoH server_name = %q, want the URL host %q",
+				profile.ID, spec.ServerName, endpoint.Hostname())
+		}
 	}
 }
