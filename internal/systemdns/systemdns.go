@@ -238,7 +238,8 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 		owner := "configured locally"
 		policy := "unknown"
 		id := "system-" + sanitizeAddress(address)
-		if isLocalStub(address) {
+		local := isLocalStub(address)
+		if local {
 			name = "System DNS stub"
 			owner = "local stub/forwarder"
 			policy = "local forwarding (upstream unknown)"
@@ -252,7 +253,7 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 		}
 		profiles = append(profiles, catalog.ResolverProfile{
 			ID: id, Name: name, Owner: owner, Policy: policy,
-			Scope: source.Scope, Interface: source.Interface,
+			Scope: source.Scope, Interface: source.Interface, Local: local,
 			Addresses: []string{address},
 			Transports: map[catalog.Protocol]catalog.TransportSpec{
 				catalog.UDP: {Port: 53},

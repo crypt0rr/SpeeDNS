@@ -622,6 +622,12 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 	if _, err := (&doqSession{conn: fakeConn, timeout: time.Second}).Query(deadlineContext, "example.com", dns.TypeA); err != nil {
 		t.Fatal(err)
 	}
+	// The context carries a deadline, so the stream must take it rather than
+	// the session timeout. Without this assertion the branch is executed but
+	// unverified, and removing its SetDeadline call keeps the suite green.
+	if len(fakeStream.deadlines) != 1 {
+		t.Fatal("DoQ context deadline was not applied to the stream")
+	}
 	if err := (&doqSession{conn: &fakeDoQConn{closeErr: errors.New("close")}}).Close(); err == nil {
 		t.Fatal("expected DoQ close error")
 	}

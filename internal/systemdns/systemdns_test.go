@@ -232,6 +232,29 @@ func TestSystemSourceHelpers(t *testing.T) {
 	}
 }
 
+// TestLoopbackSourcesAreMarkedLocal keeps the stub classification available to
+// the reporting layer. Without the flag the loopback stub is only labeled in
+// prose, and ranking cannot tell it apart from a network resolver.
+func TestLoopbackSourcesAreMarkedLocal(t *testing.T) {
+	profiles := profilesFromSources([]resolverSource{
+		{Address: "127.0.0.53"},
+		{Address: "::1"},
+		{Address: "192.0.2.1"},
+		{Address: "127.0.0.1", Block: 3, Scope: "vpn", Interface: "utun0"},
+	})
+	if len(profiles) != 4 {
+		t.Fatalf("profiles = %#v", profiles)
+	}
+	for index, wantLocal := range []bool{true, true, false, true} {
+		if profiles[index].Local != wantLocal {
+			t.Fatalf("profile %d (%s) Local = %v, want %v", index, profiles[index].ID, profiles[index].Local, wantLocal)
+		}
+	}
+	if profiles[3].ID != "system-resolver-3-127-0-0-1" {
+		t.Fatalf("scoped loopback profile ID = %q", profiles[3].ID)
+	}
+}
+
 func TestDiscoverResolvConfReaderErrors(t *testing.T) {
 	oldOpen := openResolvConf
 	t.Cleanup(func() { openResolvConf = oldOpen })

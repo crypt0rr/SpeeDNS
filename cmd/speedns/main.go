@@ -89,6 +89,10 @@ var interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
 
 var detectAddressFamiliesFunc = detectAddressFamilies
 
+// exitCodes lists every status the command can return, so documentation can be
+// checked against the contract rather than against a hand-kept list.
+func exitCodes() []int { return []int{0, 2, 3, 4, 130} }
+
 func exitCodeForError(err error) int {
 	switch {
 	case err == nil:
@@ -109,7 +113,7 @@ type progressRenderer struct {
 	interactive     bool
 	protocols       []catalog.Protocol
 	states          map[catalog.Protocol]progressState
-	printedPhases   map[catalog.Protocol]map[benchmark.ProgressPhase]bool
+	phaseMilestones map[catalog.Protocol]map[benchmark.ProgressPhase]int
 	lastLineWidth   int
 	rendered        bool
 	started         time.Time
@@ -179,18 +183,30 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 	return protocols
 }
 
+// measuredProtocols returns the protocol groups the benchmark will actually
+// run, in the documented measurement order. It is derived from the expanded
+// targets rather than from --protocol so a selected protocol that no resolver
+// supports is not counted.
+func measuredProtocols(targets []catalog.Target) []catalog.Protocol {
+	protocols := make([]catalog.Protocol, 0, len(targets))
+	for _, target := range targets {
+		protocols = append(protocols, target.Protocol)
+	}
+	return canonicalProtocols(protocols)
+}
+
 func newProgressRenderer(writer io.Writer, interactive bool, selected []catalog.Protocol, targets []catalog.Target) *progressRenderer {
 	progress := &progressRenderer{
 		writer:          writer,
 		interactive:     interactive,
 		protocols:       canonicalProtocols(selected),
 		states:          make(map[catalog.Protocol]progressState),
-		printedPhases:   make(map[catalog.Protocol]map[benchmark.ProgressPhase]bool),
+		phaseMilestones: make(map[catalog.Protocol]map[benchmark.ProgressPhase]int),
 		refreshInterval: defaultProgressRefreshInterval,
 	}
 	for _, protocol := range progress.protocols {
 		progress.states[protocol] = progressState{}
-		progress.printedPhases[protocol] = make(map[benchmark.ProgressPhase]bool)
+		progress.phaseMilestones[protocol] = make(map[benchmark.ProgressPhase]int)
 	}
 	for _, target := range targets {
 		state := progress.states[target.Protocol]
@@ -291,29 +307,84 @@ func progressPhaseRank(phase benchmark.ProgressPhase) int {
 	}
 }
 
+// progressMilestoneSteps divides the work of a non-interactive phase into
+// equal milestones, so a redirected run reports roughly every 25 percent of
+// that phase instead of a single line that always reads zero. The step count
+// keeps the log low-volume: at most five lines per phase and protocol.
+const progressMilestoneSteps = 4
+
+// progressPhaseSequence lists the phases in the order they are reached, so a
+// superseded phase can be reported before the phase that replaced it.
+var progressPhaseSequence = []benchmark.ProgressPhase{
+	benchmark.ProgressPreparing,
+	benchmark.ProgressMeasuring,
+	benchmark.ProgressComplete,
+}
+
+// progressMilestone reports how many milestones of a phase are complete. A
+// phase whose total is still unknown stays at the first milestone so its
+// opening line is not mistaken for completion, and any progress at all past
+// the total counts as the final milestone.
+func progressMilestone(completed, total int) int {
+	if total <= 0 || completed <= 0 {
+		return 0
+	}
+	if completed >= total {
+		return progressMilestoneSteps
+	}
+	return completed * progressMilestoneSteps / total
+}
+
+// progressPhaseUnits reports the counters a phase advances: measurement counts
+// DNS exchanges, every other phase counts targets.
+func progressPhaseUnits(phase benchmark.ProgressPhase, state progressState) (int, int) {
+	if phase == benchmark.ProgressMeasuring {
+		return state.exchangesCompleted, state.exchangesTotal
+	}
+	return state.targetsCompleted, state.targetsTotal
+}
+
 func (p *progressRenderer) renderUpdateLocked(update benchmark.Progress, now time.Time) {
 	if p.interactive {
 		p.renderLocked(now)
 		return
 	}
-	if p.printedPhases[update.Protocol] == nil {
-		p.printedPhases[update.Protocol] = make(map[benchmark.ProgressPhase]bool)
+	if p.phaseMilestones[update.Protocol] == nil {
+		p.phaseMilestones[update.Protocol] = make(map[benchmark.ProgressPhase]int)
 	}
-	if p.printedPhases[update.Protocol][update.Phase] {
+	// A phase can finish between two updates, so report the final state of
+	// every phase this update supersedes before reporting the current one.
+	for _, phase := range progressPhaseSequence {
+		if progressPhaseRank(phase) >= progressPhaseRank(update.Phase) {
+			break
+		}
+		if _, started := p.phaseMilestones[update.Protocol][phase]; started {
+			p.emitPhaseLocked(update.Protocol, phase)
+		}
+	}
+	p.emitPhaseLocked(update.Protocol, update.Phase)
+}
+
+// emitPhaseLocked writes one deterministic line for a phase the first time it
+// is seen and again whenever it crosses a milestone. Lines carry counters
+// only: no ETA and no resolver addresses.
+func (p *progressRenderer) emitPhaseLocked(protocol catalog.Protocol, phase benchmark.ProgressPhase) {
+	completed, total := progressPhaseUnits(phase, p.states[protocol])
+	milestone := progressMilestone(completed, total)
+	if reached, started := p.phaseMilestones[protocol][phase]; started && milestone <= reached {
 		return
 	}
-	state := p.states[update.Protocol]
-	switch update.Phase {
+	switch phase {
 	case benchmark.ProgressPreparing:
-		_, _ = fmt.Fprintf(p.writer, "progress %s: preparing %d/%d targets\n", update.Protocol, state.targetsCompleted, state.targetsTotal)
+		_, _ = fmt.Fprintf(p.writer, "progress %s: preparing %d/%d targets\n", protocol, completed, total)
 	case benchmark.ProgressMeasuring:
-		_, _ = fmt.Fprintf(p.writer, "progress %s: measuring %d/%d exchanges\n", update.Protocol, state.exchangesCompleted, state.exchangesTotal)
+		_, _ = fmt.Fprintf(p.writer, "progress %s: measuring %d/%d exchanges\n", protocol, completed, total)
 	case benchmark.ProgressComplete:
-		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", update.Protocol, state.targetsCompleted, state.targetsTotal)
+		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", protocol, completed, total)
 	default:
 		return
 	}
-	p.printedPhases[update.Protocol][update.Phase] = true
+	p.phaseMilestones[protocol][phase] = milestone
 }
 
 func (p *progressRenderer) renderLocked(now time.Time) {
@@ -476,10 +547,21 @@ func detectAddressFamilies() (map[catalog.AddressFamily]bool, error) {
 				continue
 			}
 			if ip.To4() != nil {
+				// IPv4 accepts RFC 1918 addresses because NAT makes a
+				// private v4 address an ordinary path to the Internet.
 				available[catalog.Family4] = true
-			} else {
-				available[catalog.Family6] = true
+				continue
 			}
+			// IPv6 has no NAT equivalent, so a unique-local address
+			// (fc00::/7, which covers Tailscale's fd7a::/48 and the ULAs
+			// many home routers hand out) is not evidence of a public
+			// route even though net.IP.IsGlobalUnicast reports true for
+			// it. Requiring a non-private address keeps auto mode from
+			// selecting IPv6 targets that cannot be reached.
+			if ip.IsPrivate() {
+				continue
+			}
+			available[catalog.Family6] = true
 		}
 	}
 	return available, nil
@@ -697,11 +779,11 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			return err
 		}
 	}
-	profiles, err := loadProfilesFunc(ctx, config)
+	selection, err := loadProfilesFunc(ctx, config)
 	if err != nil {
 		return err
 	}
-	if err := catalog.Validate(profiles); err != nil {
+	if err := catalog.Validate(selection.all()); err != nil {
 		return err
 	}
 	availableFamilies := map[catalog.AddressFamily]bool{}
@@ -711,16 +793,33 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			return err
 		}
 	}
-	profiles, err = catalog.FilterProfilesByFamily(profiles, family, availableFamilies)
+	profiles, err := catalog.FilterProfilesByFamily(selection.bundled(), family, availableFamilies)
 	if err != nil {
 		return err
 	}
+	// Auto mode is a heuristic over the local interface inventory, so it only
+	// prunes the bundled catalog. Resolvers the operator named explicitly
+	// (--resolver, --resolver-file, --include-system) survive auto untouched;
+	// an explicit --family 4/6/both is a deliberate instruction and still
+	// filters everything.
+	explicitProfiles := selection.explicit()
+	if family != catalog.FamilyAuto {
+		explicitProfiles, err = catalog.FilterProfilesByFamily(selection.explicit(), family, availableFamilies)
+		if err != nil {
+			return err
+		}
+	}
+	familyWarnings := autoFamilyWarnings(family, availableFamilies, selection.bundled(), profiles)
+	profiles = append(profiles, explicitProfiles...)
 	if len(profiles) == 0 {
 		return fmt.Errorf("no resolver addresses match --family %s", family)
 	}
 	targets := catalog.Expand(profiles, selected)
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
+	}
+	if err := validateAssertionTargets(assertions, targets); err != nil {
+		return err
 	}
 	seed := config.seed
 	if seed == 0 {
@@ -784,6 +883,22 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if concurrencyCapped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
 	}
+	if config.cacheMiss {
+		// Every protocol group replays the same generated names against the
+		// same resolver cache, so only the first group measured observes a
+		// genuine miss; the rest measure a warm cache. Removing the bias,
+		// rather than only disclosing it, is tracked as issue #108.
+		if measured := measuredProtocols(targets); len(measured) > 1 {
+			remaining := make([]string, 0, len(measured)-1)
+			for _, protocol := range measured[1:] {
+				remaining = append(remaining, protocol.String())
+			}
+			result.Warnings = append(result.Warnings, fmt.Sprintf(
+				"cache-miss mode replays one generated name set across every protocol; only the first measured protocol (%s) observes a true cache miss, and later protocols (%s) run against an already warm resolver cache",
+				measured[0], strings.Join(remaining, ", ")))
+		}
+	}
+	result.Warnings = append(result.Warnings, familyWarnings...)
 	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {
 		return err
@@ -825,37 +940,70 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	return evaluateAssertions(result, assertions)
 }
 
-func loadProfiles(ctx context.Context, config *cliConfig) ([]catalog.ResolverProfile, error) {
-	var profiles []catalog.ResolverProfile
+// profileSelection keeps the bundled catalog separate from resolvers the
+// operator supplied explicitly so family auto-detection can prune only the
+// former. The split lives here rather than in internal/catalog because the
+// distinction is a CLI-input concern, not a catalog property.
+type profileSelection struct {
+	// profiles holds the bundled catalog first, then the explicit profiles.
+	// They share one slice so catalog.Validate can normalize every profile in
+	// place and still detect duplicate identifiers across both groups; taking
+	// a copy here would silently drop the scalar trims Validate applies.
+	profiles []catalog.ResolverProfile
+	// explicitFrom is the index in profiles where explicit profiles begin.
+	explicitFrom int
+}
+
+// all returns every selected profile, bundled first, backed by the same array
+// the split views use.
+func (selection profileSelection) all() []catalog.ResolverProfile {
+	return selection.profiles
+}
+
+// bundled returns the profiles that came from the built-in catalog.
+func (selection profileSelection) bundled() []catalog.ResolverProfile {
+	return selection.profiles[:selection.explicitFrom]
+}
+
+// explicit returns the profiles the operator named through --resolver,
+// --resolver-file or --include-system.
+func (selection profileSelection) explicit() []catalog.ResolverProfile {
+	return selection.profiles[selection.explicitFrom:]
+}
+
+func loadProfiles(ctx context.Context, config *cliConfig) (profileSelection, error) {
+	var selection profileSelection
 	if !config.noDefaults {
-		profiles = append(profiles, catalog.DefaultResolvers()...)
+		selection.profiles = append(selection.profiles, catalog.DefaultResolvers()...)
 	}
+	// Everything appended from here on was named by the operator.
+	selection.explicitFrom = len(selection.profiles)
 	if config.resolverFile != "" {
 		file, err := os.Open(config.resolverFile)
 		if err != nil {
-			return nil, fmt.Errorf("open resolver file: %w", err)
+			return profileSelection{}, fmt.Errorf("open resolver file: %w", err)
 		}
 		fromFile, loadErr := catalog.LoadYAML(file)
 		_ = file.Close()
 		if loadErr != nil {
-			return nil, loadErr
+			return profileSelection{}, loadErr
 		}
-		profiles = append(profiles, fromFile...)
+		selection.profiles = append(selection.profiles, fromFile...)
 	}
 	for _, raw := range config.resolverFlags {
 		profile, err := catalog.ParseResolverFlag(raw)
 		if err != nil {
-			return nil, err
+			return profileSelection{}, err
 		}
-		profiles = append(profiles, profile)
+		selection.profiles = append(selection.profiles, profile)
 	}
 	if config.includeSystem {
 		fromSystem, err := discoverSystemResolvers(ctx)
 		switch {
 		case err == nil:
-			profiles = append(profiles, fromSystem...)
-		case len(profiles) == 0:
-			return nil, err
+			selection.profiles = append(selection.profiles, fromSystem...)
+		case len(selection.profiles) == 0:
+			return profileSelection{}, err
 		default:
 			// Discovery can fail for reasons the run does not depend on, such
 			// as an unsupported platform. Aborting would discard every other
@@ -863,10 +1011,45 @@ func loadProfiles(ctx context.Context, config *cliConfig) ([]catalog.ResolverPro
 			fmt.Fprintf(warningWriterFunc(), "warning: system resolver discovery failed: %v\n", err)
 		}
 	}
-	if len(profiles) == 0 {
-		return nil, errors.New("no resolver profiles selected")
+	if len(selection.profiles) == 0 {
+		return profileSelection{}, errors.New("no resolver profiles selected")
 	}
-	return profiles, nil
+	return selection, nil
+}
+
+// autoFamilyWarnings reports what --family auto pruned from the bundled
+// catalog so the reduced comparison table is visible rather than silent.
+func autoFamilyWarnings(family catalog.AddressFamily, available map[catalog.AddressFamily]bool, before, after []catalog.ResolverProfile) []string {
+	if family != catalog.FamilyAuto {
+		return nil
+	}
+	dropped := countProfileAddresses(before) - countProfileAddresses(after)
+	if dropped <= 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("--family auto detected %s on local interfaces and dropped %d bundled resolver address(es) from other families", describeFamilies(available), dropped)}
+}
+
+func countProfileAddresses(profiles []catalog.ResolverProfile) int {
+	total := 0
+	for _, profile := range profiles {
+		total += len(profile.Addresses)
+	}
+	return total
+}
+
+// describeFamilies names the detected families. Callers only reach it once at
+// least one family was detected; with none detected auto retains both literal
+// families, so nothing is dropped and no warning is produced.
+func describeFamilies(available map[catalog.AddressFamily]bool) string {
+	var names []string
+	if available[catalog.Family4] {
+		names = append(names, "IPv4")
+	}
+	if available[catalog.Family6] {
+		names = append(names, "IPv6")
+	}
+	return strings.Join(names, " and ")
 }
 
 func parseProtocols(value string) ([]catalog.Protocol, error) {
