@@ -8,6 +8,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
 )
 
 func TestJSONAndCSVExposeTargetMetadata(t *testing.T) {
@@ -147,6 +148,65 @@ func TestDurationMillisecondsRejectsInvalidRanges(t *testing.T) {
 	}
 	if got := durationMilliseconds(time.Unix(2, 0), time.Unix(1, 0)); got != 0 {
 		t.Fatalf("reverse duration = %v, want zero", got)
+	}
+}
+
+// Columns are padded by terminal cells, so every column following a wide, a
+// fullwidth or a combining-mark owner name must still start at one offset.
+func TestAlignedTableAlignsByDisplayWidth(t *testing.T) {
+	headers := []string{"Owner", "Address", "Status"}
+	rows := [][]string{
+		{"東京", "192.0.2.1", "QUALIFIED"},
+		{"ＡＢＣ", "192.0.2.2", "FAILED"},
+		{"e\u0301clair", "192.0.2.3", "INELIGIBLE"},
+		{"plain-ascii", "192.0.2.4", "QUALIFIED"},
+	}
+	var output bytes.Buffer
+	if err := writeAlignedTable(&output, headers, rows); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != len(rows)+1 {
+		t.Fatalf("table lines = %d, want %d: %q", len(lines), len(rows)+1, output.String())
+	}
+	offset := -1
+	for _, line := range lines {
+		column := strings.Index(line, "192.0.2.")
+		if column < 0 {
+			column = strings.Index(line, "Address")
+		}
+		cells := textwidth.Display(line[:column])
+		if offset < 0 {
+			offset = cells
+		}
+		if cells != offset {
+			t.Fatalf("address column starts at cell %d, want %d: %q", cells, offset, line)
+		}
+		if strings.HasSuffix(line, " ") {
+			t.Fatalf("trailing column was padded: %q", line)
+		}
+	}
+	// "plain-ascii" is the widest owner at eleven cells, so the two-cell
+	// margin plus the owner plus two padding cells start addresses at cell 15.
+	if offset != 15 {
+		t.Fatalf("address column offset = %d, want 15", offset)
+	}
+}
+
+// styledStatus cells carry zero-width ANSI codes; they must not widen a column.
+func TestAlignedTableIgnoresColourCodesInWidths(t *testing.T) {
+	var plain, coloured bytes.Buffer
+	headers := []string{"Status", "Owner", "Note"}
+	if err := writeAlignedTable(&plain, headers, [][]string{{styledStatus("FAILED", false), "owner", "note"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAlignedTable(&coloured, headers, [][]string{{styledStatus("FAILED", true), "owner", "note"}}); err != nil {
+		t.Fatal(err)
+	}
+	stripped := strings.ReplaceAll(coloured.String(), ansiRed, "")
+	stripped = strings.ReplaceAll(stripped, ansiReset, "")
+	if stripped != plain.String() {
+		t.Fatalf("coloured table = %q, want %q once the codes are removed", stripped, plain.String())
 	}
 }
 

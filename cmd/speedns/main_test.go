@@ -18,14 +18,17 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
+	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
 
 	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
+	"golang.org/x/text/width"
 )
 
 type cliErrorWriter struct{}
@@ -315,15 +318,53 @@ func TestActiveInterfaceNamesAreBestEffortAndSorted(t *testing.T) {
 	}
 }
 
+// The progress renderer used to carry its own displayWidth helper. The shared
+// package replaced it, so the widths it reports must still match exactly.
 func TestDisplayWidthUsesTerminalCells(t *testing.T) {
-	if got := displayWidth("ascii"); got != 5 {
+	if got := textwidth.Display("ascii"); got != 5 {
 		t.Fatalf("ASCII display width = %d", got)
 	}
-	if got := displayWidth("e\u0301"); got != 1 {
+	if got := textwidth.Display("e\u0301"); got != 1 {
 		t.Fatalf("combining display width = %d", got)
 	}
-	if got := displayWidth("東京"); got != 4 {
+	if got := textwidth.Display("東京"); got != 4 {
 		t.Fatalf("wide display width = %d", got)
+	}
+}
+
+// legacyDisplayWidth is the helper the progress renderer carried before the
+// measurement moved into internal/textwidth. The shared function must agree
+// with it on everything a progress line can contain.
+func legacyDisplayWidth(value string) int {
+	result := 0
+	for _, character := range value {
+		if unicode.Is(unicode.Mn, character) || unicode.Is(unicode.Me, character) {
+			continue
+		}
+		switch width.LookupRune(character).Kind() {
+		case width.EastAsianWide, width.EastAsianFullwidth:
+			result += 2
+		default:
+			result++
+		}
+	}
+	return result
+}
+
+func TestDisplayWidthMatchesPreviousProgressBehaviour(t *testing.T) {
+	values := []string{
+		"",
+		"testing | udp measuring 3/10 | elapsed 00:07 | " + progressSpinner[0],
+		"tested doh 2/2 targets",
+		"e\u0301clair.example",
+		"東京.example",
+		"\uff21\uff22\uff23",
+		"resolver.example 192.0.2.53",
+	}
+	for _, value := range values {
+		if got, want := textwidth.Display(value), legacyDisplayWidth(value); got != want {
+			t.Fatalf("display width of %q = %d, want %d", value, got, want)
+		}
 	}
 }
 

@@ -8,12 +8,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/safetext"
+	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
 )
 
 type JSONReport struct {
@@ -1092,6 +1092,15 @@ func writeProfileView(writer io.Writer, report benchmark.Report, options TableOp
 	return writeAlignedTable(writer, []string{"Profile", "Owner", "Address", "Protocol", "Median", "P95", "Cold", "Score", "Score 95% CI", "Success", "Status"}, rows)
 }
 
+// tableColumnPadding is the number of spaces kept between two columns.
+const tableColumnPadding = 2
+
+// writeAlignedTable renders a table whose columns line up by display width.
+// Counting runes, as text/tabwriter does, shears every column to the right of
+// an East Asian owner name and drifts the other way for combining marks, so
+// cells are measured in terminal cells instead. Zero-width ANSI colour codes
+// from styledStatus are discounted the same way. The trailing column is never
+// padded, so no line carries trailing whitespace.
 // targetCountText and ipv6EndpointCountText keep the collapsed summary lines
 // grammatical for a single hidden row.
 func targetCountText(count int) string {
@@ -1109,21 +1118,55 @@ func ipv6EndpointCountText(count int) string {
 }
 
 func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
-	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	indent := func(values []string) string {
-		copyValues := append([]string(nil), values...)
-		copyValues[0] = "  " + copyValues[0]
-		return strings.Join(copyValues, "\t")
-	}
-	if _, err := fmt.Fprintln(table, indent(headers)); err != nil {
-		return err
-	}
+	lines := make([][]string, 0, len(rows)+1)
+	lines = append(lines, indentedCells(headers))
 	for _, row := range rows {
-		if _, err := fmt.Fprintln(table, indent(row)); err != nil {
+		lines = append(lines, indentedCells(row))
+	}
+	widths := tableColumnWidths(lines)
+	for _, line := range lines {
+		if _, err := io.WriteString(writer, alignedTableLine(line, widths)); err != nil {
 			return err
 		}
 	}
-	return table.Flush()
+	return nil
+}
+
+// indentedCells copies values and indents the first cell by the table margin.
+func indentedCells(values []string) []string {
+	cells := append([]string(nil), values...)
+	cells[0] = "  " + cells[0]
+	return cells
+}
+
+// tableColumnWidths returns the padded width of every column except the last,
+// which is trailing and therefore never padded.
+func tableColumnWidths(lines [][]string) []int {
+	var widths []int
+	for _, line := range lines {
+		for column := 0; column < len(line)-1; column++ {
+			for len(widths) <= column {
+				widths = append(widths, 0)
+			}
+			if cells := textwidth.Display(line[column]) + tableColumnPadding; cells > widths[column] {
+				widths[column] = cells
+			}
+		}
+	}
+	return widths
+}
+
+// alignedTableLine pads every non-trailing cell out to its column width.
+func alignedTableLine(line []string, widths []int) string {
+	builder := strings.Builder{}
+	for column, cell := range line {
+		builder.WriteString(cell)
+		if column < len(widths) {
+			builder.WriteString(strings.Repeat(" ", widths[column]-textwidth.Display(cell)))
+		}
+	}
+	builder.WriteString("\n")
+	return builder.String()
 }
 
 func summaryHeaders() []string {
