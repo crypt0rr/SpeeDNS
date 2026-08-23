@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strings"
@@ -257,6 +258,9 @@ func Validate(profiles []ResolverProfile) error {
 			if address == "" {
 				return fmt.Errorf("resolver %q address %d is empty", profile.ID, addressIndex+1)
 			}
+			if err := validateAddress(address); err != nil {
+				return fmt.Errorf("resolver %q address %d: %w", profile.ID, addressIndex+1, err)
+			}
 			addressKey := canonicalAddressKey(address)
 			if previousIndex, exists := seenAddresses[addressKey]; exists {
 				return fmt.Errorf("resolver %q address %d %q duplicates address %d", profile.ID, addressIndex+1, address, previousIndex)
@@ -313,6 +317,81 @@ func Validate(profiles []ResolverProfile) error {
 		}
 	}
 	return nil
+}
+
+// validateAddress rejects resolver addresses the transport layer could never
+// dial as written. An address must be an IP literal (bare, bracketed, or
+// zoned) or a syntactically valid hostname. A port is configured per transport
+// in the `port:` field, so an address carrying one is rejected with a message
+// that says where the port belongs; without this check the run reports a
+// low-level dial failure against the resolver instead of a configuration
+// error.
+func validateAddress(address string) error {
+	host := address
+	bracketed := strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]")
+	if bracketed {
+		host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return nil
+	}
+	if bracketed {
+		return fmt.Errorf("%q is bracketed but is not an IPv6 literal", address)
+	}
+	if _, _, err := net.SplitHostPort(address); err == nil {
+		return fmt.Errorf("%q includes a port; set the port in the transport spec (port:) instead of in addresses", address)
+	}
+	if !isValidHostname(host) {
+		return fmt.Errorf("%q is not an IP literal or a valid hostname", address)
+	}
+	return nil
+}
+
+func isValidHostname(host string) bool {
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if !isValidHostLabel(label) {
+			return false
+		}
+	}
+	// A fully numeric final label is never a real DNS top label, so treating it
+	// as a hostname would silently accept a mistyped IP literal such as
+	// "192.0.2" or "10.0.0.256".
+	return !isAllDigits(labels[len(labels)-1])
+}
+
+func isValidHostLabel(label string) bool {
+	if label == "" || len(label) > 63 {
+		return false
+	}
+	if label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for index := 0; index < len(label); index++ {
+		character := label[index]
+		switch {
+		case character >= 'a' && character <= 'z':
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isAllDigits(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeBootstrapAddresses(addresses []string) ([]string, error) {

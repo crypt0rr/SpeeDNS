@@ -138,7 +138,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 		}
 		results = append(results, jsonResult)
 	}
-	rankings := append([]benchmark.Ranking(nil), report.Rankings...)
+	rankings := append(make([]benchmark.Ranking, 0, len(report.Rankings)), report.Rankings...)
 	for index := range rankings {
 		if redactedID, ok := redactedIDs[rankings[index].TargetID]; ok {
 			rankings[index].TargetID = redactedID
@@ -636,7 +636,7 @@ func styledStatus(status string, color bool) string {
 	switch status {
 	case "RECOMMENDED", "QUALIFIED", "REFERENCE":
 		colorCode = ansiGreen
-	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED":
+	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED", "TIED":
 		colorCode = ansiYellow
 	case "FAILED":
 		colorCode = ansiRed
@@ -670,12 +670,21 @@ func rankText(report benchmark.Report, targetID string) string {
 	return strconv.Itoa(rank)
 }
 
+const tieNote = "\n  TIED: the 95% score confidence interval overlaps another ranked target, so that ordering is not statistically distinguishable.\n"
+
+func tieText(stats benchmark.Statistics, color bool) string {
+	if !stats.Tie {
+		return "—"
+	}
+	return styledStatus("TIED", color)
+}
+
 func summaryRowWithOptions(protocol catalog.Protocol, result benchmark.TargetResult, status string, color bool, redactSystem bool) []string {
 	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	return []string{
 		string(protocol), view.Owner, view.Address, view.Policy,
 		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
-		scoreText(result), styledStatus(status, color),
+		scoreText(result), tieText(result.Stats, color), styledStatus(status, color),
 	}
 }
 
@@ -696,7 +705,7 @@ func comparisonRowWithOptions(report benchmark.Report, result benchmark.TargetRe
 			tlsIdentitySourceText(metadata.TLSIdentitySource), bootstrapModeText(metadata.BootstrapMode), bootstrapAddressesText(metadata.BootstrapAddresses), dialAddressTextWithOptions(result, redactSystem),
 		)
 	}
-	return append(row, styledStatus(resultStatus(result), color))
+	return append(row, tieText(result.Stats, color), styledStatus(resultStatus(result), color))
 }
 
 func dialAddressTextWithOptions(result benchmark.TargetResult, redactSystem bool) string {
@@ -787,11 +796,11 @@ func unsupportedComparisonRowWithOptions(target catalog.Target, details bool, re
 	view := targetViewFor(target, redactSystem, redactedValue)
 	row := []string{"—", view.Owner, view.Address, view.Policy, "—", "—", "—", "—", "—"}
 	if details {
-		for range comparisonHeaders(true)[len(comparisonHeaders(false))-1 : len(comparisonHeaders(true))-1] {
+		for range len(comparisonHeaders(true)) - len(comparisonHeaders(false)) {
 			row = append(row, "—")
 		}
 	}
-	return append(row, "—")
+	return append(row, "—", "—")
 }
 
 func comparisonRowsForTable(report benchmark.Report, protocol catalog.Protocol, options TableOptions) [][]string {
@@ -827,15 +836,22 @@ func pairedEffectTargetText(report benchmark.Report, targetID string, redactSyst
 	return strings.TrimSpace(view.Owner + " " + view.Address)
 }
 
+// pairedComparable reports whether an effect carries a usable delta and
+// interval. Any effect that benchmark left unmeasured records a Reason, which
+// includes samples below the paired minimum, so no reason means measured.
+func pairedComparable(effect benchmark.PairedEffect) bool {
+	return effect.Samples > 0 && effect.Reason == ""
+}
+
 func pairedDeltaText(effect benchmark.PairedEffect) string {
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return "—"
 	}
 	return fmt.Sprintf("%+.2f ms", effect.MedianDeltaMS)
 }
 
 func pairedCIText(effect benchmark.PairedEffect) string {
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return "—"
 	}
 	return fmt.Sprintf("[%+.2f, %+.2f] ms", effect.CILowMS, effect.CIHighMS)
@@ -845,7 +861,7 @@ func pairedInterpretation(effect benchmark.PairedEffect, color bool) string {
 	if effect.Reference {
 		return styledStatus("REFERENCE", color)
 	}
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return styledStatus("NOT COMPARABLE", color)
 	}
 	if effect.Indistinguishable || effect.MedianDeltaMS == 0 {
@@ -979,7 +995,7 @@ func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) erro
 }
 
 func summaryHeaders() []string {
-	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score", "Status"}
+	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score", "Tie", "Status"}
 }
 
 func comparisonHeaders(details bool) []string {
@@ -987,7 +1003,7 @@ func comparisonHeaders(details bool) []string {
 	if details {
 		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "Reconnects", "RCodes", "Endpoint", "TLSName", "TLSSource", "Bootstrap", "BootstrapAddrs", "Dial")
 	}
-	return append(headers, "Status")
+	return append(headers, "Tie", "Status")
 }
 
 func targetWarningLabel(result benchmark.TargetResult) string {
@@ -1260,13 +1276,16 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 	protocols := tableProtocols(report, options)
 	recommendations := make([][]string, 0, len(protocols))
 	provisionals := make([][]string, 0, len(protocols))
+	tiedWinner := false
 	for _, protocol := range protocols {
 		if winner, found := recommendedResult(report, protocol); found {
 			recommendations = append(recommendations, summaryRowWithOptions(protocol, winner, "RECOMMENDED", options.Color, options.RedactSystem))
+			tiedWinner = tiedWinner || winner.Stats.Tie
 			continue
 		}
 		if winner, found := rankedResult(report, protocol, 1); found {
 			provisionals = append(provisionals, summaryRowWithOptions(protocol, winner, "PROVISIONAL", options.Color, options.RedactSystem))
+			tiedWinner = tiedWinner || winner.Stats.Tie
 		}
 	}
 	if len(recommendations) == 0 {
@@ -1281,6 +1300,11 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 			return err
 		}
 		if err := writeAlignedTable(writer, summaryHeaders(), provisionals); err != nil {
+			return err
+		}
+	}
+	if tiedWinner {
+		if _, err := io.WriteString(writer, tieNote); err != nil {
 			return err
 		}
 	}

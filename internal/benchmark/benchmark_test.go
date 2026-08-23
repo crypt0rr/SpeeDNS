@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -53,13 +54,11 @@ func TestStatisticsAndRanking(t *testing.T) {
 }
 
 func TestRunWarnsWhenSampleIsClamped(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
-	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{
 			Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: 1,
 		}}}
-	}
+	})
 
 	opts := validBenchmarkOptions()
 	opts.Domains = []string{"Example.COM.", "example.com", "example.org"}
@@ -214,9 +213,17 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 	observation := func(name string, latency float64) Observation {
 		return Observation{Name: name, QType: dns.TypeA, Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: latency}
 	}
+	series := func(count int, latency func(index int) float64) []Observation {
+		observations := make([]Observation, 0, count)
+		for index := 0; index < count; index++ {
+			observations = append(observations, observation(fmt.Sprintf("q%02d.Example.", index), latency(index)))
+		}
+		return observations
+	}
 	reference := testTarget(catalog.UDP, "reference")
 	slower := testTarget(catalog.UDP, "slower")
 	noise := testTarget(catalog.UDP, "noise")
+	few := testTarget(catalog.UDP, "few")
 	protective := testTarget(catalog.UDP, "protective")
 	protective.Resolver.Policy = " Protective "
 	missing := testTarget(catalog.UDP, "missing")
@@ -226,25 +233,34 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 
 	referenceResult := TargetResult{
 		Target: reference,
-		Stats:  Statistics{Scored: 2, ScoreMS: 1},
-		Observations: []Observation{
-			observation("A.Example.", 10), observation("b.example", 20),
-			observation("a.example", 99),
-			{Success: false, Name: "failed.example", QType: dns.TypeA},
-			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: math.NaN()},
-			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: math.Inf(1)},
-			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: -1},
-		},
+		Stats:  Statistics{Scored: MinimumRecommendedSamples, ScoreMS: 1},
+		Observations: append(series(MinimumRecommendedSamples, func(int) float64 { return 10 }),
+			observation("q00.example", 99),
+			Observation{Success: false, Name: "failed.example", QType: dns.TypeA},
+			Observation{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: math.NaN()},
+			Observation{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: math.Inf(1)},
+			Observation{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: -1},
+		),
 	}
 	slowerResult := TargetResult{
-		Target: slower, Stats: Statistics{Scored: 2, ScoreMS: 2},
-		Observations: []Observation{observation("a.example", 12), observation("B.EXAMPLE.", 25),
-			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: 50, Divergent: true},
-			{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: 50, Reconnected: true}},
+		Target: slower, Stats: Statistics{Scored: MinimumRecommendedSamples, ScoreMS: 2},
+		Observations: append(series(MinimumRecommendedSamples, func(int) float64 { return 13.5 }),
+			Observation{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: 50, Divergent: true},
+			Observation{Success: true, Usable: true, ResponseClass: "answer", LatencyMS: 50, Reconnected: true}),
 	}
 	noiseResult := TargetResult{
-		Target: noise, Stats: Statistics{Scored: 2, ScoreMS: 3},
-		Observations: []Observation{observation("a.example", 9), observation("b.example", 21)},
+		Target: noise, Stats: Statistics{Scored: MinimumRecommendedSamples, ScoreMS: 3},
+		Observations: series(MinimumRecommendedSamples, func(index int) float64 {
+			if index%2 == 0 {
+				return 9
+			}
+			return 11
+		}),
+	}
+	fewResult := TargetResult{
+		Target:       few,
+		Stats:        Statistics{Scored: MinimumRecommendedSamples - 1, ScoreMS: 3.5},
+		Observations: series(MinimumRecommendedSamples-1, func(int) float64 { return 93.42 }),
 	}
 	protectiveResult := TargetResult{
 		Target: protective, Stats: Statistics{Scored: 1, ScoreMS: 4},
@@ -255,7 +271,7 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 		Observations: []Observation{observation("other.example", 40)},
 	}
 	results := []TargetResult{
-		referenceResult, slowerResult, noiseResult, protectiveResult, missingResult,
+		referenceResult, slowerResult, noiseResult, fewResult, protectiveResult, missingResult,
 		{Target: unscored}, {Target: incomplete, Incomplete: true, Stats: Statistics{Scored: 1, ScoreMS: 0.5}},
 		{Target: emptyReference, Stats: Statistics{Scored: 1, ScoreMS: 6}},
 	}
@@ -263,7 +279,8 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 		{Protocol: catalog.UDP, TargetID: reference.ID(), Rank: 1},
 		{Protocol: catalog.UDP, TargetID: slower.ID(), Rank: 2},
 		{Protocol: catalog.UDP, TargetID: noise.ID(), Rank: 3},
-		{Protocol: catalog.UDP, TargetID: protective.ID(), Rank: 4},
+		{Protocol: catalog.UDP, TargetID: few.ID(), Rank: 4},
+		{Protocol: catalog.UDP, TargetID: protective.ID(), Rank: 5},
 	}
 	first := calculatePairedEffects(results, rankings, 42)
 	second := calculatePairedEffects(results, rankings, 42)
@@ -280,16 +297,24 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 		return PairedEffect{}
 	}
 	refEffect := find(reference.ID())
-	if !refEffect.Reference || refEffect.ReferenceTargetID != reference.ID() || refEffect.Samples != 2 || refEffect.Reason != "" {
+	if !refEffect.Reference || refEffect.ReferenceTargetID != reference.ID() || refEffect.Samples != MinimumRecommendedSamples || refEffect.Reason != "" {
 		t.Fatalf("reference effect = %#v", refEffect)
 	}
 	slowEffect := find(slower.ID())
-	if slowEffect.Samples != 2 || slowEffect.MedianDeltaMS != 3.5 || slowEffect.Indistinguishable {
+	if slowEffect.Samples != MinimumRecommendedSamples || slowEffect.MedianDeltaMS != 3.5 || slowEffect.Indistinguishable || slowEffect.Reason != "" {
 		t.Fatalf("slower effect = %#v", slowEffect)
 	}
 	noiseEffect := find(noise.ID())
-	if noiseEffect.Samples != 2 || !noiseEffect.Indistinguishable || noiseEffect.CILowMS > 0 || noiseEffect.CIHighMS < 0 {
+	if noiseEffect.Samples != MinimumRecommendedSamples || !noiseEffect.Indistinguishable || noiseEffect.CILowMS > 0 || noiseEffect.CIHighMS < 0 {
 		t.Fatalf("noise effect = %#v", noiseEffect)
+	}
+	fewEffect := find(few.ID())
+	wantReason := fmt.Sprintf("insufficient paired samples (minimum %d)", MinimumRecommendedSamples)
+	if fewEffect.Samples != MinimumRecommendedSamples-1 || fewEffect.Reason != wantReason {
+		t.Fatalf("below-minimum effect = %#v", fewEffect)
+	}
+	if fewEffect.MedianDeltaMS != 0 || fewEffect.CILowMS != 0 || fewEffect.CIHighMS != 0 || fewEffect.Indistinguishable {
+		t.Fatalf("below-minimum effect reported a difference: %#v", fewEffect)
 	}
 	protectiveEffect := find(protective.ID())
 	if !protectiveEffect.Reference || protectiveEffect.Policy != "protective" || protectiveEffect.Samples != 1 {
@@ -299,8 +324,8 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 	if missingEffect.Samples != 0 || missingEffect.Reason != "no shared scored samples" {
 		t.Fatalf("missing-pair effect = %#v", missingEffect)
 	}
-	if len(first) != 6 {
-		t.Fatalf("paired effect count = %d, want 6", len(first))
+	if len(first) != 7 {
+		t.Fatalf("paired effect count = %d, want 7", len(first))
 	}
 	emptyEffect := find(emptyReference.ID())
 	if !emptyEffect.Reference || emptyEffect.Samples != 0 || emptyEffect.Reason != "no scored samples" {
@@ -327,9 +352,6 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 	if low, high := bootstrapPairedCI(nil, 1); low != 0 || high != 0 {
 		t.Fatalf("empty paired interval = %v/%v", low, high)
 	}
-	if low, high := bootstrapPairedCI([]float64{2}, 1); low != 2 || high != 2 {
-		t.Fatalf("single paired interval = %v/%v", low, high)
-	}
 	if low, high := bootstrapPairedCI([]float64{1, 3}, 1); low > high {
 		t.Fatalf("paired interval inverted = %v/%v", low, high)
 	}
@@ -343,11 +365,12 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 // keys by value ordered the groups lexicographically as doh, doq, dot, tcp,
 // udp instead.
 func TestRunMeasuresProtocolsInDocumentedOrder(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
-	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+	// A target-level fake only takes effect under the legacy scheduler, which
+	// since the scheduler became an explicit choice must be selected
+	// deliberately rather than inferred from the seam being replaced.
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 3, ResponseClass: "answer"}}}
-	}
+	})
 	var measured []catalog.Protocol
 	opts := validBenchmarkOptions()
 	opts.OnProgress = func(progress Progress) {
