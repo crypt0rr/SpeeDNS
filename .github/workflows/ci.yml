@@ -139,6 +139,32 @@ jobs:
       - name: Run unit and integration tests
         run: go test -count=1 ./...
 
+  lint:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # go vet is deliberately narrow. staticcheck catches the classes it does
+      # not, such as an ineffective break inside a select and a value that is
+      # assigned and never read - both of which were present in this tree and
+      # are fixed in the same change that adds this gate.
+      - name: Run staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+
+      - name: Run shellcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck --severity=style scripts/*.sh
+
   cross-build:
     name: Cross-build release targets
     runs-on: ubuntu-latest
