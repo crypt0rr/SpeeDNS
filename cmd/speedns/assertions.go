@@ -147,6 +147,12 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 	}
 	reasons := make([]string, 0)
 	winners := reportWinners(report)
+	// A transport that failed outright must not be a quieter result than one
+	// that merely degraded. Reported before the individual checks so the
+	// structural failure leads the message.
+	for _, protocol := range deadProtocols(report) {
+		reasons = append(reasons, fmt.Sprintf("no %s endpoint returned a usable DNS response", protocol))
+	}
 	for _, check := range assertions {
 		if len(winners) == 0 {
 			reasons = append(reasons, fmt.Sprintf("%s has no ranked protocol winners", check.raw))
@@ -180,6 +186,50 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrAssertionsFailed, strings.Join(reasons, "; "))
+}
+
+// deadProtocols returns every protocol whose non-local endpoints all returned
+// no usable DNS response at all. Without this, --assert exits 0 when an entire
+// selected transport is unreachable, because evaluateAssertions only iterates
+// protocols that produced a ranking -- so a dead transport was never examined
+// and total failure was quieter than partial degradation.
+//
+// The test is "no usable response", deliberately not "no ranked winner". A
+// resolver that answers every query but re-dials for each one has all of its
+// samples excluded from latency scoring, so it is unranked while being
+// perfectly healthy; firing on a missing ranking would fail that run. This
+// mirrors the allResponsesUnusable condition the report already uses to decide
+// that a protocol is worth warning about, so the gate cannot contradict the
+// warning printed above it.
+//
+// Targets with no measured queries at all are treated as alive: an interrupted
+// run has not shown that the transport is dead. Resolvers on the local host are
+// skipped because they are measured but never ranked, so they must not make
+// their protocol required.
+func deadProtocols(report benchmark.Report) []catalog.Protocol {
+	alive := make(map[catalog.Protocol]bool)
+	for _, result := range report.Targets {
+		if result.Target.Resolver.Local {
+			continue
+		}
+		protocol := result.Target.Protocol
+		if _, measured := alive[protocol]; !measured {
+			alive[protocol] = false
+		}
+		if result.Stats.Total == 0 || result.Stats.UsableResponses != 0 {
+			alive[protocol] = true
+		}
+	}
+	dead := make([]catalog.Protocol, 0, len(alive))
+	for protocol, reachable := range alive {
+		if !reachable {
+			dead = append(dead, protocol)
+		}
+	}
+	// Documented measurement order, so a CI failure lists transports the way
+	// every other part of the report does.
+	sort.Slice(dead, func(i, j int) bool { return catalog.CompareProtocols(dead[i], dead[j]) < 0 })
+	return dead
 }
 
 func reportWinners(report benchmark.Report) map[catalog.Protocol][]benchmark.TargetResult {
