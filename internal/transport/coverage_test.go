@@ -152,6 +152,17 @@ func TestFactorySelectionAndAddressHelpers(t *testing.T) {
 	if joinAddress(" 192.0.2.1 ", 53) != "192.0.2.1:53" || joinAddress("[2001:db8::1]", 853) != "[2001:db8::1]:853" {
 		t.Fatal("unexpected joined addresses")
 	}
+	// A link-local system nameserver is only dialable with its zone kept.
+	if got := joinAddress("fe80::1%en0", 53); got != "[fe80::1%en0]:53" {
+		t.Fatalf("zoned joined address = %q", got)
+	}
+	zoned, err := NewFactory(catalog.Target{Protocol: catalog.UDP, Address: "fe80::1%en0", Spec: catalog.TransportSpec{Port: 53}}, time.Second)
+	if err != nil || zoned.(*udpFactory).address != "[fe80::1%en0]:53" {
+		t.Fatalf("zoned UDP factory = %#v/%v", zoned, err)
+	}
+	if _, _, splitErr := net.SplitHostPort(zoned.(*udpFactory).address); splitErr != nil {
+		t.Fatalf("zoned dial address is unparseable: %v", splitErr)
+	}
 	left, _ := url.Parse("https://DNS.Example/a")
 	right, _ := url.Parse("https://dns.example/b")
 	other, _ := url.Parse("https://other.example/b")
@@ -612,6 +623,12 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 	fakeStream, fakeConn = newFakeDoQStream()
 	if _, err := (&doqSession{conn: fakeConn, timeout: time.Second}).Query(deadlineContext, "example.com", dns.TypeA); err != nil {
 		t.Fatal(err)
+	}
+	// The context carries a deadline, so the stream must take it rather than
+	// the session timeout. Without this assertion the branch is executed but
+	// unverified, and removing its SetDeadline call keeps the suite green.
+	if len(fakeStream.deadlines) != 1 {
+		t.Fatal("DoQ context deadline was not applied to the stream")
 	}
 	if err := (&doqSession{conn: &fakeDoQConn{closeErr: errors.New("close")}}).Close(); err == nil {
 		t.Fatal("expected DoQ close error")

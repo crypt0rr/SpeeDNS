@@ -46,7 +46,7 @@ Show the embedded domain corpus provenance and checksum.
 .TP
 .B speedns version
 Show version, commit, and build information.
-.SH IMPORTANT OPTIONS
+.SH OPTIONS
 .TP
 .B --protocol udp,tcp,doh,dot,doq
 Select the transports to benchmark.
@@ -57,27 +57,66 @@ Add a custom resolver endpoint. Repeat the option for multiple endpoints.
 .B --resolver-file PATH
 Load strict, versioned resolver profiles from YAML.
 .TP
+.B --no-defaults
+Do not include the bundled public resolver catalog. Use with
+.B --resolver
+or
+.B --resolver-file
+to benchmark only your own endpoints.
+.TP
+.B --family 4|6|both|auto
+Select the resolver address family. The default
+.B auto
+uses the local up-interface address inventory without performing DNS lookups or
+connection probes.
+.TP
 .B --domains PATH
 Read one domain per line from a custom list. Blank lines and comments are
-ignored.
+ignored. Underscored service labels such as _dmarc.example.com are accepted;
+the underscore is only allowed as the first character of a label.
 .TP
 .B --sample N
 Sample N domains from the selected corpus.
 .TP
+.B --cache-miss
+Opt in to bounded random names below the reserved example.com zone. It cannot
+be combined with --domains or --full.
+.TP
+.B --cache-miss-sample N
+Generate N unique reserved-zone names, at most 20, for --cache-miss. The
+generated names are still a corpus that --sample draws from: when --sample is
+smaller than N, only that many names are measured and the report warns about
+the truncation. Set --sample to N or higher to measure every generated name.
+.TP
 .B --full
 Use the complete selected domain list.
+.TP
+.B --cache-miss
+Opt in to bounded random names below the IANA-reserved
+.I example.com
+zone instead of the warm-cache corpus. Cannot be combined with
+.B --domains
+or
+.BR --full .
+.TP
+.B --cache-miss-sample N
+Number of unique reserved-zone names generated for
+.BR --cache-miss ,
+maximum 20.
 .TP
 .B --seed N
 Use a specific seed so the selected query order can be reproduced.
 .TP
 .B --type A,AAAA
-Select DNS record types.
+Select DNS record types. Zone-transfer types (AXFR, IXFR), meta-types
+(ANY, MAILA, MAILB, TSIG, TKEY) and the OPT pseudo-record are rejected.
 .TP
 .B --timeout DURATION
 Set the per-query and connection timeout, for example 2s.
 .TP
 .B --concurrency N
-Set the maximum number of measured exchanges in flight per transport.
+Set the maximum number of targets prepared at once, and of measured exchanges
+in flight, per transport.
 .TP
 .B --format table|json|csv
 Choose human-readable, JSON, or CSV output.
@@ -86,12 +125,45 @@ Choose human-readable, JSON, or CSV output.
 Write the report to a file instead of standard output. The file is replaced
 atomically and receives the same permissions an ordinary shell redirection
 would create, narrowed by the current umask.
+Write the report to a file instead of standard output. A regular file is
+replaced atomically: the report is written next to the destination and renamed
+over it only after a successful run, so a failed run leaves the previous file
+untouched. Destinations that cannot be replaced that way are written in place
+instead, which covers non-regular files such as /dev/null, named pipes, and
+/proc file descriptors, plus a writable file in a directory that rejects new
+entries. An in-place destination can keep partial output after a failed run.
+A destination that is a directory is rejected.
 .TP
 .B --details
 Include cold latency, jitter, response outcomes, and expanded diagnostics.
 .TP
 .B --raw
 Include per-query observations in JSON output.
+.TP
+.B --profile-view
+Show same-resolver transport comparisons with score confidence intervals.
+Requires table or JSON output.
+.TP
+.B --redact-system
+Redact local system resolver addresses and labels in reports.
+.TP
+.B --assert EXPRESSION
+Assert a winner metric or profile condition, and exit
+.B 4
+if it does not hold. Repeatable. Accepts
+.IR usable ,
+.IR success ,
+.IR median ,
+.IR p95 ,
+and
+.I score
+with
+.BR >= ", " > ", " <= ", " < ", or " = ,
+or
+.IR winner=PROFILE-ID .
+Rates are between 0 and 1; latencies accept a bare number of milliseconds or a
+Go duration such as
+.IR 50ms .
 .TP
 .B --include-system
 Include resolvers discovered from the operating system configuration.
@@ -106,9 +178,16 @@ while redirected standard error receives deterministic preparation,
 measurement, and completion lines. JSON and CSV runs are silent on standard
 error.
 .PP
-Preparation covers connection setup, cold probes, and warm-up queries.
+Preparation covers connection setup, cold probes, and warm-up queries, and
+runs with the same bounded concurrency as measurement.
 Measurement counts completed DNS exchanges, including failures. Progress does
 not show an ETA or resolver addresses and does not change report contents.
+.PP
+Redirected progress reports each phase when it starts, again after roughly
+every 25 percent of the work in that phase, and once more with its final
+counters before the next phase or the completion line. That bounds the log at
+five lines per phase and protocol. A phase whose total is small or zero still
+reports its final counters.
 .PP
 Transport-library diagnostics use the same standard-error channel. Interactive
 progress clears and restores its status line around such diagnostics. If all
@@ -129,6 +208,10 @@ Input or configuration was invalid.
 .B 3
 The run finished but produced no comparable DNS results.
 .TP
+.B 4
+A requested benchmark assertion did not hold. The ordinary report is written
+before this status is returned.
+.TP
 .B 130
 The run was interrupted. SpeeDNS reports
 .B interrupted
@@ -137,7 +220,12 @@ immediately.
 .SH FILES
 .TP
 .I /etc/resolv.conf
-Fallback system resolver configuration on macOS and Linux.
+System resolver configuration on Linux, and the fallback on macOS.
+.TP
+.I scutil --dns
+Queried on macOS for scoped resolver configuration before the
+.I /etc/resolv.conf
+fallback.
 .SH EXAMPLES
 .EX
 speedns --protocol udp --sample 25 --type A --seed 42
