@@ -149,3 +149,104 @@ func TestDurationMillisecondsRejectsInvalidRanges(t *testing.T) {
 		t.Fatalf("reverse duration = %v, want zero", got)
 	}
 }
+
+func lineContaining(t *testing.T, text string, needle string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	t.Fatalf("no line containing %q in:\n%s", needle, text)
+	return ""
+}
+
+func tieTableReport() benchmark.Report {
+	leader := reportTarget("tie-leader", catalog.UDP, 25, true)
+	leader.Stats.Tie = true
+	challenger := reportTarget("tie-challenger", catalog.UDP, 25, true)
+	challenger.Stats.Tie = true
+	distinct := reportTarget("distinct", catalog.TCP, 25, true)
+	return benchmark.Report{
+		Seed: 42, SampleSize: 2, Queries: 2, QueryTypes: []uint16{1},
+		Targets: []benchmark.TargetResult{leader, challenger, distinct},
+		Rankings: []benchmark.Ranking{
+			{Protocol: catalog.UDP, TargetID: leader.Target.ID(), Rank: 1, Tie: true},
+			{Protocol: catalog.UDP, TargetID: challenger.Target.ID(), Rank: 2, Tie: true},
+			{Protocol: catalog.TCP, TargetID: distinct.Target.ID(), Rank: 1},
+		},
+	}
+}
+
+func TestTableSurfacesConfidenceIntervalTies(t *testing.T) {
+	var output bytes.Buffer
+	if err := WriteTableWithOptions(&output, tieTableReport(), TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(lineContaining(t, text, "Rank"), "Tie") {
+		t.Fatalf("comparison header lost the Tie column:\n%s", text)
+	}
+	if recommendation := lineContaining(t, text, "RECOMMENDED"); !strings.Contains(recommendation, "TIED") {
+		t.Fatalf("tied recommended winner is presented as unqualified: %q", recommendation)
+	}
+	if !strings.Contains(text, "TIED: the 95% score confidence interval overlaps another ranked target") {
+		t.Fatalf("tie explanation missing from recommendation block:\n%s", text)
+	}
+	for _, owner := range []string{"Owner tie-leader", "Owner tie-challenger"} {
+		if row := lineContaining(t, text, owner); !strings.Contains(row, "TIED") {
+			t.Fatalf("comparison row for %s hides the tie: %q", owner, row)
+		}
+	}
+	if row := lineContaining(t, text, "Owner distinct"); strings.Contains(row, "TIED") {
+		t.Fatalf("untied target marked as tied: %q", row)
+	}
+}
+
+func TestTableTieMarkerIsColoredAndOmittedWhenAbsent(t *testing.T) {
+	var colored bytes.Buffer
+	if err := WriteTableWithOptions(&colored, tieTableReport(), TableOptions{Color: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(colored.String(), ansiYellow+"TIED"+ansiReset) {
+		t.Fatalf("TIED rendered without color emphasis:\n%s", colored.String())
+	}
+
+	untied := tieTableReport()
+	for index := range untied.Targets {
+		untied.Targets[index].Stats.Tie = false
+	}
+	for index := range untied.Rankings {
+		untied.Rankings[index].Tie = false
+	}
+	var plain bytes.Buffer
+	if err := WriteTableWithOptions(&plain, untied, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plain.String(), "TIED") {
+		t.Fatalf("untied report claims a tie:\n%s", plain.String())
+	}
+}
+
+func TestTableFlagsTiedProvisionalWinnerAndPropagatesNoteError(t *testing.T) {
+	provisional := reportTarget("tie-provisional", catalog.UDP, 1, false)
+	provisional.Stats.Tie = true
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{provisional},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: provisional.Target.ID(), Rank: 1, Tie: true}},
+	}
+	var output bytes.Buffer
+	if err := WriteTableWithOptions(&output, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if provisionalRow := lineContaining(t, output.String(), "PROVISIONAL"); !strings.Contains(provisionalRow, "TIED") {
+		t.Fatalf("tied provisional winner hides the tie: %q", provisionalRow)
+	}
+	if !strings.Contains(output.String(), "TIED: the 95% score confidence interval") {
+		t.Fatalf("tie explanation missing for provisional winner:\n%s", output.String())
+	}
+	if err := WriteTableWithOptions(contentFailWriter{needle: "TIED: the"}, run, TableOptions{}); err == nil {
+		t.Fatal("tie note write failure was not returned")
+	}
+}
