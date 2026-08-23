@@ -29,6 +29,31 @@ var AllProtocols = []Protocol{UDP, TCP, DoH, DoT, DoQ}
 
 func (p Protocol) String() string { return string(p) }
 
+// protocolRank returns the index of protocol in AllProtocols. Unknown
+// protocols rank after every known one.
+func protocolRank(protocol Protocol) int {
+	for index, known := range AllProtocols {
+		if protocol == known {
+			return index
+		}
+	}
+	return len(AllProtocols)
+}
+
+// CompareProtocols orders protocols by their position in AllProtocols, which
+// is the documented benchmark and display order udp, tcp, doh, dot, doq.
+// Protocol is a string type, so comparing the values directly sorts them
+// lexicographically (doh, doq, dot, tcp, udp) and silently disagrees with the
+// documented and reported order. Unknown protocols sort after every known one,
+// by name, so the result stays deterministic.
+func CompareProtocols(a, b Protocol) int {
+	rankA, rankB := protocolRank(a), protocolRank(b)
+	if rankA == rankB {
+		return strings.Compare(string(a), string(b))
+	}
+	return rankA - rankB
+}
+
 // ParseProtocol parses a user-facing protocol name.
 func ParseProtocol(value string) (Protocol, error) {
 	p := Protocol(strings.ToLower(strings.TrimSpace(value)))
@@ -53,6 +78,12 @@ type TransportSpec struct {
 // ResolverProfile is the stable configuration unit shown to users. A profile
 // may expose more than one address, but each address is benchmarked as its own
 // target.
+//
+// Local marks a resolver that runs on the local host, such as a loopback stub
+// or forwarder. Its latency is the latency of a local cache lookup and
+// excludes the upstream resolution it forwards to, so it is not comparable
+// with a resolver reached over the network. It is set by discovery, not by the
+// resolver file format, so catalogs stay portable between hosts.
 type ResolverProfile struct {
 	ID         string                     `yaml:"id"`
 	Name       string                     `yaml:"name"`
@@ -60,6 +91,7 @@ type ResolverProfile struct {
 	Policy     string                     `yaml:"policy"`
 	Scope      string                     `yaml:"scope,omitempty"`
 	Interface  string                     `yaml:"interface,omitempty"`
+	Local      bool                       `yaml:"-"`
 	Addresses  []string                   `yaml:"addresses"`
 	Transports map[Protocol]TransportSpec `yaml:"transports"`
 }
@@ -440,8 +472,8 @@ func Expand(profiles []ResolverProfile, selected []Protocol) []Target {
 		}
 	}
 	sort.Slice(targets, func(i, j int) bool {
-		if targets[i].Protocol != targets[j].Protocol {
-			return targets[i].Protocol < targets[j].Protocol
+		if order := CompareProtocols(targets[i].Protocol, targets[j].Protocol); order != 0 {
+			return order < 0
 		}
 		return targets[i].ID() < targets[j].ID()
 	})
@@ -483,7 +515,7 @@ func ParseResolverFlag(value string) (ResolverProfile, error) {
 		}
 	}
 	if port == 0 {
-		port = map[Protocol]int{UDP: 53, TCP: 53, DoH: 443, DoT: 853, DoQ: 853}[protocol]
+		port = defaultPort(protocol)
 	}
 	host := u.Hostname()
 	spec := TransportSpec{Port: port}

@@ -76,19 +76,6 @@ nfpms:
         file_info:
           mode: 0644
 
-homebrew_casks:
-  - repository:
-      owner: crypt0rr
-      name: homebrew-speedns
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    name: speedns
-    homepage: https://github.com/crypt0rr/SpeeDNS
-    description: Cross-platform DNS transport speed test CLI
-    binaries:
-      - speedns
-    url:
-      verified: github.com/crypt0rr/SpeeDNS/releases/download
-
 checksum:
   name_template: checksums.txt
 

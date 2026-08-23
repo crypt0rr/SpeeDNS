@@ -196,7 +196,9 @@ failure-penalized even if they are divergent. See
 An endpoint is marked `RECOMMENDED` only when it has at least 20 comparable
 samples and at least 99% usable responses. Short runs can show a
 `PROVISIONAL` winner, but use a larger sample or `--full` for a more stable
-comparison.
+comparison. A resolver running on the local host is never ranked or
+recommended, because its cache-hit latency is not comparable with a resolver
+reached over the network; see [System resolver baseline](#system-resolver-baseline).
 
 Resolvers can have different filtering policies. SpeeDNS compares response
 classes only within the same declared policy. Within that group, the largest
@@ -213,6 +215,14 @@ reference. The effect is the median per-name/type latency difference
 (`target - reference`) with a deterministic bootstrap 95% confidence interval.
 `NO CLEAR DIFFERENCE` means the interval includes zero, so the measured
 difference is not distinguishable from noise. These comparisons explain the
+ranking but do not replace the existing score or change rank order. A target
+that is alone in its protocol and policy group has no peer to compare against,
+so the default table counts it below the block instead of printing a
+self-comparison row. JSON includes the same information in the additive
+`paired_effects` section; CSV keeps its aggregate schema.
+difference is not distinguishable from noise. A comparison needs at least 20
+paired observations; below that the row reports `NOT COMPARABLE` instead of a
+delta and interval. These comparisons explain the
 ranking but do not replace the existing score or change rank order. JSON
 includes the same information in the additive `paired_effects` section; CSV
 keeps its aggregate schema.
@@ -238,8 +248,9 @@ The available transports are:
 SpeeDNS does not silently fall back from one protocol to another. The table
 shows the complete selected resolver/protocol matrix: an unsupported transport
 is shown as `—`, an unavailable transport is `FAILED`, a transport-valid result
-that cannot qualify is `INELIGIBLE`, an interrupted target is `INCOMPLETE`, and
-a recommendation-eligible result is `QUALIFIED`.
+that cannot qualify is `INELIGIBLE`, an interrupted target is `INCOMPLETE`, a
+resolver on the local host is `NOT COMPARABLE`, and a recommendation-eligible
+result is `QUALIFIED`.
 
 ## Default resolvers
 
@@ -271,9 +282,21 @@ not download or read a resolver catalog at runtime.
 The bundled catalog includes the provider-published IPv4 and IPv6 addresses.
 Use `--family 4`, `--family 6`, or `--family both` to choose deterministically.
 The default `--family auto` keeps literal address families visible on usable
-local interfaces. Hostname-only custom encrypted endpoints remain available
-in `auto` and `both`; explicit `4` or `6` requires IP literals so SpeeDNS does
-not perform an unmeasured bootstrap lookup to guess a family.
+local interfaces, plus loopback addresses, which stay reachable through the
+host itself no matter which families have external routes. Hostname-only
+custom encrypted endpoints remain available in `auto` and `both`; explicit `4`
+or `6` requires IP literals so SpeeDNS does not perform an unmeasured
+bootstrap lookup to guess a family.
+
+local interfaces. Unique-local IPv6 (`fc00::/7`, including Tailscale and
+router-issued ULAs) does not count as IPv6 availability, because IPv6 has no
+NAT equivalent and a ULA is not evidence of a public route; private IPv4 still
+counts. `auto` prunes only the bundled catalog and warns when it drops
+addresses, so resolvers you name with `--resolver`, `--resolver-file`, or
+`--include-system` are always benchmarked. Hostname-only custom encrypted
+endpoints remain available in `auto` and `both`; explicit `4` or `6` requires
+IP literals so SpeeDNS does not perform an unmeasured bootstrap lookup to guess
+a family.
 
 The bundled addresses are sourced from [Google Public DNS](https://developers.google.com/speed/public-dns/docs/using), [Cloudflare](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/), [Quad9](https://quad9.net/service/service-addresses-and-features/), and [DNS4EU](https://joindns4.eu/for-public).
 
@@ -352,7 +375,7 @@ not download or refresh the list.
 
 ## Custom domain lists
 
-Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line.
+Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Underscored service labels such as `_dmarc.example.com`, `_sip._tcp.example.com`, and `selector1._domainkey.example.com` are accepted unchanged, so lists paired with `--type SRV`, `--type TLSA`, or `--type TXT` work; the underscore is only allowed as the first character of a label. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, other non-letter/digit/hyphen characters, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line.
 
 ```sh
 ./speedns --domains my-domains.txt --sample 200 --seed 42
@@ -372,7 +395,10 @@ zone mode:
 
 This generates 1–20 unique labels below the IANA-reserved `example.com` zone,
 caps measured concurrency at two, and records a random nonce in the report.
-It cannot be combined with `--domains` or `--full`. Cache-miss results are
+It cannot be combined with `--domains` or `--full`. The generated names are a
+corpus that `--sample` still draws from, so keep `--sample` at least as large
+as `--cache-miss-sample`; a smaller `--sample` measures only that many
+generated names and the report warns that the corpus was truncated. Cache-miss results are
 kept in their own run and ranking population; they are never mixed with the
 normal embedded warm-cache corpus. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
 using the mode, especially for ownership, traffic, and abuse limits.
@@ -385,7 +411,13 @@ Use `--include-system` to include the resolver configured by the operating syste
 ./speedns --include-system
 ```
 
-This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. Separate macOS scopes remain separate targets even when they use the same address.
+This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. Separate macOS scopes remain separate targets even when they use the same address. Link-local IPv6 nameservers keep their zone (`fe80::1%en0`) so they stay dialable.
+
+Windows has no system resolver discovery yet, and `--include-system` reports
+it as an unsupported platform. Discovery failures do not abort a run: when
+other resolvers are selected, SpeeDNS prints a warning on stderr and
+benchmarks the rest. `--include-system` on its own still fails, because the
+run would have no resolver left.
 
 macOS discovery gives `scutil --dns` a two-second independent timeout. If it
 times out or returns no usable nameservers, SpeeDNS falls back to
@@ -395,6 +427,15 @@ ultimate upstream is not known to SpeeDNS. Scoped macOS entries are kept
 separate when the same address appears in more than one resolver block, since
 the scope and interface can change which DNS server answers.
 
+A local stub is measured and shown, but it is never ranked and never
+recommended. It answers from its own cache, so its latency excludes the
+upstream resolution it forwards to and is not comparable with a resolver
+reached over the network; without this rule a warm local cache would win every
+comparison it entered. Its row keeps the measured latency, shows no rank and
+the status `NOT COMPARABLE`, and the report carries a warning naming the
+reason. JSON marks the target with `"local": true` and CSV adds a trailing
+`local` column.
+
 When sharing a report that includes the system resolver, add
 `--redact-system`. It keeps the measurements and rankings but replaces local
 resolver addresses, identifying labels, selected dial addresses, and matching
@@ -402,6 +443,38 @@ error text with redacted values in table, JSON, and CSV output. Redaction is
 opt-in; local diagnostics are shown by default.
 
 System resolvers are tested only over transports discoverable from the operating system configuration, normally UDP and TCP.
+
+## DNSSEC probing
+
+The bundled catalog records each resolver's published policy, which may claim
+DNSSEC validation. `--dnssec` checks that claim instead of repeating it. It is
+opt-in and off by default.
+
+With `--dnssec`, every query of the run sets the EDNS(0) DO bit, and each
+prepared target answers two extra queries after all of its measured rounds:
+
+- `good-a.test.dnssec-tools.org`, a correctly signed control name that any
+  resolver must answer, and
+- `dnssec-failed.org`, a deliberately mis-signed public test zone that a
+  validating resolver must refuse with SERVFAIL.
+
+Each target then receives a verdict of `validating`, `not-validating`, or
+`inconclusive`, shown in a separate table section and emitted as a `dnssec`
+object in JSON and a `dnssec_verdict` column in CSV. The raw response codes and
+the AD (authentic data) and CD (checking disabled) flags are reported next to
+the verdict so the conclusion can be checked.
+
+```sh
+./speedns --dnssec --protocol udp,dot
+```
+
+The probe describes what those two names did at that moment over that network
+path. It is not a DNSSEC audit, it never sets the CD bit, and its queries stay
+out of the latency samples, rankings, and divergence analysis. A run without
+`--dnssec` sends byte-identical queries to earlier releases and contacts no
+probe names, so default reports remain comparable.
+[`METHODOLOGY.md`](METHODOLOGY.md) documents the verdict rules and their
+limits.
 
 ## Output
 
@@ -411,6 +484,22 @@ samples, transport failures, resolver-error counts and RCODEs, divergence,
 truncation, reconnects, incomplete targets, and the selected connection
 address.
 
+The default table leaves out rows that carry no information. When every
+selected IPv6 endpoint fails at the transport layer, each protocol comparison
+replaces those endpoint rows with one line naming how many IPv6 endpoints were
+hidden and why; partial IPv6 failures stay listed per endpoint. Paired latency
+effects leave out targets that are alone in their protocol and policy group,
+since such a row can only compare a target with itself, and count them in one
+line below the block. `--details` lists every row again, and JSON keeps every
+`paired_effects` entry in both views.
+The recommendation summary and every per-protocol comparison include a `Tie`
+column. `TIED` means the 95% score confidence interval of that target overlaps
+another ranked target, so the rank order between them is not statistically
+distinguishable; `—` means it does not. A tied recommended or provisional
+winner is also called out by a `TIED:` note below the recommendation table, so
+a rank-one result is never presented as an unqualified winner. The same flag
+is available as the CSV `tie` column and the JSON `tie` fields.
+
 For scripts and other tools, use JSON or CSV:
 
 ```sh
@@ -419,10 +508,21 @@ For scripts and other tools, use JSON or CSV:
 ./speedns --format json --raw --output result-with-samples.json
 ```
 
+`--output` replaces the destination atomically and gives it the permissions an
+ordinary shell redirection would produce, narrowed by your umask.
+`--output` replaces a regular file atomically: the report is written next to
+the destination and renamed over it only when the run succeeds, so a failed
+run leaves the previous file untouched. Destinations that cannot be replaced
+that way are written in place instead, so `--output /dev/null`, a named pipe,
+`/proc/self/fd/1`, and a writable file in a directory that rejects new entries
+all work; an in-place destination can keep partial output after a failed run.
+A destination that is a directory is rejected.
+
 The versioned JSON contract is published as
 [`schema/report-v1.json`](schema/report-v1.json). It describes the current
 `schema_version: 1` output, including optional raw samples, profile
-comparisons, paired effects, divergence details, and warnings. Consumers
+comparisons, paired effects, divergence details, the optional per-target
+`dnssec` assessment, and warnings. Consumers
 should select their parser and validation rules from the reported schema
 version rather than assuming that table or CSV output has the same shape.
 
@@ -455,13 +555,14 @@ Useful flags include:
 --cache-miss        opt in to bounded reserved-zone cache-miss names
 --cache-miss-sample N  number of unique cache-miss names (maximum 20)
 --seed N            reproduce a domain order
---type A,AAAA       record types to query
+--type A,AAAA       record types to query (zone-transfer, meta and pseudo-record types are rejected)
 --timeout 2s        per-endpoint timeout
---concurrency 4    maximum measured DNS exchanges in flight per protocol
+--concurrency 4    maximum concurrent target preparations and measured DNS exchanges per protocol
 --format table|json|csv
---output PATH       write output to a file
+--output PATH       write output to a file, /dev/null, or a pipe
 --no-color          disable terminal colors
 --redact-system     hide local system resolver details in reports
+--dnssec            opt in to DNSSEC probing (DO bit plus two pinned probes)
 --profile-view      show same-resolver transport costs and score confidence
 --assert EXPR       enforce a benchmark condition (repeatable)
 --family 4|6|both|auto  choose resolver address family (default: auto)
@@ -475,16 +576,28 @@ status line, for example:
 testing | udp done | tcp done | doh queued | dot queued | doq preparing 2/10 | elapsed 00:04 | /
 ```
 
-Preparation covers connection setup, cold probes, and warm-ups. Measuring
+Preparation covers connection setup, cold probes, and warm-ups, and runs with
+the same bounded concurrency as measurement. Measuring
 shows completed DNS exchanges, including failed exchanges; no ETA or resolver
 addresses are shown. When standard error is not a terminal, SpeeDNS prints
-deterministic phase-start and protocol-completion lines instead:
+deterministic milestone lines instead: each phase is reported when it starts,
+again roughly every 25 percent of its own work, and once more with its final
+counters, followed by the protocol-completion line:
 
 ```text
 progress doq: preparing 0/10 targets
+progress doq: preparing 10/10 targets
 progress doq: measuring 0/1000 exchanges
+progress doq: measuring 250/1000 exchanges
+progress doq: measuring 500/1000 exchanges
+progress doq: measuring 750/1000 exchanges
+progress doq: measuring 1000/1000 exchanges
 tested doq 10/10 targets
 ```
+
+That caps the log at five lines per phase and protocol. A phase whose totals
+are small or empty still reports its final counters once, and the lines carry
+counters only: no ETA and no resolver addresses.
 
 JSON and CSV runs remain completely silent on standard error. Progress never
 changes benchmark measurements or report contents.
@@ -494,8 +607,9 @@ the same standard-error channel. Interactive progress briefly clears its
 status line, prints the diagnostic, and restores the status line so messages do
 not overwrite the report or become mixed into the progress text. When every
 selected IPv6 endpoint fails before receiving a usable DNS response, table
-warnings summarize the condition as an unavailable IPv6 path; partial IPv6
-failures remain visible per endpoint.
+warnings summarize the condition as an unavailable IPv6 path and the default
+protocol comparisons replace those endpoint rows with a hidden-endpoint count;
+partial IPv6 failures remain visible per endpoint.
 
 Cache-miss JSON and CSV reports carry the corpus mode, reserved zone, and
 per-run nonce. JSON with `--profile-view` additionally includes
@@ -511,6 +625,9 @@ warnings. The command returns a distinct non-zero status:
 - `3` — no comparable DNS results were produced;
 - `4` — a requested benchmark assertion failed;
 - `130` — interrupted by the user or operating system.
+
+An interrupted run reports `interrupted` on standard error and still writes the
+partial report. A second interrupt exits immediately.
 
 ### Assertions for automation
 

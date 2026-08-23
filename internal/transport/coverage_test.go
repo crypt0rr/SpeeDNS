@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,6 +151,17 @@ func TestFactorySelectionAndAddressHelpers(t *testing.T) {
 	}
 	if joinAddress(" 192.0.2.1 ", 53) != "192.0.2.1:53" || joinAddress("[2001:db8::1]", 853) != "[2001:db8::1]:853" {
 		t.Fatal("unexpected joined addresses")
+	}
+	// A link-local system nameserver is only dialable with its zone kept.
+	if got := joinAddress("fe80::1%en0", 53); got != "[fe80::1%en0]:53" {
+		t.Fatalf("zoned joined address = %q", got)
+	}
+	zoned, err := NewFactory(catalog.Target{Protocol: catalog.UDP, Address: "fe80::1%en0", Spec: catalog.TransportSpec{Port: 53}}, time.Second)
+	if err != nil || zoned.(*udpFactory).address != "[fe80::1%en0]:53" {
+		t.Fatalf("zoned UDP factory = %#v/%v", zoned, err)
+	}
+	if _, _, splitErr := net.SplitHostPort(zoned.(*udpFactory).address); splitErr != nil {
+		t.Fatalf("zoned dial address is unparseable: %v", splitErr)
 	}
 	left, _ := url.Parse("https://DNS.Example/a")
 	right, _ := url.Parse("https://dns.example/b")
@@ -324,22 +337,20 @@ func TestStreamSessionFramingAndAllErrors(t *testing.T) {
 }
 
 func TestDeadlineAndResponseValidation(t *testing.T) {
-	conn := &scriptedConn{}
-	if err := setConnDeadline(conn, context.Background(), time.Second); err != nil || len(conn.deadlines) != 1 {
-		t.Fatal("background deadline failed")
+	timeoutOnly := queryDeadline(context.Background(), time.Second)
+	if timeoutOnly.Before(time.Now()) || timeoutOnly.After(time.Now().Add(time.Second)) {
+		t.Fatalf("timeout deadline = %v", timeoutOnly)
 	}
-	early, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	earlyDeadline := time.Now().Add(-time.Second)
+	early, cancel := context.WithDeadline(context.Background(), earlyDeadline)
 	defer cancel()
-	if err := setConnDeadline(conn, early, time.Hour); err != nil {
-		t.Fatal(err)
+	if got := queryDeadline(early, time.Hour); !got.Equal(earlyDeadline) {
+		t.Fatalf("near caller deadline = %v, want %v", got, earlyDeadline)
 	}
 	later, cancelLater := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
 	defer cancelLater()
-	if err := setConnDeadline(conn, later, time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-	if err := setConnDeadline(&scriptedConn{setDeadlineErr: errors.New("deadline")}, context.Background(), time.Second); err == nil {
-		t.Fatal("expected SetDeadline error")
+	if got := queryDeadline(later, time.Millisecond); got.After(time.Now().Add(time.Second)) {
+		t.Fatalf("far caller deadline = %v, want the transport timeout to win", got)
 	}
 
 	valid := replyFor("example.com", dns.TypeA, 7)
@@ -376,11 +387,11 @@ func TestDeadlineAndResponseValidation(t *testing.T) {
 
 func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	for _, raw := range []string{"https://", "http://dns.example/dns-query", "https:///dns-query"} {
-		if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: raw}}, time.Second); err == nil {
+		if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: raw}}, time.Second, QueryOptions{}); err == nil {
 			t.Fatalf("expected invalid DoH URL %q", raw)
 		}
 	}
-	factory, err := newDoHFactory(catalog.Target{Address: "192.0.2.53", Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query", Port: 8443, ServerName: "tls.example"}}, time.Second)
+	factory, err := newDoHFactory(catalog.Target{Address: "192.0.2.53", Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query", Port: 8443, ServerName: "tls.example"}}, time.Second, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,20 +402,20 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	urlPortFactory, err := newDoHFactory(catalog.Target{
 		Address: "192.0.2.53",
 		Spec:    catalog.TransportSpec{URL: "https://dns.example:9443/dns-query"},
-	}, time.Second)
+	}, time.Second, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := urlPortFactory.(*doHFactory).dialAddr; got != "192.0.2.53:9443" {
 		t.Fatalf("DoH URL port dial address = %q, want 192.0.2.53:9443", got)
 	}
-	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:99999/dns-query"}}, time.Second); err == nil {
+	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:99999/dns-query"}}, time.Second, QueryOptions{}); err == nil {
 		t.Fatal("invalid DoH URL port unexpectedly succeeded")
 	}
-	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:0/dns-query"}}, time.Second); err == nil {
+	if _, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example:0/dns-query"}}, time.Second, QueryOptions{}); err == nil {
 		t.Fatal("zero DoH URL port unexpectedly succeeded")
 	}
-	fallback, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second)
+	fallback, err := newDoHFactory(catalog.Target{Spec: catalog.TransportSpec{URL: "https://dns.example/dns-query"}}, time.Second, QueryOptions{})
 	if err != nil || fallback.(*doHFactory).dialAddr != "dns.example:443" || fallback.(*doHFactory).serverName != "dns.example" {
 		t.Fatalf("DoH fallback factory = %#v/%v", fallback, err)
 	}
@@ -701,7 +712,7 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 }
 
 func TestQueryPackingAndClassification(t *testing.T) {
-	plain := newQuery("example.com", dns.TypeA, 7, false)
+	plain := newQuery("example.com", dns.TypeA, 7, false, QueryOptions{})
 	if plain.Id != 7 || !plain.RecursionDesired || len(plain.Question) != 1 || len(plain.Extra) != 1 {
 		t.Fatalf("plain query = %#v", plain)
 	}
@@ -712,12 +723,12 @@ func TestQueryPackingAndClassification(t *testing.T) {
 	if _, err := packQuery(bad); err == nil {
 		t.Fatal("expected DNS packing error")
 	}
-	withExtra := newQuery("example.com", dns.TypeA, 1, false)
+	withExtra := newQuery("example.com", dns.TypeA, 1, false, QueryOptions{})
 	withExtra.Extra = append(withExtra.Extra, &dns.TXT{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeTXT, Class: dns.ClassINET}})
 	if _, err := packQuery(withExtra); err != nil {
 		t.Fatal(err)
 	}
-	withOption := newQuery("example.com", dns.TypeA, 1, false)
+	withOption := newQuery("example.com", dns.TypeA, 1, false, QueryOptions{})
 	withOption.Extra[0].(*dns.OPT).Option = []dns.EDNS0{&dns.EDNS0_NSID{}}
 	if _, err := packQuery(withOption); err != nil {
 		t.Fatal(err)
@@ -819,5 +830,52 @@ func TestLocalDoQFactoryExercisesAdapter(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("DoQ fixture did not finish")
+	}
+}
+
+// TestDoHRejectedResponsesKeepConnection pins the keep-alive behaviour of the
+// DoH error paths: a rejected reply whose body is left unread forces the HTTP
+// client to drop the connection, so every retry would pay a fresh TLS
+// handshake. The local TLS server counts accepted connections; the loopback
+// certificate is trusted explicitly for this test only.
+func TestDoHRejectedResponsesKeepConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		status      int
+	}{
+		{name: "status", contentType: "application/dns-message", status: http.StatusServiceUnavailable},
+		{name: "content type", contentType: "text/html", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var connections atomic.Int64
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.Copy(io.Discard, request.Body)
+				writer.Header().Set("Content-Type", tc.contentType)
+				writer.WriteHeader(tc.status)
+				_, _ = io.WriteString(writer, strings.Repeat("rejected body ", 64))
+			}))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+			}
+			server.StartTLS()
+			defer server.Close()
+
+			pool := x509.NewCertPool()
+			pool.AddCert(server.Certificate())
+			clientTransport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12}}
+			defer clientTransport.CloseIdleConnections()
+			session := &doHSession{client: &http.Client{Transport: clientTransport}, transport: clientTransport, endpoint: server.URL}
+			for attempt := 0; attempt < 3; attempt++ {
+				if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err == nil {
+					t.Fatalf("attempt %d accepted a rejected DoH reply", attempt)
+				}
+			}
+			if opened := connections.Load(); opened != 1 {
+				t.Fatalf("rejected DoH replies opened %d connections, want 1 reused connection", opened)
+			}
+		})
 	}
 }

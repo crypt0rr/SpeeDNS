@@ -156,7 +156,24 @@ var dialDoQ = func(ctx context.Context, address string, tlsConfig *tls.Config, c
 
 var packSessionQuery = packQuery
 
+// QueryOptions carries per-run DNS query settings. The zero value reproduces
+// the queries SpeeDNS has always sent, so a default run stays byte-identical
+// on the wire and remains comparable with previously published reports.
+type QueryOptions struct {
+	// DNSSEC sets the EDNS(0) DO bit. It is opt-in because it changes the
+	// request the resolver sees. The CD (checking disabled) bit is never set:
+	// SpeeDNS wants the resolver to validate, not to skip validation.
+	DNSSEC bool
+}
+
+// NewFactory creates a factory that sends the default query form.
 func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
+	return NewFactoryWithOptions(target, timeout, QueryOptions{})
+}
+
+// NewFactoryWithOptions creates a factory whose sessions apply the supplied
+// per-run query options to every query they send.
+func NewFactoryWithOptions(target catalog.Target, timeout time.Duration, options QueryOptions) (Factory, error) {
 	if timeout <= 0 {
 		return nil, errors.New("transport timeout must be positive")
 	}
@@ -164,9 +181,9 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 	address := firstAddress(connectionPlan)
 	switch target.Protocol {
 	case catalog.UDP:
-		return &udpFactory{address: joinAddress(target.Address, target.Spec.Port), timeout: timeout}, nil
+		return &udpFactory{address: joinAddress(target.Address, target.Spec.Port), timeout: timeout, queryOptions: options}, nil
 	case catalog.TCP:
-		return &streamFactory{address: address, connectionPlan: connectionPlan, timeout: timeout}, nil
+		return &streamFactory{address: address, connectionPlan: connectionPlan, timeout: timeout, queryOptions: options}, nil
 	case catalog.DoT:
 		serverName := target.Spec.ServerName
 		if serverName == "" {
@@ -176,6 +193,7 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			address:        address,
 			connectionPlan: connectionPlan,
 			timeout:        timeout,
+			queryOptions:   options,
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				ServerName: serverName,
@@ -188,7 +206,7 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			},
 		}, nil
 	case catalog.DoH:
-		return newDoHFactory(target, timeout)
+		return newDoHFactory(target, timeout, options)
 	case catalog.DoQ:
 		serverName := target.Spec.ServerName
 		if serverName == "" {
@@ -198,6 +216,7 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 			address:        address,
 			connectionPlan: connectionPlan,
 			timeout:        timeout,
+			queryOptions:   options,
 			tlsConfig: &tls.Config{
 				MinVersion: tls.VersionTLS13,
 				ServerName: serverName,
@@ -210,8 +229,9 @@ func NewFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
 }
 
 type udpFactory struct {
-	address string
-	timeout time.Duration
+	address      string
+	timeout      time.Duration
+	queryOptions QueryOptions
 }
 
 // resolveUDPAddress is a seam so the bootstrap lookup can be exercised without
@@ -247,7 +267,7 @@ func (f *udpFactory) Open(ctx context.Context) (Session, error) {
 		}
 		address = net.JoinHostPort(resolvedHost, port)
 	}
-	return &udpSession{address: address, timeout: f.timeout}, nil
+	return &udpSession{address: address, timeout: f.timeout, queryOptions: f.queryOptions}, nil
 }
 
 type streamFactory struct {
@@ -255,6 +275,7 @@ type streamFactory struct {
 	connectionPlan dialPlan
 	timeout        time.Duration
 	tlsConfig      *tls.Config
+	queryOptions   QueryOptions
 }
 
 func (f *streamFactory) Open(ctx context.Context) (Session, error) {
@@ -267,17 +288,19 @@ func (f *streamFactory) Open(ctx context.Context) (Session, error) {
 		return nil, err
 	}
 	return &streamSession{
-		conn:        conn,
-		reopen:      func(ctx context.Context) (net.Conn, string, error) { return plan.openStream(ctx, f.tlsConfig) },
-		timeout:     f.timeout,
-		secure:      f.tlsConfig != nil,
-		dialAddress: dialAddress,
+		conn:         conn,
+		reopen:       func(ctx context.Context) (net.Conn, string, error) { return plan.openStream(ctx, f.tlsConfig) },
+		timeout:      f.timeout,
+		secure:       f.tlsConfig != nil,
+		dialAddress:  dialAddress,
+		queryOptions: f.queryOptions,
 	}, nil
 }
 
 type udpSession struct {
-	address string
-	timeout time.Duration
+	address      string
+	timeout      time.Duration
+	queryOptions QueryOptions
 }
 
 // DialAddress reports the literal endpoint the session exchanges with, which
@@ -285,7 +308,7 @@ type udpSession struct {
 func (s *udpSession) DialAddress() string { return s.address }
 
 func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
-	query := newQuery(name, qtype, dns.Id(), false)
+	query := newQuery(name, qtype, dns.Id(), false, s.queryOptions)
 	client := &dns.Client{Net: "udp", Timeout: s.timeout}
 	response, _, err := client.ExchangeContext(ctx, query, s.address)
 	if err != nil {
@@ -306,6 +329,7 @@ type streamSession struct {
 	timeout         time.Duration
 	secure          bool
 	dialAddress     string
+	queryOptions    QueryOptions
 	lastReconnected bool
 	closed          bool
 }
@@ -331,12 +355,12 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 	if s.closed {
 		return nil, errors.New("stream session is closed")
 	}
-	query := newQuery(name, qtype, dns.Id(), s.secure)
+	query := newQuery(name, qtype, dns.Id(), s.secure, s.queryOptions)
 	packed, err := packSessionQuery(query)
 	if err != nil {
 		return nil, err
 	}
-	if len(packed) > 65535 {
+	if len(packed) > maxFramedMessage {
 		return nil, errors.New("DNS query exceeds TCP message limit")
 	}
 	reconnecting := s.conn == nil
@@ -345,33 +369,14 @@ func (s *streamSession) Query(ctx context.Context, name string, qtype uint16) (*
 		return nil, err
 	}
 	s.lastReconnected = reconnecting
-	if err := setConnDeadline(s.conn, ctx, s.timeout); err != nil {
+	// The connection is reused across queries, so the deadline is set on the
+	// connection itself and the send side stays open.
+	if err := s.conn.SetDeadline(queryDeadline(ctx, s.timeout)); err != nil {
 		return nil, s.fatal(err)
 	}
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
-	if _, err := s.conn.Write(prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := s.conn.Write(packed); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := io.ReadFull(s.conn, prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	length := int(binary.BigEndian.Uint16(prefix[:]))
-	if length == 0 {
-		return nil, s.fatal(errors.New("empty DNS response"))
-	}
-	responseBytes := make([]byte, length)
-	if _, err := io.ReadFull(s.conn, responseBytes); err != nil {
-		return nil, s.fatal(err)
-	}
-	response := new(dns.Msg)
-	if err := response.Unpack(responseBytes); err != nil {
-		return nil, s.fatal(fmt.Errorf("unpack DNS response: %w", err))
-	}
-	if err := validateResponse(response, name, qtype, query.Id, false); err != nil {
+	framing := framedStream{stream: s.conn, label: "DNS"}
+	response, err := framing.query(packed, name, qtype, query.Id, false)
+	if err != nil {
 		return nil, s.fatal(err)
 	}
 	return response, nil
@@ -434,6 +439,7 @@ type doHFactory struct {
 	connectionPlan dialPlan
 	serverName     string
 	timeout        time.Duration
+	queryOptions   QueryOptions
 }
 
 var newDoHTLSConfig = func(serverName string) *tls.Config {
@@ -445,6 +451,9 @@ var newDoHTLSConfig = func(serverName string) *tls.Config {
 // endpoint cannot force an unnecessarily large header allocation per query.
 const doHMaxResponseHeaderBytes = 64 << 10
 
+// doHMaxResponseBodyBytes bounds every DoH body read, parsed or discarded.
+const doHMaxResponseBodyBytes = 1 << 20
+
 // Go applies its ten hop redirect cap inside net/http's own CheckRedirect,
 // so installing a custom callback removes the cap entirely. A legitimate DoH
 // endpoint needs at most one or two hops, so keep a small budget of our own
@@ -454,7 +463,7 @@ const doHMaxResponseHeaderBytes = 64 << 10
 // issued per query.
 const doHMaxRedirects = 5
 
-func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error) {
+func newDoHFactory(target catalog.Target, timeout time.Duration, options QueryOptions) (Factory, error) {
 	u, err := url.Parse(target.Spec.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, fmt.Errorf("invalid DoH URL %q", target.Spec.URL)
@@ -487,6 +496,7 @@ func newDoHFactory(target catalog.Target, timeout time.Duration) (Factory, error
 		connectionPlan: connectionPlan,
 		serverName:     serverName,
 		timeout:        timeout,
+		queryOptions:   options,
 	}, nil
 }
 
@@ -495,7 +505,7 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 	if len(plan.addresses) == 0 {
 		plan = singleDialPlan(f.dialAddr, f.timeout)
 	}
-	session := &doHSession{endpoint: f.url}
+	session := &doHSession{endpoint: f.url, queryOptions: f.queryOptions}
 	tlsConfig := newDoHTLSConfig(f.serverName)
 	if len(tlsConfig.NextProtos) == 0 {
 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
@@ -568,6 +578,7 @@ type doHSession struct {
 	client          *http.Client
 	transport       *http.Transport
 	endpoint        string
+	queryOptions    QueryOptions
 	mu              sync.RWMutex
 	dialAddr        string
 	connections     uint64
@@ -618,7 +629,7 @@ func (s *doHSession) DialAddress() string {
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	connectionsBefore := s.beginQuery()
-	query := newQuery(name, qtype, 0, true)
+	query := newQuery(name, qtype, 0, true, s.queryOptions)
 	packed, err := packSessionQuery(query)
 	if err != nil {
 		return nil, err
@@ -636,12 +647,14 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH HTTP status %s", response.Status)
 	}
 	if contentType := response.Header.Get("Content-Type"); contentType != "" && !strings.Contains(strings.ToLower(contentType), "application/dns-message") {
+		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH returned content type %q", contentType)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(response.Body, doHMaxResponseBodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -655,6 +668,14 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	return message, nil
 }
 
+// drainHTTPBody consumes a bounded amount of a response body that the caller
+// will not parse, so the keep-alive connection stays reusable instead of being
+// torn down after every rejected reply. The bound matches the parsed-body limit
+// so a hostile endpoint cannot make an error path read without end.
+func drainHTTPBody(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, doHMaxResponseBodyBytes))
+}
+
 func (s *doHSession) Close() error {
 	s.transport.CloseIdleConnections()
 	return nil
@@ -665,6 +686,7 @@ type doqFactory struct {
 	connectionPlan dialPlan
 	timeout        time.Duration
 	tlsConfig      *tls.Config
+	queryOptions   QueryOptions
 }
 
 func (f *doqFactory) dialConfig() *quic.Config {
@@ -704,10 +726,11 @@ func (f *doqFactory) Open(ctx context.Context) (Session, error) {
 		return nil, err
 	}
 	return &doqSession{
-		conn:        conn,
-		reopen:      f.open,
-		timeout:     f.timeout,
-		dialAddress: dialAddress,
+		conn:         conn,
+		reopen:       f.open,
+		timeout:      f.timeout,
+		dialAddress:  dialAddress,
+		queryOptions: f.queryOptions,
 	}, nil
 }
 
@@ -717,6 +740,7 @@ type doqSession struct {
 	mu              sync.Mutex
 	timeout         time.Duration
 	dialAddress     string
+	queryOptions    QueryOptions
 	lastReconnected bool
 	closed          bool
 }
@@ -742,12 +766,12 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	if s.closed {
 		return nil, errors.New("DoQ session is closed")
 	}
-	query := newQuery(name, qtype, 0, true)
+	query := newQuery(name, qtype, 0, true, s.queryOptions)
 	packed, err := packSessionQuery(query)
 	if err != nil {
 		return nil, err
 	}
-	if len(packed) > 65535 {
+	if len(packed) > maxFramedMessage {
 		return nil, errors.New("DNS query exceeds DoQ message limit")
 	}
 	reconnecting := s.conn == nil
@@ -756,47 +780,19 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 		return nil, err
 	}
 	s.lastReconnected = reconnecting
+	// RFC 9250 gives every DoQ query its own stream, so the deadline belongs
+	// to the stream and the send side is closed once the request is written.
 	stream, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, s.fatal(err)
 	}
 	defer stream.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		if err := stream.SetDeadline(deadline); err != nil {
-			return nil, s.fatal(err)
-		}
-	} else {
-		if err := stream.SetDeadline(time.Now().Add(s.timeout)); err != nil {
-			return nil, s.fatal(err)
-		}
-	}
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
-	if _, err := stream.Write(prefix[:]); err != nil {
+	if err := stream.SetDeadline(queryDeadline(ctx, s.timeout)); err != nil {
 		return nil, s.fatal(err)
 	}
-	if _, err := stream.Write(packed); err != nil {
-		return nil, s.fatal(err)
-	}
-	if err := stream.Close(); err != nil {
-		return nil, s.fatal(err)
-	}
-	if _, err := io.ReadFull(stream, prefix[:]); err != nil {
-		return nil, s.fatal(err)
-	}
-	length := int(binary.BigEndian.Uint16(prefix[:]))
-	if length == 0 {
-		return nil, s.fatal(errors.New("empty DoQ response"))
-	}
-	responseBytes := make([]byte, length)
-	if _, err := io.ReadFull(stream, responseBytes); err != nil {
-		return nil, s.fatal(err)
-	}
-	response := new(dns.Msg)
-	if err := response.Unpack(responseBytes); err != nil {
-		return nil, s.fatal(fmt.Errorf("unpack DoQ response: %w", err))
-	}
-	if err := validateResponse(response, name, qtype, 0, true); err != nil {
+	framing := framedStream{stream: stream, closeSend: stream.Close, label: "DoQ"}
+	response, err := framing.query(packed, name, qtype, 0, true)
+	if err != nil {
 		return nil, s.fatal(err)
 	}
 	return response, nil
@@ -853,7 +849,71 @@ func (s *doqSession) Close() error {
 	return conn.CloseWithError(0, "")
 }
 
-func newQuery(name string, qtype, id uint16, padded bool) *dns.Msg {
+// maxFramedMessage is the largest DNS message the two-byte length prefix can
+// describe, and therefore the size limit shared by TCP, DoT and DoQ framing.
+const maxFramedMessage = 65535
+
+// framedStream carries out the length-prefixed DNS exchange that TCP and DoT
+// (RFC 1035 section 4.2.2) and DoQ (RFC 9250 section 4.2) all use. Only the
+// framing lives here: connection lifecycle, deadlines and transaction ID
+// rules stay with the sessions, which handle them differently.
+type framedStream struct {
+	stream io.ReadWriter
+	// closeSend ends the client side of the stream once the request has been
+	// written. DoQ requires it; a reused TCP or DoT connection must leave the
+	// send side open for the next query, and so leaves this nil.
+	closeSend func() error
+	// label names the transport in framing errors.
+	label string
+}
+
+// query performs one framed exchange and returns the validated response.
+func (f framedStream) query(packed []byte, name string, qtype, queryID uint16, zeroID bool) (*dns.Msg, error) {
+	responseBytes, err := f.exchange(packed)
+	if err != nil {
+		return nil, err
+	}
+	response := new(dns.Msg)
+	if err := response.Unpack(responseBytes); err != nil {
+		return nil, fmt.Errorf("unpack %s response: %w", f.label, err)
+	}
+	if err := validateResponse(response, name, qtype, queryID, zeroID); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+// exchange writes one length-prefixed request and reads the length-prefixed
+// response bytes.
+func (f framedStream) exchange(packed []byte) ([]byte, error) {
+	var prefix [2]byte
+	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
+	if _, err := f.stream.Write(prefix[:]); err != nil {
+		return nil, err
+	}
+	if _, err := f.stream.Write(packed); err != nil {
+		return nil, err
+	}
+	if f.closeSend != nil {
+		if err := f.closeSend(); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := io.ReadFull(f.stream, prefix[:]); err != nil {
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(prefix[:]))
+	if length == 0 {
+		return nil, fmt.Errorf("empty %s response", f.label)
+	}
+	responseBytes := make([]byte, length)
+	if _, err := io.ReadFull(f.stream, responseBytes); err != nil {
+		return nil, err
+	}
+	return responseBytes, nil
+}
+
+func newQuery(name string, qtype, id uint16, padded bool, options QueryOptions) *dns.Msg {
 	query := &dns.Msg{
 		MsgHdr: dns.MsgHdr{
 			Id:               id,
@@ -863,6 +923,13 @@ func newQuery(name string, qtype, id uint16, padded bool) *dns.Msg {
 		Question: []dns.Question{{Name: dns.Fqdn(name), Qtype: qtype, Qclass: dns.ClassINET}},
 	}
 	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 1232}}
+	if options.DNSSEC {
+		// RFC 4035: the DO bit asks the resolver for DNSSEC records and, for a
+		// validating resolver, for validated answers with the AD flag. It is
+		// set only for an opt-in --dnssec run; the default query form is
+		// unchanged so default results stay comparable across releases.
+		opt.SetDo()
+	}
 	if padded {
 		// RFC 9250 requires padding when the QUIC implementation does not
 		// provide a packet-padding policy. The same stable padding policy is
@@ -895,12 +962,15 @@ func packQuery(query *dns.Msg) ([]byte, error) {
 	return packed, nil
 }
 
-func setConnDeadline(conn net.Conn, ctx context.Context, timeout time.Duration) error {
+// queryDeadline bounds one framed exchange by the transport timeout, and by
+// the caller deadline when that is nearer. Stream and DoQ sessions share the
+// computation so a per-query budget cannot mean two different things.
+func queryDeadline(ctx context.Context, timeout time.Duration) time.Time {
 	deadline := time.Now().Add(timeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
-	return conn.SetDeadline(deadline)
+	return deadline
 }
 
 func validateResponse(response *dns.Msg, name string, qtype uint16, queryID uint16, zeroID bool) error {
