@@ -817,70 +817,72 @@ gates green on the CI-pinned toolchain.
 
 | Finding | Summary | Tracked as |
 |---|---|---|
-| P0-1 | Root label trimmed after IDNA; suite red on Go 1.27 | #109 |
-| P1-1 | omitempty hides fields the live-results contract requires | #110, #123 |
-| P1-2 | rankings: null violates report-v1.json | #110 |
+| P0-1 | Root label trimmed after IDNA; suite red on Go 1.27 | #109 ✅ |
+| P1-1 | omitempty hides fields the live-results contract requires | #110 ✅ #123 ✅ |
+| P1-2 | rankings: null violates report-v1.json | #110 ✅ |
 | P1-3 | policy is an unvalidated grouping key | issue #105 |
-| P1-4 | Paired-effect CIs have no minimum-sample gate | #115 |
+| P1-4 | Paired-effect CIs have no minimum-sample gate | #115 ✅ |
 | P1-5 | --assert passes when a protocol produced no ranking | issue #106 |
 | P1-6 | Numeric --assert applies to the whole tie group | issue #107 |
-| P1-7 | Canonical NODATA classified as an answer | #111 |
-| P1-8 | --family auto false-positives on ULA / Tailscale | #116 |
-| P1-9 | Protocols measured in undocumented order | #119 |
-| P1-10 | --cache-miss only cold for the first protocol group | issue #108, disclosed in #119 |
-| P1-11 | Hostile DoH endpoint gets unbounded redirects | #112 |
-| P1-12 | Untrusted text reaches terminal and CSV unescaped | #120 |
-| P1-13 | DoH exempt from reconnect detection | #117 |
-| P1-14 | Scoring engine not pinned by any test | #114 |
-| P1-15 | Scheduler selected by reflect-comparing a test seam | #121 |
-| P2-1 | Local stub ranked and recommended | #126 |
-| P2-2 | Tie flag never reaches the table | #124 |
-| P2-3 | Non-interactive progress never reports progress | #127 |
-| P2-4 | Default table dominated by uninformative rows | #133 |
-| P2-5 | Cloudflare DoH authenticates the wrong name | #118 |
-| P2-6 | Unsafe and pseudo-RR query types accepted | #129 |
-| P2-7 | Man page drifted; exit code 4 missing | #113 |
-| P2-8 | Release reproducibility gate never checks what ships | #128 |
-| P2-9 | README names an archive that is never produced | #113 |
-| P2-10 | README promises Homebrew casks on Linux | #113 |
-| P2-11 | Windows --include-system opens /etc/resolv.conf | #131 |
-| P2-11 | IPv6 zone IDs dropped in discovery | #131 |
-| P2-11 | --family auto discards loopback resolvers | #131 |
-| P2-11 | Catalog addresses never syntax-checked | #130 |
-| P2-11 | --assert winner=ID never validated | #130 |
-| P2-11 | --output cannot write non-regular files | #132 |
-| P2-11 | --sample silently truncates cache-miss corpus | #132 |
-| P2-11 | Underscore service labels rejected | #134 |
-| P2-11 | One invalid name aborts the whole corpus | #143 |
-| P2-11 | Table aligned by rune count, not display width | #138 |
-| P2-11 | Bootstrap 2xtimeout sentinel distorts ties | #135 |
-| P2-11 | Sequential preparation biases by catalog position | #135 |
-| P2-11 | UDP re-resolves a hostname every query | #122 |
-| P2-11 | DoT omits the dot ALPN token | #122 |
-| P2-11 | Fuzz targets assert only no-panic | #136 |
-| P2-11 | systemdns real-OS paths unasserted, non-hermetic | #136 |
-| P2-11 | Subcommand wiring unasserted | #136 |
-| P2-11 | Warnings passed as strings, re-parsed by prefix | #139 |
-| P2-11 | Report dispatch arms identical, bypass test seams | #143 |
-| P3 | No static analysis beyond go vet (SA4011, SA4006) | #125 |
-| P3 | DoQ ctx-deadline branch unasserted (mutation survived) | #125 |
-| P3 | No golden fixture regeneration path | #136 |
-| P3 | TestTCPSessionReusesConnection never checks reuse | #143 |
-| P3 | No DNSSEC capability | #141 |
-| P3 | Dead homebrew_casks config in .goreleaser.yaml | #140 |
-| P3 | --output files created 0600 | #137 |
-| P3 | Ctrl-C prints 'context canceled' | #137 |
-| P3 | Warm timer includes post-query bookkeeping | #137 |
-| P3 | Repeated Ctrl-C cannot force-quit | #137 |
-| P3 | DoH error paths do not drain the body | #137 |
-| P3 | streamSession/doqSession duplicate the framed exchange | #140 |
-| P3 | Default ports defined twice | #140 |
-| P3 | README says man ./speedns.1 | #113 |
-| P3 | Loop-invariant work rebuilt per iteration | #140 |
-| P3 | Report contract has no Go consumer path | #142 |
+| P1-7 | Canonical NODATA classified as an answer | #111 ✅ |
+| P1-8 | --family auto false-positives on ULA / Tailscale | #116 ✅ |
+| P1-9 | Protocols measured in undocumented order | #119 ✅ |
+| P1-10 | --cache-miss only cold for the first protocol group | issue #108 disclosed in #119 ✅ |
+| P1-11 | Hostile DoH endpoint gets unbounded redirects | #112 ✅ |
+| P1-12 | Untrusted text reaches terminal and CSV unescaped | #120 ✅ |
+| P1-13 | DoH exempt from reconnect detection | #117 ✅ |
+| P1-14 | Scoring engine not pinned by any test | #114 ✅ |
+| P1-15 | Scheduler selected by reflect-comparing a test seam | #121 ✅ |
+| P2-1 | Local stub ranked and recommended | #126 ✅ |
+| P2-2 | Tie flag never reaches the table | #124 ✅ |
+| P2-3 | Non-interactive progress never reports progress | #127 ✅ |
+| P2-4 | Default table dominated by uninformative rows | #133 ✅ |
+| P2-5 | Cloudflare DoH authenticates the wrong name | #118 ✅ |
+| P2-6 | Unsafe and pseudo-RR query types accepted | #129 ✅ |
+| P2-7 | Man page drifted; exit code 4 missing | #113 ✅ |
+| P2-8 | Release reproducibility gate never checks what ships | #128 ✅ |
+| P2-9 | README names an archive that is never produced | #113 ✅ |
+| P2-10 | README promises Homebrew casks on Linux | #113 ✅ |
+| P2-11 | Windows --include-system opens /etc/resolv.conf | #131 ✅ |
+| P2-11 | IPv6 zone IDs dropped in discovery | #131 ✅ |
+| P2-11 | --family auto discards loopback resolvers | #131 ✅ |
+| P2-11 | Catalog addresses never syntax-checked | #130 ✅ |
+| P2-11 | --assert winner=ID never validated | #130 ✅ |
+| P2-11 | --output cannot write non-regular files | #132 ✅ |
+| P2-11 | --sample silently truncates cache-miss corpus | #132 ✅ |
+| P2-11 | Underscore service labels rejected | #134 ✅ |
+| P2-11 | One invalid name aborts the whole corpus | #143 ✅ |
+| P2-11 | Table aligned by rune count, not display width | #138 ✅ |
+| P2-11 | Bootstrap 2xtimeout sentinel distorts ties | #135 ✅ |
+| P2-11 | Sequential preparation biases by catalog position | #135 ✅ |
+| P2-11 | UDP re-resolves a hostname every query | #122 ✅ |
+| P2-11 | DoT omits the dot ALPN token | #122 ✅ |
+| P2-11 | Fuzz targets assert only no-panic | #136 ✅ |
+| P2-11 | systemdns real-OS paths unasserted, non-hermetic | #136 ✅ |
+| P2-11 | Subcommand wiring unasserted | #136 ✅ |
+| P2-11 | Warnings passed as strings, re-parsed by prefix | #139 ✅ |
+| P2-11 | Report dispatch arms identical, bypass test seams | #143 ✅ |
+| P3 | No static analysis beyond go vet (SA4011, SA4006) | #125 ✅ |
+| P3 | DoQ ctx-deadline branch unasserted (mutation survived) | #125 ✅ |
+| P3 | No golden fixture regeneration path | #136 ✅ |
+| P3 | TestTCPSessionReusesConnection never checks reuse | #143 ✅ |
+| P3 | No DNSSEC capability | #141 ✅ |
+| P3 | Dead homebrew_casks config in .goreleaser.yaml | #140 ✅ |
+| P3 | --output files created 0600 | #137 ✅ |
+| P3 | Ctrl-C prints 'context canceled' | #137 ✅ |
+| P3 | Warm timer includes post-query bookkeeping | #137 ✅ |
+| P3 | Repeated Ctrl-C cannot force-quit | #137 ✅ |
+| P3 | DoH error paths do not drain the body | #137 ✅ |
+| P3 | streamSession/doqSession duplicate the framed exchange | #140 ✅ |
+| P3 | Default ports defined twice | #140 ✅ |
+| P3 | README says man ./speedns.1 | #113 ✅ |
+| P3 | Loop-invariant work rebuilt per iteration | #140 ✅ |
+| P3 | Report contract has no Go consumer path | #142 — closed; JSON schema remains the contract |
 
-**35 pull requests, 4 issues.**
+**36 pull requests merged, 1 closed, 4 issues open.** ✅ marks merged.
 
-Merge-order constraints are repeated in the individual pull requests. The two
-that matter most: #109 before any Go-version matrix work, and #110 before #123
-(which is stacked on it and fails until the encoder fixes land).
+All of these are merged except **#142** (public Go report types), closed in
+favour of keeping `schema/report-v1.json` as the sole published contract.
+`main` is green on Go
+1.25, 1.26 and 1.27 with gofmt, vet, staticcheck, shellcheck, `go mod tidy`,
+`-race` and 100% statement coverage all clean.
