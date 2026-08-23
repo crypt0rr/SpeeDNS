@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -183,14 +187,77 @@ func TestDiscoverMacOSScutilTimeoutFallsBack(t *testing.T) {
 	}
 }
 
-func TestSystemSourceHelpers(t *testing.T) {
-	if reader, err := originalOpenResolvConf(); err == nil {
-		_ = reader.Close()
+func TestOpenResolvConfReadsTheConfiguredPath(t *testing.T) {
+	oldPath := resolvConfPath
+	oldOpen := openResolvConf
+	t.Cleanup(func() {
+		resolvConfPath = oldPath
+		openResolvConf = oldOpen
+	})
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	contents := "# fixture\nnameserver 192.0.2.42\nnameserver 2001:db8::42\noptions edns0\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, _ = originalRunScutil(ctx)
+	resolvConfPath = path
 
+	reader, err := originalOpenResolvConf()
+	if err != nil {
+		t.Fatalf("open fixture resolv.conf = %v", err)
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read fixture resolv.conf = %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close fixture resolv.conf = %v", err)
+	}
+	if string(raw) != contents {
+		t.Fatalf("fixture resolv.conf contents = %q", string(raw))
+	}
+
+	openResolvConf = originalOpenResolvConf
+	addresses, err := discoverResolvConf()
+	if err != nil || len(addresses) != 2 || addresses[0] != "192.0.2.42" || addresses[1] != "2001:db8::42" {
+		t.Fatalf("discoverResolvConf over the fixture = %#v/%v", addresses, err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "absent.conf")
+	resolvConfPath = missing
+	if _, err := discoverResolvConf(); err == nil || !strings.Contains(err.Error(), "open "+missing) {
+		t.Fatalf("missing resolv.conf error = %v", err)
+	}
+}
+
+func TestScutilCommandQueriesDNSConfiguration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	command := scutilCommand(ctx)
+	if base := filepath.Base(command.Path); base != "scutil" {
+		t.Fatalf("scutil command path = %q", command.Path)
+	}
+	if len(command.Args) != 2 || command.Args[0] != "scutil" || command.Args[1] != "--dns" {
+		t.Fatalf("scutil command args = %#v", command.Args)
+	}
+}
+
+func TestRunScutilReportsCommandFailures(t *testing.T) {
+	oldCommand := scutilCommand
+	t.Cleanup(func() { scutilCommand = oldCommand })
+	absent := filepath.Join(t.TempDir(), "absent-scutil")
+	scutilCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, absent, "--dns")
+	}
+	output, err := originalRunScutil(context.Background())
+	if err == nil || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("runScutil over a missing binary = %q/%v", output, err)
+	}
+	if output != nil {
+		t.Fatalf("runScutil output on failure = %q", output)
+	}
+}
+
+func TestSystemSourceHelpers(t *testing.T) {
 	if got, ok := normalizeAddress(" 192.0.2.1 "); !ok || got != "192.0.2.1" {
 		t.Fatalf("normalized IPv4 = %q/%v", got, ok)
 	}
