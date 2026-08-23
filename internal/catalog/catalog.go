@@ -515,7 +515,7 @@ func ParseResolverFlag(value string) (ResolverProfile, error) {
 		}
 	}
 	if port == 0 {
-		port = map[Protocol]int{UDP: 53, TCP: 53, DoH: 443, DoT: 853, DoQ: 853}[protocol]
+		port = defaultPort(protocol)
 	}
 	host := u.Hostname()
 	spec := TransportSpec{Port: port}

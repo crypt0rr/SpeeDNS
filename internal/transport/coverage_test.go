@@ -337,22 +337,20 @@ func TestStreamSessionFramingAndAllErrors(t *testing.T) {
 }
 
 func TestDeadlineAndResponseValidation(t *testing.T) {
-	conn := &scriptedConn{}
-	if err := setConnDeadline(conn, context.Background(), time.Second); err != nil || len(conn.deadlines) != 1 {
-		t.Fatal("background deadline failed")
+	timeoutOnly := queryDeadline(context.Background(), time.Second)
+	if timeoutOnly.Before(time.Now()) || timeoutOnly.After(time.Now().Add(time.Second)) {
+		t.Fatalf("timeout deadline = %v", timeoutOnly)
 	}
-	early, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	earlyDeadline := time.Now().Add(-time.Second)
+	early, cancel := context.WithDeadline(context.Background(), earlyDeadline)
 	defer cancel()
-	if err := setConnDeadline(conn, early, time.Hour); err != nil {
-		t.Fatal(err)
+	if got := queryDeadline(early, time.Hour); !got.Equal(earlyDeadline) {
+		t.Fatalf("near caller deadline = %v, want %v", got, earlyDeadline)
 	}
 	later, cancelLater := context.WithDeadline(context.Background(), time.Now().Add(time.Hour))
 	defer cancelLater()
-	if err := setConnDeadline(conn, later, time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-	if err := setConnDeadline(&scriptedConn{setDeadlineErr: errors.New("deadline")}, context.Background(), time.Second); err == nil {
-		t.Fatal("expected SetDeadline error")
+	if got := queryDeadline(later, time.Millisecond); got.After(time.Now().Add(time.Second)) {
+		t.Fatalf("far caller deadline = %v, want the transport timeout to win", got)
 	}
 
 	valid := replyFor("example.com", dns.TypeA, 7)

@@ -146,8 +146,8 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 		return nil
 	}
 	reasons := make([]string, 0)
+	winners := reportWinners(report)
 	for _, check := range assertions {
-		winners := reportWinners(report)
 		if len(winners) == 0 {
 			reasons = append(reasons, fmt.Sprintf("%s has no ranked protocol winners", check.raw))
 			continue
