@@ -46,13 +46,9 @@ var newFactory = transport.NewFactoryWithOptions
 type protocolScheduler func(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult
 
 // runProtocol is the scheduler every protocol group is measured with. It is a
-// variable purely so a test can select runProtocolLegacy deliberately; the
-// production choice is never inferred from the state of a test hook.
+// variable so a test can substitute a scheduler deliberately; the production
+// choice is never inferred from the state of a test hook.
 var runProtocol protocolScheduler = runProtocolFair
-
-// runTargetFunc is the target-level seam used by runProtocolLegacy. Replacing
-// it has no effect unless runProtocolLegacy is also selected explicitly.
-var runTargetFunc = runTarget
 
 type Options struct {
 	Domains     []string
@@ -377,81 +373,6 @@ func buildQueries(opts Options) ([]Query, error) {
 	return queries, nil
 }
 
-// runProtocolLegacy dispatches whole targets to a worker pool through the
-// runTargetFunc seam and returns only the targets it managed to dispatch. It
-// is never selected by production code; tests that fake whole targets select
-// it explicitly.
-func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
-	if len(targets) == 0 {
-		return nil
-	}
-	emitProgress(opts, Progress{
-		Protocol:     targets[0].Protocol,
-		Phase:        ProgressPreparing,
-		TargetsTotal: len(targets),
-	})
-	results := make([]TargetResult, len(targets))
-	dispatched := make([]bool, len(targets))
-	jobs := make(chan int)
-	var wg sync.WaitGroup
-	var completedTargets atomic.Int32
-	var completedExchanges atomic.Int32
-	workers := opts.Concurrency
-	if workers > len(targets) {
-		workers = len(targets)
-	}
-	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for index := range jobs {
-				result := runTargetFunc(ctx, targets[index], queries, opts)
-				if ctx.Err() != nil {
-					// A worker may return just after cancellation, including when a
-					// test fixture ignores its context. Keep that target diagnostic
-					// but never let a partial result enter rankings.
-					markIncomplete(&result, ctx.Err())
-				}
-				results[index] = result
-				targetsDone := int(completedTargets.Add(1))
-				exchangesDone := int(completedExchanges.Add(int32(len(result.Observations))))
-				emitProgress(opts, Progress{
-					Protocol:           targets[index].Protocol,
-					Phase:              ProgressMeasuring,
-					TargetsCompleted:   targetsDone,
-					TargetsTotal:       len(targets),
-					ExchangesCompleted: exchangesDone,
-					ExchangesTotal:     len(targets) * len(queries),
-				})
-			}
-		}()
-	}
-dispatch:
-	for index := range targets {
-		if ctx.Err() != nil {
-			break
-		}
-		select {
-		case jobs <- index:
-			dispatched[index] = true
-		case <-ctx.Done():
-			break dispatch
-		}
-	}
-	close(jobs)
-	wg.Wait()
-	compacted := dispatchedResults(results, dispatched)
-	emitProgress(opts, Progress{
-		Protocol:           targets[0].Protocol,
-		Phase:              ProgressComplete,
-		TargetsCompleted:   int(completedTargets.Load()),
-		TargetsTotal:       len(targets),
-		ExchangesCompleted: int(completedExchanges.Load()),
-		ExchangesTotal:     len(targets) * len(queries),
-	})
-	return compacted
-}
-
 func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
 	orderedTargets := append([]catalog.Target(nil), targets...)
 	if len(orderedTargets) == 0 {
@@ -650,16 +571,6 @@ func emitProgress(opts Options, progress Progress) {
 	}
 }
 
-func dispatchedResults(results []TargetResult, dispatched []bool) []TargetResult {
-	compacted := make([]TargetResult, 0, len(results))
-	for index, wasDispatched := range dispatched {
-		if wasDispatched {
-			compacted = append(compacted, results[index])
-		}
-	}
-	return compacted
-}
-
 // targetRunner owns one target's reusable measured session. The fair
 // scheduler prepares all dispatched targets, then advances every target by
 // one measured query round at a time. Only query calls are concurrent; a
@@ -839,20 +750,6 @@ func (runner *targetRunner) close() {
 		runner.result.DialAddress = sessionDialAddress(runner.session)
 		_ = runner.session.Close()
 	}
-}
-
-func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts Options) TargetResult {
-	runner := newTargetRunner(ctx, target, queries, opts)
-	if runner.prepare(ctx) {
-		for _, query := range queries {
-			if !runner.measure(ctx, query) {
-				break
-			}
-		}
-		runner.probeDNSSEC(ctx)
-	}
-	runner.close()
-	return runner.result
 }
 
 func markIncomplete(result *TargetResult, err error) {
@@ -1320,7 +1217,12 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 				continue
 			}
 			if len(deltas) < MinimumRecommendedSamples {
-				effect.Reason = fmt.Sprintf("insufficient paired samples (minimum %d)", MinimumRecommendedSamples)
+				// Reason is published in paired_effects, so it stays a fixed
+				// phrase rather than interpolating MinimumRecommendedSamples:
+				// a consumer that matched on the text would otherwise break
+				// the moment the threshold changed. The threshold itself is
+				// documented in METHODOLOGY.md and derivable from samples.
+				effect.Reason = "insufficient paired samples"
 				effects = append(effects, effect)
 				continue
 			}
