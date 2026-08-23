@@ -97,7 +97,8 @@ maximum 20.
 Use a specific seed so the selected query order can be reproduced.
 .TP
 .B --type A,AAAA
-Select DNS record types.
+Select DNS record types. Zone-transfer types (AXFR, IXFR), meta-types
+(ANY, MAILA, MAILB, TSIG, TKEY) and the OPT pseudo-record are rejected.
 .TP
 .B --timeout DURATION
 Set the per-query and connection timeout, for example 2s.

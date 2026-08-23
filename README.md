@@ -483,7 +483,7 @@ Useful flags include:
 --cache-miss        opt in to bounded reserved-zone cache-miss names
 --cache-miss-sample N  number of unique cache-miss names (maximum 20)
 --seed N            reproduce a domain order
---type A,AAAA       record types to query
+--type A,AAAA       record types to query (zone-transfer, meta and pseudo-record types are rejected)
 --timeout 2s        per-endpoint timeout
 --concurrency 4    maximum measured DNS exchanges in flight per protocol
 --format table|json|csv
