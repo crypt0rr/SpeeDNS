@@ -164,8 +164,9 @@ func TestCSVFormulaLeadingCellsAreProtected(t *testing.T) {
 		{value: "+formula", want: "'+formula"},
 		{value: "-formula", want: "'-formula"},
 		{value: "@formula", want: "'@formula"},
-		{value: "\tformula", want: "'\tformula"},
-		{value: "\rformula", want: "'\rformula"},
+		{value: "\tformula", want: `'\x09formula`},
+		{value: "\rformula", want: `'\x0dformula`},
+		{value: "\x1b=cmd|'/C calc'!A1", want: `'\x1b=cmd|'/C calc'!A1`},
 		{value: "normal", want: "normal"},
 		{value: "", want: ""},
 	} {
@@ -202,12 +203,12 @@ func TestCSVFormulaProtectionCoversTargetAndErrorFields(t *testing.T) {
 		values[name] = row[index]
 	}
 	for name, want := range map[string]string{
-		"target_id":  "'=target@\taddress/udp",
+		"target_id":  `'=target@\x09address/udp`,
 		"name":       "'+name",
 		"owner":      "'-owner",
 		"policy":     "'@policy",
-		"address":    "'\taddress",
-		"open_error": "'\rerror",
+		"address":    `'\x09address`,
+		"open_error": `'\x0derror`,
 	} {
 		if values[name] != want {
 			t.Fatalf("CSV %s = %q, want %q", name, values[name], want)
