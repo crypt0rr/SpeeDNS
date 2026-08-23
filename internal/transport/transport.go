@@ -234,17 +234,28 @@ type udpFactory struct {
 	queryOptions QueryOptions
 }
 
+// lookupNetIP is the resolver call itself, kept separate from
+// resolveUDPAddress so the "succeeded but returned nothing" contract below can
+// be exercised. The real resolver never pairs a nil error with an empty slice,
+// but udpFactory.Open depends on that case producing an error rather than an
+// empty address, and an untested branch there would dial "":port.
+var lookupNetIP = net.DefaultResolver.LookupNetIP
+
 // resolveUDPAddress is a seam so the bootstrap lookup can be exercised without
 // a real system resolver.
 var resolveUDPAddress = func(ctx context.Context, address string) (string, error) {
-	resolved, err := net.DefaultResolver.LookupNetIP(ctx, "ip", address)
+	resolved, err := lookupNetIP(ctx, "ip", address)
 	if err != nil {
 		return "", err
 	}
 	if len(resolved) == 0 {
 		return "", fmt.Errorf("no addresses for %q", address)
 	}
-	return resolved[0].String(), nil
+	// LookupNetIP reports IPv4 results as IPv4-mapped IPv6 ("::ffff:8.8.8.8").
+	// Dialing that literal needs an AF_INET6 socket, so an IPv4-only host
+	// cannot reach a hostname target that resolves to IPv4 at all. Unmap
+	// restores the family the address actually belongs to.
+	return resolved[0].Unmap().String(), nil
 }
 
 // Open resolves a hostname endpoint once, here, rather than leaving it to every

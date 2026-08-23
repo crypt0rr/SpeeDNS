@@ -214,18 +214,14 @@ tables. Within each protocol and policy group, the best-ranked target is the
 reference. The effect is the median per-name/type latency difference
 (`target - reference`) with a deterministic bootstrap 95% confidence interval.
 `NO CLEAR DIFFERENCE` means the interval includes zero, so the measured
-difference is not distinguishable from noise. These comparisons explain the
-ranking but do not replace the existing score or change rank order. A target
-that is alone in its protocol and policy group has no peer to compare against,
-so the default table counts it below the block instead of printing a
-self-comparison row. JSON includes the same information in the additive
-`paired_effects` section; CSV keeps its aggregate schema.
 difference is not distinguishable from noise. A comparison needs at least 20
 paired observations; below that the row reports `NOT COMPARABLE` instead of a
-delta and interval. These comparisons explain the
-ranking but do not replace the existing score or change rank order. JSON
-includes the same information in the additive `paired_effects` section; CSV
-keeps its aggregate schema.
+delta and interval. These comparisons explain the ranking but do not replace
+the existing score or change rank order. A target that is alone in its protocol
+and policy group has no peer to compare against, so the default table counts it
+below the block instead of printing a self-comparison row. JSON includes the
+same information in the additive `paired_effects` section; CSV keeps its
+aggregate schema.
 
 ## Choosing protocols
 
@@ -283,20 +279,15 @@ The bundled catalog includes the provider-published IPv4 and IPv6 addresses.
 Use `--family 4`, `--family 6`, or `--family both` to choose deterministically.
 The default `--family auto` keeps literal address families visible on usable
 local interfaces, plus loopback addresses, which stay reachable through the
-host itself no matter which families have external routes. Hostname-only
+host itself no matter which families have external routes. Unique-local IPv6
+(`fc00::/7`, including Tailscale and router-issued ULAs) does not count as IPv6
+availability, because IPv6 has no NAT equivalent and a ULA is not evidence of a
+public route; private IPv4 still counts. `auto` prunes only the bundled catalog
+and warns when it drops addresses, so resolvers you name with `--resolver`,
+`--resolver-file`, or `--include-system` are always benchmarked. Hostname-only
 custom encrypted endpoints remain available in `auto` and `both`; explicit `4`
-or `6` requires IP literals so SpeeDNS does not perform an unmeasured
-bootstrap lookup to guess a family.
-
-local interfaces. Unique-local IPv6 (`fc00::/7`, including Tailscale and
-router-issued ULAs) does not count as IPv6 availability, because IPv6 has no
-NAT equivalent and a ULA is not evidence of a public route; private IPv4 still
-counts. `auto` prunes only the bundled catalog and warns when it drops
-addresses, so resolvers you name with `--resolver`, `--resolver-file`, or
-`--include-system` are always benchmarked. Hostname-only custom encrypted
-endpoints remain available in `auto` and `both`; explicit `4` or `6` requires
-IP literals so SpeeDNS does not perform an unmeasured bootstrap lookup to guess
-a family.
+or `6` requires IP literals so SpeeDNS does not perform an unmeasured bootstrap
+lookup to guess a family.
 
 The bundled addresses are sourced from [Google Public DNS](https://developers.google.com/speed/public-dns/docs/using), [Cloudflare](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/), [Quad9](https://quad9.net/service/service-addresses-and-features/), and [DNS4EU](https://joindns4.eu/for-public).
 
@@ -511,11 +502,11 @@ For scripts and other tools, use JSON or CSV:
 ./speedns --format json --raw --output result-with-samples.json
 ```
 
-`--output` replaces the destination atomically and gives it the permissions an
-ordinary shell redirection would produce, narrowed by your umask.
 `--output` replaces a regular file atomically: the report is written next to
 the destination and renamed over it only when the run succeeds, so a failed
-run leaves the previous file untouched. Destinations that cannot be replaced
+run leaves the previous file untouched, and the replacement gets the
+permissions an ordinary shell redirection would produce, narrowed by your
+umask. Destinations that cannot be replaced
 that way are written in place instead, so `--output /dev/null`, a named pipe,
 `/proc/self/fd/1`, and a writable file in a directory that rejects new entries
 all work; an in-place destination can keep partial output after a failed run.

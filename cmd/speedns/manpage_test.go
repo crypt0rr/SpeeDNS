@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -70,5 +72,32 @@ func TestManPageDocumentsEveryExitStatus(t *testing.T) {
 		if !strings.Contains(section, fmt.Sprintf(".B %d\n", code)) {
 			t.Fatalf("docs/speedns.1 EXIT STATUS does not document status %d", code)
 		}
+	}
+}
+
+// TestManPageDocumentsEachFlagOnce guards the failure mode that
+// TestManPageDocumentsEveryFlag cannot see: it only checks that each flag is
+// present, so a second .TP entry added instead of editing the first passes.
+// Two entries render as one run-together paragraph stating the same option
+// twice with different rules, and the man page is the only reference
+// documentation inside the deb, rpm, apk and Arch packages.
+func TestManPageDocumentsEachFlagOnce(t *testing.T) {
+	entry := regexp.MustCompile(`(?m)^\.TP\n\.B (--[a-z][a-z0-9-]*)`)
+	counts := make(map[string]int)
+	for _, match := range entry.FindAllStringSubmatch(manPage(t), -1) {
+		counts[match[1]]++
+	}
+	if len(counts) == 0 {
+		t.Fatal("no option entries found; the entry pattern no longer matches the page")
+	}
+	var duplicated []string
+	for flag, count := range counts {
+		if count > 1 {
+			duplicated = append(duplicated, fmt.Sprintf("%s (%d entries)", flag, count))
+		}
+	}
+	if len(duplicated) > 0 {
+		sort.Strings(duplicated)
+		t.Fatalf("docs/speedns.1 documents these flags more than once: %s", strings.Join(duplicated, ", "))
 	}
 }

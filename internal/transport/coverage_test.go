@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -877,5 +878,51 @@ func TestDoHRejectedResponsesKeepConnection(t *testing.T) {
 				t.Fatalf("rejected DoH replies opened %d connections, want 1 reused connection", opened)
 			}
 		})
+	}
+}
+
+// TestResolveUDPAddressRunsTheRealBootstrapLookup executes the production
+// bootstrap resolver rather than the seam every other test substitutes. That
+// body is written as a package-level func literal, which `go tool cover -func`
+// does not attribute to any declared function, so before this test it was the
+// only production code in the repository that no test ever ran while the
+// coverage gate still reported success.
+//
+// It stays hermetic by resolving literals: an IP literal is answered by the
+// resolver without a network query, which is exactly the path a UDP target
+// given as a literal takes in production.
+func TestResolveUDPAddressRunsTheRealBootstrapLookup(t *testing.T) {
+	// The result must come back in the family it belongs to. LookupNetIP
+	// reports IPv4 as IPv4-mapped IPv6, and dialing "[::ffff:127.0.0.1]:53"
+	// needs an AF_INET6 socket that an IPv4-only host does not have.
+	for _, literal := range []string{"127.0.0.1", "::1"} {
+		resolved, err := resolveUDPAddress(context.Background(), literal)
+		if err != nil {
+			t.Fatalf("resolveUDPAddress(%q) = %v", literal, err)
+		}
+		if resolved != literal {
+			t.Fatalf("resolveUDPAddress(%q) = %q, want the address unchanged", literal, resolved)
+		}
+	}
+
+	// A name that cannot resolve must surface the resolver's own error, not a
+	// zero value: udpFactory.Open reports it as the reason the target failed.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := resolveUDPAddress(canceled, "example.invalid"); err == nil {
+		t.Fatal("a canceled bootstrap lookup must report an error")
+	}
+
+	// A resolver that succeeds but returns nothing must still be an error:
+	// udpFactory.Open would otherwise build ":53" and dial the empty host.
+	// Driven through the lookup seam so the real resolveUDPAddress body runs.
+	restore := lookupNetIP
+	t.Cleanup(func() { lookupNetIP = restore })
+	lookupNetIP = func(context.Context, string, string) ([]netip.Addr, error) {
+		return nil, nil
+	}
+	if _, err := resolveUDPAddress(context.Background(), "example.test"); err == nil ||
+		!strings.Contains(err.Error(), `no addresses for "example.test"`) {
+		t.Fatalf("empty-result contract = %v", err)
 	}
 }

@@ -2,3 +2,22 @@
 /coverage.out
 /speedns
 *.test
+
+# Python bytecode. scripts/publish-live-results.py is run as a program, but an
+# import from a test or a REPL writes these, and a compiled .pyc embeds the
+# absolute source path it was built from — the same local paths that script
+# exists to redact from published output.
+__pycache__/
+*.py[cod]
+
+# Scratch produced while preparing changes. These are working files, never
+# repository content: a tracked *.patch also ships in the immutable Go module
+# zip, which cannot be edited after the tag is published.
+*.patch
+*.orig
+*.rej
+
+# Local review notes. Kept out of the module root so they are not published in
+# the source archive and the module zip.
+/CODEREVIEW.md
+

@@ -98,19 +98,6 @@ the truncation. Set --sample to N or higher to measure every generated name.
 .B --full
 Use the complete selected domain list.
 .TP
-.B --cache-miss
-Opt in to bounded random names below the IANA-reserved
-.I example.com
-zone instead of the warm-cache corpus. Cannot be combined with
-.B --domains
-or
-.BR --full .
-.TP
-.B --cache-miss-sample N
-Number of unique reserved-zone names generated for
-.BR --cache-miss ,
-maximum 20.
-.TP
 .B --seed N
 Use a specific seed so the selected query order can be reproduced.
 .TP
@@ -129,13 +116,11 @@ in flight, per transport.
 Choose human-readable, JSON, or CSV output.
 .TP
 .B --output PATH
-Write the report to a file instead of standard output. The file is replaced
-atomically and receives the same permissions an ordinary shell redirection
-would create, narrowed by the current umask.
 Write the report to a file instead of standard output. A regular file is
 replaced atomically: the report is written next to the destination and renamed
 over it only after a successful run, so a failed run leaves the previous file
-untouched. Destinations that cannot be replaced that way are written in place
+untouched, and the replacement receives the same permissions an ordinary shell
+redirection would create, narrowed by the current umask. Destinations that cannot be replaced that way are written in place
 instead, which covers non-regular files such as /dev/null, named pipes, and
 /proc file descriptors, plus a writable file in a directory that rejects new
 entries. An in-place destination can keep partial output after a failed run.

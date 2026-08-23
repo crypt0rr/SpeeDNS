@@ -54,11 +54,47 @@ jobs:
               exit 1
               ;;
           esac
-          checked_out_tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
-          if [[ "${checked_out_tag}" != "${RELEASE_TAG}" ]]; then
+          # Membership, not identity: several tags can point at one commit (a
+          # stable tag on the same commit as its final prerelease), and
+          # `git describe --exact-match` returns only one of them, chosen by
+          # rules that have nothing to do with which tag is being released.
+          if ! git tag --points-at HEAD | grep -Fqx -- "${RELEASE_TAG}"; then
             echo "${RELEASE_TAG} does not resolve to the checked-out commit" >&2
+            echo "tags at HEAD: $(git tag --points-at HEAD | tr '\n' ' ')" >&2
             exit 1
           fi
+
+      - name: Select the previous tag for release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GoReleaser defaults the changelog range to the nearest reachable
+          # tag, prereleases included. A stable tag cut after a release
+          # candidate would therefore publish notes covering only rc..stable
+          # and silently omit everything the candidate shipped. For a stable
+          # tag, compare against the previous STABLE tag instead; a prerelease
+          # keeps the default, where rc-to-rc is the useful range.
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            echo "prerelease ${RELEASE_TAG}: keeping GoReleaser's default range"
+            exit 0
+          fi
+          # Pure case matching rather than `grep -v -- '-'`, whose argument
+          # handling differs between grep implementations.
+          previous=""
+          while read -r candidate; do
+            case "${candidate}" in
+              *-*) continue ;;
+              "${RELEASE_TAG}") continue ;;
+            esac
+            previous="${candidate}"
+            break
+          done < <(git tag --list 'v*' --sort=-version:refname)
+          if [[ -z "${previous}" ]]; then
+            echo "no earlier stable tag: keeping GoReleaser's default range"
+            exit 0
+          fi
+          echo "stable ${RELEASE_TAG}: notes will cover ${previous}..${RELEASE_TAG}"
+          echo "GORELEASER_PREVIOUS_TAG=${previous}" >> "${GITHUB_ENV}"
 
       - name: Validate release credentials
         shell: bash
