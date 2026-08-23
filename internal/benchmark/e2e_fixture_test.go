@@ -19,7 +19,7 @@ func TestDeterministicResolverFixtureCoversBenchmarkOutcomes(t *testing.T) {
 	t.Cleanup(func() { newFactory = oldFactory })
 	useFairScheduler(t)
 
-	newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 		if target.Resolver.ID == "fixture-open-failure" {
 			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
 				return nil, errors.New("fixture connection failure")
@@ -148,7 +148,7 @@ func TestFairSchedulerRunCancellationIsCompleteAndUnranked(t *testing.T) {
 			}
 			return replyFor(name, qtype), nil
 		}}
-		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+		newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 			warm := transport.Session(&fakeSession{})
 			if target.Address == "alpha" {
 				warm = blocking
@@ -202,7 +202,7 @@ func TestFairSchedulerRunCancellationIsCompleteAndUnranked(t *testing.T) {
 	t.Run("cancelled while preparing", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+		newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 			if target.Address != "alpha" {
 				t.Errorf("target %q was prepared after cancellation", target.Address)
 			}

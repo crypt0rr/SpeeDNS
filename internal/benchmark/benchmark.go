@@ -39,7 +39,7 @@ var warmupNames = []string{"example.com", "example.org", "example.net"}
 
 // newFactory is kept as a small dependency seam so the scheduler and
 // statistics engine can be tested without contacting a real resolver.
-var newFactory = transport.NewFactory
+var newFactory = transport.NewFactoryWithOptions
 
 // protocolScheduler measures one protocol group of targets and returns their
 // results.
@@ -64,6 +64,14 @@ type Options struct {
 	Concurrency int
 	Protocols   []catalog.Protocol
 	OnProgress  func(Progress)
+	// DNSSEC opts the run in to DNSSEC validation probing. It sets the EDNS(0)
+	// DO bit on every query of the run and adds the two pinned probe queries
+	// described by DNSSECProbeNames. It is off by default because it changes
+	// the wire format of the measured queries and contacts two extra names.
+	DNSSEC bool
+	// DNSSECProbe overrides the pinned probe names. An empty field falls back
+	// to the corresponding default constant.
+	DNSSECProbe DNSSECProbeNames
 }
 
 // ProgressPhase identifies the kind of work represented by a progress event.
@@ -92,19 +100,24 @@ type Query struct {
 }
 
 type Observation struct {
-	Name               string        `json:"name"`
-	QType              uint16        `json:"qtype"`
-	Latency            time.Duration `json:"-"`
-	LatencyMS          float64       `json:"latency_ms,omitempty"`
-	Success            bool          `json:"success"`
-	Usable             bool          `json:"usable"`
-	RCode              int           `json:"rcode,omitempty"`
-	Truncated          bool          `json:"truncated,omitempty"`
-	ResponseClass      string        `json:"response_class,omitempty"`
-	Divergent          bool          `json:"divergent,omitempty"`
-	DivergenceBaseline string        `json:"divergence_baseline,omitempty"`
-	Reconnected        bool          `json:"reconnected,omitempty"`
-	Error              string        `json:"error,omitempty"`
+	Name      string        `json:"name"`
+	QType     uint16        `json:"qtype"`
+	Latency   time.Duration `json:"-"`
+	LatencyMS float64       `json:"latency_ms,omitempty"`
+	Success   bool          `json:"success"`
+	Usable    bool          `json:"usable"`
+	RCode     int           `json:"rcode,omitempty"`
+	Truncated bool          `json:"truncated,omitempty"`
+	// AuthenticatedData and CheckingDisabled record the DNSSEC header flags of
+	// the response exactly as received. AD is only meaningful when the query
+	// carried the DO bit, which SpeeDNS sets only for a --dnssec run.
+	AuthenticatedData  bool   `json:"authenticated_data,omitempty"`
+	CheckingDisabled   bool   `json:"checking_disabled,omitempty"`
+	ResponseClass      string `json:"response_class,omitempty"`
+	Divergent          bool   `json:"divergent,omitempty"`
+	DivergenceBaseline string `json:"divergence_baseline,omitempty"`
+	Reconnected        bool   `json:"reconnected,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
 type ColdObservation struct {
@@ -152,6 +165,7 @@ type TargetResult struct {
 	Stats        Statistics        `json:"stats"`
 	OpenError    string            `json:"open_error,omitempty"`
 	Incomplete   bool              `json:"incomplete,omitempty"`
+	DNSSEC       *DNSSECAssessment `json:"dnssec,omitempty"`
 	DialAddress  string            `json:"-"`
 }
 
@@ -494,6 +508,11 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 				break
 			}
 		}
+		// The opt-in DNSSEC probes run after every measured round so their
+		// extra queries cannot appear in, or perturb, the latency samples.
+		for _, runner := range ready {
+			runner.probeDNSSEC(ctx)
+		}
 	}
 	if ctx.Err() != nil {
 		for _, runner := range ready {
@@ -667,7 +686,7 @@ func newTargetRunner(ctx context.Context, target catalog.Target, queries []Query
 			Observations: make([]Observation, 0, len(queries)),
 		},
 	}
-	factory, err := newFactory(target, opts.Timeout)
+	factory, err := newFactory(target, opts.Timeout, transport.QueryOptions{DNSSEC: opts.DNSSEC})
 	if err != nil {
 		if ctx.Err() != nil {
 			runner.abort(ctx.Err())
@@ -791,6 +810,8 @@ func (runner *targetRunner) measure(ctx context.Context, query Query) bool {
 	} else {
 		observation.RCode = message.Rcode
 		observation.Truncated = message.Truncated
+		observation.AuthenticatedData = message.AuthenticatedData
+		observation.CheckingDisabled = message.CheckingDisabled
 		if message.Truncated {
 			observation.Error = "truncated DNS response"
 		} else {
@@ -828,6 +849,7 @@ func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts
 				break
 			}
 		}
+		runner.probeDNSSEC(ctx)
 	}
 	runner.close()
 	return runner.result

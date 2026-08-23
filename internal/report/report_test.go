@@ -134,11 +134,26 @@ func TestLocalResolverIsReportedAsNotComparable(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := strings.Split(strings.TrimSpace(csvOutput.String()), "\n")
-	if len(rows) != 3 || !strings.HasSuffix(rows[0], ",local") {
-		t.Fatalf("CSV header missing the local column: %s", csvOutput.String())
+	if len(rows) != 3 {
+		t.Fatalf("CSV rows = %d, want 3: %s", len(rows), csvOutput.String())
 	}
-	if !strings.HasSuffix(rows[1], ",true") || !strings.HasSuffix(rows[2], ",false") {
-		t.Fatalf("CSV local column = %#v", rows[1:])
+	// Locate the column by name: new columns are appended over time, so an
+	// assertion tied to the last position breaks for unrelated reasons.
+	header := strings.Split(rows[0], ",")
+	local := -1
+	for index, name := range header {
+		if name == "local" {
+			local = index
+		}
+	}
+	if local < 0 {
+		t.Fatalf("CSV header missing the local column: %s", rows[0])
+	}
+	for row, want := range map[int]string{1: "true", 2: "false"} {
+		fields := strings.Split(rows[row], ",")
+		if len(fields) <= local || fields[local] != want {
+			t.Fatalf("CSV local column in row %d = %#v, want %q", row, fields, want)
+		}
 	}
 }
 

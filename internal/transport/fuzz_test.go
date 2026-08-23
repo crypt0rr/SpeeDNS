@@ -36,7 +36,7 @@ func responseIsAcceptable(response *dns.Msg, name string, qtype, queryID uint16,
 
 func fuzzResponseSeed(f *testing.F, mutate func(*dns.Msg)) []byte {
 	f.Helper()
-	query := newQuery("example.com", dns.TypeA, 1, false)
+	query := newQuery("example.com", dns.TypeA, 1, false, QueryOptions{})
 	response := new(dns.Msg)
 	response.SetReply(query)
 	if mutate != nil {

@@ -84,7 +84,7 @@ func TestTCPSessionReusesConnection(t *testing.T) {
 }
 
 func TestSecureQueriesUseRFCStylePaddingAndZeroID(t *testing.T) {
-	query := newQuery("example.com", dns.TypeA, 0, true)
+	query := newQuery("example.com", dns.TypeA, 0, true, QueryOptions{})
 	packed, err := packQuery(query)
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestSecureQueriesUseRFCStylePaddingAndZeroID(t *testing.T) {
 }
 
 func TestValidateResponseRejectsMismatchedQuestion(t *testing.T) {
-	query := newQuery("example.com", dns.TypeA, 123, false)
+	query := newQuery("example.com", dns.TypeA, 123, false, QueryOptions{})
 	response := new(dns.Msg)
 	response.SetReply(query)
 	response.Question[0].Name = "other.example."

@@ -12,7 +12,7 @@ import (
 
 func packedQuery(t *testing.T, name string, qtype, id uint16, padded bool) []byte {
 	t.Helper()
-	packed, err := packQuery(newQuery(name, qtype, id, padded))
+	packed, err := packQuery(newQuery(name, qtype, id, padded, QueryOptions{}))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -75,6 +75,7 @@ type JSONResult struct {
 	Stats        benchmark.Statistics        `json:"stats"`
 	OpenError    string                      `json:"open_error,omitempty"`
 	Incomplete   bool                        `json:"incomplete,omitempty"`
+	DNSSEC       *benchmark.DNSSECAssessment `json:"dnssec,omitempty"`
 	Observations []benchmark.Observation     `json:"samples,omitempty"`
 	Cold         []benchmark.ColdObservation `json:"cold,omitempty"`
 }
@@ -133,6 +134,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: dialAddress,
 			},
 			Stats: result.Stats, OpenError: redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()]), Incomplete: result.Incomplete,
+			DNSSEC: redactDNSSEC(result, options.RedactSystem, redactedIDs[result.Target.ID()]),
 		}
 		if raw {
 			jsonResult.Observations = redactObservations(result, options.RedactSystem, redactedIDs[result.Target.ID()])
@@ -212,7 +214,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate", "rcode_counts", "median_ms", "p95_ms",
 		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error", "reconnects", "incomplete",
 		"endpoint_url", "tls_server_name", "tls_identity_source", "bootstrap_mode", "bootstrap_addresses", "dial_address",
-		"corpus_mode", "corpus_zone", "corpus_nonce", "local",
+		"corpus_mode", "corpus_zone", "corpus_nonce", "local", "dnssec_verdict",
 	}); err != nil {
 		return err
 	}
@@ -235,7 +237,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 			formatFloat(stats.P95MS), formatFloat(stats.MinMS), formatFloat(stats.MaxMS), formatFloat(stats.MADMS),
 			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), csvCell(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), strconv.Itoa(stats.Reconnects), strconv.FormatBool(result.Incomplete),
 			csvCell(metadata.EndpointURL), csvCell(metadata.TLSServerName), csvCell(metadata.TLSIdentitySource), csvCell(metadata.BootstrapMode), csvCell(bootstrapAddressesCSV(metadata.BootstrapAddresses)), csvCell(dialAddress),
-			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce), strconv.FormatBool(result.Target.Resolver.Local),
+			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce), strconv.FormatBool(result.Target.Resolver.Local), csvCell(dnssecVerdict(result)),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -436,6 +438,28 @@ func redactColdObservations(result benchmark.TargetResult, redact bool, redacted
 		observations[index].Error = safetext.Escape(observations[index].Error)
 	}
 	return observations
+}
+
+// redactDNSSEC copies the assessment before rewriting probe error text so a
+// redacted report cannot leak a local resolver address through a probe error.
+func redactDNSSEC(result benchmark.TargetResult, redact bool, redactedID string) *benchmark.DNSSECAssessment {
+	if result.DNSSEC == nil || !redact || !isSystemTarget(result.Target) {
+		return result.DNSSEC
+	}
+	assessment := *result.DNSSEC
+	assessment.Probes = append([]benchmark.DNSSECProbe(nil), result.DNSSEC.Probes...)
+	for index := range assessment.Probes {
+		assessment.Probes[index].Error = redactResultText(result, assessment.Probes[index].Error, true, redactedID)
+	}
+	assessment.Reason = redactResultText(result, assessment.Reason, true, redactedID)
+	return &assessment
+}
+
+func dnssecVerdict(result benchmark.TargetResult) string {
+	if result.DNSSEC == nil {
+		return ""
+	}
+	return result.DNSSEC.Verdict
 }
 
 // redactRunWarningText scrubs system resolver identities from a run-level
@@ -713,11 +737,11 @@ func styledStatus(status string, color bool) string {
 	}
 	colorCode := ""
 	switch status {
-	case "RECOMMENDED", "QUALIFIED", "REFERENCE":
+	case "RECOMMENDED", "QUALIFIED", "REFERENCE", "VALIDATING":
 		colorCode = ansiGreen
-	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED", "TIED":
+	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED", "TIED", "INCONCLUSIVE":
 		colorCode = ansiYellow
-	case "FAILED":
+	case "FAILED", "NOT VALIDATING":
 		colorCode = ansiRed
 	default:
 		return status
@@ -1053,6 +1077,70 @@ func writePairedEffects(writer io.Writer, report benchmark.Report, options Table
 		}
 	}
 	return nil
+}
+
+// dnssecProbeText renders one probe outcome without interpreting it, so a
+// reader can see the raw response code and flags next to the verdict.
+func dnssecProbeText(probe benchmark.DNSSECProbe) string {
+	if !probe.Success {
+		if probe.Error == "" {
+			return "no response"
+		}
+		return "error: " + probe.Error
+	}
+	text := fmt.Sprintf("%s answers=%d", probe.ResponseCode, probe.Answers)
+	if probe.AuthenticatedData {
+		text += " AD"
+	}
+	if probe.CheckingDisabled {
+		text += " CD"
+	}
+	return text
+}
+
+func dnssecProbeTextForRole(assessment benchmark.DNSSECAssessment, role string) string {
+	for _, probe := range assessment.Probes {
+		if probe.Role == role {
+			return dnssecProbeText(probe)
+		}
+	}
+	return "—"
+}
+
+func dnssecVerdictLabel(verdict string) string {
+	return strings.ToUpper(strings.ReplaceAll(verdict, "-", " "))
+}
+
+func dnssecRows(report benchmark.Report, options TableOptions) [][]string {
+	rows := make([][]string, 0, len(report.Targets))
+	for _, result := range report.Targets {
+		if result.DNSSEC == nil {
+			continue
+		}
+		view := targetViewFor(result.Target, options.RedactSystem, redactedValue)
+		assessment := *redactDNSSEC(result, options.RedactSystem, redactedValue)
+		rows = append(rows, []string{
+			string(result.Target.Protocol), view.Owner, view.Address,
+			styledStatus(dnssecVerdictLabel(assessment.Verdict), options.Color),
+			dnssecProbeTextForRole(assessment, benchmark.DNSSECRoleSigned),
+			dnssecProbeTextForRole(assessment, benchmark.DNSSECRoleBogus),
+			assessment.Reason,
+		})
+	}
+	return rows
+}
+
+// writeDNSSECAssessments prints the opt-in probe results. The section only
+// appears when a run actually probed, so default reports are unchanged.
+func writeDNSSECAssessments(writer io.Writer, report benchmark.Report, options TableOptions) error {
+	rows := dnssecRows(report, options)
+	if len(rows) == 0 {
+		return nil
+	}
+	if _, err := io.WriteString(writer, "\nDNSSEC validation probes (two pinned names per target; a live check, not an audit)\n"); err != nil {
+		return err
+	}
+	return writeAlignedTable(writer, []string{"Protocol", "Owner", "Address", "Verdict", "Signed probe", "Bogus probe", "Basis"}, rows)
 }
 
 func profileGroupsForTable(report benchmark.Report, options TableOptions) map[string]profileGroup {
@@ -1548,6 +1636,9 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 		}
 	}
 	if err := writePairedEffects(writer, report, options); err != nil {
+		return err
+	}
+	if err := writeDNSSECAssessments(writer, report, options); err != nil {
 		return err
 	}
 	if options.ProfileView {

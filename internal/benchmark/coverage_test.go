@@ -291,7 +291,7 @@ func TestFairProgressEventsCoverPreparationAndFailedExchanges(t *testing.T) {
 	t.Cleanup(func() { newFactory = oldFactory })
 	useFairScheduler(t)
 	var opens int
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		opens++
 		failedSession := func() transport.Session {
 			return &fakeSession{query: func(context.Context, string, uint16) (*dns.Msg, error) {
@@ -339,7 +339,7 @@ func TestFairProgressEventsReportOpenFailures(t *testing.T) {
 	oldFactory := newFactory
 	t.Cleanup(func() { newFactory = oldFactory })
 	useFairScheduler(t)
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		return nil, errors.New("fixture open failed")
 	}
 	var events []Progress
@@ -426,7 +426,7 @@ func TestFairProtocolSchedulingIsOrderIndependent(t *testing.T) {
 				{session: session},
 			}}
 		}
-		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+		newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 			return factories[target.Address], nil
 		}
 		report, err := Run(context.Background(), order, opts)
@@ -539,7 +539,7 @@ func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
 	readyRunner.close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
 			if index == 0 {
 				cancel()
@@ -563,7 +563,7 @@ func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
 		}
 		return replyFor(name, qtype), nil
 	}}
-	newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 		session := &fakeSession{}
 		if target.Address == "one" {
 			session = blocking
@@ -681,7 +681,9 @@ func TestRunTargetWithScriptedTransport(t *testing.T) {
 		}
 	}}
 	factory := &fakeFactory{opens: []fakeOpen{{session: cold[0]}, {session: cold[1]}, {session: cold[2]}, {session: warm}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	result := runTarget(context.Background(), testTarget(catalog.UDP, "scripted"), []Query{
 		{Name: "ok.example", QType: dns.TypeA}, {Name: "truncated.example", QType: dns.TypeAAAA}, {Name: "error.example", QType: dns.TypeA},
 	}, Options{QueryTypes: []uint16{dns.TypeA, dns.TypeAAAA}, Timeout: time.Second})
@@ -702,7 +704,9 @@ func TestRunTargetWithScriptedTransport(t *testing.T) {
 		return replyFor(name, qtype), nil
 	}}
 	nilFactory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: nilSession}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return nilFactory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return nilFactory, nil
+	}
 	nilResult := runTarget(context.Background(), testTarget(catalog.UDP, "nil-response"), []Query{{Name: "nil.example", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if len(nilResult.Observations) != 1 || nilResult.Observations[0].Success || nilResult.Observations[0].Error != "empty DNS response" {
 		t.Fatalf("nil response observation = %#v", nilResult.Observations)
@@ -712,7 +716,7 @@ func TestRunTargetWithScriptedTransport(t *testing.T) {
 func TestRunTargetFactoryAndOpenErrors(t *testing.T) {
 	oldFactory := newFactory
 	t.Cleanup(func() { newFactory = oldFactory })
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		return nil, errors.New("factory creation failed")
 	}
 	result := runTarget(context.Background(), testTarget(catalog.UDP, "factory"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
@@ -724,14 +728,18 @@ func TestRunTargetFactoryAndOpenErrors(t *testing.T) {
 	second := &fakeSession{}
 	third := &fakeSession{}
 	factory := &fakeFactory{opens: []fakeOpen{{err: errors.New("cold open 1")}, {err: errors.New("cold open 2")}, {err: errors.New("cold open 3")}, {session: &fakeSession{}}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	result = runTarget(context.Background(), testTarget(catalog.UDP, "cold-open"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if len(result.Cold) != 3 || result.Cold[0].Error == "" || result.OpenError != "" {
 		t.Fatalf("cold open result = %#v", result)
 	}
 
 	factory = &fakeFactory{opens: []fakeOpen{{session: first}, {session: second}, {session: third}, {err: errors.New("warm open failed")}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	result = runTarget(context.Background(), testTarget(catalog.UDP, "warm-open"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if result.OpenError != "warm open failed" || len(result.Observations) != 1 || result.Observations[0].Error != "warm open failed" {
 		t.Fatalf("warm open result = %#v", result)
@@ -749,7 +757,9 @@ func TestRunTargetStopsWhenContextCancelsDuringWarmup(t *testing.T) {
 		return replyFor(name, qtype), nil
 	}}
 	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	result := runTarget(ctx, testTarget(catalog.UDP, "cancel-warmup"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
 		t.Fatalf("cancelled warmup result = %#v", result)
@@ -763,7 +773,9 @@ func TestRunTargetStopsWhenContextCancelsDuringWarmup(t *testing.T) {
 		return replyFor(name, qtype), nil
 	}}
 	factory = &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	result = runTarget(ctx, testTarget(catalog.UDP, "cancel-query"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if !result.Incomplete || result.OpenError != context.Canceled.Error() || len(result.Observations) != 0 {
 		t.Fatalf("cancelled measured query result = %#v", result)
@@ -872,7 +884,9 @@ func TestColdLatencyExcludesSessionTeardown(t *testing.T) {
 		{session: &fakeSession{closeDelay: 100 * time.Millisecond}},
 		{session: &fakeSession{}},
 	}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	result := runTarget(context.Background(), testTarget(catalog.UDP, "cold-timing"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if len(result.Cold) != 3 || result.Cold[0].Latency >= 80*time.Millisecond {
 		t.Fatalf("cold latency included teardown: %#v", result.Cold)
@@ -884,7 +898,9 @@ func TestRunTargetRecordsReconnectDiagnostics(t *testing.T) {
 	t.Cleanup(func() { newFactory = oldFactory })
 	warm := &fakeSession{reconnected: true}
 	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	result := runTarget(context.Background(), testTarget(catalog.TCP, "reconnect-metric"), []Query{{Name: "x", QType: dns.TypeA}}, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if len(result.Observations) != 1 || !result.Observations[0].Reconnected {
 		t.Fatalf("reconnect observation = %#v", result.Observations)
@@ -907,7 +923,9 @@ func TestRunTargetExcludesDoHReconnectFromWarmScoring(t *testing.T) {
 		return replyFor(name, qtype), nil
 	}
 	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return factory, nil
+	}
 	queries := []Query{{Name: "kept.example", QType: dns.TypeA}, {Name: "dropped.example", QType: dns.TypeA}}
 	result := runTarget(context.Background(), testTarget(catalog.DoH, "doh-reconnect"), queries, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
 	if len(result.Observations) != 2 || result.Observations[0].Reconnected || !result.Observations[1].Reconnected {
@@ -929,7 +947,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 	t.Run("factory creation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return nil, errors.New("factory failed")
 		}
 		result := runTarget(ctx, target, queries, options)
@@ -941,7 +959,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 	t.Run("before cold probe", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) { return minimalSession{}, nil }}, nil
 		}
 		result := runTarget(ctx, target, queries, options)
@@ -952,7 +970,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 
 	t.Run("cold open", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
 				if index == 0 {
 					cancel()
@@ -969,7 +987,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 
 	t.Run("cold query", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
 				return &fakeSession{query: func(context.Context, string, uint16) (*dns.Msg, error) {
 					cancel()
@@ -985,7 +1003,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 
 	t.Run("warm open", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
 				if index < 3 {
 					return minimalSession{}, nil
@@ -1002,7 +1020,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 
 	t.Run("before warmup", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
 				if index < 3 {
 					return minimalSession{}, nil
@@ -1019,7 +1037,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 
 	t.Run("before measured query", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
 				if index < 3 {
 					return minimalSession{}, nil
@@ -1035,7 +1053,7 @@ func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 
 	t.Run("during measured query", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+		newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
 				if index < 3 {
 					return minimalSession{}, nil
@@ -1273,7 +1291,7 @@ func TestPrepareTargetsEdges(t *testing.T) {
 	t.Cleanup(func() { newFactory = oldFactory })
 
 	// An unset concurrency still prepares one target at a time.
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		return nil, errors.New("fixture open failed")
 	}
 	runners, dispatched := prepareTargets(context.Background(), []catalog.Target{testTarget(catalog.UDP, "solo")}, nil, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
@@ -1286,7 +1304,7 @@ func TestPrepareTargetsEdges(t *testing.T) {
 	released := make(chan struct{})
 	started := make(chan struct{})
 	var once sync.Once
-	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
 		return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
 			once.Do(func() { close(started) })
 			<-released
@@ -1363,7 +1381,7 @@ func TestPreparationIsConcurrentBoundedAndDeterministic(t *testing.T) {
 				{session: preparationSession()},
 			}}
 		}
-		newFactory = func(target catalog.Target, _ time.Duration) (transport.Factory, error) {
+		newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 			return factories[target.Address], nil
 		}
 		report, err := Run(context.Background(), targets, opts)

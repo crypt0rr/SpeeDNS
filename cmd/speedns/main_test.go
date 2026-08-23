@@ -176,7 +176,7 @@ func TestMainAndCommands(t *testing.T) {
 		t.Fatalf("invalid completion shell error = %v", err)
 	}
 	root := newRootCommand()
-	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Flags().Lookup("assert") == nil || root.Flags().Lookup("family") == nil {
+	if root.Use != "speedns" || root.Flags().Lookup("protocol") == nil || root.Flags().Lookup("redact-system") == nil || root.Flags().Lookup("assert") == nil || root.Flags().Lookup("family") == nil || root.Flags().Lookup("dnssec") == nil || root.Commands() == nil {
 		t.Fatal("root command was not configured")
 	}
 	// The full subcommand set is pinned so that adding or removing one is a
@@ -1960,5 +1960,32 @@ func TestInterruptContextReleasesSignalsAfterTheFirst(t *testing.T) {
 	<-quiet.Done()
 	if !errors.Is(quiet.Err(), context.Canceled) {
 		t.Fatalf("clean shutdown error = %v", quiet.Err())
+	}
+}
+
+func TestDNSSECFlagIsOptInAndReachesTheBenchmark(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	var requested []bool
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		requested = append(requested, options.DNSSEC)
+		return fakeCLIReport(), nil
+	}
+	config := cliConfigForTest(t)
+	config.output = filepath.Join(t.TempDir(), "default.json")
+	if err := runBenchmark(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	config = cliConfigForTest(t)
+	config.dnssec = true
+	config.output = filepath.Join(t.TempDir(), "dnssec.json")
+	if err := runBenchmark(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	if len(requested) != 2 || requested[0] || !requested[1] {
+		t.Fatalf("DNSSEC option per run = %v, want [false true]", requested)
+	}
+	if got := newRootCommand().Flags().Lookup("dnssec").DefValue; got != "false" {
+		t.Fatalf("--dnssec default = %q, want \"false\"", got)
 	}
 }
