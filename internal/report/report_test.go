@@ -72,6 +72,76 @@ func TestJSONIncludesAndRedactsRunProvenance(t *testing.T) {
 	}
 }
 
+// TestLocalResolverIsReportedAsNotComparable checks that every output surface
+// keeps the local stub's measurement while saying, in the same place, that the
+// number cannot be compared with a network resolver.
+func TestLocalResolverIsReportedAsNotComparable(t *testing.T) {
+	stub := reportTarget("53", catalog.UDP, 2, false)
+	stub.Target.Resolver.ID = "system-stub-127-0-0-53"
+	stub.Target.Resolver.Name = "System DNS stub"
+	stub.Target.Resolver.Owner = "local stub/forwarder"
+	stub.Target.Resolver.Policy = "local forwarding (upstream unknown)"
+	stub.Target.Resolver.Local = true
+	stub.Target.Address = "127.0.0.53"
+	stub.Stats.MedianMS = 0.2
+	network := reportTarget("1", catalog.UDP, 2, true)
+
+	run := benchmark.Report{
+		StartedAt: time.Unix(0, 0), FinishedAt: time.Unix(1, 0), Seed: 5, SampleSize: 1, Queries: 1,
+		QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{stub, network},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: network.Target.ID(), Rank: 1}},
+	}
+
+	if status := resultStatus(stub); status != "NOT COMPARABLE" {
+		t.Fatalf("local stub status = %q", status)
+	}
+	if status := resultStatus(network); status != "QUALIFIED" {
+		t.Fatalf("network resolver status = %q", status)
+	}
+	if rank := rankText(run, stub.Target.ID()); rank != "—" {
+		t.Fatalf("local stub rank = %q, want no rank", rank)
+	}
+
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	text := table.String()
+	if !strings.Contains(text, "NOT COMPARABLE") || !strings.Contains(text, "0.20 ms") {
+		t.Fatalf("table hid the local stub measurement or caveat: %s", text)
+	}
+	if !strings.Contains(text, "cache-hit latency excludes the upstream cost") {
+		t.Fatalf("table warnings missing the non-comparability reason: %s", text)
+	}
+	recommended, ok := recommendedResult(run, catalog.UDP)
+	if !ok || recommended.Target.ID() != network.Target.ID() {
+		t.Fatalf("recommendation = %#v/%v", recommended.Target, ok)
+	}
+
+	var jsonOutput bytes.Buffer
+	if err := WriteJSON(&jsonOutput, run, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jsonOutput.String(), "\"local\": true") {
+		t.Fatalf("JSON target missing the local flag: %s", jsonOutput.String())
+	}
+	if strings.Count(jsonOutput.String(), "\"local\":") != 1 {
+		t.Fatalf("network target should omit the local flag: %s", jsonOutput.String())
+	}
+
+	var csvOutput bytes.Buffer
+	if err := WriteCSV(&csvOutput, run); err != nil {
+		t.Fatal(err)
+	}
+	rows := strings.Split(strings.TrimSpace(csvOutput.String()), "\n")
+	if len(rows) != 3 || !strings.HasSuffix(rows[0], ",local") {
+		t.Fatalf("CSV header missing the local column: %s", csvOutput.String())
+	}
+	if !strings.HasSuffix(rows[1], ",true") || !strings.HasSuffix(rows[2], ",false") {
+		t.Fatalf("CSV local column = %#v", rows[1:])
+	}
+}
+
 func TestDurationMillisecondsRejectsInvalidRanges(t *testing.T) {
 	if got := durationMilliseconds(time.Time{}, time.Now()); got != 0 {
 		t.Fatalf("zero start duration = %v, want zero", got)
@@ -137,5 +207,106 @@ func TestAlignedTableIgnoresColourCodesInWidths(t *testing.T) {
 	stripped = strings.ReplaceAll(stripped, ansiReset, "")
 	if stripped != plain.String() {
 		t.Fatalf("coloured table = %q, want %q once the codes are removed", stripped, plain.String())
+	}
+}
+
+func lineContaining(t *testing.T, text string, needle string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	t.Fatalf("no line containing %q in:\n%s", needle, text)
+	return ""
+}
+
+func tieTableReport() benchmark.Report {
+	leader := reportTarget("tie-leader", catalog.UDP, 25, true)
+	leader.Stats.Tie = true
+	challenger := reportTarget("tie-challenger", catalog.UDP, 25, true)
+	challenger.Stats.Tie = true
+	distinct := reportTarget("distinct", catalog.TCP, 25, true)
+	return benchmark.Report{
+		Seed: 42, SampleSize: 2, Queries: 2, QueryTypes: []uint16{1},
+		Targets: []benchmark.TargetResult{leader, challenger, distinct},
+		Rankings: []benchmark.Ranking{
+			{Protocol: catalog.UDP, TargetID: leader.Target.ID(), Rank: 1, Tie: true},
+			{Protocol: catalog.UDP, TargetID: challenger.Target.ID(), Rank: 2, Tie: true},
+			{Protocol: catalog.TCP, TargetID: distinct.Target.ID(), Rank: 1},
+		},
+	}
+}
+
+func TestTableSurfacesConfidenceIntervalTies(t *testing.T) {
+	var output bytes.Buffer
+	if err := WriteTableWithOptions(&output, tieTableReport(), TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(lineContaining(t, text, "Rank"), "Tie") {
+		t.Fatalf("comparison header lost the Tie column:\n%s", text)
+	}
+	if recommendation := lineContaining(t, text, "RECOMMENDED"); !strings.Contains(recommendation, "TIED") {
+		t.Fatalf("tied recommended winner is presented as unqualified: %q", recommendation)
+	}
+	if !strings.Contains(text, "TIED: the 95% score confidence interval overlaps another ranked target") {
+		t.Fatalf("tie explanation missing from recommendation block:\n%s", text)
+	}
+	for _, owner := range []string{"Owner tie-leader", "Owner tie-challenger"} {
+		if row := lineContaining(t, text, owner); !strings.Contains(row, "TIED") {
+			t.Fatalf("comparison row for %s hides the tie: %q", owner, row)
+		}
+	}
+	if row := lineContaining(t, text, "Owner distinct"); strings.Contains(row, "TIED") {
+		t.Fatalf("untied target marked as tied: %q", row)
+	}
+}
+
+func TestTableTieMarkerIsColoredAndOmittedWhenAbsent(t *testing.T) {
+	var colored bytes.Buffer
+	if err := WriteTableWithOptions(&colored, tieTableReport(), TableOptions{Color: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(colored.String(), ansiYellow+"TIED"+ansiReset) {
+		t.Fatalf("TIED rendered without color emphasis:\n%s", colored.String())
+	}
+
+	untied := tieTableReport()
+	for index := range untied.Targets {
+		untied.Targets[index].Stats.Tie = false
+	}
+	for index := range untied.Rankings {
+		untied.Rankings[index].Tie = false
+	}
+	var plain bytes.Buffer
+	if err := WriteTableWithOptions(&plain, untied, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plain.String(), "TIED") {
+		t.Fatalf("untied report claims a tie:\n%s", plain.String())
+	}
+}
+
+func TestTableFlagsTiedProvisionalWinnerAndPropagatesNoteError(t *testing.T) {
+	provisional := reportTarget("tie-provisional", catalog.UDP, 1, false)
+	provisional.Stats.Tie = true
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{provisional},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: provisional.Target.ID(), Rank: 1, Tie: true}},
+	}
+	var output bytes.Buffer
+	if err := WriteTableWithOptions(&output, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if provisionalRow := lineContaining(t, output.String(), "PROVISIONAL"); !strings.Contains(provisionalRow, "TIED") {
+		t.Fatalf("tied provisional winner hides the tie: %q", provisionalRow)
+	}
+	if !strings.Contains(output.String(), "TIED: the 95% score confidence interval") {
+		t.Fatalf("tie explanation missing for provisional winner:\n%s", output.String())
+	}
+	if err := WriteTableWithOptions(contentFailWriter{needle: "TIED: the"}, run, TableOptions{}); err == nil {
+		t.Fatal("tie note write failure was not returned")
 	}
 }

@@ -1,0 +1,2 @@
+go test fuzz v1
+string("version: 1\nresolvers:\n  - id: boot\n    name: Boot\n    addresses: [dns.example]\n    transports:\n      dot: {server_name: dns.example, bootstrap_addresses: [192.0.2.9]}\n")
