@@ -60,6 +60,12 @@ type Options struct {
 	Concurrency int
 	Protocols   []catalog.Protocol
 	OnProgress  func(Progress)
+	// CacheMiss reports that Domains holds generated reserved-zone names whose
+	// point is that no resolver has seen them. It changes how queries are
+	// built: a name is asked exactly one question rather than one per entry in
+	// QueryTypes, because the first question caches the negative answer for
+	// the name and every later question about it is a warm read.
+	CacheMiss bool
 	// DNSSEC opts the run in to DNSSEC validation probing. It sets the EDNS(0)
 	// DO bit on every query of the run and adds the two pinned probe queries
 	// described by DNSSECProbeNames. It is off by default because it changes
@@ -362,6 +368,20 @@ func buildQueries(opts Options) ([]Query, error) {
 	count := opts.Sample
 	if opts.Full || count > len(source) {
 		count = len(source)
+	}
+	if opts.CacheMiss {
+		// One question per generated name. A resolver that answers
+		// speedns-<nonce>-0001.example.com/A with NXDOMAIN caches that
+		// negative answer for the whole name, so asking the same name for
+		// AAAA measures the cache, not a miss. Types still rotate across the
+		// corpus, so a multi-type selection is represented -- just never twice
+		// for one name.
+		queries := make([]Query, 0, count)
+		for index, domain := range source[:count] {
+			queries = append(queries, Query{Name: domain, QType: opts.QueryTypes[index%len(opts.QueryTypes)]})
+		}
+		rng.Shuffle(len(queries), func(i, j int) { queries[i], queries[j] = queries[j], queries[i] })
+		return queries, nil
 	}
 	queries := make([]Query, 0, count*len(opts.QueryTypes))
 	for _, domain := range source[:count] {

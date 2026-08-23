@@ -1677,21 +1677,49 @@ func TestParseQueryTypesRejectsZoneTransferAndPseudoTypes(t *testing.T) {
 // TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured pins the disclosure that
 // only the first measured protocol group observes a genuine cache miss: every
 // group replays the same generated names against the same resolver cache.
-func TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured(t *testing.T) {
+// TestCacheMissMeasuresEachResolverExactlyOnce pins the #108 fix. A resolver
+// holds one cache across every transport and address it offers, so measuring it
+// twice makes the second measurement a warm read of a name the first already
+// cached. Cache-miss mode therefore keeps one endpoint per resolver and says
+// which endpoints it dropped.
+func TestCacheMissMeasuresEachResolverExactlyOnce(t *testing.T) {
 	oldEngine := runBenchmarkEngine
 	oldNonce := newCacheMissNonceFunc
 	t.Cleanup(func() {
 		runBenchmarkEngine = oldEngine
 		newCacheMissNonceFunc = oldNonce
 	})
-	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+	var measured []catalog.Target
+	var options benchmark.Options
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, opts benchmark.Options) (benchmark.Report, error) {
+		measured = targets
+		options = opts
 		return fakeCLIReport(), nil
 	}
 	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
-	const warning = "only the first measured protocol (udp) observes a true cache miss"
 
+	// One resolver offering two transports on two addresses: all four endpoints
+	// reach the same cache, so three of them would measure a warm read.
+	resolverFile := filepath.Join(t.TempDir(), "resolvers.yaml")
+	if err := os.WriteFile(resolverFile, []byte(`version: 1
+resolvers:
+  - id: lab
+    name: Lab
+    owner: Lab
+    policy: unfiltered
+    addresses:
+      - 127.0.0.1
+      - 127.0.0.2
+    transports:
+      udp:
+        port: 53
+      tcp:
+        port: 53
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	multi := &cliConfig{
-		protocols: "udp,tcp", resolverFlags: []string{"lab=udp://127.0.0.1:53", "labtcp=tcp://127.0.0.1:53"},
+		protocols: "udp,tcp", resolverFile: resolverFile,
 		noDefaults: true, cacheMiss: true, cacheMissSample: 2, sample: 100, seed: 7, queryTypes: "A",
 		timeout: time.Second, concurrency: 1, format: "json", family: "4",
 		output: filepath.Join(t.TempDir(), "multi.json"),
@@ -1699,23 +1727,38 @@ func TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured(t *testing.T) {
 	if err := runBenchmark(context.Background(), multi); err != nil {
 		t.Fatal(err)
 	}
-	content, err := os.ReadFile(multi.output)
-	if err != nil || !strings.Contains(string(content), warning) || !strings.Contains(string(content), "later protocols (tcp) run against an already warm resolver cache") {
-		t.Fatalf("multi-protocol cache-miss report = %q/%v", content, err)
+	if len(measured) != 1 || measured[0].Protocol != catalog.UDP {
+		t.Fatalf("cache-miss measured %d targets (%#v), want one udp endpoint", len(measured), measured)
 	}
-
-	single := *multi
-	single.protocols = "udp"
-	single.resolverFlags = []string{"lab=udp://127.0.0.1:53"}
-	single.output = filepath.Join(t.TempDir(), "single.json")
-	if err := runBenchmark(context.Background(), &single); err != nil {
+	if !options.CacheMiss {
+		t.Fatal("the engine was not told this is a cache-miss run")
+	}
+	content, err := os.ReadFile(multi.output)
+	if err != nil {
 		t.Fatal(err)
 	}
-	content, err = os.ReadFile(single.output)
-	if err != nil || strings.Contains(string(content), "observes a true cache miss") {
-		t.Fatalf("single-protocol cache-miss report = %q/%v", content, err)
+	if !strings.Contains(string(content), "dropped 3 endpoint(s) that share a cache") {
+		t.Fatalf("the dropped endpoint was not disclosed: %s", content)
 	}
 
+	// Two independent resolvers do not share a cache, so neither is dropped.
+	independent := *multi
+	independent.protocols = "udp"
+	independent.resolverFile = ""
+	independent.resolverFlags = []string{"a=udp://127.0.0.1:53", "b=udp://127.0.0.2:53"}
+	independent.output = filepath.Join(t.TempDir(), "independent.json")
+	if err := runBenchmark(context.Background(), &independent); err != nil {
+		t.Fatal(err)
+	}
+	if len(measured) != 2 {
+		t.Fatalf("two independent resolvers measured %d targets", len(measured))
+	}
+	content, err = os.ReadFile(independent.output)
+	if err != nil || strings.Contains(string(content), "share a cache") {
+		t.Fatalf("independent resolvers must not be dropped: %q/%v", content, err)
+	}
+
+	// A warm-cache run is untouched: both transports of one resolver are kept.
 	warm := *multi
 	warm.cacheMiss = false
 	warm.domainFile = cliDomainFile(t)
@@ -1723,9 +1766,11 @@ func TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured(t *testing.T) {
 	if err := runBenchmark(context.Background(), &warm); err != nil {
 		t.Fatal(err)
 	}
-	content, err = os.ReadFile(warm.output)
-	if err != nil || strings.Contains(string(content), "observes a true cache miss") {
-		t.Fatalf("warm-cache report = %q/%v", content, err)
+	if len(measured) != 4 {
+		t.Fatalf("warm-cache run measured %d targets, want all four endpoints", len(measured))
+	}
+	if options.CacheMiss {
+		t.Fatal("a warm-cache run must not set the cache-miss option")
 	}
 }
 

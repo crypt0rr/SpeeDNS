@@ -33,7 +33,7 @@ const rootLabelSeparators = ".\u3002\uff0e\uff61"
 const CacheMissZone = "example.com"
 
 const (
-	CacheMissDefaultSample  = 10
+	CacheMissDefaultSample  = 20
 	CacheMissMaxSample      = 20
 	CacheMissMaxConcurrency = 2
 )

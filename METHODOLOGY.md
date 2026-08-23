@@ -274,6 +274,19 @@ never appended to the normal corpus, and its results must not be interpreted
 as a warm-cache ranking. The ownership, traffic limits, and intended use are
 documented in [`CACHE_MISS.md`](CACHE_MISS.md).
 
+A resolver holds one cache, shared across every transport it offers and every
+address it answers on, so any second lookup of a generated name at that
+resolver is a warm read. Cache-miss mode therefore measures each resolver
+exactly once — keeping its earliest declared transport at its lowest-sorting
+address, and naming the dropped endpoints in a warning — and asks each
+generated name exactly one question, rotating the selected query types across
+the corpus rather than pairing them per name. A resolver caches an NXDOMAIN for
+the name rather than for the query type, so asking one name for both `A` and
+`AAAA` measured a miss and then a cache hit. Both rules together are what make
+every measured cache-miss query a genuine miss; the cost is that a cache-miss
+run cannot compare transports, because doing so requires measuring one name
+twice at one resolver.
+
 `--profile-view` groups the measured target rows by resolver profile and
 address, then lists each available selected transport side by side in a
 stable order. It reuses each transport's existing median, p95, cold median,

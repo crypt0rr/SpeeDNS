@@ -406,7 +406,7 @@ For a bounded cache-miss experiment, use the separately documented reserved
 zone mode:
 
 ```sh
-./speedns --cache-miss --cache-miss-sample 10 --no-defaults \
+./speedns --cache-miss --cache-miss-sample 20 --no-defaults \
   --resolver lab=udp://192.0.2.53:53 --type A
 ```
 
@@ -417,7 +417,15 @@ corpus that `--sample` still draws from, so keep `--sample` at least as large
 as `--cache-miss-sample`; a smaller `--sample` measures only that many
 generated names and the report warns that the corpus was truncated. Cache-miss results are
 kept in their own run and ranking population; they are never mixed with the
-normal embedded warm-cache corpus. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
+normal embedded warm-cache corpus.
+
+Because a resolver holds one cache across every transport and address it
+offers, cache-miss mode measures each resolver exactly once and asks each
+generated name exactly one question — otherwise the second measurement of a
+name is a warm read of the answer the first one cached. It names the endpoints
+it dropped in a warning. The deliberate consequence is that a cache-miss run
+does not compare transports: measure one transport per invocation and compare
+the runs. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
 using the mode, especially for ownership, traffic, and abuse limits.
 
 ## System resolver baseline
@@ -571,7 +579,7 @@ Useful flags include:
 --sample N          number of domains to sample
 --full              test the complete domain list
 --cache-miss        opt in to bounded reserved-zone cache-miss names
---cache-miss-sample N  number of unique cache-miss names (maximum 20)
+--cache-miss-sample N  number of unique cache-miss names (default and maximum 20)
 --seed N            reproduce a domain order
 --type A,AAAA       record types to query (zone-transfer, meta and pseudo-record types are rejected)
 --timeout 2s        per-endpoint timeout

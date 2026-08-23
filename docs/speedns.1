@@ -87,10 +87,16 @@ names actually measured. A list with no usable entry still fails.
 .TP
 .B --cache-miss
 Opt in to bounded random names below the reserved example.com zone. It cannot
-be combined with --domains or --full.
+be combined with --domains or --full. Each resolver is measured exactly once
+and each generated name is asked exactly one question, because a resolver holds
+one cache across its transports and addresses and caches a negative answer for
+the whole name. Dropped endpoints are named in a report warning. A cache-miss
+run therefore does not compare transports.
 .TP
 .B --cache-miss-sample N
-Generate N unique reserved-zone names, at most 20, for --cache-miss. The
+Generate N unique reserved-zone names, at most 20 and 20 by default, for
+--cache-miss. Each name is asked one question, so N is also the scored sample
+count. The
 generated names are still a corpus that --sample draws from: when --sample is
 smaller than N, only that many names are measured and the report warns about
 the truncation. Set --sample to N or higher to measure every generated name.
