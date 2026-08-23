@@ -2,7 +2,7 @@ package catalog
 
 import (
 	"fmt"
-	"net"
+	"net/netip"
 	"strings"
 )
 
@@ -35,18 +35,38 @@ func ParseAddressFamily(value string) (AddressFamily, error) {
 // unspecified because selecting their eventual A/AAAA result would require a
 // separate network lookup before benchmarking.
 func AddressFamilyForAddress(address string) (AddressFamily, bool) {
+	addr, ok := parseAddressLiteral(address)
+	if !ok {
+		return "", false
+	}
+	if addr.Unmap().Is4() {
+		return Family4, true
+	}
+	return Family6, true
+}
+
+// parseAddressLiteral parses an optionally bracketed IP literal. netip is
+// used instead of net.ParseIP because a zoned link-local literal such as
+// "fe80::1%en0" is a dialable system nameserver that net.ParseIP rejects;
+// treating it as a hostname would misclassify its family.
+func parseAddressLiteral(address string) (netip.Addr, bool) {
 	address = strings.TrimSpace(address)
 	if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
 		address = strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
 	}
-	ip := net.ParseIP(address)
-	if ip == nil {
-		return "", false
+	addr, err := netip.ParseAddr(address)
+	if err != nil {
+		return netip.Addr{}, false
 	}
-	if ip.To4() != nil {
-		return Family4, true
-	}
-	return Family6, true
+	return addr, true
+}
+
+// isLoopbackLiteral reports whether address is a loopback IP literal. A
+// loopback stub resolver is answered by the host's own stack, so it stays
+// reachable no matter which families have external routes.
+func isLoopbackLiteral(address string) bool {
+	addr, ok := parseAddressLiteral(address)
+	return ok && addr.IsLoopback()
 }
 
 // FilterProfilesByFamily keeps only addresses compatible with family. The
@@ -55,7 +75,10 @@ func AddressFamilyForAddress(address string) (AddressFamily, bool) {
 // families are retained as a conservative no-probe fallback. Hostnames are
 // retained for auto and both because their family is resolved by the endpoint
 // connection path; explicit 4/6 selection rejects them rather than silently
-// making an untruthful family claim.
+// making an untruthful family claim. Loopback literals are exempt from the
+// auto filter: a local stub resolver is reachable through the loopback
+// interface even when auto-detection sees external routes for one family
+// only, so filtering it out would drop a resolver that answers.
 func FilterProfilesByFamily(profiles []ResolverProfile, family AddressFamily, available map[AddressFamily]bool) ([]ResolverProfile, error) {
 	allowed, err := allowedFamilies(family, available)
 	if err != nil {
@@ -74,7 +97,7 @@ func FilterProfilesByFamily(profiles []ResolverProfile, family AddressFamily, av
 				addresses = append(addresses, address)
 				continue
 			}
-			if allowed[addressFamily] {
+			if allowed[addressFamily] || (family == FamilyAuto && isLoopbackLiteral(address)) {
 				addresses = append(addresses, address)
 			}
 		}

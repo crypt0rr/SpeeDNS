@@ -4,6 +4,9 @@ resolvers:
     name: Example DNS
     owner: Example Corp
     policy: unfiltered
+    # Each address is an IP literal (bare, bracketed, or zoned) or a
+    # hostname. Never append a port here; ports belong in the per-transport
+    # `port:` field below.
     addresses:
       - 192.0.2.53
     transports:

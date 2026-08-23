@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,6 +151,17 @@ func TestFactorySelectionAndAddressHelpers(t *testing.T) {
 	}
 	if joinAddress(" 192.0.2.1 ", 53) != "192.0.2.1:53" || joinAddress("[2001:db8::1]", 853) != "[2001:db8::1]:853" {
 		t.Fatal("unexpected joined addresses")
+	}
+	// A link-local system nameserver is only dialable with its zone kept.
+	if got := joinAddress("fe80::1%en0", 53); got != "[fe80::1%en0]:53" {
+		t.Fatalf("zoned joined address = %q", got)
+	}
+	zoned, err := NewFactory(catalog.Target{Protocol: catalog.UDP, Address: "fe80::1%en0", Spec: catalog.TransportSpec{Port: 53}}, time.Second)
+	if err != nil || zoned.(*udpFactory).address != "[fe80::1%en0]:53" {
+		t.Fatalf("zoned UDP factory = %#v/%v", zoned, err)
+	}
+	if _, _, splitErr := net.SplitHostPort(zoned.(*udpFactory).address); splitErr != nil {
+		t.Fatalf("zoned dial address is unparseable: %v", splitErr)
 	}
 	left, _ := url.Parse("https://DNS.Example/a")
 	right, _ := url.Parse("https://dns.example/b")
@@ -611,6 +624,12 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 	if _, err := (&doqSession{conn: fakeConn, timeout: time.Second}).Query(deadlineContext, "example.com", dns.TypeA); err != nil {
 		t.Fatal(err)
 	}
+	// The context carries a deadline, so the stream must take it rather than
+	// the session timeout. Without this assertion the branch is executed but
+	// unverified, and removing its SetDeadline call keeps the suite green.
+	if len(fakeStream.deadlines) != 1 {
+		t.Fatal("DoQ context deadline was not applied to the stream")
+	}
 	if err := (&doqSession{conn: &fakeDoQConn{closeErr: errors.New("close")}}).Close(); err == nil {
 		t.Fatal("expected DoQ close error")
 	}
@@ -813,5 +832,52 @@ func TestLocalDoQFactoryExercisesAdapter(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("DoQ fixture did not finish")
+	}
+}
+
+// TestDoHRejectedResponsesKeepConnection pins the keep-alive behaviour of the
+// DoH error paths: a rejected reply whose body is left unread forces the HTTP
+// client to drop the connection, so every retry would pay a fresh TLS
+// handshake. The local TLS server counts accepted connections; the loopback
+// certificate is trusted explicitly for this test only.
+func TestDoHRejectedResponsesKeepConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		status      int
+	}{
+		{name: "status", contentType: "application/dns-message", status: http.StatusServiceUnavailable},
+		{name: "content type", contentType: "text/html", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var connections atomic.Int64
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.Copy(io.Discard, request.Body)
+				writer.Header().Set("Content-Type", tc.contentType)
+				writer.WriteHeader(tc.status)
+				_, _ = io.WriteString(writer, strings.Repeat("rejected body ", 64))
+			}))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+			}
+			server.StartTLS()
+			defer server.Close()
+
+			pool := x509.NewCertPool()
+			pool.AddCert(server.Certificate())
+			clientTransport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12}}
+			defer clientTransport.CloseIdleConnections()
+			session := &doHSession{client: &http.Client{Transport: clientTransport}, transport: clientTransport, endpoint: server.URL}
+			for attempt := 0; attempt < 3; attempt++ {
+				if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err == nil {
+					t.Fatalf("attempt %d accepted a rejected DoH reply", attempt)
+				}
+			}
+			if opened := connections.Load(); opened != 1 {
+				t.Fatalf("rejected DoH replies opened %d connections, want 1 reused connection", opened)
+			}
+		})
 	}
 }
