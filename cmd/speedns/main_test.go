@@ -99,7 +99,11 @@ func cliConfigForTest(t *testing.T) *cliConfig {
 
 func fakeCLIReport() benchmark.Report {
 	target := catalog.Target{Resolver: catalog.ResolverProfile{ID: "lab", Name: "Lab", Owner: "Owner", Policy: "unfiltered"}, Protocol: catalog.UDP, Address: "127.0.0.1", Spec: catalog.TransportSpec{Port: 53}}
-	result := benchmark.TargetResult{Target: target, Stats: benchmark.Statistics{Total: 1, Successes: 1, Scored: 1, SuccessRate: 1, MedianMS: 1, P95MS: 1, ScoreMS: 1}}
+	// UsableResponses is set because the engine only scores a sample it also
+	// counted as usable (internal/benchmark/benchmark.go:978,991); a fixture
+	// with Scored > 0 and UsableResponses == 0 describes a state Run cannot
+	// produce, and reads as a dead transport to anything checking reachability.
+	result := benchmark.TargetResult{Target: target, Stats: benchmark.Statistics{Total: 1, Successes: 1, UsableResponses: 1, Scored: 1, SuccessRate: 1, UsableRate: 1, MedianMS: 1, P95MS: 1, ScoreMS: 1}}
 	return benchmark.Report{StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0), Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{result}, Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: target.ID(), Rank: 1}}}
 }
 
@@ -971,7 +975,7 @@ func TestRunBenchmarkRejectsUnknownAssertionWinner(t *testing.T) {
 	oldEngine := runBenchmarkEngine
 	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
 	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
-		result := benchmark.TargetResult{Target: targets[0], Stats: benchmark.Statistics{Total: 1, Successes: 1, Scored: 1, SuccessRate: 1, UsableRate: 1, MedianMS: 1, P95MS: 1, ScoreMS: 1}}
+		result := benchmark.TargetResult{Target: targets[0], Stats: benchmark.Statistics{Total: 1, Successes: 1, UsableResponses: 1, Scored: 1, SuccessRate: 1, UsableRate: 1, MedianMS: 1, P95MS: 1, ScoreMS: 1}}
 		return benchmark.Report{
 			StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0), Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
 			Targets:  []benchmark.TargetResult{result},

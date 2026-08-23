@@ -167,3 +167,113 @@ func assertionTarget(id string, protocol catalog.Protocol, address string) catal
 		Spec:     catalog.TransportSpec{Port: 53},
 	}
 }
+
+// assertTarget builds one measured endpoint. Callers set the fields that decide
+// reachability; the engine only scores a sample it also counted as usable
+// (internal/benchmark/benchmark.go:978,991), so every fixture here keeps
+// UsableResponses >= Scored the way a real run does.
+func assertTarget(id string, protocol catalog.Protocol, local bool, stats benchmark.Statistics) benchmark.TargetResult {
+	return benchmark.TargetResult{
+		Target: catalog.Target{
+			Resolver: catalog.ResolverProfile{ID: id, Name: id, Owner: "Owner", Policy: "unfiltered", Local: local},
+			Protocol: protocol,
+			Address:  "192.0.2.1",
+			Spec:     catalog.TransportSpec{Port: 53},
+		},
+		Stats: stats,
+	}
+}
+
+// TestDeadProtocolsFiresOnlyOnUnreachableTransports is the core of #106: an
+// entire transport failing must not be a quieter result than one degrading.
+// The cases that must NOT fire matter more than the one that must — an
+// over-eager gate would fail healthy CI runs.
+func TestDeadProtocolsFiresOnlyOnUnreachableTransports(t *testing.T) {
+	healthy := benchmark.Statistics{Total: 6, Successes: 6, UsableResponses: 6, Scored: 6, SuccessRate: 1, UsableRate: 1}
+	dead := benchmark.Statistics{Total: 6, Failures: 6, FailureRate: 1}
+
+	// A resolver that answers every query but re-dials for each one has every
+	// sample excluded from latency scoring, so it is unranked while being
+	// perfectly healthy. Keying the gate on a missing ranking would fail it.
+	reconnecting := benchmark.Statistics{Total: 6, Successes: 6, UsableResponses: 6, Reconnects: 6, Scored: 0, SuccessRate: 1, UsableRate: 1}
+
+	// Responses arrive but none are usable: the transport is up, the resolver
+	// is not answering usefully. Still a dead protocol for gate purposes,
+	// matching the report's own allResponsesUnusable warning.
+	unusable := benchmark.Statistics{Total: 6, Successes: 6, UsableResponses: 0, ResolverFailures: 6, SuccessRate: 1}
+
+	for _, testCase := range []struct {
+		name    string
+		targets []benchmark.TargetResult
+		want    []catalog.Protocol
+	}{
+		{"every endpoint dead", []benchmark.TargetResult{assertTarget("a", catalog.DoQ, false, dead)}, []catalog.Protocol{catalog.DoQ}},
+		{"no usable responses", []benchmark.TargetResult{assertTarget("a", catalog.DoT, false, unusable)}, []catalog.Protocol{catalog.DoT}},
+		{"healthy", []benchmark.TargetResult{assertTarget("a", catalog.UDP, false, healthy)}, nil},
+		{"healthy but unranked by reconnects", []benchmark.TargetResult{assertTarget("a", catalog.DoH, false, reconnecting)}, nil},
+		{"one endpoint of two survives", []benchmark.TargetResult{
+			assertTarget("a", catalog.UDP, false, dead),
+			assertTarget("b", catalog.UDP, false, healthy),
+		}, nil},
+		{"local resolvers never make a protocol required", []benchmark.TargetResult{
+			assertTarget("stub", catalog.UDP, true, dead),
+		}, nil},
+		{"an interrupted run has proved nothing", []benchmark.TargetResult{
+			assertTarget("a", catalog.TCP, false, benchmark.Statistics{}),
+		}, nil},
+		{"reported in documented order, not lexicographic", []benchmark.TargetResult{
+			assertTarget("a", catalog.DoQ, false, dead),
+			assertTarget("b", catalog.UDP, false, dead),
+			assertTarget("c", catalog.DoH, false, dead),
+		}, []catalog.Protocol{catalog.UDP, catalog.DoH, catalog.DoQ}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := deadProtocols(benchmark.Report{Targets: testCase.targets})
+			if len(got) != len(testCase.want) {
+				t.Fatalf("deadProtocols = %v, want %v", got, testCase.want)
+			}
+			for i := range testCase.want {
+				if got[i] != testCase.want[i] {
+					t.Fatalf("deadProtocols = %v, want %v", got, testCase.want)
+				}
+			}
+		})
+	}
+}
+
+// TestEvaluateAssertionsReportsDeadTransportsFirst pins the wiring: the
+// structural failure leads the message, ordinary checks follow, and a run with
+// no assertions is still not an error however dead the transports are.
+func TestEvaluateAssertionsReportsDeadTransportsFirst(t *testing.T) {
+	good := assertTarget("good", catalog.UDP, false, benchmark.Statistics{
+		Total: 6, Successes: 6, UsableResponses: 6, Scored: 6, SuccessRate: 1, UsableRate: 0.5, P95MS: 90,
+	})
+	bad := assertTarget("bad", catalog.DoQ, false, benchmark.Statistics{Total: 6, Failures: 6, FailureRate: 1})
+	report := benchmark.Report{
+		Targets:  []benchmark.TargetResult{good, bad},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: good.Target.ID(), Rank: 1}},
+	}
+
+	// Without assertions the run is not a gate, so nothing is reported.
+	if err := evaluateAssertions(report, nil); err != nil {
+		t.Fatalf("a run with no assertions must not fail: %v", err)
+	}
+
+	checks, err := parseAssertions([]string{"usable>=0.99"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = evaluateAssertions(report, checks)
+	if err == nil || !errors.Is(err, ErrAssertionsFailed) {
+		t.Fatalf("dead transport error = %v", err)
+	}
+	message := err.Error()
+	structural := strings.Index(message, "no doq endpoint returned a usable DNS response")
+	numeric := strings.Index(message, "usable>=0.99")
+	if structural < 0 || numeric < 0 {
+		t.Fatalf("both failures must be reported: %q", message)
+	}
+	if structural > numeric {
+		t.Fatalf("the structural failure must lead the message: %q", message)
+	}
+}

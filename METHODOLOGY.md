@@ -337,6 +337,21 @@ and 1. `median`, `p95`, and `score` compare milliseconds; a bare number means
 milliseconds and Go-style duration suffixes such as `50ms` or `1.5s` are
 accepted. All support `>=`, `>`, `<=`, `<`, and `=`.
 
+A protocol whose endpoints all returned no usable DNS response fails every
+assertion of the run. Without that rule a transport failing outright is a
+quieter result than one merely degrading: assertions are evaluated per ranked
+protocol, and a dead transport produces no ranking, so nothing was ever
+checked for it. Two cases are deliberately exempt. A protocol that no selected
+resolver declares is never required, so the default `udp,tcp,doh,dot,doq`
+selection does not demand five transports of a single-resolver run. A resolver
+on the local host does not make its protocol required either, because it is
+measured but never ranked.
+
+The test is "returned no usable response", not "produced no ranking". A
+resolver that answers every query but reconnects for each one has all of its
+samples excluded from warm-latency scoring, so it is unranked while being
+entirely healthy; requiring a ranking would fail that run.
+
 Numeric assertions are evaluated against every qualified or provisional
 winner for every protocol that produced a ranking. `winner=PROFILE-ID` or
 `winner=TARGET-ID` requires the requested profile or target to be among the

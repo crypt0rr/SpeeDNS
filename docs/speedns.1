@@ -157,6 +157,10 @@ or
 Rates are between 0 and 1; latencies accept a bare number of milliseconds or a
 Go duration such as
 .IR 50ms .
+A protocol whose endpoints all returned no usable DNS response also fails,
+so a transport that is completely unreachable cannot pass the gate silently.
+A transport that no selected resolver supports is not required, and a resolver
+on the local host does not make its protocol required.
 .TP
 .B --include-system
 Include resolvers discovered from the operating system configuration.

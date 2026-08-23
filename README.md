@@ -658,6 +658,13 @@ provisional winner in every protocol that produced a ranking:
 ./speedns --protocol udp,doh --assert winner=quad9-9999
 ```
 
+A protocol whose endpoints all returned no usable DNS response fails the gate
+with status 4, so a completely unreachable transport cannot pass silently.
+`--protocol udp,doq` where every DoQ endpoint is unreachable now exits 4 rather
+than 0. A transport that no selected resolver supports is not required, and a
+resolver on the local host does not make its protocol required, since it is
+measured but never ranked.
+
 Supported metrics are `usable` and `success` (rates from `0` to `1`) plus
 `median`, `p95`, and `score` (milliseconds). Bare latency numbers are treated
 as milliseconds; duration suffixes such as `50ms` and `1.5s` are also
