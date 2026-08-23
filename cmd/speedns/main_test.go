@@ -1962,3 +1962,62 @@ func TestDNSSECFlagIsOptInAndReachesTheBenchmark(t *testing.T) {
 		t.Fatalf("--dnssec default = %q, want \"false\"", got)
 	}
 }
+
+// TestSkipInvalidDomainsDisclosesWhatItDropped covers the opt-in path end to
+// end: the run succeeds on a partly invalid list, the report says how many
+// entries were dropped and why, and the recorded corpus describes the names
+// that were measured rather than the file as written.
+func TestSkipInvalidDomainsDisclosesWhatItDropped(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+	path := filepath.Join(t.TempDir(), "mixed.txt")
+	if err := os.WriteFile(path, []byte("example.com\nexa mple.com\n*.bad\nexample.org\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	config := &cliConfig{
+		protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true,
+		domainFile: path, skipInvalid: true, sample: 10, seed: 1, queryTypes: "A",
+		timeout: time.Second, concurrency: 1, format: "json", family: "4",
+		output: filepath.Join(t.TempDir(), "skip.json"),
+	}
+	if err := runBenchmark(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(config.output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := string(content)
+	if !strings.Contains(report, "dropped 2 unusable entries") {
+		t.Fatalf("report does not disclose the skipped entries: %s", report)
+	}
+	if !strings.Contains(report, "whitespace is not allowed") || !strings.Contains(report, "wildcards are not allowed") {
+		t.Fatalf("report does not say why entries were skipped: %s", report)
+	}
+	if !strings.Contains(report, `"corpus_entries": 2`) {
+		t.Fatalf("provenance does not describe the measured corpus: %s", report)
+	}
+
+	// The same list without the opt-in must still fail.
+	strict := *config
+	strict.skipInvalid = false
+	strict.output = filepath.Join(t.TempDir(), "strict.json")
+	if err := runBenchmark(context.Background(), &strict); err == nil ||
+		!strings.Contains(err.Error(), "invalid domain names") {
+		t.Fatalf("strict load error = %v", err)
+	}
+
+	// Generated cache-miss names are always valid, so the combination is a
+	// configuration mistake rather than a no-op.
+	cacheMiss := *config
+	cacheMiss.domainFile = ""
+	cacheMiss.cacheMiss = true
+	cacheMiss.cacheMissSample = 2
+	if err := runBenchmark(context.Background(), &cacheMiss); err == nil ||
+		!strings.Contains(err.Error(), "cannot be combined with --cache-miss") {
+		t.Fatalf("cache-miss combination error = %v", err)
+	}
+}

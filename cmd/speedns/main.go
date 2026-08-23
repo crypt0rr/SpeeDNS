@@ -37,6 +37,7 @@ type cliConfig struct {
 	resolverFile    string
 	noDefaults      bool
 	domainFile      string
+	skipInvalid     bool
 	cacheMiss       bool
 	cacheMissSample int
 	sample          int
@@ -633,6 +634,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.StringVar(&config.resolverFile, "resolver-file", "", "YAML resolver profile file")
 	flags.BoolVar(&config.noDefaults, "no-defaults", false, "do not include bundled public resolvers")
 	flags.StringVar(&config.domainFile, "domains", "", "newline-delimited domain list; defaults to the embedded corpus")
+	flags.BoolVar(&config.skipInvalid, "skip-invalid-domains", false, "skip unusable entries in --domains instead of failing the run")
 	flags.BoolVar(&config.cacheMiss, "cache-miss", false, "opt in to bounded random names below the reserved example.com zone")
 	flags.IntVar(&config.cacheMissSample, "cache-miss-sample", domains.CacheMissDefaultSample, "number of unique reserved-zone names for --cache-miss (maximum 20)")
 	flags.IntVar(&config.sample, "sample", benchmark.DefaultSample, "number of domains to sample")
@@ -778,12 +780,16 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	corpusZone := ""
 	corpusNonce := ""
 	var domainList []string
+	var skippedDomains []string
 	if config.cacheMiss {
 		if strings.TrimSpace(config.domainFile) != "" {
 			return errors.New("--cache-miss cannot be combined with --domains")
 		}
 		if config.full {
 			return errors.New("--cache-miss cannot be combined with --full; use --cache-miss-sample")
+		}
+		if config.skipInvalid {
+			return errors.New("--skip-invalid-domains cannot be combined with --cache-miss; generated names are always valid")
 		}
 		corpusNonce, err = newCacheMissNonceFunc()
 		if err != nil {
@@ -796,10 +802,12 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		corpusMode = benchmark.CorpusCacheMiss
 		corpusZone = domains.CacheMissZone
 	} else {
-		domainList, err = domains.Load(config.domainFile)
-		if err != nil {
-			return err
+		corpus, loadErr := domains.LoadTolerant(config.domainFile, config.skipInvalid)
+		if loadErr != nil {
+			return loadErr
 		}
+		domainList = corpus.Names
+		skippedDomains = corpus.Skipped
 	}
 	selection, err := loadProfilesFunc(ctx, config)
 	if err != nil {
@@ -901,6 +909,13 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		CorpusSHA256:  domains.CorpusDigest(domainList),
 		Timeout:       config.timeout,
 		Concurrency:   effectiveConcurrency,
+	}
+	if len(skippedDomains) > 0 {
+		// The corpus digest and entry count in provenance describe the names
+		// that were measured, so the report must say the file held more.
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
+			"--skip-invalid-domains dropped %d unusable entries from %s: %s",
+			len(skippedDomains), config.domainFile, strings.Join(skippedDomains, "; "))))
 	}
 	if concurrencyCapped {
 		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency)))

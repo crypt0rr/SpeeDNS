@@ -191,7 +191,16 @@ from noise in this run.
 A paired comparison requires at least 20 paired observations, the same minimum
 sample count the recommendation gate uses. Below that floor no delta and no
 interval are reported: the effect keeps its paired sample count, records the
-reason `insufficient paired samples`, and the report says `NOT COMPARABLE`.
+reason `insufficient paired samples`, and the report says `NOT COMPARABLE`. The
+reason is a fixed phrase rather than one naming the current threshold, so a
+consumer matching on it does not break when the threshold changes; the sample
+count is in the same record.
+
+A target that is the only member of its protocol and policy group has no peer to
+be paired against, so it is its own reference and its row carries no
+information. The human table omits those rows and reports how many were omitted;
+`--details` and the `paired_effects` JSON section keep every entry, so the
+detailed view remains a complete record of what was measured.
 A one-sample or few-sample run measures cold-path noise, so it must not be
 presented as a directional `FASTER` or `SLOWER` verdict under a 95% confidence
 interval heading. These effects explain the existing score and never

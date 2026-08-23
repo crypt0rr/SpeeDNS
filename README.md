@@ -375,7 +375,9 @@ not download or refresh the list.
 
 ## Custom domain lists
 
-Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Underscored service labels such as `_dmarc.example.com`, `_sip._tcp.example.com`, and `selector1._domainkey.example.com` are accepted unchanged, so lists paired with `--type SRV`, `--type TLSA`, or `--type TXT` work; the underscore is only allowed as the first character of a label. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, other non-letter/digit/hyphen characters, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line.
+Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Underscored service labels such as `_dmarc.example.com`, `_sip._tcp.example.com`, and `selector1._domainkey.example.com` are accepted unchanged, so lists paired with `--type SRV`, `--type TLSA`, or `--type TXT` work; the underscore is only allowed as the first character of a label. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, other non-letter/digit/hyphen characters, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line, and every invalid entry is reported at once rather than only the first.
+
+A list is rejected as a whole by default, because the corpus size and SHA-256 recorded in the report describe what was measured. Pass `--skip-invalid-domains` to drop unusable entries and benchmark the rest: the report warns how many were dropped and why, and the recorded corpus size and checksum describe the names actually measured. A list with no usable entry still fails.
 
 ```sh
 ./speedns --domains my-domains.txt --sample 200 --seed 42
