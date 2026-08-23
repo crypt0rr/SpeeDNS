@@ -19,6 +19,8 @@ import (
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
+
+	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
 )
 
@@ -1382,6 +1384,75 @@ func TestCobraOutputErrorsAreIgnoredBySimpleCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = newRootCommand()
+}
+
+func TestParseQueryTypesRejectsZoneTransferAndPseudoTypes(t *testing.T) {
+	rejected := []struct {
+		name     string
+		input    string
+		wantKind string
+	}{
+		{name: "axfr", input: "AXFR", wantKind: "unsafe"},
+		{name: "axfr numeric", input: "252", wantKind: "unsafe"},
+		{name: "ixfr", input: "IXFR", wantKind: "unsafe"},
+		{name: "ixfr numeric", input: "251", wantKind: "unsafe"},
+		{name: "any", input: "ANY", wantKind: "unsafe"},
+		{name: "any numeric", input: "255", wantKind: "unsafe"},
+		{name: "maila", input: "MAILA", wantKind: "unsafe"},
+		{name: "mailb", input: "MAILB", wantKind: "unsafe"},
+		{name: "opt", input: "OPT", wantKind: "invalid"},
+		{name: "opt numeric", input: "41", wantKind: "invalid"},
+		{name: "tsig", input: "TSIG", wantKind: "invalid"},
+		{name: "tkey", input: "TKEY", wantKind: "invalid"},
+		{name: "lowercase", input: "axfr", wantKind: "unsafe"},
+		{name: "trailing member of a list", input: "A,AAAA,AXFR", wantKind: "unsafe"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			types, err := parseQueryTypes(tc.input)
+			if err == nil {
+				t.Fatalf("parseQueryTypes(%q) = %#v, want error", tc.input, types)
+			}
+			if !strings.HasPrefix(err.Error(), tc.wantKind+" DNS query type ") {
+				t.Fatalf("parseQueryTypes(%q) error = %q, want %s classification", tc.input, err, tc.wantKind)
+			}
+		})
+	}
+
+	if _, err := parseQueryTypes("nonsense"); err == nil || !strings.HasPrefix(err.Error(), "unknown DNS query type ") {
+		t.Fatalf("unknown type error = %v, want unknown classification", err)
+	}
+
+	accepted := []struct {
+		name  string
+		input string
+		want  uint16
+	}{
+		{name: "a", input: "A", want: dns.TypeA},
+		{name: "aaaa", input: "aaaa", want: dns.TypeAAAA},
+		{name: "mx", input: "MX", want: dns.TypeMX},
+		{name: "txt", input: "TXT", want: dns.TypeTXT},
+		{name: "srv", input: "SRV", want: dns.TypeSRV},
+		{name: "ns", input: "NS", want: dns.TypeNS},
+		{name: "soa", input: "SOA", want: dns.TypeSOA},
+		{name: "ptr", input: "PTR", want: dns.TypePTR},
+		{name: "caa", input: "CAA", want: dns.TypeCAA},
+		{name: "tlsa", input: "TLSA", want: dns.TypeTLSA},
+		{name: "https", input: "HTTPS", want: dns.TypeHTTPS},
+		{name: "svcb", input: "SVCB", want: dns.TypeSVCB},
+		{name: "unusual numeric", input: "65000", want: 65000},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			types, err := parseQueryTypes(tc.input)
+			if err != nil {
+				t.Fatalf("parseQueryTypes(%q) = %v, want success", tc.input, err)
+			}
+			if len(types) != 1 || types[0] != tc.want {
+				t.Fatalf("parseQueryTypes(%q) = %#v, want [%d]", tc.input, types, tc.want)
+			}
+		})
+	}
 }
 
 // TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured pins the disclosure that

@@ -617,7 +617,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.IntVar(&config.sample, "sample", benchmark.DefaultSample, "number of domains to sample")
 	flags.BoolVar(&config.full, "full", false, "test the complete embedded or custom domain list")
 	flags.Int64Var(&config.seed, "seed", 0, "random seed (0 chooses and prints a new seed)")
-	flags.StringVar(&config.queryTypes, "type", "A,AAAA", "comma-separated DNS record types")
+	flags.StringVar(&config.queryTypes, "type", "A,AAAA", "comma-separated DNS record types; zone-transfer, meta and pseudo-record types are rejected")
 	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout")
 	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum measured DNS exchanges in flight per protocol")
 	flags.BoolVar(&config.includeSystem, "include-system", false, "include the configured system resolver as a baseline")
@@ -1071,6 +1071,52 @@ func parseProtocols(value string) ([]catalog.Protocol, error) {
 	return protocols, nil
 }
 
+// rejectedQueryType explains why a DNS type may never be used as a QTYPE by
+// the benchmark. "invalid" types are meta or pseudo records that cannot legally
+// appear in a question section at all; "unsafe" types are syntactically valid
+// questions that must not be aimed at a resolver under test.
+type rejectedQueryType struct {
+	kind   string
+	reason string
+}
+
+// rejectedQueryTypes is a deny-list, not an allow-list: benchmarking an unusual
+// but legitimate record type stays supported.
+var rejectedQueryTypes = map[uint16]rejectedQueryType{
+	dns.TypeOPT: {
+		kind:   "invalid",
+		reason: "OPT is an EDNS(0) pseudo-record that belongs in the additional section, and every query already carries its own",
+	},
+	dns.TypeTKEY: {
+		kind:   "invalid",
+		reason: "TKEY is a key-establishment meta-record, not a queryable type",
+	},
+	dns.TypeTSIG: {
+		kind:   "invalid",
+		reason: "TSIG is a transaction-signature meta-record, not a queryable type",
+	},
+	dns.TypeAXFR: {
+		kind:   "unsafe",
+		reason: "AXFR requests a full zone transfer, which recursive resolvers refuse",
+	},
+	dns.TypeIXFR: {
+		kind:   "unsafe",
+		reason: "IXFR requests an incremental zone transfer, which recursive resolvers refuse",
+	},
+	dns.TypeANY: {
+		kind:   "unsafe",
+		reason: "ANY is an obsolete meta-query that resolvers answer inconsistently or refuse",
+	},
+	dns.TypeMAILB: {
+		kind:   "unsafe",
+		reason: "MAILB is an obsolete meta-query with no defined resolver behaviour",
+	},
+	dns.TypeMAILA: {
+		kind:   "unsafe",
+		reason: "MAILA is an obsolete meta-query with no defined resolver behaviour",
+	},
+}
+
 func parseQueryTypes(value string) ([]uint16, error) {
 	if strings.TrimSpace(value) == "" {
 		return nil, errors.New("--type cannot be empty")
@@ -1086,8 +1132,11 @@ func parseQueryTypes(value string) ([]uint16, error) {
 				ok = true
 			}
 		}
-		if !ok || qtype == dns.TypeANY {
-			return nil, fmt.Errorf("unsupported or unsafe DNS query type %q", item)
+		if !ok {
+			return nil, fmt.Errorf("unknown DNS query type %q", item)
+		}
+		if rejected, found := rejectedQueryTypes[qtype]; found {
+			return nil, fmt.Errorf("%s DNS query type %q: %s", rejected.kind, item, rejected.reason)
 		}
 		if !seen[qtype] {
 			seen[qtype] = true
