@@ -23,7 +23,14 @@ exchanges are in flight at once, and a target's session is never used
 concurrently. This preserves bounded active work while preventing early
 catalog entries from receiving a different sequence of measurement rounds.
 Preparation (cold probes and warmups) is kept separate from the measured
-rounds. There is no transport fallback.
+rounds. Preparation itself also runs with at most `--concurrency` targets in
+flight, and a single target is always prepared by one worker so its session is
+never used concurrently. Preparing targets one after another would have made a
+target's cold probes start systematically later, and left its warm session
+idle for longer, the further down the ordered catalog it sat; bounded parallel
+preparation shrinks that positional bias by the concurrency factor. Results
+and rankings stay in target-identity order regardless of which preparation
+finished first. There is no transport fallback.
 
 Three excluded warm-up queries are sent before the measured phase. Encrypted
 and stream transports reuse their connections during measured queries. UDP
@@ -133,7 +140,11 @@ and the complete target identity, not from a target-ID length or process-wide
 random state. Each bootstrap replicate resamples the complete scoring outcome
 vector: successful latency observations and scoring failures. This means the
 uncertainty of the failure penalty is represented as well as latency
-uncertainty.
+uncertainty. A replicate that happens to draw only failures has no latency
+term, so it scores the timeout penalty itself, exactly as the score function
+would for a failure rate of 1. No out-of-range sentinel is used, because a
+replicate score the score function cannot produce would inflate the reported
+upper bound and change which targets are reported as tied.
 
 Rank order is deterministic: score first, then target ID. A target is in the
 leader's tie group when its 95% bootstrap interval overlaps the leader's

@@ -508,7 +508,7 @@ Useful flags include:
 --seed N            reproduce a domain order
 --type A,AAAA       record types to query (zone-transfer, meta and pseudo-record types are rejected)
 --timeout 2s        per-endpoint timeout
---concurrency 4    maximum measured DNS exchanges in flight per protocol
+--concurrency 4    maximum concurrent target preparations and measured DNS exchanges per protocol
 --format table|json|csv
 --output PATH       write output to a file, /dev/null, or a pipe
 --no-color          disable terminal colors
@@ -526,7 +526,8 @@ status line, for example:
 testing | udp done | tcp done | doh queued | dot queued | doq preparing 2/10 | elapsed 00:04 | /
 ```
 
-Preparation covers connection setup, cold probes, and warm-ups. Measuring
+Preparation covers connection setup, cold probes, and warm-ups, and runs with
+the same bounded concurrency as measurement. Measuring
 shows completed DNS exchanges, including failed exchanges; no ETA or resolver
 addresses are shown. When standard error is not a terminal, SpeeDNS prints
 deterministic milestone lines instead: each phase is reported when it starts,
