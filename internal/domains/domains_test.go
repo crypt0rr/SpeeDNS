@@ -153,3 +153,39 @@ func TestNormalizeRejectsInvalidUTF8(t *testing.T) {
 		t.Fatalf("invalid UTF-8 error = %v", err)
 	}
 }
+
+// TestNormalizeTrimsEveryRootLabelForm pins the root-label rule against the
+// Unicode tables x/net/idna selects by Go toolchain. UTS-46 maps the
+// ideographic and fullwidth stops onto the ASCII separator, so all four forms
+// have to survive normalization identically on every supported toolchain.
+func TestNormalizeTrimsEveryRootLabelForm(t *testing.T) {
+	for _, input := range []string{
+		"example.com.",
+		"EXAMPLE.COM.",
+		"example.com。",
+		"example.com．",
+		"example.com｡",
+	} {
+		got, err := Normalize([]string{input})
+		if err != nil {
+			t.Fatalf("Normalize(%q) error = %v", input, err)
+		}
+		if len(got) != 1 || got[0] != "example.com" {
+			t.Fatalf("Normalize(%q) = %#v, want [example.com]", input, got)
+		}
+	}
+}
+
+// TestNormalizeSkipsBareRootLabels covers names that consist only of label
+// separators; they carry no queryable name and must be skipped rather than
+// rejected, matching the documented handling of a bare root dot.
+func TestNormalizeSkipsBareRootLabels(t *testing.T) {
+	for _, input := range []string{"。", "．", "｡", "。．"} {
+		if _, err := Normalize([]string{input, "example.com"}); err != nil {
+			t.Fatalf("Normalize(%q, example.com) error = %v", input, err)
+		}
+	}
+	if _, err := Normalize([]string{"。"}); err == nil {
+		t.Fatal("expected a list of only root labels to be empty")
+	}
+}

@@ -19,6 +19,11 @@ import (
 
 const maxDomainLineSize = 64 * 1024
 
+// rootLabelSeparators lists every code point UTS-46 maps onto the DNS label
+// separator: FULL STOP, IDEOGRAPHIC FULL STOP, FULLWIDTH FULL STOP, and
+// HALFWIDTH IDEOGRAPHIC FULL STOP.
+const rootLabelSeparators = ".\u3002\uff0e\uff61"
+
 // CacheMissZone is the IANA-reserved example zone used only by the explicit
 // cache-miss mode. SpeeDNS never sends these names unless the user opts in.
 const CacheMissZone = "example.com"
@@ -194,11 +199,23 @@ func normalize(value string) (string, error) {
 		return "", errors.New("empty labels are not allowed")
 	}
 
+	// The root label must be removed before IDNA processing. UTS-46 ToASCII
+	// with VerifyDNSLength rejects a trailing empty label, so trimming
+	// afterwards makes acceptance depend on the Unicode tables the building
+	// Go toolchain selects (x/net/idna ships tables15 for < go1.27 and
+	// tables17 for go1.27+). UTS-46 also maps the ideographic and fullwidth
+	// stops onto the ASCII separator, so every form has to be trimmed here.
+	value = strings.TrimRight(value, rootLabelSeparators)
+	if value == "" {
+		return "", nil
+	}
 	name, err := lookupProfile.ToASCII(value)
 	if err != nil {
 		return "", err
 	}
-	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	// main now trims the root label before ToASCII, so no trailing dot can
+	// survive to here; only case folding remains.
+	name = strings.ToLower(name)
 	if err := checkLabelSyntax(name); err != nil {
 		return "", err
 	}
