@@ -35,9 +35,11 @@ speedns --cache-miss --cache-miss-sample 10 --no-defaults \
   --resolver lab=udp://192.0.2.53:53 --type A --no-color
 ```
 
-`--cache-miss` cannot be combined with `--domains` or `--full`. The regular
-`--sample` flag controls the warm-cache corpus; `--cache-miss-sample` controls
-this bounded generated corpus. The report labels the corpus mode, zone, and
+`--cache-miss` cannot be combined with `--domains` or `--full`.
+`--cache-miss-sample` sizes this bounded generated corpus, and `--sample`
+still selects how many of those names are measured. Keep `--sample` at least
+as large as `--cache-miss-sample`; a smaller `--sample` measures only that
+many generated names, and the report warns that the corpus was truncated. The report labels the corpus mode, zone, and
 nonce. Cache-miss results receive their own rankings and must not be compared
 with a warm-cache run as if they were the same sample population.
 

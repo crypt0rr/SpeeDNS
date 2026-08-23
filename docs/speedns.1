@@ -78,6 +78,16 @@ the underscore is only allowed as the first character of a label.
 .B --sample N
 Sample N domains from the selected corpus.
 .TP
+.B --cache-miss
+Opt in to bounded random names below the reserved example.com zone. It cannot
+be combined with --domains or --full.
+.TP
+.B --cache-miss-sample N
+Generate N unique reserved-zone names, at most 20, for --cache-miss. The
+generated names are still a corpus that --sample draws from: when --sample is
+smaller than N, only that many names are measured and the report warns about
+the truncation. Set --sample to N or higher to measure every generated name.
+.TP
 .B --full
 Use the complete selected domain list.
 .TP
@@ -111,7 +121,14 @@ Set the maximum number of measured exchanges in flight per transport.
 Choose human-readable, JSON, or CSV output.
 .TP
 .B --output PATH
-Write the report to a file instead of standard output.
+Write the report to a file instead of standard output. A regular file is
+replaced atomically: the report is written next to the destination and renamed
+over it only after a successful run, so a failed run leaves the previous file
+untouched. Destinations that cannot be replaced that way are written in place
+instead, which covers non-regular files such as /dev/null, named pipes, and
+/proc file descriptors, plus a writable file in a directory that rejects new
+entries. An in-place destination can keep partial output after a failed run.
+A destination that is a directory is rejected.
 .TP
 .B --details
 Include cold latency, jitter, response outcomes, and expanded diagnostics.

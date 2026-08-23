@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1384,6 +1386,181 @@ func TestCobraOutputErrorsAreIgnoredBySimpleCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = newRootCommand()
+}
+
+func TestOutputWriterWritesNonRegularDestinationsInPlace(t *testing.T) {
+	writer, finalize, err := outputWriter(os.DevNull)
+	if err != nil {
+		t.Fatalf("device writer = %v", err)
+	}
+	if _, err := io.WriteString(writer, "discarded report"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err != nil {
+		t.Fatalf("device finalize = %v", err)
+	}
+	info, err := os.Stat(os.DevNull)
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		t.Fatalf("%s was replaced: %v/%v", os.DevNull, info, err)
+	}
+
+	fifo := filepath.Join(t.TempDir(), "report.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("create fifo: %v", err)
+	}
+	received := make(chan string, 1)
+	go func() {
+		content, readErr := os.ReadFile(fifo)
+		if readErr != nil {
+			received <- "read error: " + readErr.Error()
+			return
+		}
+		received <- string(content)
+	}()
+	writer, finalize, err = outputWriter(fifo)
+	if err != nil {
+		t.Fatalf("fifo writer = %v", err)
+	}
+	if _, err := io.WriteString(writer, "piped report"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err != nil {
+		t.Fatalf("fifo finalize = %v", err)
+	}
+	if got := <-received; got != "piped report" {
+		t.Fatalf("fifo reader got %q", got)
+	}
+
+	// Discarding a non-regular destination cannot restore it, but it must
+	// still close the destination without reporting an error.
+	writer, finalize, err = outputWriter(os.DevNull)
+	if err != nil {
+		t.Fatalf("device discard writer = %v", err)
+	}
+	if _, err := io.WriteString(writer, "partial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(false); err != nil {
+		t.Fatalf("device discard finalize = %v", err)
+	}
+}
+
+func TestOutputWriterFallsBackWhenTemporaryFilesAreRejected(t *testing.T) {
+	oldCreate := createTempOutputFile
+	oldOpen := openOutputFile
+	t.Cleanup(func() {
+		createTempOutputFile = oldCreate
+		openOutputFile = oldOpen
+	})
+	createTempOutputFile = func(string, string) (outputFileHandle, error) {
+		return nil, fmt.Errorf("open .report.speedns-1: %w", os.ErrPermission)
+	}
+
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writer, finalize, err := outputWriter(path)
+	if err != nil {
+		t.Fatalf("fallback writer = %v", err)
+	}
+	if _, err := io.WriteString(writer, "fresh"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err != nil {
+		t.Fatalf("fallback finalize = %v", err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != "fresh" {
+		t.Fatalf("fallback output = %q/%v", content, err)
+	}
+
+	openOutputFile = func(string) (outputFileHandle, error) { return nil, errors.New("open failed") }
+	if _, _, err := outputWriter(path); err == nil || !strings.Contains(err.Error(), "open failed") {
+		t.Fatalf("direct open error = %v", err)
+	}
+
+	file := &fakeOutputFile{name: "direct-sync", syncErr: errors.New("sync failed")}
+	openOutputFile = func(string) (outputFileHandle, error) { return file, nil }
+	if _, finalize, err = outputWriter(path); err != nil {
+		t.Fatal(err)
+	} else if err := finalize(true); err == nil || !strings.Contains(err.Error(), "sync failed") {
+		t.Fatalf("direct sync error = %v", err)
+	}
+
+	file = &fakeOutputFile{name: "direct-close", closeErr: errors.New("close failed")}
+	openOutputFile = func(string) (outputFileHandle, error) { return file, nil }
+	if _, finalize, err = outputWriter(path); err != nil {
+		t.Fatal(err)
+	} else if err := finalize(true); err == nil || !strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("direct commit close error = %v", err)
+	}
+
+	if _, finalize, err = outputWriter(path); err != nil {
+		t.Fatal(err)
+	} else if err := finalize(false); err == nil || !strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("direct discard close error = %v", err)
+	}
+
+	// A directory destination keeps its dedicated error instead of being
+	// written in place.
+	if _, _, err := outputWriter(t.TempDir()); err == nil || !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("directory destination error = %v", err)
+	}
+}
+
+func TestRunBenchmarkWarnsWhenSampleTruncatesCacheMissCorpus(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldNonce := newCacheMissNonceFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		newCacheMissNonceFunc = oldNonce
+	})
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		measured := options.Sample
+		if measured > len(options.Domains) {
+			measured = len(options.Domains)
+		}
+		report := fakeCLIReport()
+		report.SampleSize = measured
+		report.Queries = measured * len(options.QueryTypes)
+		return report, nil
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+	config := &cliConfig{
+		protocols: "udp", resolverFlags: []string{"lab=udp://127.0.0.1:53"}, noDefaults: true,
+		cacheMiss: true, cacheMissSample: 20, sample: 5, seed: 7, queryTypes: "A", timeout: time.Second,
+		concurrency: 1, format: "json", family: "4", output: filepath.Join(t.TempDir(), "cache.json"),
+	}
+	if err := runBenchmark(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(config.output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"effective sample of 5 truncated the generated cache-miss corpus of 20 names",
+		"\"sample_size\": 5",
+		"\"corpus_entries\": 20",
+	} {
+		if !strings.Contains(string(content), expected) {
+			t.Fatalf("cache-miss truncation report missing %q: %s", expected, content)
+		}
+	}
+
+	config.sample = 20
+	config.output = filepath.Join(t.TempDir(), "full.json")
+	if err := runBenchmark(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(config.output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(content), "truncated the generated cache-miss corpus") {
+		t.Fatalf("unexpected truncation warning: %s", content)
+	}
 }
 
 func TestParseQueryTypesRejectsZoneTransferAndPseudoTypes(t *testing.T) {
