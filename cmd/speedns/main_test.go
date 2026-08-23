@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1743,5 +1745,169 @@ func TestDuplicateProfileIDsAcrossGroupsAreRejected(t *testing.T) {
 	}
 	if err := catalog.Validate(selection.all()); err == nil {
 		t.Fatal("expected a duplicate resolver id across bundled and explicit profiles to be rejected")
+	}
+}
+
+type failingCloser struct{}
+
+func (failingCloser) Close() error { return errors.New("probe close failed") }
+
+func TestOutputWriterMatchesOrdinaryFileMode(t *testing.T) {
+	directory := t.TempDir()
+	reference := filepath.Join(directory, "reference")
+	referenceFile, err := os.OpenFile(reference, os.O_WRONLY|os.O_CREATE|os.O_EXCL, ordinaryFileMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := referenceFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	referenceInfo, err := os.Stat(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(directory, "report.json")
+	writer, finalize, err := outputWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(writer, "{}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != referenceInfo.Mode().Perm() {
+		t.Fatalf("--output mode = %v, want the ordinary creation mode %v", info.Mode().Perm(), referenceInfo.Mode().Perm())
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "{}\n" {
+		t.Fatalf("output contents = %q/%v", string(contents), err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("output directory holds %d entries, want the report and the reference only", len(entries))
+	}
+}
+
+func TestOutputWriterKeepsReportWhenPermissionsCannotBeSet(t *testing.T) {
+	oldProbe := createOutputProbeFile
+	oldChmod := chmodOutputFile
+	t.Cleanup(func() {
+		createOutputProbeFile = oldProbe
+		chmodOutputFile = oldChmod
+	})
+
+	directory := t.TempDir()
+	createOutputProbeFile = func(string) (io.Closer, error) { return nil, errors.New("probe failed") }
+	unprobed := filepath.Join(directory, "unprobed.json")
+	writer, finalize, err := outputWriter(unprobed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(writer, "{}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err != nil {
+		t.Fatalf("failed probe blocked the report: %v", err)
+	}
+	if _, err := os.Stat(unprobed); err != nil {
+		t.Fatal(err)
+	}
+
+	createOutputProbeFile = func(string) (io.Closer, error) { return failingCloser{}, nil }
+	if mode, ok := probeOrdinaryFileMode(filepath.Join(directory, "absent")); ok {
+		t.Fatalf("unusable probe reported mode %v", mode)
+	}
+
+	createOutputProbeFile = oldProbe
+	chmodOutputFile = func(string, fs.FileMode) error { return errors.New("chmod failed") }
+	unchanged := filepath.Join(directory, "unchanged.json")
+	writer, finalize, err = outputWriter(unchanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(writer, "{}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err != nil {
+		t.Fatalf("failed permission change blocked the report: %v", err)
+	}
+	contents, err := os.ReadFile(unchanged)
+	if err != nil || string(contents) != "{}\n" {
+		t.Fatalf("output contents = %q/%v", string(contents), err)
+	}
+}
+
+func TestErrorMessageRendersInterruptionInPlainLanguage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "canceled", err: context.Canceled, want: "interrupted"},
+		{name: "wrapped cancel", err: fmt.Errorf("run benchmark: %w", context.Canceled), want: "interrupted"},
+		{name: "deadline", err: context.DeadlineExceeded, want: context.DeadlineExceeded.Error()},
+		{name: "configuration", err: errors.New("unsupported output format"), want: "unsupported output format"},
+		{name: "assertions", err: ErrAssertionsFailed, want: ErrAssertionsFailed.Error()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := errorMessage(tc.err); got != tc.want {
+				t.Fatalf("errorMessage = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(errorMessage(tc.err), "context canceled") {
+				t.Fatalf("errorMessage leaked context plumbing: %q", errorMessage(tc.err))
+			}
+		})
+	}
+	if code := exitCodeForError(context.Canceled); code != 130 {
+		t.Fatalf("interruption exit code = %d, want 130", code)
+	}
+}
+
+func TestInterruptContextReleasesSignalsAfterTheFirst(t *testing.T) {
+	oldNotify, oldStop := notifySignals, stopSignals
+	t.Cleanup(func() { notifySignals = oldNotify; stopSignals = oldStop })
+	channels := make(chan chan<- os.Signal, 2)
+	var registered []os.Signal
+	var released atomic.Int64
+	notifySignals = func(channel chan<- os.Signal, signals ...os.Signal) {
+		registered = append([]os.Signal(nil), signals...)
+		channels <- channel
+	}
+	stopSignals = func(chan<- os.Signal) { released.Add(1) }
+
+	runContext, stop := interruptContext(context.Background())
+	defer stop()
+	channel := <-channels
+	if len(registered) != 2 || registered[0] != os.Interrupt || registered[1] != syscall.SIGTERM {
+		t.Fatalf("registered signals = %#v", registered)
+	}
+	channel <- os.Interrupt
+	<-runContext.Done()
+	if !errors.Is(runContext.Err(), context.Canceled) {
+		t.Fatalf("interrupted run error = %v", runContext.Err())
+	}
+	if released.Load() != 1 {
+		t.Fatalf("signal registration released %d times, want the default restored once", released.Load())
+	}
+	if code := exitCodeForError(runContext.Err()); code != 130 {
+		t.Fatalf("interrupted exit code = %d, want 130", code)
+	}
+
+	quiet, quietStop := interruptContext(context.Background())
+	<-channels
+	quietStop()
+	<-quiet.Done()
+	if !errors.Is(quiet.Err(), context.Canceled) {
+		t.Fatalf("clean shutdown error = %v", quiet.Err())
 	}
 }

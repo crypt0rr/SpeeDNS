@@ -122,6 +122,9 @@ in flight, per transport.
 Choose human-readable, JSON, or CSV output.
 .TP
 .B --output PATH
+Write the report to a file instead of standard output. The file is replaced
+atomically and receives the same permissions an ordinary shell redirection
+would create, narrowed by the current umask.
 Write the report to a file instead of standard output. A regular file is
 replaced atomically: the report is written next to the destination and renamed
 over it only after a successful run, so a failed run leaves the previous file
@@ -210,7 +213,10 @@ A requested benchmark assertion did not hold. The ordinary report is written
 before this status is returned.
 .TP
 .B 130
-The run was interrupted.
+The run was interrupted. SpeeDNS reports
+.B interrupted
+on standard error and writes the partial report; a second interrupt exits
+immediately.
 .SH FILES
 .TP
 .I /etc/resolv.conf

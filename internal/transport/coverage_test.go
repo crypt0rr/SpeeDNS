@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -830,5 +832,52 @@ func TestLocalDoQFactoryExercisesAdapter(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("DoQ fixture did not finish")
+	}
+}
+
+// TestDoHRejectedResponsesKeepConnection pins the keep-alive behaviour of the
+// DoH error paths: a rejected reply whose body is left unread forces the HTTP
+// client to drop the connection, so every retry would pay a fresh TLS
+// handshake. The local TLS server counts accepted connections; the loopback
+// certificate is trusted explicitly for this test only.
+func TestDoHRejectedResponsesKeepConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		status      int
+	}{
+		{name: "status", contentType: "application/dns-message", status: http.StatusServiceUnavailable},
+		{name: "content type", contentType: "text/html", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var connections atomic.Int64
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.Copy(io.Discard, request.Body)
+				writer.Header().Set("Content-Type", tc.contentType)
+				writer.WriteHeader(tc.status)
+				_, _ = io.WriteString(writer, strings.Repeat("rejected body ", 64))
+			}))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+			}
+			server.StartTLS()
+			defer server.Close()
+
+			pool := x509.NewCertPool()
+			pool.AddCert(server.Certificate())
+			clientTransport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12}}
+			defer clientTransport.CloseIdleConnections()
+			session := &doHSession{client: &http.Client{Transport: clientTransport}, transport: clientTransport, endpoint: server.URL}
+			for attempt := 0; attempt < 3; attempt++ {
+				if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err == nil {
+					t.Fatalf("attempt %d accepted a rejected DoH reply", attempt)
+				}
+			}
+			if opened := connections.Load(); opened != 1 {
+				t.Fatalf("rejected DoH replies opened %d connections, want 1 reused connection", opened)
+			}
+		})
 	}
 }

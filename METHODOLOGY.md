@@ -39,6 +39,16 @@ reports the DNS transaction time only.
 ## What is measured
 
 Warm latency is measured from immediately before a DNS exchange until the
+validated response or error returns. Per-query deadline setup and post-exchange
+bookkeeping, such as the reconnect check, fall outside the timed section. TCP,
+DoT, and any recovered stream connection are not closed before the timer stops.
+A query that follows a TCP, DoT, or DoQ reconnect is recorded as a reconnect
+sample and excluded from ordinary warm-latency scoring; its reconnect count and
+selected dial address remain visible in detailed output and machine-readable
+results. DoQ sessions use TLS 1.3 with ALPN `doq`, an explicit keepalive period
+equal to the configured timeout, and a maximum idle timeout of twice that
+timeout. The failed exchange that caused the reconnect is counted once and is
+never retried.
 validated response or error returns. TCP, DoT, and any recovered stream
 connection are not closed before the timer stops. A query that follows a TCP,
 DoT, DoH, or DoQ reconnect is recorded as a reconnect sample and excluded from

@@ -462,6 +462,8 @@ For scripts and other tools, use JSON or CSV:
 ./speedns --format json --raw --output result-with-samples.json
 ```
 
+`--output` replaces the destination atomically and gives it the permissions an
+ordinary shell redirection would produce, narrowed by your umask.
 `--output` replaces a regular file atomically: the report is written next to
 the destination and renamed over it only when the run succeeds, so a failed
 run leaves the previous file untouched. Destinations that cannot be replaced
@@ -574,6 +576,9 @@ warnings. The command returns a distinct non-zero status:
 - `3` — no comparable DNS results were produced;
 - `4` — a requested benchmark assertion failed;
 - `130` — interrupted by the user or operating system.
+
+An interrupted run reports `interrupted` on standard error and still writes the
+partial report. A second interrupt exits immediately.
 
 ### Assertions for automation
 
