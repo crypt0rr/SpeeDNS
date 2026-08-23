@@ -250,6 +250,11 @@ System resolver configuration on Linux, and the fallback on macOS.
 Queried on macOS for scoped resolver configuration before the
 .I /etc/resolv.conf
 fallback.
+.TP
+.I GetAdaptersAddresses
+Queried on Windows for per-adapter resolver configuration. Each adapter that
+is up and configures a resolver becomes a separate target, labeled with the
+adapter name Windows shows.
 .SH EXAMPLES
 .EX
 speedns --protocol udp --sample 25 --type A --seed 42
