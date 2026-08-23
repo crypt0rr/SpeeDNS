@@ -359,3 +359,39 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 		t.Fatal("paired bootstrap seed ignored target identity")
 	}
 }
+
+// TestRunMeasuresProtocolsInDocumentedOrder pins the protocol execution order
+// to METHODOLOGY.md. catalog.Protocol is a string type, so sorting the group
+// keys by value ordered the groups lexicographically as doh, doq, dot, tcp,
+// udp instead.
+func TestRunMeasuresProtocolsInDocumentedOrder(t *testing.T) {
+	// A target-level fake only takes effect under the legacy scheduler, which
+	// since the scheduler became an explicit choice must be selected
+	// deliberately rather than inferred from the seam being replaced.
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 3, ResponseClass: "answer"}}}
+	})
+	var measured []catalog.Protocol
+	opts := validBenchmarkOptions()
+	opts.OnProgress = func(progress Progress) {
+		if progress.Phase == ProgressPreparing {
+			measured = append(measured, progress.Protocol)
+		}
+	}
+	// Supplied in the lexicographic order the defect produced so the assertion
+	// fails if the input order leaks through.
+	targets := []catalog.Target{
+		testTarget(catalog.DoH, "doh"), testTarget(catalog.DoQ, "doq"), testTarget(catalog.DoT, "dot"),
+		testTarget(catalog.TCP, "tcp"), testTarget(catalog.UDP, "udp"),
+	}
+	if _, err := Run(context.Background(), targets, opts); err != nil {
+		t.Fatal(err)
+	}
+	want := []catalog.Protocol{catalog.UDP, catalog.TCP, catalog.DoH, catalog.DoT, catalog.DoQ}
+	if !reflect.DeepEqual(measured, want) {
+		t.Fatalf("measured protocol order = %#v, want %#v", measured, want)
+	}
+	if !reflect.DeepEqual(want, catalog.AllProtocols) {
+		t.Fatalf("documented order = %#v, want catalog.AllProtocols %#v", want, catalog.AllProtocols)
+	}
+}

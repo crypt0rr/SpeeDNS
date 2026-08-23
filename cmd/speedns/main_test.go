@@ -1289,6 +1289,61 @@ func TestCobraOutputErrorsAreIgnoredBySimpleCommands(t *testing.T) {
 	_ = newRootCommand()
 }
 
+// TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured pins the disclosure that
+// only the first measured protocol group observes a genuine cache miss: every
+// group replays the same generated names against the same resolver cache.
+func TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldNonce := newCacheMissNonceFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		newCacheMissNonceFunc = oldNonce
+	})
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+	const warning = "only the first measured protocol (udp) observes a true cache miss"
+
+	multi := &cliConfig{
+		protocols: "udp,tcp", resolverFlags: []string{"lab=udp://127.0.0.1:53", "labtcp=tcp://127.0.0.1:53"},
+		noDefaults: true, cacheMiss: true, cacheMissSample: 2, sample: 100, seed: 7, queryTypes: "A",
+		timeout: time.Second, concurrency: 1, format: "json", family: "4",
+		output: filepath.Join(t.TempDir(), "multi.json"),
+	}
+	if err := runBenchmark(context.Background(), multi); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(multi.output)
+	if err != nil || !strings.Contains(string(content), warning) || !strings.Contains(string(content), "later protocols (tcp) run against an already warm resolver cache") {
+		t.Fatalf("multi-protocol cache-miss report = %q/%v", content, err)
+	}
+
+	single := *multi
+	single.protocols = "udp"
+	single.resolverFlags = []string{"lab=udp://127.0.0.1:53"}
+	single.output = filepath.Join(t.TempDir(), "single.json")
+	if err := runBenchmark(context.Background(), &single); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(single.output)
+	if err != nil || strings.Contains(string(content), "observes a true cache miss") {
+		t.Fatalf("single-protocol cache-miss report = %q/%v", content, err)
+	}
+
+	warm := *multi
+	warm.cacheMiss = false
+	warm.domainFile = cliDomainFile(t)
+	warm.output = filepath.Join(t.TempDir(), "warm.json")
+	if err := runBenchmark(context.Background(), &warm); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(warm.output)
+	if err != nil || strings.Contains(string(content), "observes a true cache miss") {
+		t.Fatalf("warm-cache report = %q/%v", content, err)
+	}
+}
+
 // TestValidateNormalizationReachesSelectedProfiles guards the split introduced
 // for --family auto. catalog.Validate normalizes profiles in place, so the
 // bundled and explicit views must share one backing array; handing Validate a
