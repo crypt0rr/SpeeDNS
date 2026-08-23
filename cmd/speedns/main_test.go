@@ -20,6 +20,9 @@ import (
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
+
+	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
 )
 
@@ -335,7 +338,7 @@ func TestProgressRendererHandlesConcurrentCompletionStyles(t *testing.T) {
 	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressPreparing, TargetsCompleted: 0, TargetsTotal: 1})
 	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 2})
 	logProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 1, ExchangesTotal: 2})
-	want := "progress doq: preparing 0/1 targets\nprogress udp: preparing 0/1 targets\nprogress doq: measuring 0/2 exchanges\ntested doq 1/1 targets\nprogress udp: measuring 0/2 exchanges\ntested udp 1/1 targets\nprogress tcp: preparing 0/1 targets\nprogress tcp: measuring 0/2 exchanges\ntested tcp 1/1 targets\n"
+	want := "progress doq: preparing 0/1 targets\nprogress udp: preparing 0/1 targets\nprogress doq: preparing 1/1 targets\nprogress doq: measuring 0/2 exchanges\nprogress doq: measuring 2/2 exchanges\ntested doq 1/1 targets\nprogress udp: preparing 1/1 targets\nprogress udp: measuring 0/2 exchanges\nprogress udp: measuring 2/2 exchanges\ntested udp 1/1 targets\nprogress tcp: preparing 0/1 targets\nprogress tcp: preparing 1/1 targets\nprogress tcp: measuring 0/2 exchanges\nprogress tcp: measuring 1/2 exchanges\ntested tcp 1/1 targets\n"
 	if got := logOutput.String(); got != want {
 		t.Fatalf("non-TTY progress = %q, want %q", got, want)
 	}
@@ -408,6 +411,71 @@ func TestProgressRendererHandlesConcurrentUpdates(t *testing.T) {
 	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 32, ExchangesTotal: 32})
 	if !strings.Contains(output.String(), "progress udp: measuring") || !strings.Contains(output.String(), "tested udp 1/1 targets") {
 		t.Fatalf("concurrent progress output = %q", output.String())
+	}
+}
+
+func TestNonInteractiveProgressReportsMilestones(t *testing.T) {
+	var output bytes.Buffer
+	progress := newProgressRenderer(&output, false, []catalog.Protocol{catalog.UDP}, []catalog.Target{{Protocol: catalog.UDP, Address: "192.0.2.1"}})
+	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	for exchange := 0; exchange <= 20; exchange++ {
+		progress.Update(benchmark.Progress{
+			Protocol:           catalog.UDP,
+			Phase:              benchmark.ProgressMeasuring,
+			TargetsCompleted:   1,
+			TargetsTotal:       1,
+			ExchangesCompleted: exchange,
+			ExchangesTotal:     20,
+		})
+	}
+	progress.Update(benchmark.Progress{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 20, ExchangesTotal: 20})
+
+	want := "progress udp: preparing 0/1 targets\n" +
+		"progress udp: preparing 1/1 targets\n" +
+		"progress udp: measuring 0/20 exchanges\n" +
+		"progress udp: measuring 5/20 exchanges\n" +
+		"progress udp: measuring 10/20 exchanges\n" +
+		"progress udp: measuring 15/20 exchanges\n" +
+		"progress udp: measuring 20/20 exchanges\n" +
+		"tested udp 1/1 targets\n"
+	if got := output.String(); got != want {
+		t.Fatalf("milestone progress = %q, want %q", got, want)
+	}
+	if strings.Contains(output.String(), "192.0.2.") || strings.Contains(output.String(), "elapsed") {
+		t.Fatalf("milestone progress leaked an address or an ETA: %q", output.String())
+	}
+}
+
+func TestNonInteractiveProgressReportsFinalStateForSmallAndEmptyTotals(t *testing.T) {
+	var small bytes.Buffer
+	smallProgress := newProgressRenderer(&small, false, []catalog.Protocol{catalog.TCP}, []catalog.Target{{Protocol: catalog.TCP}})
+	smallProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressPreparing, TargetsTotal: 1})
+	smallProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 1, TargetsTotal: 1, ExchangesTotal: 2})
+	smallProgress.Update(benchmark.Progress{Protocol: catalog.TCP, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1, ExchangesCompleted: 2, ExchangesTotal: 2})
+	wantSmall := "progress tcp: preparing 0/1 targets\n" +
+		"progress tcp: preparing 1/1 targets\n" +
+		"progress tcp: measuring 0/2 exchanges\n" +
+		"progress tcp: measuring 2/2 exchanges\n" +
+		"tested tcp 1/1 targets\n"
+	if got := small.String(); got != wantSmall {
+		t.Fatalf("small-total progress = %q, want %q", got, wantSmall)
+	}
+
+	var empty bytes.Buffer
+	emptyProgress := newProgressRenderer(&empty, false, []catalog.Protocol{catalog.DoH}, nil)
+	emptyProgress.Update(benchmark.Progress{Protocol: catalog.DoH, Phase: benchmark.ProgressMeasuring})
+	emptyProgress.Update(benchmark.Progress{Protocol: catalog.DoH, Phase: benchmark.ProgressMeasuring})
+	emptyProgress.Update(benchmark.Progress{Protocol: catalog.DoH, Phase: benchmark.ProgressComplete})
+	wantEmpty := "progress doh: measuring 0/0 exchanges\ntested doh 0/0 targets\n"
+	if got := empty.String(); got != wantEmpty {
+		t.Fatalf("zero-total progress = %q, want %q", got, wantEmpty)
+	}
+
+	var unknown bytes.Buffer
+	unknownProgress := newProgressRenderer(&unknown, false, []catalog.Protocol{catalog.DoT}, nil)
+	unknownProgress.Update(benchmark.Progress{Protocol: catalog.DoT, Phase: benchmark.ProgressPhase("unknown")})
+	if unknown.Len() != 0 {
+		t.Fatalf("unknown progress phase = %q", unknown.String())
 	}
 }
 
@@ -602,10 +670,124 @@ func TestDetectAddressFamilies(t *testing.T) {
 	}
 }
 
+func TestDetectAddressFamiliesIgnoresUniqueLocalIPv6(t *testing.T) {
+	oldInterfaces := listNetworkInterfacesFunc
+	oldAddresses := interfaceAddressesFunc
+	t.Cleanup(func() {
+		listNetworkInterfacesFunc = oldInterfaces
+		interfaceAddressesFunc = oldAddresses
+	})
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "up", Flags: net.FlagUp}}, nil
+	}
+	var addresses []net.Addr
+	interfaceAddressesFunc = func(net.Interface) ([]net.Addr, error) { return addresses, nil }
+
+	// RFC 1918 IPv4 counts because NAT is a real path to the Internet, while
+	// unique-local IPv6 (fc00::/7) is not evidence of a public IPv6 route even
+	// though net.IP.IsGlobalUnicast reports true for it.
+	addresses = []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.168.1.10")},
+		&net.IPNet{IP: net.ParseIP("fd47:a90b:1d35:4f2d::1")},
+		&net.IPNet{IP: net.ParseIP("fd7a:115c:a1e0::6a36:ec14")},
+		&net.IPNet{IP: net.ParseIP("fe80::1")},
+		&net.IPAddr{IP: net.ParseIP("::1")},
+		&net.IPAddr{IP: net.ParseIP("127.0.0.1")},
+		&net.IPNet{IP: net.ParseIP("169.254.1.1")},
+	}
+	available, err := detectAddressFamilies()
+	if err != nil || !available[catalog.Family4] || available[catalog.Family6] {
+		t.Fatalf("ULA-only host families = %#v/%v", available, err)
+	}
+
+	addresses = append(addresses, &net.IPNet{IP: net.ParseIP("2606:4700:4700::1111")})
+	available, err = detectAddressFamilies()
+	if err != nil || !available[catalog.Family4] || !available[catalog.Family6] {
+		t.Fatalf("global-unicast host families = %#v/%v", available, err)
+	}
+}
+
+func TestRunBenchmarkAutoFamilyKeepsExplicitResolvers(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldDetector := detectAddressFamiliesFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		detectAddressFamiliesFunc = oldDetector
+	})
+	var captured []catalog.Target
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		captured = append([]catalog.Target(nil), targets...)
+		return fakeCLIReport(), nil
+	}
+	detectAddressFamiliesFunc = func() (map[catalog.AddressFamily]bool, error) {
+		return map[catalog.AddressFamily]bool{catalog.Family4: true}, nil
+	}
+	newConfig := func(family string) *cliConfig {
+		return &cliConfig{
+			protocols: "udp", resolverFlags: []string{"mine=udp://[fd00::1]:53"}, noDefaults: true,
+			domainFile: cliDomainFile(t), sample: 1, seed: 1, queryTypes: "A", timeout: time.Second,
+			concurrency: 1, format: "json", family: family, output: filepath.Join(t.TempDir(), family+".json"),
+		}
+	}
+	if err := runBenchmark(context.Background(), newConfig("auto")); err != nil {
+		t.Fatalf("auto run with explicit ULA resolver = %v", err)
+	}
+	if len(captured) != 1 || captured[0].Address != "fd00::1" {
+		t.Fatalf("explicit ULA resolver dropped by --family auto: %#v", captured)
+	}
+	if err := runBenchmark(context.Background(), newConfig("4")); err == nil || !strings.Contains(err.Error(), "no resolver addresses match") {
+		t.Fatalf("explicit --family 4 should still filter explicit resolvers: %v", err)
+	}
+}
+
+func TestRunBenchmarkAutoFamilyWarnsAboutDroppedCatalogAddresses(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldDetector := detectAddressFamiliesFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		detectAddressFamiliesFunc = oldDetector
+	})
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+	for _, test := range []struct {
+		name      string
+		available map[catalog.AddressFamily]bool
+		want      string
+		absent    string
+	}{
+		{name: "v4only", available: map[catalog.AddressFamily]bool{catalog.Family4: true}, want: "--family auto detected IPv4 on local interfaces and dropped"},
+		{name: "v6only", available: map[catalog.AddressFamily]bool{catalog.Family6: true}, want: "--family auto detected IPv6 on local interfaces and dropped"},
+		{name: "both", available: map[catalog.AddressFamily]bool{catalog.Family4: true, catalog.Family6: true}, absent: "--family auto detected"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			detectAddressFamiliesFunc = func() (map[catalog.AddressFamily]bool, error) { return test.available, nil }
+			config := &cliConfig{
+				protocols: "udp", domainFile: cliDomainFile(t), sample: 1, seed: 1, queryTypes: "A",
+				timeout: time.Second, concurrency: 1, format: "json", family: "auto",
+				output: filepath.Join(t.TempDir(), "auto.json"),
+			}
+			if err := runBenchmark(context.Background(), config); err != nil {
+				t.Fatalf("auto run = %v", err)
+			}
+			content, err := os.ReadFile(config.output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.want != "" && !strings.Contains(string(content), test.want) {
+				t.Fatalf("missing auto-family warning %q in %s", test.want, content)
+			}
+			if test.absent != "" && strings.Contains(string(content), test.absent) {
+				t.Fatalf("unexpected auto-family warning in %s", content)
+			}
+		})
+	}
+}
+
 func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 	defaultProfiles, err := loadProfiles(context.Background(), &cliConfig{})
-	if err != nil || len(defaultProfiles) != 10 {
-		t.Fatalf("default profiles = %d/%v", len(defaultProfiles), err)
+	if err != nil || len(defaultProfiles.bundled()) != 10 || len(defaultProfiles.explicit()) != 0 || len(defaultProfiles.all()) != 10 {
+		t.Fatalf("default profiles = %#v/%v", defaultProfiles, err)
 	}
 	if _, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true}); err == nil {
 		t.Fatal("expected empty profile selection error")
@@ -620,7 +802,7 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	profiles, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true, resolverFile: validPath, resolverFlags: []string{"extra=tcp://127.0.0.2:5300"}})
-	if err != nil || len(profiles) != 2 {
+	if err != nil || len(profiles.bundled()) != 0 || len(profiles.explicit()) != 2 {
 		t.Fatalf("custom profiles = %#v/%v", profiles, err)
 	}
 	badPath := filepath.Join(dir, "bad.yaml")
@@ -639,7 +821,7 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 		return []catalog.ResolverProfile{{ID: "system", Name: "System", Scope: "corp.example", Interface: "utun0", Addresses: []string{"127.0.0.1"}, Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}}}}, nil
 	}
 	profiles, err = loadProfiles(context.Background(), &cliConfig{noDefaults: true, includeSystem: true})
-	if err != nil || len(profiles) != 1 || profiles[0].ID != "system" || profiles[0].Scope != "corp.example" || profiles[0].Interface != "utun0" {
+	if err != nil || len(profiles.explicit()) != 1 || profiles.explicit()[0].ID != "system" || profiles.explicit()[0].Scope != "corp.example" || profiles.explicit()[0].Interface != "utun0" {
 		t.Fatalf("system profiles = %#v/%v", profiles, err)
 	}
 	discoverSystemResolvers = func(context.Context) ([]catalog.ResolverProfile, error) {
@@ -647,6 +829,35 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 	}
 	if _, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true, includeSystem: true}); err == nil {
 		t.Fatal("expected system discovery error")
+	}
+}
+
+// Discovery can fail for reasons the rest of the run does not depend on, such
+// as an unsupported platform. That must not discard the resolvers the user
+// selected explicitly.
+func TestLoadProfilesWarnsWhenSystemDiscoveryFails(t *testing.T) {
+	oldDiscover := discoverSystemResolvers
+	oldWarningWriter := warningWriterFunc
+	t.Cleanup(func() {
+		discoverSystemResolvers = oldDiscover
+		warningWriterFunc = oldWarningWriter
+	})
+	if oldWarningWriter() != os.Stderr {
+		t.Fatal("warnings must default to stderr")
+	}
+	discoverSystemResolvers = func(context.Context) ([]catalog.ResolverProfile, error) {
+		return nil, &systemdns.UnsupportedPlatformError{OS: "windows"}
+	}
+	var warnings bytes.Buffer
+	warningWriterFunc = func() io.Writer { return &warnings }
+
+	selection, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true, includeSystem: true, resolverFlags: []string{"lab=udp://127.0.0.1:5300"}})
+	profiles := selection.all()
+	if err != nil || len(profiles) != 1 || profiles[0].ID != "custom-lab" {
+		t.Fatalf("profiles with failed system discovery = %#v/%v", profiles, err)
+	}
+	if !strings.Contains(warnings.String(), "system resolver discovery failed") || !strings.Contains(warnings.String(), "windows") {
+		t.Fatalf("discovery warning = %q", warnings.String())
 	}
 }
 
@@ -686,8 +897,8 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 			}
 		})
 	}
-	loadProfilesFunc = func(context.Context, *cliConfig) ([]catalog.ResolverProfile, error) {
-		return []catalog.ResolverProfile{{ID: "bad", Name: "", Addresses: []string{"127.0.0.1"}}}, nil
+	loadProfilesFunc = func(context.Context, *cliConfig) (profileSelection, error) {
+		return profileSelection{profiles: []catalog.ResolverProfile{{ID: "bad", Name: "", Addresses: []string{"127.0.0.1"}}}}, nil
 	}
 	if err := runBenchmark(context.Background(), base()); err == nil {
 		t.Fatal("expected catalog validation error")
@@ -703,6 +914,42 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 	full.sample = 0
 	if err := runBenchmark(context.Background(), full); err != nil {
 		t.Fatalf("full mode should pass sample validation: %v", err)
+	}
+}
+
+func TestRunBenchmarkRejectsUnknownAssertionWinner(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		result := benchmark.TargetResult{Target: targets[0], Stats: benchmark.Statistics{Total: 1, Successes: 1, Scored: 1, SuccessRate: 1, UsableRate: 1, MedianMS: 1, P95MS: 1, ScoreMS: 1}}
+		return benchmark.Report{
+			StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0), Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+			Targets:  []benchmark.TargetResult{result},
+			Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: targets[0].ID(), Rank: 1}},
+		}, nil
+	}
+
+	unknown := cliConfigForTest(t)
+	unknown.output = filepath.Join(t.TempDir(), "unknown.json")
+	unknown.assertions = []string{"winner=custom-labb"}
+	err := runBenchmark(context.Background(), unknown)
+	if err == nil || !strings.Contains(err.Error(), "no selected resolver matches") {
+		t.Fatalf("unknown winner error = %v", err)
+	}
+	if code := exitCodeForError(err); code != 2 {
+		t.Fatalf("unknown winner exit code = %d, want 2 (invalid input) rather than 4", code)
+	}
+	if _, statErr := os.Stat(unknown.output); !os.IsNotExist(statErr) {
+		t.Fatalf("unknown winner must fail before the report is written: %v", statErr)
+	}
+
+	for _, winner := range []string{"custom-lab", "custom-lab@127.0.0.1/udp"} {
+		known := cliConfigForTest(t)
+		known.output = filepath.Join(t.TempDir(), "known.json")
+		known.assertions = []string{"winner=" + winner}
+		if err := runBenchmark(context.Background(), known); err != nil {
+			t.Fatalf("winner=%s run = %v", winner, err)
+		}
 	}
 }
 
@@ -764,6 +1011,19 @@ func TestRunBenchmarkFamilySelection(t *testing.T) {
 	config.family = "4"
 	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "not an IP literal") {
 		t.Fatalf("hostname family error = %v", err)
+	}
+
+	oldLoad := loadProfilesFunc
+	t.Cleanup(func() { loadProfilesFunc = oldLoad })
+	loadProfilesFunc = func(context.Context, *cliConfig) (profileSelection, error) {
+		return profileSelection{profiles: []catalog.ResolverProfile{{
+			ID: "hostname", Name: "Hostname", Owner: "Test", Policy: "unfiltered",
+			Addresses:  []string{"dns.example"},
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}},
+		}}}, nil
+	}
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "not an IP literal") {
+		t.Fatalf("bundled hostname family error = %v", err)
 	}
 }
 
@@ -927,7 +1187,7 @@ func TestRunBenchmarkProgressUsesStderrAndMachineFormatsStaySilent(t *testing.T)
 	if err := runBenchmark(context.Background(), tableConfig); err != nil {
 		t.Fatalf("table benchmark = %v", err)
 	}
-	if got := stderr.String(); got != "progress udp: preparing 0/1 targets\nprogress udp: measuring 0/1 exchanges\ntested udp 1/1 targets\n" {
+	if got := stderr.String(); got != "progress udp: preparing 0/1 targets\nprogress udp: preparing 1/1 targets\nprogress udp: measuring 0/1 exchanges\nprogress udp: measuring 1/1 exchanges\ntested udp 1/1 targets\n" {
 		t.Fatalf("table progress stderr = %q", got)
 	}
 	reportBytes, err := os.ReadFile(tableConfig.output)
@@ -1300,5 +1560,176 @@ func TestRunBenchmarkWarnsWhenSampleTruncatesCacheMissCorpus(t *testing.T) {
 	}
 	if strings.Contains(string(content), "truncated the generated cache-miss corpus") {
 		t.Fatalf("unexpected truncation warning: %s", content)
+	}
+}
+
+func TestParseQueryTypesRejectsZoneTransferAndPseudoTypes(t *testing.T) {
+	rejected := []struct {
+		name     string
+		input    string
+		wantKind string
+	}{
+		{name: "axfr", input: "AXFR", wantKind: "unsafe"},
+		{name: "axfr numeric", input: "252", wantKind: "unsafe"},
+		{name: "ixfr", input: "IXFR", wantKind: "unsafe"},
+		{name: "ixfr numeric", input: "251", wantKind: "unsafe"},
+		{name: "any", input: "ANY", wantKind: "unsafe"},
+		{name: "any numeric", input: "255", wantKind: "unsafe"},
+		{name: "maila", input: "MAILA", wantKind: "unsafe"},
+		{name: "mailb", input: "MAILB", wantKind: "unsafe"},
+		{name: "opt", input: "OPT", wantKind: "invalid"},
+		{name: "opt numeric", input: "41", wantKind: "invalid"},
+		{name: "tsig", input: "TSIG", wantKind: "invalid"},
+		{name: "tkey", input: "TKEY", wantKind: "invalid"},
+		{name: "lowercase", input: "axfr", wantKind: "unsafe"},
+		{name: "trailing member of a list", input: "A,AAAA,AXFR", wantKind: "unsafe"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			types, err := parseQueryTypes(tc.input)
+			if err == nil {
+				t.Fatalf("parseQueryTypes(%q) = %#v, want error", tc.input, types)
+			}
+			if !strings.HasPrefix(err.Error(), tc.wantKind+" DNS query type ") {
+				t.Fatalf("parseQueryTypes(%q) error = %q, want %s classification", tc.input, err, tc.wantKind)
+			}
+		})
+	}
+
+	if _, err := parseQueryTypes("nonsense"); err == nil || !strings.HasPrefix(err.Error(), "unknown DNS query type ") {
+		t.Fatalf("unknown type error = %v, want unknown classification", err)
+	}
+
+	accepted := []struct {
+		name  string
+		input string
+		want  uint16
+	}{
+		{name: "a", input: "A", want: dns.TypeA},
+		{name: "aaaa", input: "aaaa", want: dns.TypeAAAA},
+		{name: "mx", input: "MX", want: dns.TypeMX},
+		{name: "txt", input: "TXT", want: dns.TypeTXT},
+		{name: "srv", input: "SRV", want: dns.TypeSRV},
+		{name: "ns", input: "NS", want: dns.TypeNS},
+		{name: "soa", input: "SOA", want: dns.TypeSOA},
+		{name: "ptr", input: "PTR", want: dns.TypePTR},
+		{name: "caa", input: "CAA", want: dns.TypeCAA},
+		{name: "tlsa", input: "TLSA", want: dns.TypeTLSA},
+		{name: "https", input: "HTTPS", want: dns.TypeHTTPS},
+		{name: "svcb", input: "SVCB", want: dns.TypeSVCB},
+		{name: "unusual numeric", input: "65000", want: 65000},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			types, err := parseQueryTypes(tc.input)
+			if err != nil {
+				t.Fatalf("parseQueryTypes(%q) = %v, want success", tc.input, err)
+			}
+			if len(types) != 1 || types[0] != tc.want {
+				t.Fatalf("parseQueryTypes(%q) = %#v, want [%d]", tc.input, types, tc.want)
+			}
+		})
+	}
+}
+
+// TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured pins the disclosure that
+// only the first measured protocol group observes a genuine cache miss: every
+// group replays the same generated names against the same resolver cache.
+func TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldNonce := newCacheMissNonceFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		newCacheMissNonceFunc = oldNonce
+	})
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+	const warning = "only the first measured protocol (udp) observes a true cache miss"
+
+	multi := &cliConfig{
+		protocols: "udp,tcp", resolverFlags: []string{"lab=udp://127.0.0.1:53", "labtcp=tcp://127.0.0.1:53"},
+		noDefaults: true, cacheMiss: true, cacheMissSample: 2, sample: 100, seed: 7, queryTypes: "A",
+		timeout: time.Second, concurrency: 1, format: "json", family: "4",
+		output: filepath.Join(t.TempDir(), "multi.json"),
+	}
+	if err := runBenchmark(context.Background(), multi); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(multi.output)
+	if err != nil || !strings.Contains(string(content), warning) || !strings.Contains(string(content), "later protocols (tcp) run against an already warm resolver cache") {
+		t.Fatalf("multi-protocol cache-miss report = %q/%v", content, err)
+	}
+
+	single := *multi
+	single.protocols = "udp"
+	single.resolverFlags = []string{"lab=udp://127.0.0.1:53"}
+	single.output = filepath.Join(t.TempDir(), "single.json")
+	if err := runBenchmark(context.Background(), &single); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(single.output)
+	if err != nil || strings.Contains(string(content), "observes a true cache miss") {
+		t.Fatalf("single-protocol cache-miss report = %q/%v", content, err)
+	}
+
+	warm := *multi
+	warm.cacheMiss = false
+	warm.domainFile = cliDomainFile(t)
+	warm.output = filepath.Join(t.TempDir(), "warm.json")
+	if err := runBenchmark(context.Background(), &warm); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(warm.output)
+	if err != nil || strings.Contains(string(content), "observes a true cache miss") {
+		t.Fatalf("warm-cache report = %q/%v", content, err)
+	}
+}
+
+// TestValidateNormalizationReachesSelectedProfiles guards the split introduced
+// for --family auto. catalog.Validate normalizes profiles in place, so the
+// bundled and explicit views must share one backing array; handing Validate a
+// copy silently dropped the scalar trims while map and slice writes still
+// propagated, which made the loss easy to miss.
+func TestValidateNormalizationReachesSelectedProfiles(t *testing.T) {
+	selection := profileSelection{
+		profiles: []catalog.ResolverProfile{{
+			ID: "  spaced-id  ", Name: "  Spaced Name  ", Owner: "  Owner  ",
+			Policy: "  unfiltered  ", Scope: "  scope  ", Interface: "  eth0  ",
+			Addresses:  []string{"192.0.2.1"},
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {}},
+		}},
+		explicitFrom: 0,
+	}
+	if err := catalog.Validate(selection.all()); err != nil {
+		t.Fatal(err)
+	}
+	got := selection.explicit()[0]
+	if got.ID != "spaced-id" || got.Name != "Spaced Name" || got.Owner != "Owner" ||
+		got.Policy != "unfiltered" || got.Scope != "scope" || got.Interface != "eth0" {
+		t.Fatalf("normalization did not reach the selected profile: %#v", got)
+	}
+	if got.Transports[catalog.UDP].Port != 53 {
+		t.Fatalf("default port did not reach the selected profile: %d", got.Transports[catalog.UDP].Port)
+	}
+}
+
+// TestDuplicateProfileIDsAcrossGroupsAreRejected pins that validation still
+// sees bundled and explicit profiles as one set, so a custom resolver cannot
+// silently shadow a bundled identifier.
+func TestDuplicateProfileIDsAcrossGroupsAreRejected(t *testing.T) {
+	profile := func(id string) catalog.ResolverProfile {
+		return catalog.ResolverProfile{
+			ID: id, Name: id, Addresses: []string{"192.0.2.1"},
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}},
+		}
+	}
+	selection := profileSelection{
+		profiles:     []catalog.ResolverProfile{profile("shared"), profile("shared")},
+		explicitFrom: 1,
+	}
+	if err := catalog.Validate(selection.all()); err == nil {
+		t.Fatal("expected a duplicate resolver id across bundled and explicit profiles to be rejected")
 	}
 }
