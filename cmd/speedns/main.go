@@ -87,6 +87,10 @@ var interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
 
 var detectAddressFamiliesFunc = detectAddressFamilies
 
+// exitCodes lists every status the command can return, so documentation can be
+// checked against the contract rather than against a hand-kept list.
+func exitCodes() []int { return []int{0, 2, 3, 4, 130} }
+
 func exitCodeForError(err error) int {
 	switch {
 	case err == nil:
@@ -474,10 +478,21 @@ func detectAddressFamilies() (map[catalog.AddressFamily]bool, error) {
 				continue
 			}
 			if ip.To4() != nil {
+				// IPv4 accepts RFC 1918 addresses because NAT makes a
+				// private v4 address an ordinary path to the Internet.
 				available[catalog.Family4] = true
-			} else {
-				available[catalog.Family6] = true
+				continue
 			}
+			// IPv6 has no NAT equivalent, so a unique-local address
+			// (fc00::/7, which covers Tailscale's fd7a::/48 and the ULAs
+			// many home routers hand out) is not evidence of a public
+			// route even though net.IP.IsGlobalUnicast reports true for
+			// it. Requiring a non-private address keeps auto mode from
+			// selecting IPv6 targets that cannot be reached.
+			if ip.IsPrivate() {
+				continue
+			}
+			available[catalog.Family6] = true
 		}
 	}
 	return available, nil
@@ -695,11 +710,11 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			return err
 		}
 	}
-	profiles, err := loadProfilesFunc(ctx, config)
+	selection, err := loadProfilesFunc(ctx, config)
 	if err != nil {
 		return err
 	}
-	if err := catalog.Validate(profiles); err != nil {
+	if err := catalog.Validate(selection.all()); err != nil {
 		return err
 	}
 	availableFamilies := map[catalog.AddressFamily]bool{}
@@ -709,16 +724,33 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			return err
 		}
 	}
-	profiles, err = catalog.FilterProfilesByFamily(profiles, family, availableFamilies)
+	profiles, err := catalog.FilterProfilesByFamily(selection.bundled(), family, availableFamilies)
 	if err != nil {
 		return err
 	}
+	// Auto mode is a heuristic over the local interface inventory, so it only
+	// prunes the bundled catalog. Resolvers the operator named explicitly
+	// (--resolver, --resolver-file, --include-system) survive auto untouched;
+	// an explicit --family 4/6/both is a deliberate instruction and still
+	// filters everything.
+	explicitProfiles := selection.explicit()
+	if family != catalog.FamilyAuto {
+		explicitProfiles, err = catalog.FilterProfilesByFamily(selection.explicit(), family, availableFamilies)
+		if err != nil {
+			return err
+		}
+	}
+	familyWarnings := autoFamilyWarnings(family, availableFamilies, selection.bundled(), profiles)
+	profiles = append(profiles, explicitProfiles...)
 	if len(profiles) == 0 {
 		return fmt.Errorf("no resolver addresses match --family %s", family)
 	}
 	targets := catalog.Expand(profiles, selected)
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
+	}
+	if err := validateAssertionTargets(assertions, targets); err != nil {
+		return err
 	}
 	seed := config.seed
 	if seed == 0 {
@@ -782,6 +814,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if concurrencyCapped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("cache-miss mode capped concurrency at %d to limit reserved-zone traffic", domains.CacheMissMaxConcurrency))
 	}
+	result.Warnings = append(result.Warnings, familyWarnings...)
 	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {
 		return err
@@ -823,41 +856,109 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	return evaluateAssertions(result, assertions)
 }
 
-func loadProfiles(ctx context.Context, config *cliConfig) ([]catalog.ResolverProfile, error) {
-	var profiles []catalog.ResolverProfile
+// profileSelection keeps the bundled catalog separate from resolvers the
+// operator supplied explicitly so family auto-detection can prune only the
+// former. The split lives here rather than in internal/catalog because the
+// distinction is a CLI-input concern, not a catalog property.
+type profileSelection struct {
+	// profiles holds the bundled catalog first, then the explicit profiles.
+	// They share one slice so catalog.Validate can normalize every profile in
+	// place and still detect duplicate identifiers across both groups; taking
+	// a copy here would silently drop the scalar trims Validate applies.
+	profiles []catalog.ResolverProfile
+	// explicitFrom is the index in profiles where explicit profiles begin.
+	explicitFrom int
+}
+
+// all returns every selected profile, bundled first, backed by the same array
+// the split views use.
+func (selection profileSelection) all() []catalog.ResolverProfile {
+	return selection.profiles
+}
+
+// bundled returns the profiles that came from the built-in catalog.
+func (selection profileSelection) bundled() []catalog.ResolverProfile {
+	return selection.profiles[:selection.explicitFrom]
+}
+
+// explicit returns the profiles the operator named through --resolver,
+// --resolver-file or --include-system.
+func (selection profileSelection) explicit() []catalog.ResolverProfile {
+	return selection.profiles[selection.explicitFrom:]
+}
+
+func loadProfiles(ctx context.Context, config *cliConfig) (profileSelection, error) {
+	var selection profileSelection
 	if !config.noDefaults {
-		profiles = append(profiles, catalog.DefaultResolvers()...)
+		selection.profiles = append(selection.profiles, catalog.DefaultResolvers()...)
 	}
+	// Everything appended from here on was named by the operator.
+	selection.explicitFrom = len(selection.profiles)
 	if config.resolverFile != "" {
 		file, err := os.Open(config.resolverFile)
 		if err != nil {
-			return nil, fmt.Errorf("open resolver file: %w", err)
+			return profileSelection{}, fmt.Errorf("open resolver file: %w", err)
 		}
 		fromFile, loadErr := catalog.LoadYAML(file)
 		_ = file.Close()
 		if loadErr != nil {
-			return nil, loadErr
+			return profileSelection{}, loadErr
 		}
-		profiles = append(profiles, fromFile...)
+		selection.profiles = append(selection.profiles, fromFile...)
 	}
 	for _, raw := range config.resolverFlags {
 		profile, err := catalog.ParseResolverFlag(raw)
 		if err != nil {
-			return nil, err
+			return profileSelection{}, err
 		}
-		profiles = append(profiles, profile)
+		selection.profiles = append(selection.profiles, profile)
 	}
 	if config.includeSystem {
 		fromSystem, err := discoverSystemResolvers(ctx)
 		if err != nil {
-			return nil, err
+			return profileSelection{}, err
 		}
-		profiles = append(profiles, fromSystem...)
+		selection.profiles = append(selection.profiles, fromSystem...)
 	}
-	if len(profiles) == 0 {
-		return nil, errors.New("no resolver profiles selected")
+	if len(selection.profiles) == 0 {
+		return profileSelection{}, errors.New("no resolver profiles selected")
 	}
-	return profiles, nil
+	return selection, nil
+}
+
+// autoFamilyWarnings reports what --family auto pruned from the bundled
+// catalog so the reduced comparison table is visible rather than silent.
+func autoFamilyWarnings(family catalog.AddressFamily, available map[catalog.AddressFamily]bool, before, after []catalog.ResolverProfile) []string {
+	if family != catalog.FamilyAuto {
+		return nil
+	}
+	dropped := countProfileAddresses(before) - countProfileAddresses(after)
+	if dropped <= 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("--family auto detected %s on local interfaces and dropped %d bundled resolver address(es) from other families", describeFamilies(available), dropped)}
+}
+
+func countProfileAddresses(profiles []catalog.ResolverProfile) int {
+	total := 0
+	for _, profile := range profiles {
+		total += len(profile.Addresses)
+	}
+	return total
+}
+
+// describeFamilies names the detected families. Callers only reach it once at
+// least one family was detected; with none detected auto retains both literal
+// families, so nothing is dropped and no warning is produced.
+func describeFamilies(available map[catalog.AddressFamily]bool) string {
+	var names []string
+	if available[catalog.Family4] {
+		names = append(names, "IPv4")
+	}
+	if available[catalog.Family6] {
+		names = append(names, "IPv6")
+	}
+	return strings.Join(names, " and ")
 }
 
 func parseProtocols(value string) ([]catalog.Protocol, error) {
