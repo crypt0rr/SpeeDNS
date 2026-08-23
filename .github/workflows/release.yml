@@ -121,27 +121,21 @@ jobs:
       - name: Install Linux package inspection tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes rpm zstd
 
+      # Build the release tag's own artifacts, unsigned, as the reproducibility
+      # reference. This is deliberately not a --snapshot build: a snapshot
+      # carries a different version string, so comparing two snapshots proves
+      # only that two throwaway builds agree, never that the artifacts this job
+      # goes on to publish are reproducible.
       - name: Build reproducibility reference
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
           version: 'v2.17.1'
-          args: release --snapshot --clean --skip=publish --skip=sign
+          args: release --clean --skip=publish --skip=sign
 
       - name: Save reproducibility reference
         shell: bash
         run: cp -a dist "${RUNNER_TEMP}/speedns-repro-reference"
-
-      - name: Build reproducibility candidate
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
-        with:
-          distribution: goreleaser
-          version: 'v2.17.1'
-          args: release --snapshot --clean --skip=publish --skip=sign
-
-      - name: Compare reproducibility artifacts
-        shell: bash
-        run: bash scripts/compare-release-artifacts.sh "${RUNNER_TEMP}/speedns-repro-reference" dist
 
       - name: Test release scripts fixture
         shell: bash
@@ -155,6 +149,14 @@ jobs:
           args: release --clean --skip=publish
         env:
           COSIGN_YES: 'true'
+
+      # Compare what is about to be published against the independent rebuild.
+      # compare-release-artifacts.sh hashes archives, packages, SBOMs and
+      # checksums.txt only, so the signing step's extra files do not affect it
+      # and checksums.txt itself is unchanged by signing.
+      - name: Verify the published artifacts are reproducible
+        shell: bash
+        run: bash scripts/compare-release-artifacts.sh "${RUNNER_TEMP}/speedns-repro-reference" dist
 
       - name: Verify and smoke-test exact release assets
         shell: bash

@@ -138,7 +138,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 		}
 		results = append(results, jsonResult)
 	}
-	rankings := append([]benchmark.Ranking(nil), report.Rankings...)
+	rankings := append(make([]benchmark.Ranking, 0, len(report.Rankings)), report.Rankings...)
 	for index := range rankings {
 		if redactedID, ok := redactedIDs[rankings[index].TargetID]; ok {
 			rankings[index].TargetID = redactedID
@@ -827,15 +827,22 @@ func pairedEffectTargetText(report benchmark.Report, targetID string, redactSyst
 	return strings.TrimSpace(view.Owner + " " + view.Address)
 }
 
+// pairedComparable reports whether an effect carries a usable delta and
+// interval. Any effect that benchmark left unmeasured records a Reason, which
+// includes samples below the paired minimum, so no reason means measured.
+func pairedComparable(effect benchmark.PairedEffect) bool {
+	return effect.Samples > 0 && effect.Reason == ""
+}
+
 func pairedDeltaText(effect benchmark.PairedEffect) string {
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return "—"
 	}
 	return fmt.Sprintf("%+.2f ms", effect.MedianDeltaMS)
 }
 
 func pairedCIText(effect benchmark.PairedEffect) string {
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return "—"
 	}
 	return fmt.Sprintf("[%+.2f, %+.2f] ms", effect.CILowMS, effect.CIHighMS)
@@ -845,7 +852,7 @@ func pairedInterpretation(effect benchmark.PairedEffect, color bool) string {
 	if effect.Reference {
 		return styledStatus("REFERENCE", color)
 	}
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return styledStatus("NOT COMPARABLE", color)
 	}
 	if effect.Indistinguishable || effect.MedianDeltaMS == 0 {

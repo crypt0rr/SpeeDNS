@@ -846,6 +846,45 @@ func TestReportFormattingBranchesAndWriteErrors(t *testing.T) {
 	}
 }
 
+func TestPairedEffectsBelowMinimumSamplesAreNotComparable(t *testing.T) {
+	first := reportTarget("first", catalog.UDP, 1, false)
+	second := reportTarget("second", catalog.UDP, 1, false)
+	reason := "insufficient paired samples (minimum 20)"
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{first, second},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: first.Target.ID(), Rank: 1}},
+		PairedEffects: []benchmark.PairedEffect{
+			{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: first.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 1, Reference: true},
+			{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: second.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 1, Reason: reason},
+		},
+	}
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	tableText := table.String()
+	if !strings.Contains(tableText, "NOT COMPARABLE") {
+		t.Fatalf("below-minimum paired row is not marked incomparable: %s", tableText)
+	}
+	if strings.Contains(tableText, "FASTER") || strings.Contains(tableText, "SLOWER") {
+		t.Fatalf("below-minimum paired row rendered a directional verdict: %s", tableText)
+	}
+
+	// A stale delta or interval must never reach the table once benchmark has
+	// recorded a reason for the effect.
+	stale := benchmark.PairedEffect{Samples: 1, MedianDeltaMS: 83.42, CILowMS: 83.42, CIHighMS: 83.42, Reason: reason}
+	if got := pairedInterpretation(stale, false); got != "NOT COMPARABLE" {
+		t.Fatalf("below-minimum interpretation = %q", got)
+	}
+	if pairedDeltaText(stale) != "—" || pairedCIText(stale) != "—" {
+		t.Fatalf("below-minimum formatting = %q/%q", pairedDeltaText(stale), pairedCIText(stale))
+	}
+	if strings.Contains(tableText, "83.42") {
+		t.Fatalf("below-minimum paired row rendered a delta: %s", tableText)
+	}
+}
+
 func TestPairedEffectsAreRenderedExportedAndRedacted(t *testing.T) {
 	first := reportTarget("first", catalog.UDP, 2, true)
 	second := reportTarget("second", catalog.UDP, 2, false)

@@ -31,14 +31,18 @@ Use the `arm64` asset on a 64-bit ARM host. Package-manager signatures are
 not substituted for the release checksum and Sigstore verification described
 below.
 
-### Homebrew / Linuxbrew
+### Homebrew (macOS)
 
-Install the SpeeDNS cask from the tap on macOS or Debian/Linux with Linuxbrew:
+Install the SpeeDNS cask from the tap on macOS:
 
 ```sh
 brew tap crypt0rr/speedns
 brew install --cask speedns
 ```
+
+Homebrew casks are macOS-only, so `brew install --cask` does not work under
+Linuxbrew. On Linux, install the Debian, RPM, APK, or Arch package from the
+release assets instead; those also install the man page.
 
 After installation, verify the command and run a benchmark:
 
@@ -81,9 +85,9 @@ speedns completion fish >speedns.fish
 speedns completion powershell >speedns.ps1
 ```
 
-Release archives include `speedns.1`; Debian packages install it as
-`/usr/share/man/man1/speedns.1`. View it directly from an extracted archive
-with `man ./speedns.1`.
+Release archives include `docs/speedns.1`; Debian, RPM, APK, and Arch packages
+install it as `/usr/share/man/man1/speedns.1`. View it directly from an
+extracted archive with `man ./docs/speedns.1`.
 
 The canonical Go module path is `github.com/crypt0rr/SpeeDNS`. Install the
 latest published command directly with:
@@ -114,7 +118,7 @@ Release archives also carry a GitHub artifact attestation. With the GitHub CLI,
 verify an archive against this repository:
 
 ```sh
-gh attestation verify speedns_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS
+gh attestation verify SpeeDNS_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS
 ```
 
 Replace the archive name with the exact asset you downloaded. The release
@@ -208,7 +212,9 @@ tables. Within each protocol and policy group, the best-ranked target is the
 reference. The effect is the median per-name/type latency difference
 (`target - reference`) with a deterministic bootstrap 95% confidence interval.
 `NO CLEAR DIFFERENCE` means the interval includes zero, so the measured
-difference is not distinguishable from noise. These comparisons explain the
+difference is not distinguishable from noise. A comparison needs at least 20
+paired observations; below that the row reports `NOT COMPARABLE` instead of a
+delta and interval. These comparisons explain the
 ranking but do not replace the existing score or change rank order. JSON
 includes the same information in the additive `paired_effects` section; CSV
 keeps its aggregate schema.
@@ -314,6 +320,12 @@ resolvers:
         bootstrap_addresses:
           - 192.0.2.53
 ```
+
+Each entry in `addresses` must be an IP literal (`192.0.2.53`,
+`2001:db8::53`, `[2001:db8::53]`, or a zoned link-local such as
+`fe80::1%eth0`) or a hostname (`dns.example`). Do not append a port: the port
+belongs in the transport spec's `port:` field, and an address such as
+`192.0.2.53:5353` is rejected before the benchmark starts.
 
 Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order. TLS certificate validation is always enabled.
 
@@ -523,11 +535,13 @@ Supported metrics are `usable` and `success` (rates from `0` to `1`) plus
 `median`, `p95`, and `score` (milliseconds). Bare latency numbers are treated
 as milliseconds; duration suffixes such as `50ms` and `1.5s` are also
 accepted. Operators are `>=`, `>`, `<=`, `<`, and `=`. `winner=` accepts a
-resolver profile ID or a complete target ID. A tied rank-one result satisfies
-the winner assertion. Invalid expressions return status `2`; failed
-assertions return status `4` after the normal report has been written. Status
-`3` for no comparable results and status `130` for interruption take
-precedence.
+resolver profile ID or a complete target ID, and is checked against the
+targets actually selected for the run before any query is sent: a `winner=`
+value that matches no selected resolver is invalid input (status `2`), not a
+lost comparison. A tied rank-one result satisfies the winner assertion.
+Invalid expressions return status `2`; failed assertions return status `4`
+after the normal report has been written. Status `3` for no comparable results
+and status `130` for interruption take precedence.
 
 ## Troubleshooting
 
