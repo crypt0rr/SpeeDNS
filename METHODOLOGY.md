@@ -352,11 +352,17 @@ resolver that answers every query but reconnects for each one has all of its
 samples excluded from warm-latency scoring, so it is unranked while being
 entirely healthy; requiring a ranking would fail that run.
 
-Numeric assertions are evaluated against every qualified or provisional
-winner for every protocol that produced a ranking. `winner=PROFILE-ID` or
-`winner=TARGET-ID` requires the requested profile or target to be among the
-rank-one winners for every such protocol. Confidence-interval ties therefore
-count as winner membership. The requested winner is checked against the
+Numeric assertions are evaluated against the rank-one target of every protocol
+that produced a ranking -- one target per protocol, chosen deterministically.
+Confidence-interval tie-group members are deliberately not included: tie
+membership depends on bootstrap interval overlap, so it moves with sample size
+and network noise, and a threshold applied to the whole group would pass or
+fail the same command on identical infrastructure.
+
+`winner=PROFILE-ID` or `winner=TARGET-ID` is a different question and keeps the
+wider set: it requires the requested profile or target to be among the rank-one
+winners for every such protocol, and confidence-interval ties count as winner
+membership, because a tie means the run cannot say the resolver did not win. The requested winner is checked against the
 targets selected for the run before any query is sent, so an ID that no
 selected profile or target carries is invalid input (status 2) rather than a
 lost comparison; a benchmark never reports that a resolver failed to win when

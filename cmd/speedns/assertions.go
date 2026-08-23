@@ -147,6 +147,7 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 	}
 	reasons := make([]string, 0)
 	winners := reportWinners(report)
+	leaders := rankOneWinners(report)
 	// A transport that failed outright must not be a quieter result than one
 	// that merely degraded. Reported before the individual checks so the
 	// structural failure leads the message.
@@ -174,11 +175,19 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 			continue
 		}
 		for _, protocol := range winnerProtocols(winners) {
-			for _, winner := range winners[protocol] {
-				actual, ok := assertionMetricValue(winner, check.metric)
-				if !ok || !assertionComparison(actual, check.operator, check.value) {
-					reasons = append(reasons, fmt.Sprintf("%s: %s winner %s has %s=%s", check.raw, protocol, winner.Target.ID(), check.metric, assertionActualText(check.metric, actual)))
-				}
+			winner, ranked := leaders[protocol]
+			if !ranked {
+				// The protocol produced rankings -- reportWinners admitted a
+				// tie-group member for it -- but no rank-one entry. That is a
+				// malformed report rather than a healthy run, and skipping it
+				// would leave the threshold silently unchecked, which is the
+				// failure mode #106 removed.
+				reasons = append(reasons, fmt.Sprintf("%s: %s produced no rank-one target to check", check.raw, protocol))
+				continue
+			}
+			actual, ok := assertionMetricValue(winner, check.metric)
+			if !ok || !assertionComparison(actual, check.operator, check.value) {
+				reasons = append(reasons, fmt.Sprintf("%s: %s winner %s has %s=%s", check.raw, protocol, winner.Target.ID(), check.metric, assertionActualText(check.metric, actual)))
 			}
 		}
 	}
@@ -230,6 +239,33 @@ func deadProtocols(report benchmark.Report) []catalog.Protocol {
 	// every other part of the report does.
 	sort.Slice(dead, func(i, j int) bool { return catalog.CompareProtocols(dead[i], dead[j]) < 0 })
 	return dead
+}
+
+// rankOneWinners returns the single rank-one target of each protocol.
+//
+// reportWinners deliberately admits every confidence-interval tie-group member,
+// because `winner=ID` asks whether a resolver won and a tie means the run
+// cannot say it did not. Numeric thresholds are a different question. Applying
+// `p95<50ms` to the whole tie group makes the number of targets it must hold
+// for a function of network noise -- measured against the bundled catalog it
+// was 6, 3 and 10 of 10 targets at --sample 3, 10 and 25 -- so the same command
+// passes or fails on identical infrastructure. That is non-determinism rather
+// than strictness, and it contradicts what README and METHODOLOGY promise.
+func rankOneWinners(report benchmark.Report) map[catalog.Protocol]benchmark.TargetResult {
+	results := make(map[string]benchmark.TargetResult, len(report.Targets))
+	for _, result := range report.Targets {
+		results[result.Target.ID()] = result
+	}
+	leaders := make(map[catalog.Protocol]benchmark.TargetResult)
+	for _, ranking := range report.Rankings {
+		if ranking.Rank != 1 {
+			continue
+		}
+		if result, ok := results[ranking.TargetID]; ok {
+			leaders[ranking.Protocol] = result
+		}
+	}
+	return leaders
 }
 
 func reportWinners(report benchmark.Report) map[catalog.Protocol][]benchmark.TargetResult {
