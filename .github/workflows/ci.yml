@@ -103,6 +103,42 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  toolchain-matrix:
+    name: Toolchain (go${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - '1.25.x'
+          - 'stable'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Report toolchain
+        run: go version
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      # Behaviour that depends on the standard library or on toolchain-selected
+      # data tables must hold on every supported Go release, not only on the
+      # pinned one used for releases. Dependency behaviour can change with the
+      # toolchain: golang.org/x/net/idna selects its Unicode tables with build
+      # tags such as //go:build go1.27.
+      - name: Run unit and integration tests
+        run: go test -count=1 ./...
+
   cross-build:
     name: Cross-build release targets
     runs-on: ubuntu-latest
