@@ -31,9 +31,10 @@ var currentOS = runtime.GOOS
 var resolvConfPath = "/etc/resolv.conf"
 
 // resolvConfPlatforms lists the operating systems that publish the active
-// resolver set through /etc/resolv.conf. Anything outside this set (Windows
-// above all) has no discovery implementation here, and opening a Unix path
-// there would report a missing file rather than the real limitation.
+// resolver set through /etc/resolv.conf. macOS and Windows are handled
+// separately; anything outside all three has no discovery implementation here,
+// and opening a Unix path there would report a missing file rather than the
+// real limitation.
 var resolvConfPlatforms = map[string]bool{
 	"aix":       true,
 	"android":   true,
@@ -53,9 +54,10 @@ var resolvConfPlatforms = map[string]bool{
 // other resolvers can treat it as a warning instead of a fatal error.
 var ErrUnsupportedPlatform = errors.New("system resolver discovery is not supported on this platform")
 
-// UnsupportedPlatformError names the platform that cannot be inspected.
-// Windows would need GetAdaptersAddresses, which this build does not
-// implement.
+// UnsupportedPlatformError names the platform that cannot be inspected. Linux
+// and the BSDs are read through /etc/resolv.conf, macOS through scutil, and
+// Windows through GetAdaptersAddresses; a platform outside those exposes its
+// resolver set some other way that this build does not know about.
 type UnsupportedPlatformError struct {
 	OS string
 }
@@ -100,16 +102,19 @@ type macOSResolverBlock struct {
 }
 
 // Discover reads the current system resolver configuration without changing
-// it. macOS exposes scoped resolver blocks through scutil; Linux generally
+// it. macOS exposes scoped resolver blocks through scutil; Windows exposes
+// per-adapter resolver sets through GetAdaptersAddresses; Linux generally
 // exposes the active set through resolv.conf (including a systemd-resolved
-// stub). Each macOS block remains a separate system profile, even when two
-// blocks contain the same nameserver address.
+// stub). Each macOS block and each Windows adapter remains a separate system
+// profile, even when two of them contain the same nameserver address.
 func Discover(ctx context.Context) ([]catalog.ResolverProfile, error) {
 	var sources []resolverSource
 	var err error
 	switch {
 	case currentOS == "darwin":
 		sources, err = discoverMacOSSources(ctx)
+	case currentOS == "windows":
+		sources, err = discoverWindowsSources()
 	case resolvConfPlatforms[currentOS]:
 		var addresses []string
 		addresses, err = discoverResolvConf()

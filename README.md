@@ -411,13 +411,14 @@ Use `--include-system` to include the resolver configured by the operating syste
 ./speedns --include-system
 ```
 
-This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. Separate macOS scopes remain separate targets even when they use the same address. Link-local IPv6 nameservers keep their zone (`fe80::1%en0`) so they stay dialable.
+This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. On Windows, it reads the per-adapter configuration through `GetAdaptersAddresses`, the same source the Windows resolver uses; adapters that are down are skipped, as are the `fec0:0:0:ffff::/64` placeholders Windows lists on adapters with no IPv6 DNS configured.
 
-Windows has no system resolver discovery yet, and `--include-system` reports
-it as an unsupported platform. Discovery failures do not abort a run: when
-other resolvers are selected, SpeeDNS prints a warning on stderr and
-benchmarks the rest. `--include-system` on its own still fails, because the
-run would have no resolver left.
+Separate macOS scopes and separate Windows adapters remain separate targets even when they use the same address, because a laptop on Wi-Fi with a VPN up is running two different resolver paths and folding them together would hide the comparison. Link-local IPv6 nameservers keep their zone (`fe80::1%en0` on macOS, `fe80::1%12` on Windows) so they stay dialable.
+
+Discovery failures do not abort a run: when other resolvers are selected,
+SpeeDNS prints a warning on stderr and benchmarks the rest.
+`--include-system` on its own still fails, because the run would have no
+resolver left.
 
 macOS discovery gives `scutil --dns` a two-second independent timeout. If it
 times out or returns no usable nameservers, SpeeDNS falls back to

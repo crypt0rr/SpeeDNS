@@ -193,6 +193,20 @@ jobs:
           ./dist/speedns-linux-amd64 version
           ls -lh dist
 
+      - name: Compile-check platforms that ship only through go install
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Windows is not a release target, but `go install` works there and
+          # internal/systemdns has a Windows-only resolver-discovery path that
+          # no other job compiles or vets.
+          for target in windows/amd64 windows/arm64; do
+            IFS=/ read -r goos goarch <<< "${target}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" go build -o /dev/null ./...
+            GOOS="${goos}" GOARCH="${goarch}" go vet ./...
+            echo "compiled and vetted ${goos}/${goarch}"
+          done
+
       - name: Upload cross-build binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

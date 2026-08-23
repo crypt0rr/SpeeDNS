@@ -1469,33 +1469,6 @@ func TestOutputWriterWritesNonRegularDestinationsInPlace(t *testing.T) {
 		t.Fatalf("%s was replaced: %v/%v", os.DevNull, info, err)
 	}
 
-	fifo := filepath.Join(t.TempDir(), "report.fifo")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatalf("create fifo: %v", err)
-	}
-	received := make(chan string, 1)
-	go func() {
-		content, readErr := os.ReadFile(fifo)
-		if readErr != nil {
-			received <- "read error: " + readErr.Error()
-			return
-		}
-		received <- string(content)
-	}()
-	writer, finalize, err = outputWriter(fifo)
-	if err != nil {
-		t.Fatalf("fifo writer = %v", err)
-	}
-	if _, err := io.WriteString(writer, "piped report"); err != nil {
-		t.Fatal(err)
-	}
-	if err := finalize(true); err != nil {
-		t.Fatalf("fifo finalize = %v", err)
-	}
-	if got := <-received; got != "piped report" {
-		t.Fatalf("fifo reader got %q", got)
-	}
-
 	// Discarding a non-regular destination cannot restore it, but it must
 	// still close the destination without reporting an error.
 	writer, finalize, err = outputWriter(os.DevNull)

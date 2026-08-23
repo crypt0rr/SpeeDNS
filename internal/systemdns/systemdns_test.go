@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -382,8 +383,8 @@ func TestDiscoverKeepsZonedIPv6Nameserver(t *testing.T) {
 	}
 }
 
-// Windows has no discovery implementation here, so the caller must be told
-// which platform is unsupported instead of being handed a missing Unix path.
+// A platform with no discovery implementation must tell the caller which
+// platform is unsupported instead of handing back a missing Unix path.
 func TestDiscoverUnsupportedPlatform(t *testing.T) {
 	oldOS := currentOS
 	oldOpen := openResolvConf
@@ -391,7 +392,7 @@ func TestDiscoverUnsupportedPlatform(t *testing.T) {
 		currentOS = oldOS
 		openResolvConf = oldOpen
 	})
-	currentOS = "windows"
+	currentOS = "plan9"
 	openResolvConf = func() (io.ReadCloser, error) {
 		t.Error("resolv.conf must not be opened on an unsupported platform")
 		return nil, errors.New("unexpected open")
@@ -405,10 +406,126 @@ func TestDiscoverUnsupportedPlatform(t *testing.T) {
 		t.Fatalf("unsupported sentinel = %v", err)
 	}
 	var unsupported *UnsupportedPlatformError
-	if !errors.As(err, &unsupported) || unsupported.OS != "windows" {
+	if !errors.As(err, &unsupported) || unsupported.OS != "plan9" {
 		t.Fatalf("unsupported platform error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "windows") || strings.Contains(err.Error(), "resolv.conf") {
+	if !strings.Contains(err.Error(), "plan9") || strings.Contains(err.Error(), "resolv.conf") {
 		t.Fatalf("unsupported platform message = %q", err.Error())
+	}
+}
+
+// withWindowsAdapters points discovery at a fixed adapter table so the Windows
+// path can be exercised on any host, the way the macOS path is exercised
+// through recorded scutil output.
+func withWindowsAdapters(t *testing.T, adapters []windowsAdapter, err error) {
+	t.Helper()
+	oldOS, oldDiscover, oldOpen := currentOS, discoverWindowsAdapters, openResolvConf
+	t.Cleanup(func() {
+		currentOS, discoverWindowsAdapters, openResolvConf = oldOS, oldDiscover, oldOpen
+	})
+	currentOS = "windows"
+	discoverWindowsAdapters = func() ([]windowsAdapter, error) { return adapters, err }
+	openResolvConf = func() (io.ReadCloser, error) {
+		t.Error("resolv.conf must not be read on Windows")
+		return nil, errors.New("unexpected open")
+	}
+}
+
+// TestDiscoverWindowsKeepsAdaptersSeparate is the shape that matters on a
+// Windows laptop: Wi-Fi and a VPN each configure their own resolvers, and a
+// benchmark that folded them together would hide exactly the comparison the
+// operator is running. Each adapter becomes its own numbered block, labeled
+// with the name Windows itself shows.
+func TestDiscoverWindowsKeepsAdaptersSeparate(t *testing.T) {
+	withWindowsAdapters(t, []windowsAdapter{
+		{Index: 12, Name: "Wi-Fi", Nameservers: []string{"192.168.1.1", "192.168.1.1", "fe80::1%12"}},
+		{Index: 30, Name: "Corp VPN", Nameservers: []string{"192.168.1.1"}},
+	}, nil)
+
+	profiles, err := Discover(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 3 {
+		t.Fatalf("windows profiles = %#v", profiles)
+	}
+	// The duplicate within the Wi-Fi adapter is dropped; the same address on
+	// a different adapter is a genuinely different resolver path and stays.
+	got := make([]string, 0, len(profiles))
+	for _, profile := range profiles {
+		got = append(got, profile.ID+" | "+profile.Name+" | "+profile.Addresses[0])
+	}
+	want := []string{
+		"system-resolver-1-192-168-1-1 | System DNS (interface: Wi-Fi) | 192.168.1.1",
+		"system-resolver-1-fe80--1-12 | System DNS (interface: Wi-Fi) | fe80::1%12",
+		"system-resolver-2-192-168-1-1 | System DNS (interface: Corp VPN) | 192.168.1.1",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("profile %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestWindowsSourcesDropsUnusableEntries covers what must never reach a
+// ranking: the site-local placeholders Windows lists on adapters with no IPv6
+// DNS at all, and anything that is not an address. An adapter left with
+// nothing does not consume a block number, so the report has no gaps.
+func TestWindowsSourcesDropsUnusableEntries(t *testing.T) {
+	sources := windowsSources([]windowsAdapter{
+		{Index: 3, Name: "Ethernet", Nameservers: []string{"fec0:0:0:ffff::1", "fec0:0:0:ffff::2", "fec0:0:0:ffff::3"}},
+		{Index: 4, Name: "  ", Nameservers: []string{"not-an-address", "9.9.9.9"}},
+		{Index: 0, Name: "", Nameservers: []string{"1.1.1.1"}},
+	})
+	if len(sources) != 2 {
+		t.Fatalf("windows sources = %#v", sources)
+	}
+	if sources[0].Block != 1 || sources[0].Address != "9.9.9.9" || sources[0].Interface != "if-index-4" {
+		t.Fatalf("first usable source = %#v", sources[0])
+	}
+	if sources[1].Block != 2 || sources[1].Address != "1.1.1.1" || sources[1].Interface != "" {
+		t.Fatalf("unnamed source = %#v", sources[1])
+	}
+}
+
+// TestWindowsInterfaceLabelFlattensAdapterNames guards the aligned report
+// table: adapter names are user-editable in Windows, so a name carrying a
+// newline or a run of tabs must not break the column layout downstream.
+func TestWindowsInterfaceLabelFlattensAdapterNames(t *testing.T) {
+	label := windowsInterfaceLabel(windowsAdapter{Index: 7, Name: "  Wi-Fi\n\t 5GHz  "})
+	if label != "Wi-Fi 5GHz" {
+		t.Fatalf("adapter label = %q", label)
+	}
+}
+
+// TestDiscoverWindowsReportsFailures keeps the two failure modes distinct: the
+// adapter table could not be read at all, and it was read but configured no
+// usable resolver. The second is not an error from the API, so the package
+// must produce the message itself.
+func TestDiscoverWindowsReportsFailures(t *testing.T) {
+	withWindowsAdapters(t, nil, errors.New("read Windows adapter addresses: access denied"))
+	if _, err := Discover(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("adapter read failure = %v", err)
+	}
+
+	withWindowsAdapters(t, []windowsAdapter{{Index: 9, Name: "Ethernet"}}, nil)
+	if _, err := Discover(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "no system nameservers found") {
+		t.Fatalf("empty adapter table = %v", err)
+	}
+}
+
+// TestPlatformWindowsAdaptersIsBuildGated documents the seam: on a build that
+// is not Windows the real reader is absent, and the placeholder says so rather
+// than pretending the host has no resolvers. Discover never routes here in
+// production because currentOS mirrors runtime.GOOS.
+func TestPlatformWindowsAdaptersIsBuildGated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("this build has the real adapter reader")
+	}
+	adapters, err := platformWindowsAdapters()
+	if adapters != nil || err == nil || !strings.Contains(err.Error(), "not built for Windows") {
+		t.Fatalf("placeholder reader = %#v/%v", adapters, err)
 	}
 }
