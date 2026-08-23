@@ -1,101 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Offline regression test for publish-live-results.py. Every evidence file is
+# encoded by the real speedns report writer, so a shape the encoder cannot
+# produce can never make this fixture pass. Nothing contacts a resolver.
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "${temporary_dir}"' EXIT
 
 evidence_dir="${temporary_dir}/evidence"
 results_dir="${temporary_dir}/results"
-mkdir -p "${evidence_dir}"
 
-python3 - "${evidence_dir}" <<'PY'
-import json
-import pathlib
-import sys
-
-output = pathlib.Path(sys.argv[1])
-endpoints = {
-    "udp": {"address": "8.8.8.8"},
-    "tcp": {"address": "8.8.8.8"},
-    "doh": {
-        "address": "dns.google",
-        "endpoint_url": "https://dns.google/dns-query",
-        "tls_server_name": "dns.google",
-    },
-    "dot": {"address": "dns.google", "tls_server_name": "dns.google"},
-    "doq": {"address": "dns.quad9.net", "tls_server_name": "dns.quad9.net"},
+# Evidence is produced by the real report encoder instead of a hand-written
+# literal, so the publisher is only ever asked to accept JSON that speedns can
+# actually emit. The generator never dials a resolver.
+generate_evidence() {
+	local target_dir="$1"
+	local failed="${2:-}"
+	(cd "${root_dir}" && go run ./scripts/testdata/live-results-evidence \
+		--output-dir "${target_dir}" \
+		--failed "${failed}")
 }
-protocols = list(endpoints)
-for protocol, endpoint in endpoints.items():
-    target = {
-        "id": f"fixture-{protocol}",
-        "name": "Fixture resolver",
-        "owner": "Fixture <script>",
-        "policy": "unfiltered & <test>",
-        "address": endpoint["address"],
-        "protocol": protocol,
-        **endpoint,
-    }
-    stats = {
-        "total": 1,
-        "successes": 1,
-        "failures": 0,
-        "usable_responses": 1,
-        "resolver_failures": 0,
-        "scored": 1,
-        "divergent": 0,
-        "truncated": 0,
-        "reconnects": 0,
-        "success_rate": 1.0,
-        "failure_rate": 0.0,
-        "usable_rate": 1.0,
-        "resolver_failure_rate": 0.0,
-        "scoring_failure_rate": 0.0,
-        "median_ms": 12.34,
-        "p95_ms": 15.67,
-        "min_ms": 10.0,
-        "max_ms": 17.0,
-        "mad_ms": 1.0,
-        "cold_median_ms": 20.0,
-        "score_ms": 13.67,
-        "ci_low_ms": 11.0,
-        "ci_high_ms": 16.0,
-        "recommended": True,
-        "tie": False,
-    }
-    report = {
-        "schema_version": 1,
-        "run": {
-            "started_at": "2026-01-02T03:00:00.000Z",
-            "finished_at": "2026-01-02T03:00:01.000Z",
-            "seed": 42,
-            "corpus_mode": "warm-cache",
-            "corpus_zone": "",
-            "sample_size": 1,
-            "queries_per_target": 1,
-            "query_types": [1],
-            "provenance": {
-                "speedns_version": "fixture",
-                "commit": "0123456789abcdef0123456789abcdef01234567",
-                "build_date": "fixture",
-                "os": "linux",
-                "architecture": "amd64",
-                "interfaces": [],
-                "protocols": [protocol],
-                "corpus_entries": 1000,
-                "corpus_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "timeout_ms": 5000,
-                "concurrency": 1,
-                "duration_ms": 1000.0,
-            },
-        },
-        "results": [{"target": target, "stats": stats}],
-        "rankings": [{"protocol": protocol, "target_id": target["id"], "rank": 1, "tie": False}],
-        "warnings": [],
-    }
-    (output / f"{protocol}.json").write_text(json.dumps(report) + "\n", encoding="utf-8")
-PY
+
+# Published records are checked against the schema the publisher ships beside
+# them rather than against this script's expectations.
+validate_record() {
+	local published="$1"
+	python3 "${root_dir}/scripts/testdata/validate-json-schema.py" \
+		--schema "${published}/live-results-v1.schema.json" \
+		--instance "${published}/latest.json"
+}
+
+generate_evidence "${evidence_dir}"
 cp -R "${evidence_dir}" "${temporary_dir}/original-evidence"
 
 export SPEEDNS_RESULTS_RUN_ID=fixture-run
@@ -123,6 +59,7 @@ if grep -Fq '<script>' "${results_dir}/index.html"; then
 	echo "HTML escaping fixture failed" >&2
 	exit 1
 fi
+validate_record "${results_dir}"
 python3 - "${results_dir}/latest.json" <<'PY'
 import json
 import pathlib
@@ -131,6 +68,7 @@ import sys
 record = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert record["run"]["outcome"] == "passed"
 assert record["run"]["seed"] == 42
+assert record["failures"] == []
 assert len(record["transports"]) == 5
 assert len(record["summary"]) == 5
 PY
@@ -180,47 +118,24 @@ if python3 "${root_dir}/scripts/publish-live-results.py" \
 	exit 1
 fi
 
-cp -R "${temporary_dir}/original-evidence" "${temporary_dir}/no-comparable-evidence"
+generate_evidence "${temporary_dir}/no-comparable-evidence" doq
 python3 - "${temporary_dir}/no-comparable-evidence/doq.json" <<'PY'
 import json
 import pathlib
 import sys
 
-path = pathlib.Path(sys.argv[1])
-report = json.loads(path.read_text(encoding="utf-8"))
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert report["rankings"] == [], report["rankings"]
 stats = report["results"][0]["stats"]
-stats.update(
-    {
-        "successes": 0,
-        "failures": 1,
-        "usable_responses": 0,
-        "resolver_failures": 0,
-        "scored": 0,
-        "success_rate": 0.0,
-        "failure_rate": 1.0,
-        "usable_rate": 0.0,
-        "resolver_failure_rate": 0.0,
-        "scoring_failure_rate": 1.0,
-        "median_ms": 0.0,
-        "p95_ms": 0.0,
-        "min_ms": 0.0,
-        "max_ms": 0.0,
-        "mad_ms": 0.0,
-        "cold_median_ms": 0.0,
-        "score_ms": 0.0,
-        "ci_low_ms": 0.0,
-        "ci_high_ms": 0.0,
-        "recommended": False,
-        "tie": False,
-    }
-)
-report["rankings"] = []
-path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+for key in ("cold_median_ms", "ci_low_ms", "ci_high_ms", "tie"):
+    assert key in stats, f"encoder dropped stats.{key} for a failed transport"
+    assert not stats[key], (key, stats[key])
 PY
 export SPEEDNS_RESULTS_RUN_ID=fixture-no-comparable-run
 python3 "${root_dir}/scripts/publish-live-results.py" \
 	--evidence-dir "${temporary_dir}/no-comparable-evidence" \
 	--output-dir "${temporary_dir}/no-comparable-results"
+validate_record "${temporary_dir}/no-comparable-results"
 python3 - "${temporary_dir}/no-comparable-results/latest.json" <<'PY'
 import json
 import pathlib
@@ -230,6 +145,32 @@ record = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert record["run"]["outcome"] == "failed"
 assert record["failures"] == ["doq: no comparable ranking"]
 assert record["summary"][-1]["status"] == "failed"
+assert record["summary"][-1]["winner"] is None
+assert record["transports"][-1]["status"] == "failed"
+PY
+
+generate_evidence "${temporary_dir}/all-failed-evidence" udp,tcp,doh,dot,doq
+export SPEEDNS_RESULTS_RUN_ID=fixture-all-failed-run
+python3 "${root_dir}/scripts/publish-live-results.py" \
+	--evidence-dir "${temporary_dir}/all-failed-evidence" \
+	--output-dir "${temporary_dir}/all-failed-results"
+validate_record "${temporary_dir}/all-failed-results"
+python3 - "${temporary_dir}/all-failed-results/latest.json" <<'PY'
+import json
+import pathlib
+import sys
+
+record = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert record["run"]["outcome"] == "failed"
+assert record["failures"] == [
+    "udp: no comparable ranking",
+    "tcp: no comparable ranking",
+    "doh: no comparable ranking",
+    "dot: no comparable ranking",
+    "doq: no comparable ranking",
+]
+assert all(item["status"] == "failed" for item in record["transports"])
+assert all(item["status"] == "failed" and item["winner"] is None for item in record["summary"])
 PY
 
 cp -R "${temporary_dir}/original-evidence" "${temporary_dir}/failed-evidence"
@@ -244,6 +185,7 @@ export SPEEDNS_RESULTS_RUN_ID=fixture-failed-run
 python3 "${root_dir}/scripts/publish-live-results.py" \
 	--evidence-dir "${temporary_dir}/failed-evidence" \
 	--output-dir "${temporary_dir}/failed-results"
+validate_record "${temporary_dir}/failed-results"
 python3 - "${temporary_dir}/failed-results/latest.json" <<'PY'
 import json
 import pathlib
