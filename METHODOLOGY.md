@@ -179,6 +179,13 @@ median of `target latency - reference latency`, so a positive value means the
 target was slower. A deterministic bootstrap of those paired deltas provides
 the 95% confidence interval. When the interval contains zero, the report says
 `NO CLEAR DIFFERENCE`: the observed ranking difference is not distinguishable
+from noise in this run. These effects explain the existing score and never
+change ranking order. A group with a single member has no peer to compare
+against, so its only row would be a self-comparison; the default table counts
+those targets in one line below the block and `--details` lists them again.
+JSON exposes them in the additive `paired_effects` section, always including
+every entry, while the human table shows them below the protocol comparisons
+and CSV retains its aggregate one-row-per-target schema.
 from noise in this run.
 
 A paired comparison requires at least 20 paired observations, the same minimum
