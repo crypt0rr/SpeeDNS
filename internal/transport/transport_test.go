@@ -308,3 +308,15 @@ func TestResponseClassSeparatesAnswersFromNodata(t *testing.T) {
 		t.Fatalf("ResponseClass(no question, one answer) = %q, want %q", got, "answer")
 	}
 }
+
+// TestUDPFactoryRejectsMalformedEndpoint covers the endpoint-parse guard added
+// when the bootstrap lookup moved into Open. A target whose address and port
+// cannot be split has no dialable endpoint, so it must fail when the session
+// opens rather than on every query.
+func TestUDPFactoryRejectsMalformedEndpoint(t *testing.T) {
+	factory := &udpFactory{address: "dns.example:53:53", timeout: time.Second}
+	if _, err := factory.Open(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "invalid UDP endpoint") {
+		t.Fatalf("malformed UDP endpoint error = %v", err)
+	}
+}
