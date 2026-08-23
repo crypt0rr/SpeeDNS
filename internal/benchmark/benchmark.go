@@ -1217,7 +1217,12 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 				continue
 			}
 			if len(deltas) < MinimumRecommendedSamples {
-				effect.Reason = fmt.Sprintf("insufficient paired samples (minimum %d)", MinimumRecommendedSamples)
+				// Reason is published in paired_effects, so it stays a fixed
+				// phrase rather than interpolating MinimumRecommendedSamples:
+				// a consumer that matched on the text would otherwise break
+				// the moment the threshold changed. The threshold itself is
+				// documented in METHODOLOGY.md and derivable from samples.
+				effect.Reason = "insufficient paired samples"
 				effects = append(effects, effect)
 				continue
 			}
