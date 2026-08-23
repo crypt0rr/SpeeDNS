@@ -600,10 +600,124 @@ func TestDetectAddressFamilies(t *testing.T) {
 	}
 }
 
+func TestDetectAddressFamiliesIgnoresUniqueLocalIPv6(t *testing.T) {
+	oldInterfaces := listNetworkInterfacesFunc
+	oldAddresses := interfaceAddressesFunc
+	t.Cleanup(func() {
+		listNetworkInterfacesFunc = oldInterfaces
+		interfaceAddressesFunc = oldAddresses
+	})
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) {
+		return []net.Interface{{Name: "up", Flags: net.FlagUp}}, nil
+	}
+	var addresses []net.Addr
+	interfaceAddressesFunc = func(net.Interface) ([]net.Addr, error) { return addresses, nil }
+
+	// RFC 1918 IPv4 counts because NAT is a real path to the Internet, while
+	// unique-local IPv6 (fc00::/7) is not evidence of a public IPv6 route even
+	// though net.IP.IsGlobalUnicast reports true for it.
+	addresses = []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.168.1.10")},
+		&net.IPNet{IP: net.ParseIP("fd47:a90b:1d35:4f2d::1")},
+		&net.IPNet{IP: net.ParseIP("fd7a:115c:a1e0::6a36:ec14")},
+		&net.IPNet{IP: net.ParseIP("fe80::1")},
+		&net.IPAddr{IP: net.ParseIP("::1")},
+		&net.IPAddr{IP: net.ParseIP("127.0.0.1")},
+		&net.IPNet{IP: net.ParseIP("169.254.1.1")},
+	}
+	available, err := detectAddressFamilies()
+	if err != nil || !available[catalog.Family4] || available[catalog.Family6] {
+		t.Fatalf("ULA-only host families = %#v/%v", available, err)
+	}
+
+	addresses = append(addresses, &net.IPNet{IP: net.ParseIP("2606:4700:4700::1111")})
+	available, err = detectAddressFamilies()
+	if err != nil || !available[catalog.Family4] || !available[catalog.Family6] {
+		t.Fatalf("global-unicast host families = %#v/%v", available, err)
+	}
+}
+
+func TestRunBenchmarkAutoFamilyKeepsExplicitResolvers(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldDetector := detectAddressFamiliesFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		detectAddressFamiliesFunc = oldDetector
+	})
+	var captured []catalog.Target
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		captured = append([]catalog.Target(nil), targets...)
+		return fakeCLIReport(), nil
+	}
+	detectAddressFamiliesFunc = func() (map[catalog.AddressFamily]bool, error) {
+		return map[catalog.AddressFamily]bool{catalog.Family4: true}, nil
+	}
+	newConfig := func(family string) *cliConfig {
+		return &cliConfig{
+			protocols: "udp", resolverFlags: []string{"mine=udp://[fd00::1]:53"}, noDefaults: true,
+			domainFile: cliDomainFile(t), sample: 1, seed: 1, queryTypes: "A", timeout: time.Second,
+			concurrency: 1, format: "json", family: family, output: filepath.Join(t.TempDir(), family+".json"),
+		}
+	}
+	if err := runBenchmark(context.Background(), newConfig("auto")); err != nil {
+		t.Fatalf("auto run with explicit ULA resolver = %v", err)
+	}
+	if len(captured) != 1 || captured[0].Address != "fd00::1" {
+		t.Fatalf("explicit ULA resolver dropped by --family auto: %#v", captured)
+	}
+	if err := runBenchmark(context.Background(), newConfig("4")); err == nil || !strings.Contains(err.Error(), "no resolver addresses match") {
+		t.Fatalf("explicit --family 4 should still filter explicit resolvers: %v", err)
+	}
+}
+
+func TestRunBenchmarkAutoFamilyWarnsAboutDroppedCatalogAddresses(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	oldDetector := detectAddressFamiliesFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		detectAddressFamiliesFunc = oldDetector
+	})
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+	for _, test := range []struct {
+		name      string
+		available map[catalog.AddressFamily]bool
+		want      string
+		absent    string
+	}{
+		{name: "v4only", available: map[catalog.AddressFamily]bool{catalog.Family4: true}, want: "--family auto detected IPv4 on local interfaces and dropped"},
+		{name: "v6only", available: map[catalog.AddressFamily]bool{catalog.Family6: true}, want: "--family auto detected IPv6 on local interfaces and dropped"},
+		{name: "both", available: map[catalog.AddressFamily]bool{catalog.Family4: true, catalog.Family6: true}, absent: "--family auto detected"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			detectAddressFamiliesFunc = func() (map[catalog.AddressFamily]bool, error) { return test.available, nil }
+			config := &cliConfig{
+				protocols: "udp", domainFile: cliDomainFile(t), sample: 1, seed: 1, queryTypes: "A",
+				timeout: time.Second, concurrency: 1, format: "json", family: "auto",
+				output: filepath.Join(t.TempDir(), "auto.json"),
+			}
+			if err := runBenchmark(context.Background(), config); err != nil {
+				t.Fatalf("auto run = %v", err)
+			}
+			content, err := os.ReadFile(config.output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.want != "" && !strings.Contains(string(content), test.want) {
+				t.Fatalf("missing auto-family warning %q in %s", test.want, content)
+			}
+			if test.absent != "" && strings.Contains(string(content), test.absent) {
+				t.Fatalf("unexpected auto-family warning in %s", content)
+			}
+		})
+	}
+}
+
 func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 	defaultProfiles, err := loadProfiles(context.Background(), &cliConfig{})
-	if err != nil || len(defaultProfiles) != 10 {
-		t.Fatalf("default profiles = %d/%v", len(defaultProfiles), err)
+	if err != nil || len(defaultProfiles.bundled()) != 10 || len(defaultProfiles.explicit()) != 0 || len(defaultProfiles.all()) != 10 {
+		t.Fatalf("default profiles = %#v/%v", defaultProfiles, err)
 	}
 	if _, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true}); err == nil {
 		t.Fatal("expected empty profile selection error")
@@ -618,7 +732,7 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	profiles, err := loadProfiles(context.Background(), &cliConfig{noDefaults: true, resolverFile: validPath, resolverFlags: []string{"extra=tcp://127.0.0.2:5300"}})
-	if err != nil || len(profiles) != 2 {
+	if err != nil || len(profiles.bundled()) != 0 || len(profiles.explicit()) != 2 {
 		t.Fatalf("custom profiles = %#v/%v", profiles, err)
 	}
 	badPath := filepath.Join(dir, "bad.yaml")
@@ -637,7 +751,7 @@ func TestLoadProfilesAllSourcesAndErrors(t *testing.T) {
 		return []catalog.ResolverProfile{{ID: "system", Name: "System", Scope: "corp.example", Interface: "utun0", Addresses: []string{"127.0.0.1"}, Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}}}}, nil
 	}
 	profiles, err = loadProfiles(context.Background(), &cliConfig{noDefaults: true, includeSystem: true})
-	if err != nil || len(profiles) != 1 || profiles[0].ID != "system" || profiles[0].Scope != "corp.example" || profiles[0].Interface != "utun0" {
+	if err != nil || len(profiles.explicit()) != 1 || profiles.explicit()[0].ID != "system" || profiles.explicit()[0].Scope != "corp.example" || profiles.explicit()[0].Interface != "utun0" {
 		t.Fatalf("system profiles = %#v/%v", profiles, err)
 	}
 	discoverSystemResolvers = func(context.Context) ([]catalog.ResolverProfile, error) {
@@ -684,8 +798,8 @@ func TestRunBenchmarkValidationAndSelection(t *testing.T) {
 			}
 		})
 	}
-	loadProfilesFunc = func(context.Context, *cliConfig) ([]catalog.ResolverProfile, error) {
-		return []catalog.ResolverProfile{{ID: "bad", Name: "", Addresses: []string{"127.0.0.1"}}}, nil
+	loadProfilesFunc = func(context.Context, *cliConfig) (profileSelection, error) {
+		return profileSelection{profiles: []catalog.ResolverProfile{{ID: "bad", Name: "", Addresses: []string{"127.0.0.1"}}}}, nil
 	}
 	if err := runBenchmark(context.Background(), base()); err == nil {
 		t.Fatal("expected catalog validation error")
@@ -798,6 +912,19 @@ func TestRunBenchmarkFamilySelection(t *testing.T) {
 	config.family = "4"
 	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "not an IP literal") {
 		t.Fatalf("hostname family error = %v", err)
+	}
+
+	oldLoad := loadProfilesFunc
+	t.Cleanup(func() { loadProfilesFunc = oldLoad })
+	loadProfilesFunc = func(context.Context, *cliConfig) (profileSelection, error) {
+		return profileSelection{profiles: []catalog.ResolverProfile{{
+			ID: "hostname", Name: "Hostname", Owner: "Test", Policy: "unfiltered",
+			Addresses:  []string{"dns.example"},
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}},
+		}}}, nil
+	}
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "not an IP literal") {
+		t.Fatalf("bundled hostname family error = %v", err)
 	}
 }
 
@@ -1160,4 +1287,51 @@ func TestCobraOutputErrorsAreIgnoredBySimpleCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = newRootCommand()
+}
+
+// TestValidateNormalizationReachesSelectedProfiles guards the split introduced
+// for --family auto. catalog.Validate normalizes profiles in place, so the
+// bundled and explicit views must share one backing array; handing Validate a
+// copy silently dropped the scalar trims while map and slice writes still
+// propagated, which made the loss easy to miss.
+func TestValidateNormalizationReachesSelectedProfiles(t *testing.T) {
+	selection := profileSelection{
+		profiles: []catalog.ResolverProfile{{
+			ID: "  spaced-id  ", Name: "  Spaced Name  ", Owner: "  Owner  ",
+			Policy: "  unfiltered  ", Scope: "  scope  ", Interface: "  eth0  ",
+			Addresses:  []string{"192.0.2.1"},
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {}},
+		}},
+		explicitFrom: 0,
+	}
+	if err := catalog.Validate(selection.all()); err != nil {
+		t.Fatal(err)
+	}
+	got := selection.explicit()[0]
+	if got.ID != "spaced-id" || got.Name != "Spaced Name" || got.Owner != "Owner" ||
+		got.Policy != "unfiltered" || got.Scope != "scope" || got.Interface != "eth0" {
+		t.Fatalf("normalization did not reach the selected profile: %#v", got)
+	}
+	if got.Transports[catalog.UDP].Port != 53 {
+		t.Fatalf("default port did not reach the selected profile: %d", got.Transports[catalog.UDP].Port)
+	}
+}
+
+// TestDuplicateProfileIDsAcrossGroupsAreRejected pins that validation still
+// sees bundled and explicit profiles as one set, so a custom resolver cannot
+// silently shadow a bundled identifier.
+func TestDuplicateProfileIDsAcrossGroupsAreRejected(t *testing.T) {
+	profile := func(id string) catalog.ResolverProfile {
+		return catalog.ResolverProfile{
+			ID: id, Name: id, Addresses: []string{"192.0.2.1"},
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}},
+		}
+	}
+	selection := profileSelection{
+		profiles:     []catalog.ResolverProfile{profile("shared"), profile("shared")},
+		explicitFrom: 1,
+	}
+	if err := catalog.Validate(selection.all()); err == nil {
+		t.Fatal("expected a duplicate resolver id across bundled and explicit profiles to be rejected")
+	}
 }
