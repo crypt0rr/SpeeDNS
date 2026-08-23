@@ -893,6 +893,30 @@ func TestRunTargetRecordsReconnectDiagnostics(t *testing.T) {
 	}
 }
 
+// TestRunTargetExcludesDoHReconnectFromWarmScoring covers the DoH session
+// shape: the flag is reported per query, so only the query that paid for a
+// fresh HTTPS connection is excluded from warm-latency scoring.
+func TestRunTargetExcludesDoHReconnectFromWarmScoring(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	warm := &fakeSession{}
+	warm.query = func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		warm.reconnected = name == "dropped.example"
+		return replyFor(name, qtype), nil
+	}
+	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	queries := []Query{{Name: "kept.example", QType: dns.TypeA}, {Name: "dropped.example", QType: dns.TypeA}}
+	result := runTarget(context.Background(), testTarget(catalog.DoH, "doh-reconnect"), queries, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(result.Observations) != 2 || result.Observations[0].Reconnected || !result.Observations[1].Reconnected {
+		t.Fatalf("DoH reconnect observations = %#v", result.Observations)
+	}
+	stats := calculateStatistics(result, time.Second, 42)
+	if stats.Reconnects != 1 || stats.Scored != 1 {
+		t.Fatalf("DoH reconnect statistics = %#v", stats)
+	}
+}
+
 func TestRunTargetCancellationBranchesDoNotCreateSamples(t *testing.T) {
 	oldFactory := newFactory
 	t.Cleanup(func() { newFactory = oldFactory })

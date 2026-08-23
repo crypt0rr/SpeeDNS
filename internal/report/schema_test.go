@@ -202,3 +202,89 @@ func numberValue(value any) (float64, bool) {
 		return 0, false
 	}
 }
+
+// TestJSONReportWithNoComparableResultsMatchesSchema covers the case the tool
+// exists to reveal: every endpoint failed, so nothing is ranked. The published
+// schema requires "rankings" to be an array, and a nil slice marshals as null.
+func TestJSONReportWithNoComparableResultsMatchesSchema(t *testing.T) {
+	var schemaDocument map[string]any
+	if err := json.Unmarshal(schema.ReportV1(), &schemaDocument); err != nil {
+		t.Fatal(err)
+	}
+	failed := reportTarget("1", catalog.UDP, 0, false)
+	failed.Stats = benchmark.Statistics{}
+	failed.OpenError = "open failed"
+	run := benchmark.Report{
+		StartedAt: time.Unix(0, 0), FinishedAt: time.Unix(1, 0), Seed: 42,
+		SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		Targets: []benchmark.TargetResult{failed},
+	}
+	var output bytes.Buffer
+	if err := WriteJSON(&output, run, false); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(output.Bytes(), []byte(`"rankings": null`)) {
+		t.Fatalf("rankings marshalled as null:\n%s", output.String())
+	}
+	var instance any
+	decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+	decoder.UseNumber()
+	if err := decoder.Decode(&instance); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateJSONSchema(schemaDocument, instance, schemaDocument, "$"); err != nil {
+		t.Fatalf("JSON does not match schema: %v\n%s", err, output.String())
+	}
+}
+
+// TestStatisticsCarryEveryLiveResultsField checks encoder output against the
+// live-results contract that scripts/publish-live-results.py enforces. The
+// publisher requires every key in $defs/stats, so an omitempty tag on a field
+// that is zero for a failed transport silently breaks the publish job while the
+// report schema still validates.
+func TestStatisticsCarryEveryLiveResultsField(t *testing.T) {
+	var liveSchema map[string]any
+	if err := json.Unmarshal(schema.LiveResultsV1(), &liveSchema); err != nil {
+		t.Fatal(err)
+	}
+	defs, ok := liveSchema["$defs"].(map[string]any)
+	if !ok {
+		t.Fatal("live-results schema has no $defs")
+	}
+	stats, ok := defs["stats"].(map[string]any)
+	if !ok {
+		t.Fatal("live-results schema has no $defs/stats")
+	}
+	required, ok := stats["required"].([]any)
+	if !ok || len(required) == 0 {
+		t.Fatal("live-results $defs/stats has no required list")
+	}
+
+	// A transport that never produced a usable response leaves every latency
+	// and confidence field at zero; that is exactly when omitempty bites.
+	for _, name := range []string{"all-failed", "scored"} {
+		t.Run(name, func(t *testing.T) {
+			result := reportTarget("1", catalog.UDP, 0, false)
+			if name == "all-failed" {
+				result.Stats = benchmark.Statistics{Total: 1, Failures: 1}
+			}
+			encoded, err := json.Marshal(result.Stats)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(encoded, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range required {
+				field, ok := key.(string)
+				if !ok {
+					t.Fatalf("required entry %#v is not a string", key)
+				}
+				if _, present := decoded[field]; !present {
+					t.Fatalf("stats.%s is missing from encoder output: %s", field, encoded)
+				}
+			}
+		})
+	}
+}
