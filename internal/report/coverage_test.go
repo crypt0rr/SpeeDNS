@@ -164,8 +164,9 @@ func TestCSVFormulaLeadingCellsAreProtected(t *testing.T) {
 		{value: "+formula", want: "'+formula"},
 		{value: "-formula", want: "'-formula"},
 		{value: "@formula", want: "'@formula"},
-		{value: "\tformula", want: "'\tformula"},
-		{value: "\rformula", want: "'\rformula"},
+		{value: "\tformula", want: `'\x09formula`},
+		{value: "\rformula", want: `'\x0dformula`},
+		{value: "\x1b=cmd|'/C calc'!A1", want: `'\x1b=cmd|'/C calc'!A1`},
 		{value: "normal", want: "normal"},
 		{value: "", want: ""},
 	} {
@@ -202,12 +203,12 @@ func TestCSVFormulaProtectionCoversTargetAndErrorFields(t *testing.T) {
 		values[name] = row[index]
 	}
 	for name, want := range map[string]string{
-		"target_id":  "'=target@\taddress/udp",
+		"target_id":  `'=target@\x09address/udp`,
 		"name":       "'+name",
 		"owner":      "'-owner",
 		"policy":     "'@policy",
-		"address":    "'\taddress",
-		"open_error": "'\rerror",
+		"address":    `'\x09address`,
+		"open_error": `'\x0derror`,
 	} {
 		if values[name] != want {
 			t.Fatalf("CSV %s = %q, want %q", name, values[name], want)
@@ -843,6 +844,45 @@ func TestReportFormattingBranchesAndWriteErrors(t *testing.T) {
 	warningReportWithTarget.Warnings = []string{"generic warning"}
 	if err := WriteTableWithOptions(contentFailWriter{needle: "generic warning"}, warningReportWithTarget, TableOptions{}); err == nil {
 		t.Fatal("warning row propagation was not returned")
+	}
+}
+
+func TestPairedEffectsBelowMinimumSamplesAreNotComparable(t *testing.T) {
+	first := reportTarget("first", catalog.UDP, 1, false)
+	second := reportTarget("second", catalog.UDP, 1, false)
+	reason := "insufficient paired samples (minimum 20)"
+	run := benchmark.Report{
+		Seed: 42, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{first, second},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: first.Target.ID(), Rank: 1}},
+		PairedEffects: []benchmark.PairedEffect{
+			{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: first.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 1, Reference: true},
+			{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: second.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 1, Reason: reason},
+		},
+	}
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	tableText := table.String()
+	if !strings.Contains(tableText, "NOT COMPARABLE") {
+		t.Fatalf("below-minimum paired row is not marked incomparable: %s", tableText)
+	}
+	if strings.Contains(tableText, "FASTER") || strings.Contains(tableText, "SLOWER") {
+		t.Fatalf("below-minimum paired row rendered a directional verdict: %s", tableText)
+	}
+
+	// A stale delta or interval must never reach the table once benchmark has
+	// recorded a reason for the effect.
+	stale := benchmark.PairedEffect{Samples: 1, MedianDeltaMS: 83.42, CILowMS: 83.42, CIHighMS: 83.42, Reason: reason}
+	if got := pairedInterpretation(stale, false); got != "NOT COMPARABLE" {
+		t.Fatalf("below-minimum interpretation = %q", got)
+	}
+	if pairedDeltaText(stale) != "—" || pairedCIText(stale) != "—" {
+		t.Fatalf("below-minimum formatting = %q/%q", pairedDeltaText(stale), pairedCIText(stale))
+	}
+	if strings.Contains(tableText, "83.42") {
+		t.Fatalf("below-minimum paired row rendered a delta: %s", tableText)
 	}
 }
 

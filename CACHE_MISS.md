@@ -35,9 +35,11 @@ speedns --cache-miss --cache-miss-sample 10 --no-defaults \
   --resolver lab=udp://192.0.2.53:53 --type A --no-color
 ```
 
-`--cache-miss` cannot be combined with `--domains` or `--full`. The regular
-`--sample` flag controls the warm-cache corpus; `--cache-miss-sample` controls
-this bounded generated corpus. The report labels the corpus mode, zone, and
+`--cache-miss` cannot be combined with `--domains` or `--full`.
+`--cache-miss-sample` sizes this bounded generated corpus, and `--sample`
+still selects how many of those names are measured. Keep `--sample` at least
+as large as `--cache-miss-sample`; a smaller `--sample` measures only that
+many generated names, and the report warns that the corpus was truncated. The report labels the corpus mode, zone, and
 nonce. Cache-miss results receive their own rankings and must not be compared
 with a warm-cache run as if they were the same sample population.
 
@@ -47,6 +49,19 @@ The generated names normally produce negative answers, and resolver policy,
 local interception, aggressive negative caching, and authoritative behavior
 can all affect the result. A cache-miss run is therefore a diagnostic view of
 one controlled query population, not a claim about every uncached domain.
+
+## One cache miss per run
+
+Protocols are measured one group at a time, in the documented order `udp`,
+`tcp`, `doh`, `dot`, `doq`, and every group replays the same generated name
+set. A resolver keeps one cache across its transports, so only the first
+measured protocol sees a genuine cache miss; the later protocols re-query
+names the resolver has already looked up and therefore measure a warm cache.
+Selecting more than one protocol in cache-miss mode adds a report warning that
+names the protocol that got the cold lookup. Treat a cross-protocol comparison
+from a single cache-miss run as biased in favor of the later protocols, and
+measure one protocol per invocation when the comparison matters. Removing the
+bias, rather than only reporting it, is tracked as issue #108.
 
 Use `--profile-view` to inspect the transport cost for the same resolver and
 address within the same run. The view includes median, p95, cold latency, the

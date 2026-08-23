@@ -23,7 +23,14 @@ exchanges are in flight at once, and a target's session is never used
 concurrently. This preserves bounded active work while preventing early
 catalog entries from receiving a different sequence of measurement rounds.
 Preparation (cold probes and warmups) is kept separate from the measured
-rounds. There is no transport fallback.
+rounds. Preparation itself also runs with at most `--concurrency` targets in
+flight, and a single target is always prepared by one worker so its session is
+never used concurrently. Preparing targets one after another would have made a
+target's cold probes start systematically later, and left its warm session
+idle for longer, the further down the ordered catalog it sat; bounded parallel
+preparation shrinks that positional bias by the concurrency factor. Results
+and rankings stay in target-identity order regardless of which preparation
+finished first. There is no transport fallback.
 
 Three excluded warm-up queries are sent before the measured phase. Encrypted
 and stream transports reuse their connections during measured queries. UDP
@@ -32,13 +39,28 @@ reports the DNS transaction time only.
 ## What is measured
 
 Warm latency is measured from immediately before a DNS exchange until the
+validated response or error returns. Per-query deadline setup and post-exchange
+bookkeeping, such as the reconnect check, fall outside the timed section. TCP,
+DoT, and any recovered stream connection are not closed before the timer stops.
+A query that follows a TCP, DoT, or DoQ reconnect is recorded as a reconnect
+sample and excluded from ordinary warm-latency scoring; its reconnect count and
+selected dial address remain visible in detailed output and machine-readable
+results. DoQ sessions use TLS 1.3 with ALPN `doq`, an explicit keepalive period
+equal to the configured timeout, and a maximum idle timeout of twice that
+timeout. The failed exchange that caused the reconnect is counted once and is
+never retried.
 validated response or error returns. TCP, DoT, and any recovered stream
 connection are not closed before the timer stops. A query that follows a TCP,
-DoT, or DoQ reconnect is recorded as a reconnect sample and excluded from
+DoT, DoH, or DoQ reconnect is recorded as a reconnect sample and excluded from
 ordinary warm-latency scoring; its reconnect count and selected dial address
-remain visible in detailed output and machine-readable results. DoQ sessions
-use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to the
-configured timeout, and a maximum idle timeout of twice that timeout. The
+remain visible in detailed output and machine-readable results. A DoH session
+reuses one pooled HTTPS connection; when that connection is gone, the HTTP
+client opens a new one transparently, so the query that pays for the new TCP,
+TLS, and HTTP handshake is the reconnect sample. The connection the session
+opens for its first exchange is the DoH equivalent of the dial the stream
+transports perform when the session is opened, and is not a reconnect. DoQ
+sessions use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to
+the configured timeout, and a maximum idle timeout of twice that timeout. The
 failed exchange that caused the reconnect is counted once and is never
 retried.
 
@@ -69,6 +91,13 @@ The classes are `answer`, `nodata`, `nxdomain`, and DNS response-code classes
 such as `rcode-2` (SERVFAIL) or `rcode-5` (REFUSED). A successful observation
 whose class differs from a unique plurality baseline is divergent and is
 excluded from comparative latency scoring.
+
+A response is classified `answer` only when its answer section carries a record
+of the queried type. A NOERROR response without one is `nodata`, including the
+canonical form that carries an SOA in the authority section. Authority records
+are never read as an answer: doing so would make "this name has no such record"
+indistinguishable from "here is the address", which is the most common genuine
+difference between resolvers on the default `A,AAAA` query set.
 
 If two or more classes are tied for the plurality, the group is ambiguous:
 there is no defensible baseline, so every successful observation in that group
@@ -102,6 +131,18 @@ to receive `RECOMMENDED`. A result with valid samples but insufficient quality
 is `INELIGIBLE`; a result with no transport-valid response is `FAILED`.
 Interrupted targets are `INCOMPLETE` and are never ranked.
 
+A resolver that runs on the local host, such as a loopback stub or forwarder,
+is measured and reported but is never ranked and never recommended. It answers
+from its own cache, so the measurement is cache-hit latency and excludes the
+upstream resolution it forwards to; comparing it with a resolver reached over
+the network would compare two different quantities. Such a target is
+`NOT COMPARABLE`, has no rank, and carries a permanent warning naming that
+reason. The classification comes from system resolver discovery, not from the
+resolver file format, so it cannot be asserted by a catalog. JSON reports it
+in the additive `local` field on the target and CSV in a trailing `local`
+column, so a consumer can tell a missing rank caused by non-comparability
+apart from one caused by a failure.
+
 ## Confidence intervals and ties
 
 Confidence intervals use a deterministic bootstrap seeded from the run seed
@@ -109,12 +150,25 @@ and the complete target identity, not from a target-ID length or process-wide
 random state. Each bootstrap replicate resamples the complete scoring outcome
 vector: successful latency observations and scoring failures. This means the
 uncertainty of the failure penalty is represented as well as latency
-uncertainty.
+uncertainty. A replicate that happens to draw only failures has no latency
+term, so it scores the timeout penalty itself, exactly as the score function
+would for a failure rate of 1. No out-of-range sentinel is used, because a
+replicate score the score function cannot produce would inflate the reported
+upper bound and change which targets are reported as tied.
 
 Rank order is deterministic: score first, then target ID. A target is in the
 leader's tie group when its 95% bootstrap interval overlaps the leader's
 interval. The leader is marked as tied too, so the tie is visible from either
 row.
+
+Every output surfaces that flag. The human table has a `Tie` column in the
+recommendation summary and in each per-protocol comparison; a tied row reads
+`TIED`, an untied row reads `—`. When a recommended or provisional winner is
+tied, the recommendation block also carries a `TIED:` note stating that the
+ordering is not statistically distinguishable, so a rank-one row is never
+presented as an unqualified winner. CSV keeps its `tie` column and JSON keeps
+`tie` on both `rankings[]` and `results[].stats`. The strict `1..N` rank is
+still reported: a tie qualifies the ordering, it does not remove it.
 
 The report also includes paired latency effects. For each protocol and
 normalized declared policy, the best-ranked target in that group is the local
@@ -132,6 +186,18 @@ those targets in one line below the block and `--details` lists them again.
 JSON exposes them in the additive `paired_effects` section, always including
 every entry, while the human table shows them below the protocol comparisons
 and CSV retains its aggregate one-row-per-target schema.
+from noise in this run.
+
+A paired comparison requires at least 20 paired observations, the same minimum
+sample count the recommendation gate uses. Below that floor no delta and no
+interval are reported: the effect keeps its paired sample count, records the
+reason `insufficient paired samples`, and the report says `NOT COMPARABLE`.
+A one-sample or few-sample run measures cold-path noise, so it must not be
+presented as a directional `FASTER` or `SLOWER` verdict under a 95% confidence
+interval heading. These effects explain the existing score and never
+change ranking order. JSON exposes them in the additive `paired_effects`
+section; the human table shows them below the protocol comparisons, while CSV
+retains its aggregate one-row-per-target schema.
 
 ## Interruption and diagnostics
 
@@ -143,8 +209,18 @@ do not appear in the report.
 
 JSON contains the structured result and optional raw observations. CSV keeps
 the aggregate schema and adds reconnect/incomplete diagnostics at the end.
-CSV cells beginning with `=`, `+`, `-`, `@`, tab, or carriage return are
-prefixed with an apostrophe to prevent spreadsheet formula interpretation.
+Text that SpeeDNS did not produce itself is escaped before it reaches a
+terminal or a CSV cell. Session errors quote strings chosen by the endpoint,
+such as the certificate names in an `x509` hostname mismatch, and resolver
+names, owners, and policies arrive from `--resolver`, `--resolver-file`, or
+the system resolver configuration; control characters in any of them are
+rendered as visible `\x1b`-style sequences, so neither a certificate field nor
+a configured name can rewrite the terminal. The status colours are the only
+escape sequences the table emits itself. CSV cells are escaped first and the
+formula guard runs afterwards on the escaped value: a cell beginning with
+`=`, `+`, `-`, `@`, or an escape sequence - which is how a leading tab,
+carriage return, or ESC is rendered - is prefixed with an apostrophe to
+prevent spreadsheet formula interpretation.
 For encrypted targets, these reports also expose the effective TLS server
 name, whether it was configured explicitly or derived from the endpoint,
 whether bootstrap came from explicit IP candidates, the target address, or
@@ -172,7 +248,12 @@ The normal run uses the embedded corpus and is treated as the warm-cache
 population. The opt-in `--cache-miss` mode instead generates a bounded set of
 unique labels below the IANA-reserved `example.com` zone. It allows at most 20
 names and two measured exchanges in flight, records a per-run random nonce,
-and rejects custom domain files and `--full`. The generated population is
+and rejects custom domain files and `--full`. `--sample` still selects the
+measured names from that generated corpus, so a `--sample` below
+`--cache-miss-sample` measures only part of it and the run reports a warning
+naming both sizes; `run.provenance.corpus_entries` and `corpus_sha256` keep
+describing the corpus the run drew from, as they do for warm-cache runs, while
+`sample_size` reports how many names were measured. The generated population is
 never appended to the normal corpus, and its results must not be interpreted
 as a warm-cache ranking. The ownership, traffic limits, and intended use are
 documented in [`CACHE_MISS.md`](CACHE_MISS.md).
@@ -197,17 +278,53 @@ Numeric assertions are evaluated against every qualified or provisional
 winner for every protocol that produced a ranking. `winner=PROFILE-ID` or
 `winner=TARGET-ID` requires the requested profile or target to be among the
 rank-one winners for every such protocol. Confidence-interval ties therefore
-count as winner membership. The ordinary report is emitted before an
-assertion failure; invalid expressions return status 2 and failed assertions
-return status 4. No-comparable and interruption statuses retain precedence.
+count as winner membership. The requested winner is checked against the
+targets selected for the run before any query is sent, so an ID that no
+selected profile or target carries is invalid input (status 2) rather than a
+lost comparison; a benchmark never reports that a resolver failed to win when
+it was never measured. The ordinary report is emitted before an assertion
+failure; invalid expressions return status 2 and failed assertions return
+status 4. No-comparable and interruption statuses retain precedence.
 
 ## Address-family selection
+
+Every resolver address is syntax-checked before the run starts: an entry must
+be an IP literal (bare, bracketed, or zoned) or a syntactically valid
+hostname. Ports are configured per transport, so an address carrying one is
+rejected as invalid input instead of producing a run in which every query
+fails with a dial error attributed to the resolver.
 
 Bundled resolver profiles carry the provider-published IPv4 and IPv6 literals.
 `--family 4`, `--family 6`, and `--family both` are deterministic filters.
 The default `--family auto` uses the up-interface address inventory without
 performing DNS lookups or connection probes; when no usable family can be
 detected, both literal families are retained rather than silently claiming a
+route. Loopback literals are exempt from the `auto` filter, because a local
+stub resolver is answered by the host's own stack regardless of which families
+have external routes. Hostname-only custom endpoints remain available in
+`auto` and `both`, while explicit family selection requires literals so the
+benchmark does not include an unmeasured bootstrap lookup. Explicit `4`, `6`,
+and `both` stay exact filters, loopback included.
+
 route. Hostname-only custom endpoints remain available in `auto` and `both`,
 while explicit family selection requires literals so the benchmark does not
 include an unmeasured bootstrap lookup.
+
+Auto-detection treats the two families differently. An RFC 1918 IPv4 address
+counts as IPv4 availability because NAT makes a private v4 address an ordinary
+path to the Internet. A unique-local IPv6 address (`fc00::/7`, which covers
+Tailscale's `fd7a::/48` and the ULAs many home routers hand out) does not count
+as IPv6 availability: IPv6 has no NAT equivalent, so a ULA is not evidence of a
+public route, and treating it as one produced comparison tables where every
+IPv6 endpoint failed. Only global unicast IPv6 outside `fc00::/7` marks IPv6 as
+available.
+
+Auto-detection is a heuristic, so it prunes only the bundled catalog. Resolvers
+the operator named explicitly — `--resolver`, `--resolver-file`, and
+`--include-system` discovery — are never dropped by `auto`, because a resolver
+someone asked for by address should be measured and reported rather than
+silently removed. An explicit `--family 4`, `6`, or `both` is a deliberate
+instruction and still filters every profile, explicit ones included. When
+`auto` drops bundled addresses the run emits a warning naming the detected
+families and the number of addresses removed, so the reduced comparison table
+is visible rather than silent.

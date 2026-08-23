@@ -13,6 +13,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
 type JSONReport struct {
@@ -85,6 +86,7 @@ type JSONTarget struct {
 	Policy             string           `json:"policy"`
 	Address            string           `json:"address"`
 	Protocol           catalog.Protocol `json:"protocol"`
+	Local              bool             `json:"local,omitempty"`
 	EndpointURL        string           `json:"endpoint_url,omitempty"`
 	TLSServerName      string           `json:"tls_server_name,omitempty"`
 	TLSIdentitySource  string           `json:"tls_identity_source,omitempty"`
@@ -125,7 +127,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 		jsonResult := JSONResult{
 			Target: JSONTarget{
 				ID: view.ID, Name: view.Name, Owner: view.Owner, Policy: view.Policy,
-				Address: view.Address, Protocol: result.Target.Protocol,
+				Address: view.Address, Protocol: result.Target.Protocol, Local: result.Target.Resolver.Local,
 				EndpointURL: metadata.EndpointURL, TLSServerName: metadata.TLSServerName,
 				TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
 				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: dialAddress,
@@ -138,7 +140,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 		}
 		results = append(results, jsonResult)
 	}
-	rankings := append([]benchmark.Ranking(nil), report.Rankings...)
+	rankings := append(make([]benchmark.Ranking, 0, len(report.Rankings)), report.Rankings...)
 	for index := range rankings {
 		if redactedID, ok := redactedIDs[rankings[index].TargetID]; ok {
 			rankings[index].TargetID = redactedID
@@ -213,7 +215,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate", "rcode_counts", "median_ms", "p95_ms",
 		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error", "reconnects", "incomplete",
 		"endpoint_url", "tls_server_name", "tls_identity_source", "bootstrap_mode", "bootstrap_addresses", "dial_address",
-		"corpus_mode", "corpus_zone", "corpus_nonce",
+		"corpus_mode", "corpus_zone", "corpus_nonce", "local",
 	}); err != nil {
 		return err
 	}
@@ -236,7 +238,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 			formatFloat(stats.P95MS), formatFloat(stats.MinMS), formatFloat(stats.MaxMS), formatFloat(stats.MADMS),
 			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), csvCell(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), strconv.Itoa(stats.Reconnects), strconv.FormatBool(result.Incomplete),
 			csvCell(metadata.EndpointURL), csvCell(metadata.TLSServerName), csvCell(metadata.TLSIdentitySource), csvCell(metadata.BootstrapMode), csvCell(bootstrapAddressesCSV(metadata.BootstrapAddresses)), csvCell(dialAddress),
-			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce),
+			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce), strconv.FormatBool(result.Target.Resolver.Local),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -261,18 +263,33 @@ func placeholderText(value string) string {
 	if value == "" {
 		return "—"
 	}
-	return value
+	return safetext.Escape(value)
 }
 
-// csvCell prefixes values that spreadsheet applications may interpret as a
-// formula. The leading apostrophe is part of the exported cell value and is
-// understood by spreadsheet programs as text protection.
+// csvCell escapes control characters and then prefixes values that spreadsheet
+// applications may interpret as a formula. The leading apostrophe is part of
+// the exported cell value and is understood by spreadsheet programs as text
+// protection.
+//
+// The order matters, and the guard is re-evaluated on the escaped value. A
+// value such as "\x1b=cmd|'/C calc'!A1" passes a plain first-character test,
+// because its first character is ESC rather than '='; escaping it afterwards
+// would then hand a spreadsheet a cell whose visible content starts with a
+// formula. An escape sequence therefore joins the leading characters that ask
+// for the apostrophe, which also keeps the guard stable for values that were
+// already escaped upstream. Escaping never removes bytes, so it cannot shift
+// a formula character into the leading position after the guard looked at it
+// either.
 func csvCell(value string) string {
+	value = safetext.Escape(value)
 	if value == "" {
 		return value
 	}
+	if strings.HasPrefix(value, safetext.EscapePrefix) {
+		return "'" + value
+	}
 	switch value[0] {
-	case '=', '+', '-', '@', '\t', '\r':
+	case '=', '+', '-', '@':
 		return "'" + value
 	default:
 		return value
@@ -340,10 +357,16 @@ func redactedTargetIDs(report benchmark.Report, redact bool) map[string]string {
 	return ids
 }
 
+// targetViewFor builds the presentation values for one target. Every field is
+// escaped here because catalog.Validate only trims the surrounding whitespace
+// of resolver names, owners, policies, scopes and interfaces, so --resolver,
+// --resolver-file and the system resolver configuration can all place control
+// characters in them. Escaping at the view keeps every consumer - table, CSV
+// and JSON - on the same rendered value.
 func targetViewFor(target catalog.Target, redact bool, redactedID string) targetView {
 	view := targetView{
-		ID: target.ID(), Name: target.DisplayName(), Owner: target.Resolver.Owner,
-		Policy: target.Resolver.Policy, Address: target.Address,
+		ID: safetext.Escape(target.ID()), Name: safetext.Escape(target.DisplayName()), Owner: safetext.Escape(target.Resolver.Owner),
+		Policy: safetext.Escape(target.Resolver.Policy), Address: safetext.Escape(target.Address),
 	}
 	if redact && isSystemTarget(target) {
 		view.ID = redactedID
@@ -358,41 +381,62 @@ func redactResultText(result benchmark.TargetResult, value string, redact bool, 
 	if !redact || !isSystemTarget(result.Target) || value == "" {
 		return value
 	}
-	replacements := []string{
+	sources := []string{
 		result.Target.ID(), redactedID,
 		result.Target.DisplayName(), redactedSystemName,
 		result.Target.Resolver.Owner, redactedSystemOwner,
 		result.DialAddress, redactedValue,
 		result.Target.Address, redactedValue,
 	}
-	filtered := replacements[:0]
-	for index := 0; index+1 < len(replacements); index += 2 {
-		if replacements[index] == "" {
+	replacements := make([]string, 0, len(sources)*2)
+	for index := 0; index+1 < len(sources); index += 2 {
+		if sources[index] == "" {
 			continue
 		}
-		filtered = append(filtered, replacements[index], replacements[index+1])
+		replacements = append(replacements, sources[index], sources[index+1])
+		// Warnings are escaped where they are built, so a local value that
+		// contains control characters appears in them in its escaped form.
+		// Both spellings must be redacted, since this helper is also called
+		// with values that are still unescaped.
+		if escaped := safetext.Escape(sources[index]); escaped != sources[index] {
+			replacements = append(replacements, escaped, sources[index+1])
+		}
 	}
-	return strings.NewReplacer(filtered...).Replace(value)
+	return strings.NewReplacer(replacements...).Replace(value)
 }
 
+// redactObservations also escapes the per-query error text. Those strings come
+// from the measured endpoint - a DoH status line, a TLS diagnostic quoting
+// certificate fields - so they get the same treatment as the target metadata
+// rather than being the one report value that reaches a consumer unescaped.
 func redactObservations(result benchmark.TargetResult, redact bool, redactedID string) []benchmark.Observation {
-	if !redact || !isSystemTarget(result.Target) || len(result.Observations) == 0 {
+	redacting := redact && isSystemTarget(result.Target)
+	if len(result.Observations) == 0 {
 		return result.Observations
 	}
 	observations := append([]benchmark.Observation(nil), result.Observations...)
 	for index := range observations {
-		observations[index].Error = redactResultText(result, observations[index].Error, true, redactedID)
+		if redacting {
+			observations[index].Error = redactResultText(result, observations[index].Error, true, redactedID)
+		}
+		observations[index].Error = safetext.Escape(observations[index].Error)
+		observations[index].ResponseClass = safetext.Escape(observations[index].ResponseClass)
+		observations[index].DivergenceBaseline = safetext.Escape(observations[index].DivergenceBaseline)
 	}
 	return observations
 }
 
 func redactColdObservations(result benchmark.TargetResult, redact bool, redactedID string) []benchmark.ColdObservation {
-	if !redact || !isSystemTarget(result.Target) || len(result.Cold) == 0 {
+	redacting := redact && isSystemTarget(result.Target)
+	if len(result.Cold) == 0 {
 		return result.Cold
 	}
 	observations := append([]benchmark.ColdObservation(nil), result.Cold...)
 	for index := range observations {
-		observations[index].Error = redactResultText(result, observations[index].Error, true, redactedID)
+		if redacting {
+			observations[index].Error = redactResultText(result, observations[index].Error, true, redactedID)
+		}
+		observations[index].Error = safetext.Escape(observations[index].Error)
 	}
 	return observations
 }
@@ -622,6 +666,9 @@ func resultStatus(result benchmark.TargetResult) string {
 	if result.Stats.Successes == 0 {
 		return "FAILED"
 	}
+	if result.Target.Resolver.Local {
+		return "NOT COMPARABLE"
+	}
 	if result.Stats.Recommended {
 		return "QUALIFIED"
 	}
@@ -636,7 +683,7 @@ func styledStatus(status string, color bool) string {
 	switch status {
 	case "RECOMMENDED", "QUALIFIED", "REFERENCE":
 		colorCode = ansiGreen
-	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED":
+	case "PROVISIONAL", "INELIGIBLE", "INCOMPLETE", "NOT COMPARABLE", "NO CLEAR DIFFERENCE", "NOT MEASURED", "TIED":
 		colorCode = ansiYellow
 	case "FAILED":
 		colorCode = ansiRed
@@ -670,12 +717,21 @@ func rankText(report benchmark.Report, targetID string) string {
 	return strconv.Itoa(rank)
 }
 
+const tieNote = "\n  TIED: the 95% score confidence interval overlaps another ranked target, so that ordering is not statistically distinguishable.\n"
+
+func tieText(stats benchmark.Statistics, color bool) string {
+	if !stats.Tie {
+		return "—"
+	}
+	return styledStatus("TIED", color)
+}
+
 func summaryRowWithOptions(protocol catalog.Protocol, result benchmark.TargetResult, status string, color bool, redactSystem bool) []string {
 	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	return []string{
 		string(protocol), view.Owner, view.Address, view.Policy,
 		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
-		scoreText(result), styledStatus(status, color),
+		scoreText(result), tieText(result.Stats, color), styledStatus(status, color),
 	}
 }
 
@@ -696,7 +752,7 @@ func comparisonRowWithOptions(report benchmark.Report, result benchmark.TargetRe
 			tlsIdentitySourceText(metadata.TLSIdentitySource), bootstrapModeText(metadata.BootstrapMode), bootstrapAddressesText(metadata.BootstrapAddresses), dialAddressTextWithOptions(result, redactSystem),
 		)
 	}
-	return append(row, styledStatus(resultStatus(result), color))
+	return append(row, tieText(result.Stats, color), styledStatus(resultStatus(result), color))
 }
 
 func dialAddressTextWithOptions(result benchmark.TargetResult, redactSystem bool) string {
@@ -706,42 +762,42 @@ func dialAddressTextWithOptions(result benchmark.TargetResult, redactSystem bool
 	if redactSystem && isSystemTarget(result.Target) {
 		return redactedValue
 	}
-	return result.DialAddress
+	return safetext.Escape(result.DialAddress)
 }
 
 func endpointURLText(value string) string {
 	if value == "" {
 		return "—"
 	}
-	return value
+	return safetext.Escape(value)
 }
 
 func tlsServerNameText(value string) string {
 	if value == "" {
 		return "—"
 	}
-	return value
+	return safetext.Escape(value)
 }
 
 func tlsIdentitySourceText(value string) string {
 	if value == "" || value == catalog.TLSIdentityNotApplicable {
 		return "—"
 	}
-	return value
+	return safetext.Escape(value)
 }
 
 func bootstrapModeText(value string) string {
 	if value == "" || value == catalog.BootstrapNotApplicable {
 		return "—"
 	}
-	return value
+	return safetext.Escape(value)
 }
 
 func bootstrapAddressesText(addresses []string) string {
 	if len(addresses) == 0 {
 		return "—"
 	}
-	return strings.Join(addresses, ";")
+	return safetext.Escape(strings.Join(addresses, ";"))
 }
 
 func sortComparisonResults(report benchmark.Report, results []benchmark.TargetResult) {
@@ -787,11 +843,11 @@ func unsupportedComparisonRowWithOptions(target catalog.Target, details bool, re
 	view := targetViewFor(target, redactSystem, redactedValue)
 	row := []string{"—", view.Owner, view.Address, view.Policy, "—", "—", "—", "—", "—"}
 	if details {
-		for range comparisonHeaders(true)[len(comparisonHeaders(false))-1 : len(comparisonHeaders(true))-1] {
+		for range len(comparisonHeaders(true)) - len(comparisonHeaders(false)) {
 			row = append(row, "—")
 		}
 	}
-	return append(row, "—")
+	return append(row, "—", "—")
 }
 
 // collapsedIPv6Targets returns the endpoints that the collapsed IPv6 warning
@@ -860,15 +916,22 @@ func pairedEffectTargetText(report benchmark.Report, targetID string, redactSyst
 	return strings.TrimSpace(view.Owner + " " + view.Address)
 }
 
+// pairedComparable reports whether an effect carries a usable delta and
+// interval. Any effect that benchmark left unmeasured records a Reason, which
+// includes samples below the paired minimum, so no reason means measured.
+func pairedComparable(effect benchmark.PairedEffect) bool {
+	return effect.Samples > 0 && effect.Reason == ""
+}
+
 func pairedDeltaText(effect benchmark.PairedEffect) string {
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return "—"
 	}
 	return fmt.Sprintf("%+.2f ms", effect.MedianDeltaMS)
 }
 
 func pairedCIText(effect benchmark.PairedEffect) string {
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return "—"
 	}
 	return fmt.Sprintf("[%+.2f, %+.2f] ms", effect.CILowMS, effect.CIHighMS)
@@ -878,7 +941,7 @@ func pairedInterpretation(effect benchmark.PairedEffect, color bool) string {
 	if effect.Reference {
 		return styledStatus("REFERENCE", color)
 	}
-	if effect.Samples == 0 {
+	if !pairedComparable(effect) {
 		return styledStatus("NOT COMPARABLE", color)
 	}
 	if effect.Indistinguishable || effect.MedianDeltaMS == 0 {
@@ -929,7 +992,7 @@ func pairedEffectRows(report benchmark.Report, options TableOptions) ([][]string
 			continue
 		}
 		rows = append(rows, []string{
-			string(effect.Protocol), effect.Policy,
+			string(effect.Protocol), safetext.Escape(effect.Policy),
 			pairedEffectTargetText(report, effect.TargetID, options.RedactSystem),
 			pairedEffectTargetText(report, effect.ReferenceTargetID, options.RedactSystem),
 			strconv.Itoa(effect.Samples), pairedDeltaText(effect), pairedCIText(effect),
@@ -1064,7 +1127,7 @@ func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) erro
 }
 
 func summaryHeaders() []string {
-	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score", "Status"}
+	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score", "Tie", "Status"}
 }
 
 func comparisonHeaders(details bool) []string {
@@ -1072,7 +1135,7 @@ func comparisonHeaders(details bool) []string {
 	if details {
 		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "Reconnects", "RCodes", "Endpoint", "TLSName", "TLSSource", "Bootstrap", "BootstrapAddrs", "Dial")
 	}
-	return append(headers, "Status")
+	return append(headers, "Tie", "Status")
 }
 
 func targetWarningLabel(result benchmark.TargetResult) string {
@@ -1179,6 +1242,9 @@ func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []st
 		if result.Stats.Truncated > 0 {
 			parts = append(parts, fmt.Sprintf("%d truncated responses", result.Stats.Truncated))
 		}
+		if result.Target.Resolver.Local {
+			parts = append(parts, "local resolver; cache-hit latency excludes the upstream cost, so it is not ranked or recommended")
+		}
 		if len(parts) > 0 {
 			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabelWithOptions(result, redactSystem), strings.Join(parts, "; ")))
 		}
@@ -1188,7 +1254,7 @@ func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []st
 			if redactSystem {
 				warning = redactWarningValue(report, warning, redactedTargetIDs(report, true))
 			}
-			warnings = append(warnings, warning)
+			warnings = append(warnings, safetext.Escape(warning))
 		}
 	}
 	return warnings
@@ -1248,12 +1314,32 @@ func writeWarnings(writer io.Writer, report benchmark.Report, details bool) erro
 	return writeWarningsWithOptions(writer, report, details, false)
 }
 
-func writeWarningsWithOptions(writer io.Writer, report benchmark.Report, details bool, redactSystem bool) error {
+// detailWarnings returns the full warning list rendered under --details.
+//
+// Warnings arrive as free text that embeds the session error of a target, and
+// that error quotes strings the endpoint chose - a certificate SAN reaches it
+// through "x509: certificate is valid for ...", and ESC survives the IA5String
+// check that x509 applies to those fields. The benchmark escapes the warnings
+// it builds, but the report does not depend on that: the list is escaped here,
+// where the report takes ownership of it, rather than in the writer, so every
+// producer of a warning is covered. Escaping is idempotent, so a warning that
+// was already escaped is unchanged.
+func detailWarnings(report benchmark.Report, redactSystem bool) []string {
 	warnings := report.Warnings
-	if !details {
-		warnings = compactWarningsWithOptions(report, redactSystem)
-	} else if redactSystem {
+	if redactSystem {
 		warnings = redactWarnings(report, redactedTargetIDs(report, true))
+	}
+	escaped := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		escaped = append(escaped, safetext.Escape(warning))
+	}
+	return escaped
+}
+
+func writeWarningsWithOptions(writer io.Writer, report benchmark.Report, details bool, redactSystem bool) error {
+	warnings := compactWarningsWithOptions(report, redactSystem)
+	if details {
+		warnings = detailWarnings(report, redactSystem)
 	}
 	if len(warnings) == 0 {
 		return nil
@@ -1295,7 +1381,7 @@ func divergenceExcludedText(detail benchmark.DivergenceDetail, redactedIDs map[s
 		if replacement, ok := redactedIDs[targetID]; ok {
 			targetID = replacement
 		}
-		part := targetID + "=" + exclusion.ResponseClass
+		part := safetext.Escape(targetID) + "=" + exclusion.ResponseClass
 		if exclusion.Treatment != "" {
 			part += "[" + exclusion.Treatment + "]"
 		}
@@ -1318,7 +1404,7 @@ func writeDivergenceDetails(writer io.Writer, report benchmark.Report, redactSys
 			baseline = "ambiguous (no baseline)"
 		}
 		if _, err := fmt.Fprintf(writer, "  - %s/%s policy=%s compared=%d baseline=%s; classes=%s; excluded=%s\n",
-			detail.Name, benchmark.QueryTypeName(detail.QType), detail.Policy, detail.Compared, baseline,
+			safetext.Escape(detail.Name), benchmark.QueryTypeName(detail.QType), safetext.Escape(detail.Policy), detail.Compared, safetext.Escape(baseline),
 			divergenceClassesText(detail.Classes), divergenceExcludedText(detail, redactedIDs)); err != nil {
 			return err
 		}
@@ -1345,13 +1431,16 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 	protocols := tableProtocols(report, options)
 	recommendations := make([][]string, 0, len(protocols))
 	provisionals := make([][]string, 0, len(protocols))
+	tiedWinner := false
 	for _, protocol := range protocols {
 		if winner, found := recommendedResult(report, protocol); found {
 			recommendations = append(recommendations, summaryRowWithOptions(protocol, winner, "RECOMMENDED", options.Color, options.RedactSystem))
+			tiedWinner = tiedWinner || winner.Stats.Tie
 			continue
 		}
 		if winner, found := rankedResult(report, protocol, 1); found {
 			provisionals = append(provisionals, summaryRowWithOptions(protocol, winner, "PROVISIONAL", options.Color, options.RedactSystem))
+			tiedWinner = tiedWinner || winner.Stats.Tie
 		}
 	}
 	if len(recommendations) == 0 {
@@ -1366,6 +1455,11 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 			return err
 		}
 		if err := writeAlignedTable(writer, summaryHeaders(), provisionals); err != nil {
+			return err
+		}
+	}
+	if tiedWinner {
+		if _, err := io.WriteString(writer, tieNote); err != nil {
 			return err
 		}
 	}
