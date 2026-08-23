@@ -119,6 +119,30 @@ func validBenchmarkOptions() Options {
 	}
 }
 
+// useTargetSeam selects the legacy target-level scheduler and installs seam as
+// its runTargetFunc hook. Selecting the scheduler explicitly keeps a
+// whole-target fake from silently deciding which scheduler is measured.
+func useTargetSeam(t *testing.T, seam func(context.Context, catalog.Target, []Query, Options) TargetResult) {
+	t.Helper()
+	oldScheduler := runProtocol
+	oldTarget := runTargetFunc
+	t.Cleanup(func() {
+		runProtocol = oldScheduler
+		runTargetFunc = oldTarget
+	})
+	runProtocol = runProtocolLegacy
+	runTargetFunc = seam
+}
+
+// useFairScheduler selects the scheduler the binary ships, so a test asserts
+// production behaviour rather than the legacy target-level path.
+func useFairScheduler(t *testing.T) {
+	t.Helper()
+	oldScheduler := runProtocol
+	t.Cleanup(func() { runProtocol = oldScheduler })
+	runProtocol = runProtocolFair
+}
+
 func TestRunValidationAndQueryConstruction(t *testing.T) {
 	base := validBenchmarkOptions()
 	cases := []struct {
@@ -172,12 +196,10 @@ func TestRunValidationAndQueryConstruction(t *testing.T) {
 }
 
 func TestRunAndProtocolScheduling(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
 	var progress []Progress
-	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 2, ResponseClass: "answer"}}}
-	}
+	})
 	opts := validBenchmarkOptions()
 	opts.OnProgress = func(p Progress) { progress = append(progress, p) }
 	targets := []catalog.Target{testTarget(catalog.TCP, "two"), testTarget(catalog.UDP, "one")}
@@ -197,8 +219,8 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 			t.Fatalf("progress[%d] phase = %q, want %q", index, progress[index].Phase, want)
 		}
 	}
-	if progress[0].Protocol != catalog.TCP || progress[3].Protocol != catalog.UDP {
-		t.Fatalf("progress protocol order = %#v/%#v, want tcp then udp", progress[0].Protocol, progress[3].Protocol)
+	if progress[0].Protocol != catalog.UDP || progress[3].Protocol != catalog.TCP {
+		t.Fatalf("progress protocol order = %#v/%#v, want udp then tcp", progress[0].Protocol, progress[3].Protocol)
 	}
 	if _, ok := report.ResultFor(report.Targets[0].Target.ID()); !ok {
 		t.Fatal("ResultFor did not find an existing result")
@@ -247,7 +269,7 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 		cancel()
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1}}}
 	}
-	cancelledTargets := []catalog.Target{testTarget(catalog.TCP, "cancel-first"), testTarget(catalog.UDP, "not-dispatched")}
+	cancelledTargets := []catalog.Target{testTarget(catalog.UDP, "cancel-first"), testTarget(catalog.TCP, "not-dispatched")}
 	cancelledReport, err := Run(ctx, cancelledTargets, opts)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
@@ -266,12 +288,8 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 
 func TestFairProgressEventsCoverPreparationAndFailedExchanges(t *testing.T) {
 	oldFactory := newFactory
-	oldTarget := runTargetFunc
-	t.Cleanup(func() {
-		newFactory = oldFactory
-		runTargetFunc = oldTarget
-	})
-	runTargetFunc = runTarget
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 	var opens int
 	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
 		opens++
@@ -319,12 +337,8 @@ func TestFairProgressEventsCoverPreparationAndFailedExchanges(t *testing.T) {
 
 func TestFairProgressEventsReportOpenFailures(t *testing.T) {
 	oldFactory := newFactory
-	oldTarget := runTargetFunc
-	t.Cleanup(func() {
-		newFactory = oldFactory
-		runTargetFunc = oldTarget
-	})
-	runTargetFunc = runTarget
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) {
 		return nil, errors.New("fixture open failed")
 	}
@@ -354,13 +368,9 @@ func TestFairProgressEventsReportOpenFailures(t *testing.T) {
 }
 
 func TestFairProtocolSchedulingIsOrderIndependent(t *testing.T) {
-	oldTarget := runTargetFunc
 	oldFactory := newFactory
-	t.Cleanup(func() {
-		runTargetFunc = oldTarget
-		newFactory = oldFactory
-	})
-	runTargetFunc = runTarget
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 
 	targets := []catalog.Target{
 		testTarget(catalog.UDP, "one"),
@@ -478,12 +488,9 @@ func TestFairProtocolSchedulingIsOrderIndependent(t *testing.T) {
 }
 
 func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
-	oldTarget := runTargetFunc
 	oldFactory := newFactory
-	t.Cleanup(func() {
-		runTargetFunc = oldTarget
-		newFactory = oldFactory
-	})
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
 	target := testTarget(catalog.UDP, "edge")
 	query := Query{Name: "edge.example", QType: dns.TypeA}
 	opts := Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1}
@@ -494,11 +501,12 @@ func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
 		t.Fatalf("empty fair protocol results = %#v", got)
 	}
 
-	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
+	// The legacy scheduler clamps its worker pool to the target count.
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
 		return TargetResult{Target: target, Observations: []Observation{{Success: true, LatencyMS: 1, ResponseClass: "answer"}}}
-	}
+	})
 	runProtocol(context.Background(), []catalog.Target{target}, []Query{query}, Options{Concurrency: 5})
-	runTargetFunc = runTarget
+	useFairScheduler(t)
 
 	runQueryRound(context.Background(), nil, query, 1)
 	readyRunner := &targetRunner{
@@ -583,14 +591,12 @@ func TestFairSchedulerCancellationAndHelperEdges(t *testing.T) {
 }
 
 func TestRunNoComparableReportsRetainUnavailableTargets(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
-	runTargetFunc = func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
 		return TargetResult{
 			Target: target, OpenError: "connection refused",
 			Observations: failedObservations(queries, errors.New("connection refused")),
 		}
-	}
+	})
 	opts := validBenchmarkOptions()
 	opts.Domains = []string{"example.com"}
 	opts.QueryTypes = []uint16{dns.TypeA}
@@ -609,9 +615,7 @@ func TestRunNoComparableReportsRetainUnavailableTargets(t *testing.T) {
 }
 
 func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
-	runTargetFunc = func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
+	useTargetSeam(t, func(_ context.Context, target catalog.Target, queries []Query, _ Options) TargetResult {
 		observations := make([]Observation, 0, len(queries))
 		for _, query := range queries {
 			observations = append(observations, Observation{
@@ -620,7 +624,7 @@ func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
 			})
 		}
 		return TargetResult{Target: target, Observations: observations}
-	}
+	})
 	opts := validBenchmarkOptions()
 	opts.Domains = []string{"example.com"}
 	opts.QueryTypes = []uint16{dns.TypeA}
@@ -639,8 +643,7 @@ func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
 }
 
 func TestRunProtocolCancellationBeforeDispatch(t *testing.T) {
-	oldTarget := runTargetFunc
-	t.Cleanup(func() { runTargetFunc = oldTarget })
+	useFairScheduler(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	results := runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "one")}, nil, Options{Concurrency: 5})
@@ -889,6 +892,30 @@ func TestRunTargetRecordsReconnectDiagnostics(t *testing.T) {
 	stats := calculateStatistics(result, time.Second, 42)
 	if stats.Reconnects != 1 || stats.Scored != 0 {
 		t.Fatalf("reconnect statistics = %#v", stats)
+	}
+}
+
+// TestRunTargetExcludesDoHReconnectFromWarmScoring covers the DoH session
+// shape: the flag is reported per query, so only the query that paid for a
+// fresh HTTPS connection is excluded from warm-latency scoring.
+func TestRunTargetExcludesDoHReconnectFromWarmScoring(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	warm := &fakeSession{}
+	warm.query = func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+		warm.reconnected = name == "dropped.example"
+		return replyFor(name, qtype), nil
+	}
+	factory := &fakeFactory{opens: []fakeOpen{{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: warm}}}
+	newFactory = func(catalog.Target, time.Duration) (transport.Factory, error) { return factory, nil }
+	queries := []Query{{Name: "kept.example", QType: dns.TypeA}, {Name: "dropped.example", QType: dns.TypeA}}
+	result := runTarget(context.Background(), testTarget(catalog.DoH, "doh-reconnect"), queries, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second})
+	if len(result.Observations) != 2 || result.Observations[0].Reconnected || !result.Observations[1].Reconnected {
+		t.Fatalf("DoH reconnect observations = %#v", result.Observations)
+	}
+	stats := calculateStatistics(result, time.Second, 42)
+	if stats.Reconnects != 1 || stats.Scored != 1 {
+		t.Fatalf("DoH reconnect statistics = %#v", stats)
 	}
 }
 
