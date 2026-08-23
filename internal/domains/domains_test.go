@@ -3,6 +3,8 @@ package domains
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -208,5 +210,68 @@ func TestValidateInputsCapsReportedInvalidNames(t *testing.T) {
 	}
 	if got := strings.Count(err.Error(), "whitespace is not allowed"); got != maxReportedInvalidNames {
 		t.Fatalf("reported %d invalid names, want %d: %v", got, maxReportedInvalidNames, err)
+	}
+}
+
+// TestLoadTolerantSkipsUnusableEntries covers the opt-in path: unusable entries
+// are dropped and described, and the returned corpus is what will be measured.
+func TestLoadTolerantSkipsUnusableEntries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mixed.txt")
+	contents := "example.com\nexa mple.com\nexample..com\n*.bad.com\nexample.org\n"
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("a mixed list must fail without the opt-in")
+	}
+	result, err := LoadTolerant(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Names) != 2 || result.Names[0] != "example.com" || result.Names[1] != "example.org" {
+		t.Fatalf("kept names = %#v", result.Names)
+	}
+	if len(result.Skipped) != 3 {
+		t.Fatalf("skipped = %#v, want three entries", result.Skipped)
+	}
+	for _, want := range []string{"whitespace is not allowed", "empty labels are not allowed", "wildcards are not allowed"} {
+		if !strings.Contains(strings.Join(result.Skipped, "; "), want) {
+			t.Fatalf("skipped entries missing %q: %#v", want, result.Skipped)
+		}
+	}
+}
+
+// TestLoadTolerantStillFailsWithoutAUsableName keeps the opt-in from turning a
+// wholly wrong file into an empty measurement.
+func TestLoadTolerantStillFailsWithoutAUsableName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "allbad.txt")
+	if err := os.WriteFile(path, []byte("*.a\n*.b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadTolerant(path, true); err == nil || !strings.Contains(err.Error(), "no usable names") {
+		t.Fatalf("all-invalid list error = %v", err)
+	}
+}
+
+// TestLoadTolerantCapsSkippedDescriptions keeps the warning bounded for a file
+// that is wrong throughout.
+func TestLoadTolerantCapsSkippedDescriptions(t *testing.T) {
+	lines := []string{"example.com"}
+	for index := 0; index < maxReportedInvalidNames+4; index++ {
+		lines = append(lines, fmt.Sprintf("bad %d.example", index))
+	}
+	path := filepath.Join(t.TempDir(), "many.txt")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := LoadTolerant(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Skipped) != maxReportedInvalidNames+1 {
+		t.Fatalf("skipped descriptions = %d, want the cap plus a summary line", len(result.Skipped))
+	}
+	if !strings.Contains(result.Skipped[len(result.Skipped)-1], "and 4 more") {
+		t.Fatalf("missing the overflow summary: %#v", result.Skipped)
 	}
 }

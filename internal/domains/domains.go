@@ -60,23 +60,63 @@ type domainInput struct {
 
 // Load returns either the embedded corpus or a user-provided newline-delimited
 // list. Empty lines, comments, duplicates, and a trailing root dot are handled
-// consistently in both modes.
+// consistently in both modes. Any entry that is not a usable domain name fails
+// the whole list.
 func Load(path string) ([]string, error) {
+	result, err := LoadTolerant(path, false)
+	return result.Names, err
+}
+
+// LoadResult carries a loaded corpus and, when invalid entries were skipped
+// rather than rejected, a bounded description of what was dropped.
+type LoadResult struct {
+	Names   []string
+	Skipped []string
+}
+
+// LoadTolerant loads a corpus, optionally skipping entries that are not usable
+// domain names instead of failing the list.
+//
+// Skipping is never the default. A run measures a corpus whose size and digest
+// are recorded in the report, so quietly benchmarking a subset of what the
+// caller supplied would make that provenance describe a file rather than a
+// measurement. A caller that opts in is expected to disclose the difference.
+//
+// A list with no usable entry still fails: there is nothing to measure, and
+// reporting an empty corpus would be worse than an error.
+func LoadTolerant(path string, skipInvalid bool) (LoadResult, error) {
 	if strings.TrimSpace(path) == "" {
 		if _, err := verifyEmbeddedCorpus(); err != nil {
-			return nil, fmt.Errorf("verify embedded domain corpus: %w", err)
+			return LoadResult{}, fmt.Errorf("verify embedded domain corpus: %w", err)
 		}
-		return Normalize(data.Domains())
+		// The embedded corpus is pinned and checksum-verified, so it is never
+		// loaded tolerantly: an invalid entry there is a build problem.
+		names, err := Normalize(data.Domains())
+		return LoadResult{Names: names}, err
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open domain list: %w", err)
+		return LoadResult{}, fmt.Errorf("open domain list: %w", err)
 	}
 	defer file.Close()
-	return loadReader(file)
+	if skipInvalid {
+		return loadReaderSkipping(file)
+	}
+	names, err := loadReader(file)
+	return LoadResult{Names: names}, err
 }
 
 func loadReader(reader io.Reader) ([]string, error) {
+	lines, err := scanDomainLines(reader)
+	if err != nil {
+		return nil, err
+	}
+	return validateInputs(lines)
+}
+
+// scanDomainLines reads a newline-delimited list, dropping blank lines and
+// comments and remembering each remaining entry's line number.
+func scanDomainLines(reader io.Reader) ([]domainInput, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024), maxDomainLineSize)
 	var lines []domainInput
@@ -92,7 +132,16 @@ func loadReader(reader io.Reader) ([]string, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read domain list: %w", err)
 	}
-	return validateInputs(lines)
+	return lines, nil
+}
+
+// loadReaderSkipping reads a list and drops entries that are not usable names.
+func loadReaderSkipping(reader io.Reader) (LoadResult, error) {
+	lines, err := scanDomainLines(reader)
+	if err != nil {
+		return LoadResult{}, err
+	}
+	return validateInputsSkipping(lines)
 }
 
 // Normalize validates and canonicalizes a list of domain names. It is shared
@@ -189,6 +238,42 @@ func validateInputs(inputs []domainInput) ([]string, error) {
 		return nil, errors.New("domain list is empty")
 	}
 	return domains, nil
+}
+
+// validateInputsSkipping normalizes what it can and describes what it dropped.
+// The description is bounded like the rejection error, so a wholly invalid file
+// cannot produce an unbounded warning.
+func validateInputsSkipping(inputs []domainInput) (LoadResult, error) {
+	seen := make(map[string]struct{}, len(inputs))
+	names := make([]string, 0, len(inputs))
+	skipped := make([]string, 0)
+	dropped := 0
+	for _, input := range inputs {
+		name, err := normalize(input.value)
+		if err != nil {
+			dropped++
+			// Only a file read reaches here, so every entry has a line number.
+			if len(skipped) < maxReportedInvalidNames {
+				skipped = append(skipped, fmt.Sprintf("line %d %q: %v", input.line, input.value, err))
+			}
+			continue
+		}
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return LoadResult{}, errors.New("domain list has no usable names")
+	}
+	if dropped > len(skipped) {
+		skipped = append(skipped, fmt.Sprintf("and %d more", dropped-len(skipped)))
+	}
+	return LoadResult{Names: names, Skipped: skipped}, nil
 }
 
 func normalize(value string) (string, error) {

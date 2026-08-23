@@ -78,6 +78,13 @@ the underscore is only allowed as the first character of a label.
 .B --sample N
 Sample N domains from the selected corpus.
 .TP
+.B --skip-invalid-domains
+Skip entries in
+.B --domains
+that are not usable domain names instead of failing the run. The report warns
+how many were dropped, and the recorded corpus size and checksum describe the
+names actually measured. A list with no usable entry still fails.
+.TP
 .B --cache-miss
 Opt in to bounded random names below the reserved example.com zone. It cannot
 be combined with --domains or --full.

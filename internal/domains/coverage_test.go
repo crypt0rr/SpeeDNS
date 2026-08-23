@@ -91,3 +91,23 @@ func TestCacheMissNamesAreBoundedAndUnique(t *testing.T) {
 	}
 	randomRead = oldRandomRead
 }
+
+// TestLoadReaderSkippingHandlesReadErrorsAndIgnorableLines covers the tolerant
+// reader's remaining paths: a failing reader, and entries that are ignored
+// rather than skipped (blank lines, comments, the bare root, and duplicates).
+func TestLoadReaderSkippingHandlesReadErrorsAndIgnorableLines(t *testing.T) {
+	if _, err := loadReaderSkipping(failingReader{}); err == nil ||
+		!strings.Contains(err.Error(), "read domain list") {
+		t.Fatalf("tolerant read error = %v", err)
+	}
+	result, err := loadReaderSkipping(strings.NewReader("\n# comment\n.\nexample.com\nEXAMPLE.COM\n*.bad\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Names) != 1 || result.Names[0] != "example.com" {
+		t.Fatalf("tolerant names = %#v", result.Names)
+	}
+	if len(result.Skipped) != 1 || !strings.Contains(result.Skipped[0], "wildcards are not allowed") {
+		t.Fatalf("tolerant skipped = %#v", result.Skipped)
+	}
+}
