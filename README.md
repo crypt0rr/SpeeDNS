@@ -196,7 +196,9 @@ failure-penalized even if they are divergent. See
 An endpoint is marked `RECOMMENDED` only when it has at least 20 comparable
 samples and at least 99% usable responses. Short runs can show a
 `PROVISIONAL` winner, but use a larger sample or `--full` for a more stable
-comparison.
+comparison. A resolver running on the local host is never ranked or
+recommended, because its cache-hit latency is not comparable with a resolver
+reached over the network; see [System resolver baseline](#system-resolver-baseline).
 
 Resolvers can have different filtering policies. SpeeDNS compares response
 classes only within the same declared policy. Within that group, the largest
@@ -240,8 +242,9 @@ The available transports are:
 SpeeDNS does not silently fall back from one protocol to another. The table
 shows the complete selected resolver/protocol matrix: an unsupported transport
 is shown as `—`, an unavailable transport is `FAILED`, a transport-valid result
-that cannot qualify is `INELIGIBLE`, an interrupted target is `INCOMPLETE`, and
-a recommendation-eligible result is `QUALIFIED`.
+that cannot qualify is `INELIGIBLE`, an interrupted target is `INCOMPLETE`, a
+resolver on the local host is `NOT COMPARABLE`, and a recommendation-eligible
+result is `QUALIFIED`.
 
 ## Default resolvers
 
@@ -402,6 +405,15 @@ times out or returns no usable nameservers, SpeeDNS falls back to
 ultimate upstream is not known to SpeeDNS. Scoped macOS entries are kept
 separate when the same address appears in more than one resolver block, since
 the scope and interface can change which DNS server answers.
+
+A local stub is measured and shown, but it is never ranked and never
+recommended. It answers from its own cache, so its latency excludes the
+upstream resolution it forwards to and is not comparable with a resolver
+reached over the network; without this rule a warm local cache would win every
+comparison it entered. Its row keeps the measured latency, shows no rank and
+the status `NOT COMPARABLE`, and the report carries a warning naming the
+reason. JSON marks the target with `"local": true` and CSV adds a trailing
+`local` column.
 
 When sharing a report that includes the system resolver, add
 `--redact-system`. It keeps the measurements and rankings but replaces local

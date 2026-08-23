@@ -86,6 +86,7 @@ type JSONTarget struct {
 	Policy             string           `json:"policy"`
 	Address            string           `json:"address"`
 	Protocol           catalog.Protocol `json:"protocol"`
+	Local              bool             `json:"local,omitempty"`
 	EndpointURL        string           `json:"endpoint_url,omitempty"`
 	TLSServerName      string           `json:"tls_server_name,omitempty"`
 	TLSIdentitySource  string           `json:"tls_identity_source,omitempty"`
@@ -126,7 +127,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 		jsonResult := JSONResult{
 			Target: JSONTarget{
 				ID: view.ID, Name: view.Name, Owner: view.Owner, Policy: view.Policy,
-				Address: view.Address, Protocol: result.Target.Protocol,
+				Address: view.Address, Protocol: result.Target.Protocol, Local: result.Target.Resolver.Local,
 				EndpointURL: metadata.EndpointURL, TLSServerName: metadata.TLSServerName,
 				TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
 				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: dialAddress,
@@ -214,7 +215,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent", "truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate", "rcode_counts", "median_ms", "p95_ms",
 		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error", "reconnects", "incomplete",
 		"endpoint_url", "tls_server_name", "tls_identity_source", "bootstrap_mode", "bootstrap_addresses", "dial_address",
-		"corpus_mode", "corpus_zone", "corpus_nonce",
+		"corpus_mode", "corpus_zone", "corpus_nonce", "local",
 	}); err != nil {
 		return err
 	}
@@ -237,7 +238,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 			formatFloat(stats.P95MS), formatFloat(stats.MinMS), formatFloat(stats.MaxMS), formatFloat(stats.MADMS),
 			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), csvCell(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), strconv.Itoa(stats.Reconnects), strconv.FormatBool(result.Incomplete),
 			csvCell(metadata.EndpointURL), csvCell(metadata.TLSServerName), csvCell(metadata.TLSIdentitySource), csvCell(metadata.BootstrapMode), csvCell(bootstrapAddressesCSV(metadata.BootstrapAddresses)), csvCell(dialAddress),
-			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce),
+			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce), strconv.FormatBool(result.Target.Resolver.Local),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -664,6 +665,9 @@ func resultStatus(result benchmark.TargetResult) string {
 	}
 	if result.Stats.Successes == 0 {
 		return "FAILED"
+	}
+	if result.Target.Resolver.Local {
+		return "NOT COMPARABLE"
 	}
 	if result.Stats.Recommended {
 		return "QUALIFIED"
@@ -1152,6 +1156,9 @@ func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []st
 		}
 		if result.Stats.Truncated > 0 {
 			parts = append(parts, fmt.Sprintf("%d truncated responses", result.Stats.Truncated))
+		}
+		if result.Target.Resolver.Local {
+			parts = append(parts, "local resolver; cache-hit latency excludes the upstream cost, so it is not ranked or recommended")
 		}
 		if len(parts) > 0 {
 			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabelWithOptions(result, redactSystem), strings.Join(parts, "; ")))

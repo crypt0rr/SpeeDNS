@@ -1065,7 +1065,7 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		sort.Float64s(cold)
 		stats.ColdMedianMS = percentile(cold, 0.5)
 	}
-	stats.Recommended = !result.Incomplete && stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
+	stats.Recommended = !result.Target.Resolver.Local && !result.Incomplete && stats.Scored >= MinimumRecommendedSamples && stats.UsableRate >= MinimumRecommendedSuccessRate
 	return stats
 }
 
@@ -1329,10 +1329,15 @@ func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 	return percentile(scores, 0.025), percentile(scores, 0.975)
 }
 
+// makeRankings orders the comparable targets of each protocol. A resolver on
+// the local host is measured and reported, but never ranked: its latency is a
+// local cache lookup that excludes the upstream resolution it forwards to, so
+// placing it in the same order as a network resolver would compare two
+// different quantities.
 func makeRankings(results []TargetResult) []Ranking {
 	byProtocol := make(map[catalog.Protocol][]int)
 	for index, result := range results {
-		if result.Stats.Scored > 0 && !result.Incomplete {
+		if result.Stats.Scored > 0 && !result.Incomplete && !result.Target.Resolver.Local {
 			byProtocol[result.Target.Protocol] = append(byProtocol[result.Target.Protocol], index)
 		}
 	}
@@ -1415,7 +1420,9 @@ func collectWarnings(results []TargetResult) []string {
 			}
 			warnings = append(warnings, warning)
 		}
-		if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
+		if result.Target.Resolver.Local {
+			warnings = append(warnings, fmt.Sprintf("%s runs on the local host: it measures cache-hit latency and excludes the upstream resolution cost, so its result is not comparable with a network resolver and is reported without a rank or recommendation", label))
+		} else if result.Stats.Scored > 0 && !result.Incomplete && !result.Stats.Recommended {
 			warnings = append(warnings, fmt.Sprintf("%s is not recommendation-eligible yet: needs at least %d comparable samples and %.0f%% usable responses", label, MinimumRecommendedSamples, MinimumRecommendedSuccessRate*100))
 		}
 	}

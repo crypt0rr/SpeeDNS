@@ -71,6 +71,76 @@ func TestJSONIncludesAndRedactsRunProvenance(t *testing.T) {
 	}
 }
 
+// TestLocalResolverIsReportedAsNotComparable checks that every output surface
+// keeps the local stub's measurement while saying, in the same place, that the
+// number cannot be compared with a network resolver.
+func TestLocalResolverIsReportedAsNotComparable(t *testing.T) {
+	stub := reportTarget("53", catalog.UDP, 2, false)
+	stub.Target.Resolver.ID = "system-stub-127-0-0-53"
+	stub.Target.Resolver.Name = "System DNS stub"
+	stub.Target.Resolver.Owner = "local stub/forwarder"
+	stub.Target.Resolver.Policy = "local forwarding (upstream unknown)"
+	stub.Target.Resolver.Local = true
+	stub.Target.Address = "127.0.0.53"
+	stub.Stats.MedianMS = 0.2
+	network := reportTarget("1", catalog.UDP, 2, true)
+
+	run := benchmark.Report{
+		StartedAt: time.Unix(0, 0), FinishedAt: time.Unix(1, 0), Seed: 5, SampleSize: 1, Queries: 1,
+		QueryTypes: []uint16{1}, Targets: []benchmark.TargetResult{stub, network},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: network.Target.ID(), Rank: 1}},
+	}
+
+	if status := resultStatus(stub); status != "NOT COMPARABLE" {
+		t.Fatalf("local stub status = %q", status)
+	}
+	if status := resultStatus(network); status != "QUALIFIED" {
+		t.Fatalf("network resolver status = %q", status)
+	}
+	if rank := rankText(run, stub.Target.ID()); rank != "—" {
+		t.Fatalf("local stub rank = %q, want no rank", rank)
+	}
+
+	var table bytes.Buffer
+	if err := WriteTableWithOptions(&table, run, TableOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	text := table.String()
+	if !strings.Contains(text, "NOT COMPARABLE") || !strings.Contains(text, "0.20 ms") {
+		t.Fatalf("table hid the local stub measurement or caveat: %s", text)
+	}
+	if !strings.Contains(text, "cache-hit latency excludes the upstream cost") {
+		t.Fatalf("table warnings missing the non-comparability reason: %s", text)
+	}
+	recommended, ok := recommendedResult(run, catalog.UDP)
+	if !ok || recommended.Target.ID() != network.Target.ID() {
+		t.Fatalf("recommendation = %#v/%v", recommended.Target, ok)
+	}
+
+	var jsonOutput bytes.Buffer
+	if err := WriteJSON(&jsonOutput, run, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jsonOutput.String(), "\"local\": true") {
+		t.Fatalf("JSON target missing the local flag: %s", jsonOutput.String())
+	}
+	if strings.Count(jsonOutput.String(), "\"local\":") != 1 {
+		t.Fatalf("network target should omit the local flag: %s", jsonOutput.String())
+	}
+
+	var csvOutput bytes.Buffer
+	if err := WriteCSV(&csvOutput, run); err != nil {
+		t.Fatal(err)
+	}
+	rows := strings.Split(strings.TrimSpace(csvOutput.String()), "\n")
+	if len(rows) != 3 || !strings.HasSuffix(rows[0], ",local") {
+		t.Fatalf("CSV header missing the local column: %s", csvOutput.String())
+	}
+	if !strings.HasSuffix(rows[1], ",true") || !strings.HasSuffix(rows[2], ",false") {
+		t.Fatalf("CSV local column = %#v", rows[1:])
+	}
+}
+
 func TestDurationMillisecondsRejectsInvalidRanges(t *testing.T) {
 	if got := durationMilliseconds(time.Time{}, time.Now()); got != 0 {
 		t.Fatalf("zero start duration = %v, want zero", got)

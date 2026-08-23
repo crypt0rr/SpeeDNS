@@ -360,6 +360,80 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 	}
 }
 
+// TestLocalResolverIsMeasuredButNeverRankedOrRecommended pins the
+// non-comparability rule for a resolver running on the local host. A loopback
+// stub answers from its own cache, so its latency excludes the upstream
+// resolution it forwards to and must never win a ranking or carry a
+// recommendation, however fast it looks.
+func TestLocalResolverIsMeasuredButNeverRankedOrRecommended(t *testing.T) {
+	observations := func(latency float64) []Observation {
+		samples := make([]Observation, 0, MinimumRecommendedSamples)
+		for index := 0; index < MinimumRecommendedSamples; index++ {
+			samples = append(samples, Observation{
+				Name: fmt.Sprintf("name%d.example", index), QType: dns.TypeA,
+				Success: true, Usable: true, RCode: dns.RcodeSuccess,
+				ResponseClass: "answer", LatencyMS: latency,
+			})
+		}
+		return samples
+	}
+
+	stub := testTarget(catalog.UDP, "127.0.0.53")
+	stub.Resolver.ID = "system-stub-127-0-0-53"
+	stub.Resolver.Name = "System DNS stub"
+	stub.Resolver.Policy = "local forwarding (upstream unknown)"
+	stub.Resolver.Local = true
+	network := testTarget(catalog.UDP, "192.0.2.53")
+
+	stubResult := TargetResult{Target: stub, Observations: observations(0.2)}
+	networkResult := TargetResult{Target: network, Observations: observations(12)}
+	stubResult.Stats = calculateStatistics(stubResult, 2*time.Second, 7)
+	networkResult.Stats = calculateStatistics(networkResult, 2*time.Second, 7)
+
+	if stubResult.Stats.Scored != MinimumRecommendedSamples || stubResult.Stats.MedianMS != 0.2 {
+		t.Fatalf("local stub measurement dropped: %#v", stubResult.Stats)
+	}
+	if stubResult.Stats.ScoreMS >= networkResult.Stats.ScoreMS {
+		t.Fatalf("fixture must make the local stub look fastest: %v vs %v", stubResult.Stats.ScoreMS, networkResult.Stats.ScoreMS)
+	}
+	if stubResult.Stats.Recommended {
+		t.Fatalf("local stub was marked recommendation-eligible: %#v", stubResult.Stats)
+	}
+	if !networkResult.Stats.Recommended {
+		t.Fatalf("network resolver lost its recommendation: %#v", networkResult.Stats)
+	}
+
+	rankings := makeRankings([]TargetResult{stubResult, networkResult})
+	if len(rankings) != 1 || rankings[0].TargetID != network.ID() || rankings[0].Rank != 1 {
+		t.Fatalf("rankings admitted the local stub: %#v", rankings)
+	}
+
+	warnings := collectWarnings([]TargetResult{stubResult, networkResult})
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %#v", warnings)
+	}
+	for _, expected := range []string{"System DNS stub 127.0.0.53/udp", "cache-hit latency", "upstream resolution cost", "not comparable"} {
+		if !strings.Contains(warnings[0], expected) {
+			t.Fatalf("non-comparability warning missing %q: %q", expected, warnings[0])
+		}
+	}
+	if strings.Contains(warnings[0], "recommendation-eligible yet") {
+		t.Fatalf("local stub reported as a quality problem: %q", warnings[0])
+	}
+
+	// The classification, not the address, decides: the same loopback target
+	// without the flag stays a normal ranked, recommendable resolver.
+	unflagged := stubResult
+	unflagged.Target.Resolver.Local = false
+	unflagged.Stats = calculateStatistics(unflagged, 2*time.Second, 7)
+	if !unflagged.Stats.Recommended {
+		t.Fatalf("unflagged target lost its recommendation: %#v", unflagged.Stats)
+	}
+	if unflaggedRankings := makeRankings([]TargetResult{unflagged}); len(unflaggedRankings) != 1 {
+		t.Fatalf("unflagged target was excluded from ranking: %#v", unflaggedRankings)
+	}
+}
+
 // TestRunMeasuresProtocolsInDocumentedOrder pins the protocol execution order
 // to METHODOLOGY.md. catalog.Protocol is a string type, so sorting the group
 // keys by value ordered the groups lexicographically as doh, doq, dot, tcp,
