@@ -68,6 +68,7 @@
         "policy": {"type": "string"},
         "address": {"type": "string"},
         "protocol": {"$ref": "#/$defs/protocol"},
+        "local": {"type": "boolean"},
         "endpoint_url": {"type": "string"},
         "tls_server_name": {"type": "string"},
         "tls_identity_source": {"type": "string"},

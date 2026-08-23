@@ -84,7 +84,12 @@ func TestLoadRejectsStrictDomainSyntaxWithSourceLine(t *testing.T) {
 		{name: "long label", value: strings.Repeat("a", 64) + ".example", want: "invalid domain name"},
 		{name: "leading hyphen", value: "-example.com", want: "invalid domain name"},
 		{name: "trailing hyphen", value: "example-.com", want: "invalid domain name"},
-		{name: "underscore", value: "_service.example", want: "invalid domain name"},
+		{name: "interior underscore", value: "under_score.example", want: "leading underscore"},
+		{name: "doubled underscore", value: "__dmarc.example", want: "leading underscore"},
+		{name: "bare underscore label", value: "_.example", want: "must name a host or service"},
+		{name: "non-ldh ascii", value: "ex!ample.com", want: "leading underscore"},
+		{name: "at sign", value: "user@example.com", want: "leading underscore"},
+		{name: "slash", value: "example.com/path", want: "leading underscore"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -93,6 +98,42 @@ func TestLoadRejectsStrictDomainSyntaxWithSourceLine(t *testing.T) {
 				t.Fatalf("validation error = %v, want line 3 and %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoadAcceptsUnderscoredServiceLabels(t *testing.T) {
+	got, err := loadReader(strings.NewReader(
+		"_dmarc.example.com\n" +
+			"_sip._tcp.example.com\n" +
+			"_443._TCP.Example.COM.\n" +
+			"selector1._domainkey.example.com\n" +
+			"_dmarc.BÜCHER.example\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"_dmarc.example.com",
+		"_sip._tcp.example.com",
+		"_443._tcp.example.com",
+		"selector1._domainkey.example.com",
+		"_dmarc.xn--bcher-kva.example",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("service label count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("service label %d = %q, want %q", index, got[index], want[index])
+		}
+	}
+}
+
+func TestNormalizeKeepsLengthLimitsOnUnderscoredLabels(t *testing.T) {
+	if _, err := Normalize([]string{"_" + strings.Repeat("a", 62) + ".example"}); err != nil {
+		t.Fatalf("63-octet service label = %v", err)
+	}
+	if _, err := Normalize([]string{"_" + strings.Repeat("a", 63) + ".example"}); err == nil {
+		t.Fatal("64-octet service label was accepted")
 	}
 }
 
@@ -110,5 +151,41 @@ func TestLoadRejectsOverlongDomain(t *testing.T) {
 func TestNormalizeRejectsInvalidUTF8(t *testing.T) {
 	if _, err := normalize(string([]byte{0xff})); err == nil || !strings.Contains(err.Error(), "UTF-8") {
 		t.Fatalf("invalid UTF-8 error = %v", err)
+	}
+}
+
+// TestNormalizeTrimsEveryRootLabelForm pins the root-label rule against the
+// Unicode tables x/net/idna selects by Go toolchain. UTS-46 maps the
+// ideographic and fullwidth stops onto the ASCII separator, so all four forms
+// have to survive normalization identically on every supported toolchain.
+func TestNormalizeTrimsEveryRootLabelForm(t *testing.T) {
+	for _, input := range []string{
+		"example.com.",
+		"EXAMPLE.COM.",
+		"example.com。",
+		"example.com．",
+		"example.com｡",
+	} {
+		got, err := Normalize([]string{input})
+		if err != nil {
+			t.Fatalf("Normalize(%q) error = %v", input, err)
+		}
+		if len(got) != 1 || got[0] != "example.com" {
+			t.Fatalf("Normalize(%q) = %#v, want [example.com]", input, got)
+		}
+	}
+}
+
+// TestNormalizeSkipsBareRootLabels covers names that consist only of label
+// separators; they carry no queryable name and must be skipped rather than
+// rejected, matching the documented handling of a bare root dot.
+func TestNormalizeSkipsBareRootLabels(t *testing.T) {
+	for _, input := range []string{"。", "．", "｡", "。．"} {
+		if _, err := Normalize([]string{input, "example.com"}); err != nil {
+			t.Fatalf("Normalize(%q, example.com) error = %v", input, err)
+		}
+	}
+	if _, err := Normalize([]string{"。"}); err == nil {
+		t.Fatal("expected a list of only root labels to be empty")
 	}
 }
