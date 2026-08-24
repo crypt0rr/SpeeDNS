@@ -1,7 +1,13 @@
 package schema
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -54,5 +60,59 @@ func TestLiveResultsV1IsEmbeddedJSONSchema(t *testing.T) {
 	contents[0] = 'x'
 	if LiveResultsV1()[0] == 'x' {
 		t.Fatal("LiveResultsV1 did not return an independent copy")
+	}
+}
+
+// TestRepositoryTracksNoBinaries fails if a compiled artifact is committed.
+//
+// A 14 MB scratch binary reached main in the v0.3.0 pre-release commit, swept
+// in by a `git add -A` after an audit left a build in .gotmp/. Nothing caught
+// it: gofmt, vet, staticcheck and the coverage gate all only look at Go source,
+// and the earlier stray-file check grepped for .pyc and .patch by name.
+//
+// This matters more than tidiness. The Go module zip is immutable once
+// proxy.golang.org fetches a tag, so a binary committed at a release tag can
+// never be removed -- only superseded.
+func TestRepositoryTracksNoBinaries(t *testing.T) {
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
+	if err != nil {
+		t.Skipf("git ls-files unavailable: %v", err)
+	}
+
+	// Files that are legitimately non-text. Keep this list short and explicit:
+	// every entry is a decision that something binary belongs in the tree.
+	allowed := map[string]bool{}
+
+	var offenders []string
+	for _, name := range strings.Split(string(listed), "\x00") {
+		if name == "" || allowed[name] {
+			continue
+		}
+		path := filepath.Join(root, name)
+		info, statErr := os.Stat(path)
+		if statErr != nil || info.IsDir() {
+			continue
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			continue
+		}
+		// A NUL byte in the first 8 KB is the same heuristic git itself uses to
+		// decide a blob is binary.
+		head := content
+		if len(head) > 8192 {
+			head = head[:8192]
+		}
+		if bytes.IndexByte(head, 0) >= 0 {
+			offenders = append(offenders, fmt.Sprintf("%s (%d bytes)", name, len(content)))
+		}
+	}
+	if len(offenders) > 0 {
+		sort.Strings(offenders)
+		t.Fatalf("compiled or binary artifacts are tracked:\n  %s", strings.Join(offenders, "\n  "))
 	}
 }
