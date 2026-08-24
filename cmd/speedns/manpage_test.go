@@ -101,3 +101,66 @@ func TestManPageDocumentsEachFlagOnce(t *testing.T) {
 		t.Fatalf("docs/speedns.1 documents these flags more than once: %s", strings.Join(duplicated, ", "))
 	}
 }
+
+// manPageEntries splits the OPTIONS list into one body per documented flag.
+func manPageEntries(t *testing.T) map[string]string {
+	t.Helper()
+	entry := regexp.MustCompile(`(?ms)^\.TP\n\.B (--[a-z][a-z0-9-]*)[^\n]*\n(.*?)(?:\n\.TP|\z)`)
+	entries := make(map[string]string)
+	for _, match := range entry.FindAllStringSubmatch(manPage(t), -1) {
+		entries[match[1]] = match[2]
+	}
+	if len(entries) == 0 {
+		t.Fatal("no option entries found; the entry pattern no longer matches the page")
+	}
+	return entries
+}
+
+// TestManPageDocumentsOnlyRealFlags is the reverse of
+// TestManPageDocumentsEveryFlag, which only checks that every real flag is
+// present. Nothing stopped the page describing a flag the binary does not
+// have -- a rename that updated the code and not the docs leaves the old name
+// documented, and a reader of the packaged man page is told to use an option
+// that exits 2.
+func TestManPageDocumentsOnlyRealFlags(t *testing.T) {
+	real := make(map[string]bool)
+	newRootCommand().Flags().VisitAll(func(flag *pflag.Flag) { real[flag.Name] = true })
+
+	var invented []string
+	for name := range manPageEntries(t) {
+		if !real[strings.TrimPrefix(name, "--")] {
+			invented = append(invented, name)
+		}
+	}
+	if len(invented) > 0 {
+		sort.Strings(invented)
+		t.Fatalf("docs/speedns.1 documents flags the binary does not have: %s", strings.Join(invented, ", "))
+	}
+}
+
+// TestManPageStatesEveryDefault derives the expected values from pflag rather
+// than restating them, so the page cannot quietly disagree with the binary
+// after a default changes. Only flags whose default is meaningful to a reader
+// are required: an empty string or a false boolean is the absence of an
+// option, not a value worth printing.
+func TestManPageStatesEveryDefault(t *testing.T) {
+	entries := manPageEntries(t)
+	var missing []string
+	newRootCommand().Flags().VisitAll(func(flag *pflag.Flag) {
+		if flag.Hidden || flag.DefValue == "" || flag.DefValue == "false" || flag.DefValue == "0" {
+			return
+		}
+		body, documented := entries["--"+flag.Name]
+		if !documented {
+			return // TestManPageDocumentsEveryFlag owns that failure.
+		}
+		if !strings.Contains(body, flag.DefValue) {
+			missing = append(missing, fmt.Sprintf("--%s (default %q)", flag.Name, flag.DefValue))
+		}
+	})
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		t.Fatalf("docs/speedns.1 does not state these defaults:\n  %s\n\nA reader of the packaged man page cannot discover them.",
+			strings.Join(missing, "\n  "))
+	}
+}
