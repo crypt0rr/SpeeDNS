@@ -47,8 +47,11 @@
         "ci_low_ms": 0,
         "ci_high_ms": 0,
         "recommended": false,
-        "tie": false
+        "tie": false,
+        "answers": 0,
+        "answer_rate": 0
       },
+      "status": "failed",
       "open_error": "fixture connection failed"
     },
     {
@@ -87,8 +90,11 @@
         "ci_low_ms": 1,
         "ci_high_ms": 4,
         "recommended": true,
-        "tie": false
-      }
+        "tie": false,
+        "answers": 0,
+        "answer_rate": 0
+      },
+      "status": "qualified"
     }
   ],
   "rankings": [

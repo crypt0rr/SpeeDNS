@@ -157,6 +157,11 @@ func TestStatisticsHoldTheirInvariants(t *testing.T) {
 		}
 		// Counts must nest: scored samples are a subset of usable responses,
 		// which are a subset of successes, which are a subset of the total.
+		// An answer is a usable response that carried a record, so it nests
+		// inside usable just as scored does.
+		if stats.Answers > stats.UsableResponses {
+			t.Fatalf("iteration %d: answers %d exceed usable responses %d", iteration, stats.Answers, stats.UsableResponses)
+		}
 		if !(stats.Scored <= stats.UsableResponses && stats.UsableResponses <= stats.Successes && stats.Successes <= stats.Total) {
 			t.Fatalf("iteration %d: counts do not nest: scored=%d usable=%d successes=%d total=%d",
 				iteration, stats.Scored, stats.UsableResponses, stats.Successes, stats.Total)
@@ -176,6 +181,7 @@ func TestStatisticsHoldTheirInvariants(t *testing.T) {
 			{"failure_rate", stats.FailureRate, stats.Failures},
 			{"usable_rate", stats.UsableRate, stats.UsableResponses},
 			{"resolver_failure_rate", stats.ResolverFailureRate, stats.ResolverFailures},
+			{"answer_rate", stats.AnswerRate, stats.Answers},
 		} {
 			if rate.value < 0 || rate.value > 1 || math.IsNaN(rate.value) {
 				t.Fatalf("iteration %d: %s = %v, want a proportion in [0,1]", iteration, rate.name, rate.value)

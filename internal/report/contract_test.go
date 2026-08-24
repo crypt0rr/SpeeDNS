@@ -336,3 +336,79 @@ func TestTableWarningsCoverTheSameTargetsAsJSON(t *testing.T) {
 		t.Fatalf("a targeted warning was added beside an existing rebuilt line:\n%s", joined)
 	}
 }
+
+// TestCSVCarriesRunIdentity pins the columns that make a CSV row
+// self-describing.
+//
+// CSV is the only trivially appendable format and the natural home for a weekly
+// series, but no column said which run a row came from: append two weeks into
+// one file and every row was undated and unattributable, and you could not tell
+// whether two rows measured the same domains with the same settings. It was
+// also the only one of the three formats not reproducible from its own
+// contents, while the table header carries the seed and JSON carries all of it.
+func TestCSVCarriesRunIdentity(t *testing.T) {
+	report := contractFixture()
+	report.StartedAt = time.Date(2026, 8, 24, 21, 30, 0, 0, time.UTC)
+	report.QueryTypes = []uint16{1, 28}
+	report.Provenance = &benchmark.RunProvenance{
+		Version:      "0.4.0",
+		CorpusSHA256: "800d075a11ff",
+	}
+
+	var buffer bytes.Buffer
+	if err := WriteCSV(&buffer, report); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := csv.NewReader(&buffer).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	column := make(map[string]int, len(rows[0]))
+	for index, name := range rows[0] {
+		column[name] = index
+	}
+	for field, want := range map[string]string{
+		"started_at":      "2026-08-24T21:30:00Z",
+		"seed":            "7",
+		"sample_size":     "40",
+		"query_types":     "A|AAAA",
+		"speedns_version": "0.4.0",
+		"corpus_sha256":   "800d075a11ff",
+		"status":          "ineligible",
+	} {
+		index, present := column[field]
+		if !present {
+			t.Fatalf("CSV has no %q column", field)
+		}
+		if got := rows[1][index]; got != want {
+			t.Fatalf("CSV %s = %q, want %q", field, got, want)
+		}
+	}
+	// The delimiter matters: a comma inside query_types would shift every
+	// column after it for a naive reader.
+	if strings.Contains(rows[1][column["query_types"]], ",") {
+		t.Fatal("query_types must not contain a comma")
+	}
+
+	// A report without provenance is valid and must still produce parseable
+	// rows rather than panicking or shifting columns.
+	bare := contractFixture()
+	bare.Provenance = nil
+	var bareBuffer bytes.Buffer
+	if err := WriteCSV(&bareBuffer, bare); err != nil {
+		t.Fatal(err)
+	}
+	bareRows, err := csv.NewReader(&bareBuffer).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bareRows[1]) != len(rows[1]) {
+		t.Fatalf("a report without provenance produced %d columns, want %d", len(bareRows[1]), len(rows[1]))
+	}
+	if got := bareRows[1][column["speedns_version"]]; got != "" {
+		t.Fatalf("missing provenance should leave the version empty, got %q", got)
+	}
+	if got := bareRows[1][column["started_at"]]; got != "" {
+		t.Fatalf("a report with no start time should leave started_at empty, got %q", got)
+	}
+}

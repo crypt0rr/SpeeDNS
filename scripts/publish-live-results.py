@@ -378,14 +378,24 @@ def build_record(items: list[dict[str, Any]], failure_lines: list[str]) -> dict[
         rank_one = next((ranking for ranking in rankings if ranking["rank"] == 1), None)
         if rank_one is None:
             derived_failures.append(f"{protocol}: no comparable ranking")
-        if stats["recommended"]:
+        # Read the verdict the tool published rather than deriving a second
+        # one. This used to invent a "measured" tier where SpeeDNS reports
+        # "ineligible", so the dashboard and the CLI printed different labels
+        # for the same endpoint. Older reports have no status field, so the
+        # previous derivation remains as a fallback.
+        status = item["result"].get("status")
+        if not status:
+            if stats["recommended"]:
+                status = "recommended"
+            elif stats["scored"] > 0:
+                status = "measured"
+            elif stats["successes"] > 0:
+                status = "ineligible"
+            else:
+                status = "failed"
+        elif status == "qualified":
+            # The dashboard's own vocabulary for a qualified endpoint.
             status = "recommended"
-        elif stats["scored"] > 0:
-            status = "measured"
-        elif stats["successes"] > 0:
-            status = "ineligible"
-        else:
-            status = "failed"
         transports.append(
             {
                 "protocol": protocol,

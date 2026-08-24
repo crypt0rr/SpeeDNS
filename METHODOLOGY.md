@@ -36,6 +36,21 @@ Three excluded warm-up queries are sent before the measured phase. Encrypted
 and stream transports reuse their connections during measured queries. UDP
 reports the DNS transaction time only.
 
+A default run sends roughly 8,650 DNS queries: about 206 per resolver/transport
+target, being 3 cold probes, 3 warm-ups and 200 measured exchanges, over the ten
+bundled profiles and the transports they declare. The load is not even. Four of
+the ten bundled profiles are DNS4EU addresses, so the smallest of the four
+operators receives roughly 38% of the total. `CACHE_MISS.md` states the
+separate reserved-zone budget for `--cache-miss`, which is 200 queries.
+
+Each target also records how many of its usable responses carried an actual
+record rather than NODATA, published as `answers` and `answer_rate`. NODATA is
+usable and is scored, so without this a resolver answering every query with an
+empty answer section is indistinguishable from a working one on the success and
+usable columns. It is disclosed and never penalised: on the default `A,AAAA`
+corpus a real resolver returns a record only about 45% of the time, so an
+absolute threshold would produce false accusations.
+
 ## What is measured
 
 Warm latency is measured from immediately before a DNS exchange until the

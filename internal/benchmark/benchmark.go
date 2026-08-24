@@ -158,6 +158,15 @@ type Statistics struct {
 	CIHighMS            float64        `json:"ci_high_ms"`
 	Recommended         bool           `json:"recommended"`
 	Tie                 bool           `json:"tie"`
+	// Answers counts responses that carried an actual record, as opposed to
+	// NODATA. NODATA is usable and is scored, which is correct, but it means
+	// Usable 100% spans everything from a working resolver down to a sinkhole
+	// answering every query with an empty answer section. On the default
+	// A,AAAA corpus a real resolver answers with a record only about 45% of
+	// the time, so the two columns a reader treats as "did it work" cannot
+	// tell those apart without this.
+	Answers    int     `json:"answers"`
+	AnswerRate float64 `json:"answer_rate"`
 }
 
 type TargetResult struct {
@@ -1013,6 +1022,9 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		usable := observationUsable(observation)
 		if observation.Success && !observation.Truncated && usable {
 			stats.UsableResponses++
+			if responseClassName(observation.ResponseClass) == "answer" {
+				stats.Answers++
+			}
 		}
 		if observation.Success && !observation.Truncated && !usable {
 			stats.ResolverFailures++
@@ -1049,6 +1061,7 @@ func calculateStatistics(result TargetResult, timeout time.Duration, seed int64)
 		stats.SuccessRate = float64(stats.Successes) / float64(stats.Total)
 		stats.FailureRate = float64(stats.Failures) / float64(stats.Total)
 		stats.UsableRate = float64(stats.UsableResponses) / float64(stats.Total)
+		stats.AnswerRate = float64(stats.Answers) / float64(stats.Total)
 		stats.ResolverFailureRate = float64(stats.ResolverFailures) / float64(stats.Total)
 	}
 	if len(scoreSamples) > 0 {
