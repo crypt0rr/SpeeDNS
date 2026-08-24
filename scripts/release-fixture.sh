@@ -94,11 +94,14 @@ fake_gh="${validate_bin}/gh"
 printf '%s\n' '#!/usr/bin/env bash' \
 	'set -euo pipefail' \
 	'if [[ "${1:-}" != release || "${2:-}" != view ]]; then exit 2; fi' \
+	'wants=false; for a in "$@"; do case "$a" in *isPrerelease*) wants=true ;; esac; done' \
 	'case "$(<"${FAKE_RELEASE_STATE}")" in' \
-	'published) printf "%s\\n" false ;;' \
-	'draft) printf "%s\\n" true ;;' \
+	'published) d=false; p=false ;;' \
+	'draft) d=true; p=false ;;' \
+	'prerelease) d=false; p=true ;;' \
 	'*) exit 1 ;;' \
-	'esac' >"${fake_gh}"
+	'esac' \
+	'if [[ "$wants" == true ]]; then printf "%s\\n%s\\n" "$d" "$p"; else printf "%s\\n" "$d"; fi' >"${fake_gh}"
 chmod +x "${fake_gh}"
 printf '%s\n' published >"${fake_state}"
 PATH="${validate_bin}:${PATH}" \
@@ -119,6 +122,16 @@ if PATH="${validate_bin}:${PATH}" \
 	FAKE_RELEASE_STATE="${fake_state}" \
 	bash "${root_dir}/scripts/validate-published-release.sh" "v${version}" "example/repository"; then
 	echo "missing release was unexpectedly accepted" >&2
+	exit 1
+fi
+# A prerelease must be refused: the Homebrew workflow fires on every published
+# release, so accepting one would point the stable cask at a release candidate.
+printf '%s\n' prerelease >"${fake_state}"
+if PATH="${validate_bin}:${PATH}" \
+	GH_TOKEN=fixture-token \
+	FAKE_RELEASE_STATE="${fake_state}" \
+	bash "${root_dir}/scripts/validate-published-release.sh" "v${version}" "example/repository"; then
+	echo "prerelease was unexpectedly accepted for the Homebrew cask" >&2
 	exit 1
 fi
 
