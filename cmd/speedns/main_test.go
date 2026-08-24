@@ -2070,3 +2070,182 @@ func TestSkipInvalidDomainsDisclosesWhatItDropped(t *testing.T) {
 		t.Fatalf("cache-miss combination error = %v", err)
 	}
 }
+
+// TestClassifyLocalResolversSeparatesTheHostFromTheNetwork pins the two
+// deliberately different strengths.
+//
+// METHODOLOGY promises a resolver on the local host is never ranked, because it
+// answers from its own cache and excludes the upstream resolution it forwards.
+// That fired only for system-discovered targets and tested loopback alone, so
+// `--resolver pihole=udp://127.0.0.1` was ranked and a router forwarder
+// competed with public resolvers.
+func TestClassifyLocalResolversSeparatesTheHostFromTheNetwork(t *testing.T) {
+	// The measuring host holds one routable address and one ULA.
+	own := map[string]bool{"203.0.113.7": true, "fd00::7": true}
+
+	profile := func(id string, addresses ...string) catalog.ResolverProfile {
+		return catalog.ResolverProfile{
+			ID: id, Name: id, Owner: "Owner", Policy: "unfiltered",
+			Addresses:  addresses,
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}},
+		}
+	}
+	profiles := []catalog.ResolverProfile{
+		profile("loopback4", "127.0.0.1"),
+		profile("loopback6", "::1"),
+		profile("this-host", "203.0.113.7"),
+		profile("this-host-v6", "fd00::7"),
+		profile("router", "192.168.1.1"),
+		profile("cgnat", "100.100.100.100"),
+		profile("linklocal", "169.254.1.1"),
+		profile("ula", "fd7a:115c:a1e0::53"),
+		profile("public", "8.8.8.8"),
+		profile("public6", "2001:4860:4860::8888"),
+		profile("mapped-loopback", "::ffff:127.0.0.1"),
+		// A hostname endpoint carries no literal to classify; it must be
+		// skipped rather than guessed at.
+		profile("hostname", "dns.example.test"),
+	}
+
+	onNetwork := classifyLocalResolvers(profiles, own)
+
+	local := map[string]bool{}
+	for _, p := range profiles {
+		if p.Local {
+			local[p.ID] = true
+		}
+	}
+	// Loopback and the host's own addresses ARE the local host.
+	for _, id := range []string{"loopback4", "loopback6", "this-host", "this-host-v6", "mapped-loopback"} {
+		if !local[id] {
+			t.Errorf("%s should be classified as running on the local host", id)
+		}
+	}
+	// Everything else keeps its rank, including private addresses the host
+	// does not hold: the tool cannot tell a forwarder from a self-hosted
+	// recursive resolver, and refusing to rank one would punish a legitimate
+	// setup.
+	for _, id := range []string{"router", "cgnat", "linklocal", "ula", "public", "public6", "hostname"} {
+		if local[id] {
+			t.Errorf("%s must not be treated as running on the local host", id)
+		}
+	}
+	// But the private ones must be disclosed.
+	reported := strings.Join(onNetwork, " ")
+	for _, id := range []string{"router", "cgnat", "linklocal", "ula"} {
+		if !strings.Contains(reported, id) {
+			t.Errorf("%s is reached over the local network and must be reported: %q", id, reported)
+		}
+	}
+	for _, id := range []string{"public", "public6", "loopback4", "this-host", "hostname"} {
+		if strings.Contains(reported, id) {
+			t.Errorf("%s must not be reported as on-network: %q", id, reported)
+		}
+	}
+}
+
+// TestHostOwnAddressesReadsUpInterfacesOnly covers the inventory, including
+// loopback, which the family detector deliberately skips but this one needs.
+func TestHostOwnAddressesReadsUpInterfacesOnly(t *testing.T) {
+	oldList, oldAddrs := listNetworkInterfacesFunc, interfaceAddressesFunc
+	t.Cleanup(func() { listNetworkInterfacesFunc, interfaceAddressesFunc = oldList, oldAddrs })
+
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) {
+		return []net.Interface{
+			{Index: 1, Name: "lo", Flags: net.FlagUp},
+			{Index: 2, Name: "eth0", Flags: net.FlagUp},
+			{Index: 3, Name: "eth1"}, // down: must be ignored
+		}, nil
+	}
+	interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
+		switch iface.Name {
+		case "lo":
+			return []net.Addr{&net.IPNet{IP: net.ParseIP("127.0.0.1")}}, nil
+		case "eth0":
+			return []net.Addr{&net.IPNet{IP: net.ParseIP("203.0.113.7")}}, nil
+		default:
+			return []net.Addr{&net.IPNet{IP: net.ParseIP("198.51.100.9")}}, nil
+		}
+	}
+	own, err := hostOwnAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !own["127.0.0.1"] || !own["203.0.113.7"] {
+		t.Fatalf("inventory missing an up-interface address: %#v", own)
+	}
+	if own["198.51.100.9"] {
+		t.Fatalf("an address on a down interface reached the inventory: %#v", own)
+	}
+
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) { return nil, errors.New("no interfaces") }
+	if _, err := hostOwnAddresses(); err == nil {
+		t.Fatal("an interface enumeration failure must be reported")
+	}
+	listNetworkInterfacesFunc = func() ([]net.Interface, error) {
+		return []net.Interface{{Index: 1, Name: "eth0", Flags: net.FlagUp}}, nil
+	}
+	interfaceAddressesFunc = func(net.Interface) ([]net.Addr, error) { return nil, errors.New("no addresses") }
+	if _, err := hostOwnAddresses(); err == nil {
+		t.Fatal("an address enumeration failure must be reported")
+	}
+}
+
+// TestOnNetworkResolversAreDisclosedAndRedacted covers how the on-network
+// warning reaches the report, including under --redact-system where naming the
+// resolver would leak the host's own network layout.
+func TestOnNetworkResolversAreDisclosedAndRedacted(t *testing.T) {
+	oldEngine, oldOwn := runBenchmarkEngine, hostOwnAddressesFunc
+	t.Cleanup(func() { runBenchmarkEngine, hostOwnAddressesFunc = oldEngine, oldOwn })
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+	hostOwnAddressesFunc = func() (map[string]bool, error) { return map[string]bool{}, nil }
+
+	base := &cliConfig{
+		protocols: "udp", resolverFlags: []string{"router=udp://192.168.1.1:53"}, noDefaults: true,
+		sample: 5, seed: 1, queryTypes: "A", timeout: time.Second, concurrency: 1,
+		format: "json", family: "4",
+	}
+	named := *base
+	named.output = filepath.Join(t.TempDir(), "named.json")
+	if err := runBenchmark(context.Background(), &named); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(named.output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "192.168.1.1") ||
+		!strings.Contains(string(content), "may be a forwarder") {
+		t.Fatalf("the on-network resolver was not disclosed: %s", content)
+	}
+
+	// Redacted: the count is still disclosed, the address is not.
+	redacted := *base
+	redacted.redactSystem = true
+	redacted.output = filepath.Join(t.TempDir(), "redacted.json")
+	if err := runBenchmark(context.Background(), &redacted); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(redacted.output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "1 resolver(s) are reached over the local network") {
+		t.Fatalf("the redacted disclosure is missing: %s", content)
+	}
+	if strings.Contains(string(content), "192.168.1.1") {
+		t.Fatalf("--redact-system leaked a local address: %s", content)
+	}
+
+	// An inventory failure must stop the run rather than silently skipping
+	// classification, which would quietly restore the old behaviour.
+	hostOwnAddressesFunc = func() (map[string]bool, error) { return nil, errors.New("inventory unavailable") }
+	failing := *base
+	failing.output = filepath.Join(t.TempDir(), "failing.json")
+	if err := runBenchmark(context.Background(), &failing); err == nil ||
+		!strings.Contains(err.Error(), "inventory unavailable") {
+		t.Fatalf("inventory failure = %v", err)
+	}
+}

@@ -124,12 +124,27 @@ is `INELIGIBLE`; a result with no transport-valid response is `FAILED`.
 Interrupted targets are `INCOMPLETE` and are never ranked.
 
 A resolver that runs on the local host, such as a loopback stub or forwarder,
-is measured and reported but is never ranked and never recommended. It answers
+is measured and reported but is never ranked and never recommended. "On the
+local host" means a loopback address or any address the measuring machine
+itself holds on an up interface, and the classification is applied to every
+resolver the run selects -- bundled, `--resolver`, `--resolver-file` and
+discovered alike -- rather than only to discovered ones. It answers
 from its own cache, so the measurement is cache-hit latency and excludes the
 upstream resolution it forwards to; comparing it with a resolver reached over
 the network would compare two different quantities. Such a target is
 `NOT COMPARABLE`, has no rank, and carries a permanent warning naming that
-reason. The classification comes from system resolver discovery, not from the
+reason.
+
+A resolver reached over the local network but not on the measuring host -- an
+RFC 1918, CGNAT, link-local or unique-local address -- is treated differently
+and deliberately more weakly. It is still ranked, because SpeeDNS cannot tell a
+caching forwarder from a self-hosted recursive resolver and refusing to rank one
+would penalise a legitimate setup. The report warns that its latency may exclude
+the upstream resolution it is being compared against, so the reader can apply
+the judgement the tool cannot. Under `--redact-system` the count is disclosed
+without the address.
+
+The local-host classification comes from the address inventory, not from the
 resolver file format, so it cannot be asserted by a catalog. JSON reports it
 in the additive `local` field on the target and CSV in a trailing `local`
 column, so a consumer can tell a missing rank caused by non-comparability
