@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -350,5 +351,44 @@ func TestNumericAssertionsTargetRankOneOnly(t *testing.T) {
 	if err := evaluateAssertions(unranked, numeric); err == nil ||
 		!strings.Contains(err.Error(), "has no ranked protocol winners") {
 		t.Fatalf("unranked report = %v", err)
+	}
+}
+
+// TestAssertionComparisonAtExactEquality pins the boundary of every operator.
+//
+// A user writing --assert 'usable>=0.99' against a resolver that returns
+// exactly 0.99 is relying on >= including equality. Nothing tested any operator
+// at its boundary, so flipping >= to > or <= to < changes whether their CI gate
+// passes while every gate here stays green. These are the values people
+// actually write in a threshold, so the boundary is the case that matters most.
+func TestAssertionComparisonAtExactEquality(t *testing.T) {
+	for _, testCase := range []struct {
+		operator string
+		actual   float64
+		expected float64
+		want     bool
+	}{
+		// At equality, inclusive operators hold and strict ones do not.
+		{">=", 0.99, 0.99, true},
+		{"<=", 0.99, 0.99, true},
+		{">", 0.99, 0.99, false},
+		{"<", 0.99, 0.99, false},
+		{"=", 0.99, 0.99, true},
+		// Just off the boundary, in both directions.
+		{">=", 0.98, 0.99, false},
+		{">=", 1.00, 0.99, true},
+		{"<=", 1.00, 0.99, false},
+		{"<=", 0.98, 0.99, true},
+		{">", 1.00, 0.99, true},
+		{"<", 0.98, 0.99, true},
+		{"=", 0.98, 0.99, false},
+		// An unknown operator must never quietly hold.
+		{"~", 0.99, 0.99, false},
+	} {
+		t.Run(fmt.Sprintf("%v%s%v", testCase.actual, testCase.operator, testCase.expected), func(t *testing.T) {
+			if got := assertionComparison(testCase.actual, testCase.operator, testCase.expected); got != testCase.want {
+				t.Fatalf("%v %s %v = %v, want %v", testCase.actual, testCase.operator, testCase.expected, got, testCase.want)
+			}
+		})
 	}
 }
