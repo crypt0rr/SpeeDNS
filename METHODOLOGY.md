@@ -170,19 +170,43 @@ presented as an unqualified winner. CSV keeps its `tie` column and JSON keeps
 `tie` on both `rankings[]` and `results[].stats`. The strict `1..N` rank is
 still reported: a tie qualifies the ordering, it does not remove it.
 
-The report also includes paired latency effects. For each protocol and
-normalized declared policy, the best-ranked target in that group is the local
-reference. Each other target is paired with that reference by normalized query
-name and record type. Only usable, non-divergent observations that were not
-recorded immediately after a reconnect are included. The reported delta is the
+The report also includes paired latency effects. For each protocol, the
+best-ranked target of that protocol is the reference, and each other target is
+paired with it by normalized query name and record type. Only usable,
+non-divergent observations that were not recorded immediately after a reconnect
+are included, and a pair is formed only where both resolvers returned the same
+response class.
+
+The grouping used to include the resolver's declared policy. That string is
+free text, and in practice most groups had one member -- five of the ten
+bundled profiles sit alone in their policy string, as does every `--resolver`
+endpoint and every discovered system resolver -- so most targets could only be
+compared with themselves. Since the rankings these effects exist to explain are
+scoped to a protocol, the comparisons now share that scope.
+
+The response-class requirement is what the policy grouping was really for. A
+filtering resolver that sinkholes a name answers from its own blocklist while
+the reference performs a real recursion, and comparing those two measures the
+filtering policy rather than the resolver's speed. Requiring a matching class
+removes exactly those pairs, one observation at a time, without requiring every
+resolver in a comparison to declare the same policy string. Divergence
+detection is unchanged and still groups by declared policy, where a fine
+grouping is correct: two resolvers with different filtering policies are
+*expected* to return different answers, and treating that as divergence would
+be a false positive.
+
+Resolvers on the local host are excluded from paired effects entirely. They are
+never ranked, and pairing one against the protocol winner would present a
+cache-hit latency as though it were comparable. The reported delta is the
 median of `target latency - reference latency`, so a positive value means the
 target was slower. A deterministic bootstrap of those paired deltas provides
 the 95% confidence interval. When the interval contains zero, the report says
 `NO CLEAR DIFFERENCE`: the observed ranking difference is not distinguishable
 from noise in this run. These effects explain the existing score and never
-change ranking order. A group with a single member has no peer to compare
-against, so its only row would be a self-comparison; the default table counts
-those targets in one line below the block and `--details` lists them again.
+change ranking order. A protocol with a single measured target has no peer to
+compare against, so its only row would be a self-comparison; the default table
+counts those targets in one line below the block and `--details` lists them
+again.
 JSON exposes them in the additive `paired_effects` section, always including
 every entry, while the human table shows them below the protocol comparisons
 and CSV retains its aggregate one-row-per-target schema.
@@ -196,8 +220,8 @@ reason is a fixed phrase rather than one naming the current threshold, so a
 consumer matching on it does not break when the threshold changes; the sample
 count is in the same record.
 
-A target that is the only member of its protocol and policy group has no peer to
-be paired against, so it is its own reference and its row carries no
+A target that is the only measured member of its protocol has no peer to be
+paired against, so it is its own reference and its row carries no
 information. The human table omits those rows and reports how many were omitted;
 `--details` and the `paired_effects` JSON section keep every entry, so the
 detailed view remains a complete record of what was measured.

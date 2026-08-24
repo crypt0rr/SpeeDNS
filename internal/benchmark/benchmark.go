@@ -1160,37 +1160,44 @@ func bootstrapCI(samples []scoreSample, timeout time.Duration, seed int64) (floa
 	return percentile(scores, 0.025), percentile(scores, 0.975)
 }
 
-type pairedGroupKey struct {
-	protocol catalog.Protocol
-	policy   string
-}
-
-// calculatePairedEffects builds policy-local comparisons against the best
-// ranked target in each protocol/policy group. It deliberately runs after
-// makeRankings so the existing score remains the only ranking authority.
+// calculatePairedEffects compares every measured target against the best ranked
+// target of its protocol. It deliberately runs after makeRankings so the
+// existing score remains the only ranking authority.
+//
+// Grouping is by protocol alone. It used to include the resolver's policy
+// string, which is free text: in the bundled catalog five of ten profiles sit
+// alone in their policy, as does every --resolver endpoint and every
+// discovered system resolver, so most groups had one member and a group of one
+// can only compare a target with itself. The rankings this section exists to
+// explain are protocol-scoped, so the comparisons now share their scope.
+//
+// Dropping policy from the key does not drop the protection it was meant to
+// give. A filtering resolver that sinkholes a name answers from its own
+// blocklist while the reference performs a real recursion, and that difference
+// measures policy rather than speed -- so pairedLatencyDeltas now requires the
+// two observations to share a response class, which removes exactly those
+// pairs and nothing else.
+//
+// Resolvers on the local host are skipped. They are never ranked, so pairing
+// one against the protocol winner would present a cache-hit latency as if it
+// were comparable.
 func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int64) []PairedEffect {
 	ranks := make(map[string]int, len(rankings))
 	for _, ranking := range rankings {
 		ranks[ranking.TargetID] = ranking.Rank
 	}
-	groups := make(map[pairedGroupKey][]int)
+	groups := make(map[catalog.Protocol][]int)
 	for index, result := range results {
-		if result.Incomplete || result.Stats.Scored == 0 {
+		if result.Incomplete || result.Stats.Scored == 0 || result.Target.Resolver.Local {
 			continue
 		}
-		key := pairedGroupKey{protocol: result.Target.Protocol, policy: divergencePolicy(result.Target.Resolver.Policy)}
-		groups[key] = append(groups[key], index)
+		groups[result.Target.Protocol] = append(groups[result.Target.Protocol], index)
 	}
-	keys := make([]pairedGroupKey, 0, len(groups))
+	keys := make([]catalog.Protocol, 0, len(groups))
 	for key := range groups {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].protocol != keys[j].protocol {
-			return keys[i].protocol < keys[j].protocol
-		}
-		return keys[i].policy < keys[j].policy
-	})
+	sort.Slice(keys, func(i, j int) bool { return catalog.CompareProtocols(keys[i], keys[j]) < 0 })
 
 	effects := make([]PairedEffect, 0)
 	for _, key := range keys {
@@ -1216,8 +1223,12 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 		for _, index := range indexes {
 			target := results[index]
 			effect := PairedEffect{
-				Protocol:          key.protocol,
-				Policy:            key.policy,
+				Protocol: key,
+				// Policy now labels the target's own declared policy rather
+				// than naming the group, so the column still says what a
+				// resolver claims to do while no longer deciding who it is
+				// compared against.
+				Policy:            divergencePolicy(target.Target.Resolver.Policy),
 				TargetID:          target.Target.ID(),
 				ReferenceTargetID: reference.Target.ID(),
 				Reference:         target.Target.ID() == reference.Target.ID(),
@@ -1248,7 +1259,7 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 			}
 			sort.Float64s(deltas)
 			effect.MedianDeltaMS = percentile(deltas, 0.5)
-			effect.CILowMS, effect.CIHighMS = bootstrapPairedCI(deltas, pairedBootstrapSeed(seed, key.protocol, key.policy, reference.Target.ID(), target.Target.ID()))
+			effect.CILowMS, effect.CIHighMS = bootstrapPairedCI(deltas, pairedBootstrapSeed(seed, key, reference.Target.ID(), target.Target.ID()))
 			effect.Indistinguishable = effect.CILowMS <= 0 && effect.CIHighMS >= 0
 			effects = append(effects, effect)
 		}
@@ -1265,43 +1276,65 @@ func calculatePairedEffects(results []TargetResult, rankings []Ranking, seed int
 	return effects
 }
 
+// pairedSample is one comparable observation: how long the answer took, and
+// what kind of answer it was.
+type pairedSample struct {
+	latencyMS     float64
+	responseClass string
+}
+
+// pairedLatencyDeltas pairs the two targets' observations by name and type, and
+// keeps only the pairs where both resolvers returned the same class of answer.
+//
+// The class check is what replaces the policy grouping key. A filtering
+// resolver that sinkholes a name answers from its own blocklist in well under a
+// millisecond while the reference performs a real recursion; pairing those two
+// measures the filtering policy, not the resolver's speed. Requiring a matching
+// class removes exactly those pairs, per pair, without needing every resolver
+// in a comparison to declare the same policy string.
 func pairedLatencyDeltas(target, reference TargetResult) []float64 {
-	targetLatencies := pairedObservationLatencies(target)
-	referenceLatencies := pairedObservationLatencies(reference)
-	keys := make([]string, 0, len(targetLatencies))
-	for key := range targetLatencies {
-		if _, ok := referenceLatencies[key]; ok {
-			keys = append(keys, key)
+	targetSamples := pairedObservationSamples(target)
+	referenceSamples := pairedObservationSamples(reference)
+	keys := make([]string, 0, len(targetSamples))
+	for key, sample := range targetSamples {
+		peer, ok := referenceSamples[key]
+		if !ok || peer.responseClass != sample.responseClass {
+			continue
 		}
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	deltas := make([]float64, 0, len(keys))
 	for _, key := range keys {
-		deltas = append(deltas, targetLatencies[key]-referenceLatencies[key])
+		deltas = append(deltas, targetSamples[key].latencyMS-referenceSamples[key].latencyMS)
 	}
 	return deltas
 }
 
-func pairedObservationLatencies(result TargetResult) map[string]float64 {
-	latencies := make(map[string]float64)
+func pairedObservationSamples(result TargetResult) map[string]pairedSample {
+	samples := make(map[string]pairedSample)
 	for _, observation := range result.Observations {
 		if !observationUsable(observation) || observation.Divergent || observation.Reconnected ||
 			math.IsNaN(observation.LatencyMS) || math.IsInf(observation.LatencyMS, 0) || observation.LatencyMS < 0 {
 			continue
 		}
 		key := queryKey(observation.Name, observation.QType)
-		if _, exists := latencies[key]; !exists {
-			latencies[key] = observation.LatencyMS
+		if _, exists := samples[key]; !exists {
+			samples[key] = pairedSample{
+				latencyMS:     observation.LatencyMS,
+				responseClass: responseClassName(observation.ResponseClass),
+			}
 		}
 	}
-	return latencies
+	return samples
 }
 
-func pairedBootstrapSeed(seed int64, protocol catalog.Protocol, policy, referenceID, targetID string) int64 {
+// pairedBootstrapSeed derives a stable per-comparison seed. Policy is no longer
+// part of it: the pair is identified by its protocol and its two target IDs,
+// which is what the comparison actually is now that grouping is protocol-only.
+func pairedBootstrapSeed(seed int64, protocol catalog.Protocol, referenceID, targetID string) int64 {
 	hasher := fnv.New64a()
 	_, _ = hasher.Write([]byte(string(protocol)))
-	_, _ = hasher.Write([]byte{0})
-	_, _ = hasher.Write([]byte(policy))
 	_, _ = hasher.Write([]byte{0})
 	_, _ = hasher.Write([]byte(referenceID))
 	_, _ = hasher.Write([]byte{0})

@@ -209,6 +209,13 @@ validated DNS message was received, a usable response is a normal `NOERROR`
 (including NODATA) or `NXDOMAIN` result, and a scored sample is a usable result
 that is not divergent from the other resolvers in the same policy group and
 was not obtained immediately after a stream reconnect.
+
+Paired latency effects compare every measured target against the best-ranked
+target of the same protocol. A pair is only formed where both resolvers
+returned the same response class, so a filtering resolver answering from its
+blocklist is never compared against a real recursion — that difference measures
+policy, not speed. Resolvers on the local host are excluded, since they are
+never ranked.
 Responses such as `SERVFAIL`, `REFUSED`, and other resolver errors are shown in
 the results but cannot win latency scoring. This prevents an unhealthy or
 blocked resolver from appearing fast merely because it rejects queries
@@ -234,15 +241,15 @@ observations. This keeps blocking, filtered, `NXDOMAIN`, `NODATA`, `SERVFAIL`,
 and `REFUSED` behavior explicit without treating unlike policies as identical.
 
 The human-readable report also shows paired latency effects below the protocol
-tables. Within each protocol and policy group, the best-ranked target is the
-reference. The effect is the median per-name/type latency difference
+tables. Within each protocol, the best-ranked target is the reference. The effect is the median per-name/type latency difference
 (`target - reference`) with a deterministic bootstrap 95% confidence interval.
 `NO CLEAR DIFFERENCE` means the interval includes zero, so the measured
 difference is not distinguishable from noise. A comparison needs at least 20
 paired observations; below that the row reports `NOT COMPARABLE` instead of a
 delta and interval. These comparisons explain the ranking but do not replace
-the existing score or change rank order. A target that is alone in its protocol
-and policy group has no peer to compare against, so the default table counts it
+the existing score or change rank order. A target that is the only measured
+member of its protocol has no peer to compare against, so the default table
+counts it
 below the block instead of printing a self-comparison row. JSON includes the
 same information in the additive `paired_effects` section; CSV keeps its
 aggregate schema.
@@ -514,7 +521,7 @@ The default table leaves out rows that carry no information. When every
 selected IPv6 endpoint fails at the transport layer, each protocol comparison
 replaces those endpoint rows with one line naming how many IPv6 endpoints were
 hidden and why; partial IPv6 failures stay listed per endpoint. Paired latency
-effects leave out targets that are alone in their protocol and policy group,
+effects leave out targets that are the only measured member of their protocol,
 since such a row can only compare a target with itself, and count them in one
 line below the block. `--details` lists every row again, and JSON keeps every
 `paired_effects` entry in both views.
