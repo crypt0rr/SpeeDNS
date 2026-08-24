@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -90,6 +91,10 @@ var interfaceAddressesFunc = func(iface net.Interface) ([]net.Addr, error) {
 }
 
 var detectAddressFamiliesFunc = detectAddressFamilies
+
+// hostOwnAddressesFunc is a seam so tests can describe a host without touching
+// the machine they run on.
+var hostOwnAddressesFunc = hostOwnAddresses
 
 // exitCodes lists every status the command can return, so documentation can be
 // checked against the contract rather than against a hand-kept list.
@@ -559,6 +564,89 @@ func activeInterfaceNames() []string {
 // detectAddressFamilies reports IP families present on an up interface. It
 // deliberately performs no DNS lookup or connection attempt; auto mode uses
 // the local interface inventory as a safe, offline bootstrap signal.
+// hostOwnAddresses returns every address configured on an up interface,
+// loopback included. It answers one question: is this resolver running on the
+// machine doing the measuring?
+//
+// It reuses the same seams as detectAddressFamilies and performs no lookup and
+// no connection, so it stays an offline check.
+func hostOwnAddresses() (map[string]bool, error) {
+	interfaces, err := listNetworkInterfacesFunc()
+	if err != nil {
+		return nil, fmt.Errorf("inspect network interfaces: %w", err)
+	}
+	own := make(map[string]bool)
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addresses, err := interfaceAddressesFunc(iface)
+		if err != nil {
+			return nil, fmt.Errorf("inspect addresses for interface %q: %w", iface.Name, err)
+		}
+		for _, address := range addresses {
+			if ip, ok := interfaceAddressIP(address); ok {
+				if parsed, valid := netip.AddrFromSlice(ip); valid {
+					own[parsed.Unmap().String()] = true
+				}
+			}
+		}
+	}
+	return own, nil
+}
+
+// classifyLocalResolvers marks resolvers that run on the measuring host and
+// reports the ones merely reached across the local network.
+//
+// METHODOLOGY.md promises that a resolver on the local host is never ranked and
+// never recommended, because it answers from its own cache and so excludes the
+// upstream resolution it forwards. That protection previously fired only for
+// targets found by system discovery, and even there tested loopback alone -- so
+// `--resolver pihole=udp://127.0.0.1` was ranked, and a router forwarder on
+// 192.168.1.1 competed directly with public resolvers.
+//
+// The two treatments are deliberately different in strength. An address the
+// host itself holds IS the local host, and gets the documented treatment. A
+// private address the host does NOT hold might be a forwarder or might be a
+// self-hosted recursive resolver, and the tool cannot tell; refusing to rank it
+// would punish a legitimate setup, so it stays ranked and the report says what
+// it cannot know.
+func classifyLocalResolvers(profiles []catalog.ResolverProfile, own map[string]bool) []string {
+	onNetwork := make([]string, 0)
+	for index := range profiles {
+		for _, address := range profiles[index].Addresses {
+			parsed, err := netip.ParseAddr(address)
+			if err != nil {
+				continue
+			}
+			parsed = parsed.Unmap()
+			if parsed.IsLoopback() || own[parsed.String()] {
+				profiles[index].Local = true
+				break
+			}
+			if isPrivateAddress(parsed) {
+				onNetwork = append(onNetwork, fmt.Sprintf("%s %s", profiles[index].ID, address))
+			}
+		}
+	}
+	return onNetwork
+}
+
+// isPrivateAddress reports whether an address can only be reached across the
+// local network: RFC 1918, CGNAT 100.64/10, link-local, and IPv6 unique-local.
+func isPrivateAddress(address netip.Addr) bool {
+	if address.IsPrivate() || address.IsLinkLocalUnicast() {
+		return true
+	}
+	if address.Is4() {
+		octets := address.As4()
+		// 100.64.0.0/10, the carrier-grade NAT range, which IsPrivate does
+		// not cover and which Tailscale hands out.
+		return octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127
+	}
+	return false
+}
+
 func detectAddressFamilies() (map[catalog.AddressFamily]bool, error) {
 	interfaces, err := listNetworkInterfacesFunc()
 	if err != nil {
@@ -869,6 +957,15 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if len(profiles) == 0 {
 		return fmt.Errorf("no resolver addresses match --family %s", family)
 	}
+	// Classify before expanding, so every source of profiles -- bundled,
+	// --resolver, --resolver-file and system discovery -- gets the same
+	// treatment. Previously only discovery set Local, and only for loopback.
+	ownAddresses, err := hostOwnAddressesFunc()
+	if err != nil {
+		return err
+	}
+	onNetworkResolvers := classifyLocalResolvers(profiles, ownAddresses)
+
 	targets := catalog.Expand(profiles, selected)
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
@@ -953,6 +1050,15 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
 			"effective sample of %d truncated the generated cache-miss corpus of %d names; raise --sample or lower --cache-miss-sample to measure every generated name",
 			config.sample, len(domainList))))
+	}
+	if len(onNetworkResolvers) > 0 && !config.redactSystem {
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
+			"reached over the local network and may be a forwarder answering from its own cache, which excludes the upstream resolution its latency is compared against: %s",
+			strings.Join(onNetworkResolvers, ", "))))
+	} else if len(onNetworkResolvers) > 0 {
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
+			"%d resolver(s) are reached over the local network and may be forwarders answering from their own cache, which excludes the upstream resolution their latency is compared against",
+			len(onNetworkResolvers))))
 	}
 	if len(cacheMissDropped) > 0 {
 		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
