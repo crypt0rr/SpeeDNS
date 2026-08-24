@@ -204,3 +204,73 @@ func TestStatisticsHoldTheirInvariants(t *testing.T) {
 		}
 	}
 }
+
+// TestTieGroupsOrderByMedian pins the fix for unreproducible rank order.
+//
+// Ordering overlapping targets by raw score made the headline result a coin
+// flip: four runs of one command at one seed produced three different orders,
+// and the target with the worst median in every run took rank one twice. The
+// instability lives entirely in the 0.40 x p95 term, whose interval is 66-143%
+// of its estimate where the median's is 9-14%.
+//
+// Within a tie group the median decides; outside one the score still does.
+func TestTieGroupsOrderByMedian(t *testing.T) {
+	target := func(address string, median, score, low, high float64) TargetResult {
+		return TargetResult{
+			Target: testTarget(catalog.UDP, address),
+			Stats: Statistics{
+				Total: 40, Successes: 40, UsableResponses: 40, Scored: 40,
+				SuccessRate: 1, UsableRate: 1,
+				MedianMS: median, P95MS: score * 2, ScoreMS: score,
+				CILowMS: low, CIHighMS: high,
+			},
+		}
+	}
+	// Two overlapping intervals: the worse score has the better median, which
+	// is exactly the case that used to flip between runs. A third target sits
+	// clear of both.
+	results := []TargetResult{
+		target("noisy", 22.0, 20.0, 10.0, 40.0),
+		target("steady", 18.0, 25.0, 12.0, 42.0),
+		target("slow", 60.0, 80.0, 70.0, 90.0),
+	}
+
+	rankings := makeRankings(results)
+	got := make([]string, 0, len(rankings))
+	for _, ranking := range rankings {
+		got = append(got, ranking.TargetID)
+	}
+	want := []string{
+		testTarget(catalog.UDP, "steady").ID(), // better median inside the tie group
+		testTarget(catalog.UDP, "noisy").ID(),
+		testTarget(catalog.UDP, "slow").ID(), // no overlap: ranked by score
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("rank %d = %q, want %q (order: %v)", index+1, got[index], want[index], got)
+		}
+	}
+
+	// Outside a tie group the score still decides, so this is not a silent
+	// switch to median-based ranking.
+	separate := []TargetResult{
+		target("worse-score-better-median", 5.0, 90.0, 85.0, 95.0),
+		target("better-score", 50.0, 10.0, 5.0, 15.0),
+	}
+	order := makeRankings(separate)
+	if order[0].TargetID != testTarget(catalog.UDP, "better-score").ID() {
+		t.Fatalf("non-overlapping targets must rank by score, got %q first", order[0].TargetID)
+	}
+
+	// Degenerate but not impossible: equal scores with disjoint intervals.
+	// The order must still be deterministic rather than depending on map
+	// iteration, so it falls back to the target ID.
+	identical := []TargetResult{
+		target("zzz", 10.0, 30.0, 40.0, 50.0),
+		target("aaa", 20.0, 30.0, 1.0, 5.0),
+	}
+	stable := makeRankings(identical)
+	if stable[0].TargetID != testTarget(catalog.UDP, "aaa").ID() {
+		t.Fatalf("equal scores must break ties by target ID, got %q first", stable[0].TargetID)
+	}
+}
