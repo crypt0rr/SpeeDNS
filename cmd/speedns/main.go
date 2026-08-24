@@ -774,8 +774,13 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if config.sample <= 0 && !config.full {
 		return errors.New("--sample must be greater than zero")
 	}
-	if config.timeout <= 0 || config.concurrency <= 0 {
-		return errors.New("--timeout and --concurrency must be positive")
+	// Split, so the message names the flag that actually failed and echoes
+	// the value. --sample one line above already does this.
+	if config.timeout <= 0 {
+		return fmt.Errorf("--timeout must be greater than zero, got %s", config.timeout)
+	}
+	if config.concurrency <= 0 {
+		return fmt.Errorf("--concurrency must be greater than zero, got %d", config.concurrency)
 	}
 	if config.profileView && strings.EqualFold(config.format, "csv") {
 		return errors.New("--profile-view requires table or json output")

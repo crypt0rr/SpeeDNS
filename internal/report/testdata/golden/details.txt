@@ -1,19 +1,25 @@
 SpeeDNS benchmark
 Seed: 42 | sample: 1 domains | query types: A
+2 targets
 
 Recommendations
-  Protocol  Owner     Address     Policy      Median   P95      Success  Usable   Score    Tie  Status
-  udp       Owner 10  192.0.2.10  unfiltered  2.00 ms  3.00 ms  100.00%  100.00%  2.40 ms  —    RECOMMENDED
+  Protocol  Owner     Address     Policy      Min      Median   P95      Success  Usable   Score    Score 95% CI     Tie  Status
+  udp       Owner 10  192.0.2.10  unfiltered  1.00 ms  2.00 ms  3.00 ms  100.00%  100.00%  2.40 ms  [1.00, 4.00] ms  —    RECOMMENDED
+
+  Status: QUALIFIED meets the recommendation bar; INELIGIBLE does not yet, and appears as
+  PROVISIONAL in the summary when it is still the best-ranked target for its protocol.
+  NOT COMPARABLE is measured but never ranked; NO ENDPOINT means the resolver does not
+  offer that transport; FAILED and INCOMPLETE produced no usable result.
 
 Comparisons
 
 Protocol UDP
-  Rank  Owner     Address     Policy      Median   P95      Success  Usable   Score    Cold     MAD      Scored  Failed  ResolverFail  Divergent  Truncated  Reconnects  RCodes  Endpoint  TLSName  TLSSource  Bootstrap  BootstrapAddrs  Dial  Tie  Status
-  1     Owner 10  192.0.2.10  unfiltered  2.00 ms  3.00 ms  100.00%  100.00%  2.40 ms  5.00 ms  0.50 ms  2       0       0             0          0          0           —       —         —        —          —          —               —     —    QUALIFIED
+  Rank  Owner     Address     Policy      Min      Median   P95      Success  Usable   Score    Score 95% CI     Cold     MAD      Scored  Failed  ResolverFail  Divergent  Truncated  Reconnects  RCodes  Endpoint  TLSName  TLSSource  Bootstrap  BootstrapAddrs  Dial  Tie  Status
+  1     Owner 10  192.0.2.10  unfiltered  1.00 ms  2.00 ms  3.00 ms  100.00%  100.00%  2.40 ms  [1.00, 4.00] ms  5.00 ms  0.50 ms  2       0       0             0          0          0           —       —         —        —          —          —               —     —    QUALIFIED
 
 Protocol TCP
-  Rank  Owner     Address     Policy      Median  P95  Success  Usable  Score  Cold  MAD  Scored  Failed  ResolverFail  Divergent  Truncated  Reconnects  RCodes  Endpoint  TLSName  TLSSource  Bootstrap  BootstrapAddrs  Dial  Tie  Status
-  —     Owner 11  192.0.2.11  unfiltered  —       —    0.00%    0.00%   —      —     —    0       2       0             0          0          0           —       —         —        —          —          —               —     —    FAILED
+  Rank  Owner     Address     Policy      Min  Median  P95  Success  Usable  Score  Score 95% CI  Cold  MAD  Scored  Failed  ResolverFail  Divergent  Truncated  Reconnects  RCodes  Endpoint  TLSName  TLSSource  Bootstrap  BootstrapAddrs  Dial  Tie  Status
+  —     Owner 11  192.0.2.11  unfiltered  —    —       —    0.00%    0.00%   —      —             —     —    0       2       0             0          0          0           —       —         —        —          —          —               —     —    FAILED
 
 Divergence details
   - example.com/A policy=unfiltered compared=2 baseline=answer; classes=answer:1,nxdomain:1; excluded=10@192.0.2.10/udp=nxdomain[latency-excluded]
