@@ -775,6 +775,15 @@ func rankText(report benchmark.Report, targetID string) string {
 
 const tieNote = "\n  TIED: the 95% score confidence interval overlaps another ranked target, so that ordering is not statistically distinguishable.\n"
 
+// statusNote explains the Status vocabulary. PROVISIONAL and INELIGIBLE are the
+// same predicate seen from two sides -- the summary names the row's role, the
+// comparison table names its eligibility -- and a reader meeting both words for
+// one target in one report has no way to know that.
+const statusNote = "\n  Status: QUALIFIED meets the recommendation bar; INELIGIBLE does not yet, and appears as\n" +
+	"  PROVISIONAL in the summary when it is still the best-ranked target for its protocol.\n" +
+	"  NOT COMPARABLE is measured but never ranked; NO ENDPOINT means the resolver does not\n" +
+	"  offer that transport; FAILED and INCOMPLETE produced no usable result.\n"
+
 func tieText(stats benchmark.Statistics, color bool) string {
 	if !stats.Tie {
 		return "—"
@@ -786,8 +795,9 @@ func summaryRowWithOptions(protocol catalog.Protocol, result benchmark.TargetRes
 	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	return []string{
 		string(protocol), view.Owner, view.Address, view.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
-		scoreText(result), tieText(result.Stats, color), styledStatus(status, color),
+		latencyText(result.Stats.MinMS), latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS),
+		percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
+		scoreText(result), profileScoreCIText(result.Stats), tieText(result.Stats, color), styledStatus(status, color),
 	}
 }
 
@@ -795,8 +805,9 @@ func comparisonRowWithOptions(report benchmark.Report, result benchmark.TargetRe
 	view := targetViewFor(result.Target, redactSystem, redactedValue)
 	row := []string{
 		rankText(report, result.Target.ID()), view.Owner, view.Address, view.Policy,
-		latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS), percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
-		scoreText(result),
+		latencyText(result.Stats.MinMS), latencyText(result.Stats.MedianMS), latencyText(result.Stats.P95MS),
+		percentText(result.Stats.SuccessRate), percentText(result.Stats.UsableRate),
+		scoreText(result), profileScoreCIText(result.Stats),
 	}
 	if details {
 		metadata := result.Target.EndpointMetadata()
@@ -897,13 +908,18 @@ func comparisonRowsWithOptions(report benchmark.Report, protocol catalog.Protoco
 
 func unsupportedComparisonRowWithOptions(target catalog.Target, details bool, redactSystem bool) []string {
 	view := targetViewFor(target, redactSystem, redactedValue)
-	row := []string{"—", view.Owner, view.Address, view.Policy, "—", "—", "—", "—", "—"}
-	if details {
-		for range len(comparisonHeaders(true)) - len(comparisonHeaders(false)) {
-			row = append(row, "—")
-		}
+	// Built to the header's own width so a new column cannot leave this row
+	// short, which alignedTableLine turns into a panic rather than a
+	// misalignment. The last cell says why the row is empty: four consecutive
+	// all-dash tables otherwise read as "your resolver broke on four
+	// protocols" when it simply does not offer them.
+	headers := comparisonHeaders(details)
+	row := make([]string, 0, len(headers))
+	row = append(row, "—", view.Owner, view.Address, view.Policy)
+	for len(row) < len(headers)-1 {
+		row = append(row, "—")
 	}
-	return append(row, "—", "—")
+	return append(row, "NO ENDPOINT")
 }
 
 // collapsedIPv6Targets returns the endpoints that the collapsed IPv6 warning
@@ -1246,6 +1262,16 @@ func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) erro
 		lines = append(lines, indentedCells(row))
 	}
 	widths := tableColumnWidths(lines)
+	// Pad short rows to the header width. A row with fewer cells than the
+	// header makes alignedTableLine compute a negative pad and panic with
+	// "strings: negative Repeat count", so a forgotten column in one of the
+	// row builders crashes the report rather than misaligning it.
+	for index, line := range lines {
+		for len(line) < len(widths) {
+			line = append(line, "")
+		}
+		lines[index] = line
+	}
 	for _, line := range lines {
 		if _, err := io.WriteString(writer, alignedTableLine(line, widths)); err != nil {
 			return err
@@ -1292,11 +1318,11 @@ func alignedTableLine(line []string, widths []int) string {
 }
 
 func summaryHeaders() []string {
-	return []string{"Protocol", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score", "Tie", "Status"}
+	return []string{"Protocol", "Owner", "Address", "Policy", "Min", "Median", "P95", "Success", "Usable", "Score", "Score 95% CI", "Tie", "Status"}
 }
 
 func comparisonHeaders(details bool) []string {
-	headers := []string{"Rank", "Owner", "Address", "Policy", "Median", "P95", "Success", "Usable", "Score"}
+	headers := []string{"Rank", "Owner", "Address", "Policy", "Min", "Median", "P95", "Success", "Usable", "Score", "Score 95% CI"}
 	if details {
 		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "Reconnects", "RCodes", "Endpoint", "TLSName", "TLSSource", "Bootstrap", "BootstrapAddrs", "Dial")
 	}
@@ -1561,12 +1587,56 @@ func writeDivergenceDetails(writer io.Writer, report benchmark.Report, redactSys
 	return nil
 }
 
+// needsStatusNote reports whether any target carries a status the reader is
+// likely to need explained. A run where everything qualified needs no legend,
+// so the note stays out of the common case.
+// runHeaderLine describes the run itself: when it started, how long it took,
+// what built it, and how many targets it measured.
+func runHeaderLine(report benchmark.Report) string {
+	parts := make([]string, 0, 4)
+	if !report.StartedAt.IsZero() {
+		parts = append(parts, report.StartedAt.UTC().Format("2006-01-02T15:04:05Z"))
+		if !report.FinishedAt.IsZero() {
+			parts = append(parts, fmt.Sprintf("%.1fs", report.FinishedAt.Sub(report.StartedAt).Seconds()))
+		}
+	}
+	parts = append(parts, fmt.Sprintf("%d targets", len(report.Targets)))
+	// Provenance is an optional pointer: a report built without it is valid,
+	// and the redaction tests construct exactly that.
+	if provenance := report.Provenance; provenance != nil {
+		version := provenance.Version
+		if version == "" {
+			version = "dev"
+		}
+		if provenance.OS != "" && provenance.Architecture != "" {
+			version = fmt.Sprintf("%s %s/%s", version, provenance.OS, provenance.Architecture)
+		}
+		parts = append(parts, version)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func needsStatusNote(report benchmark.Report) bool {
+	for _, result := range report.Targets {
+		if resultStatus(result) != "QUALIFIED" {
+			return true
+		}
+	}
+	return false
+}
+
 func WriteTable(writer io.Writer, report benchmark.Report, details bool) error {
 	return WriteTableWithOptions(writer, report, TableOptions{Details: details})
 }
 
 func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options TableOptions) error {
-	if _, err := fmt.Fprintf(writer, "SpeeDNS benchmark\nSeed: %d | sample: %d domains | query types: %s\n\n", report.Seed, report.SampleSize, queryTypes(report.QueryTypes)); err != nil {
+	// Two header lines, because this table is what gets pasted into a change
+	// ticket and the first line alone does not say when, by what, or against
+	// how many targets. Every value comes off the report, never from
+	// time.Now(), so the goldens stay deterministic. The interface inventory
+	// is deliberately not promoted here: it names the host's own networks.
+	if _, err := fmt.Fprintf(writer, "SpeeDNS benchmark\nSeed: %d | sample: %d domains | query types: %s\n%s\n\n",
+		report.Seed, report.SampleSize, queryTypes(report.QueryTypes), runHeaderLine(report)); err != nil {
 		return err
 	}
 	if report.CorpusMode != "" {
@@ -1609,6 +1679,11 @@ func WriteTableWithOptions(writer io.Writer, report benchmark.Report, options Ta
 	}
 	if tiedWinner {
 		if _, err := io.WriteString(writer, tieNote); err != nil {
+			return err
+		}
+	}
+	if needsStatusNote(report) {
+		if _, err := io.WriteString(writer, statusNote); err != nil {
 			return err
 		}
 	}

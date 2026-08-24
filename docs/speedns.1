@@ -226,6 +226,30 @@ views.
 .PP
 A qualified recommendation requires at least 20 scored comparable samples and
 99 percent usable responses. A short run may show a provisional winner instead.
+.SS Status vocabulary
+.B QUALIFIED
+meets the recommendation bar;
+.B INELIGIBLE
+does not, and the summary calls that same target
+.B PROVISIONAL
+when it is still the best-ranked one for its protocol.
+.B NO ENDPOINT
+means the resolver does not offer that transport.
+.B NOT COMPARABLE
+is measured but never ranked.
+.B FAILED
+and
+.B INCOMPLETE
+produced no usable result. The report prints this legend whenever a status
+other than
+.B QUALIFIED
+appears.
+.PP
+Every table shows
+.B Score 95% CI
+beside the score, and
+.B Min ,
+the fastest observed exchange.
 .SH EXIT STATUS
 .TP
 .B 0
