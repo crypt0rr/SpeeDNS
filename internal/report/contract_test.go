@@ -266,6 +266,7 @@ func TestWriteAlignedTablePadsShortRows(t *testing.T) {
 	}
 }
 
+<<<<<<< HEAD
 // TestCSVCarriesRunIdentity pins the columns that make a CSV row
 // self-describing.
 //
@@ -339,5 +340,75 @@ func TestCSVCarriesRunIdentity(t *testing.T) {
 	}
 	if got := bareRows[1][column["started_at"]]; got != "" {
 		t.Fatalf("a report with no start time should leave started_at empty, got %q", got)
+=======
+// TestTableWarningsCoverTheSameTargetsAsJSON pins the two views to each other.
+//
+// compactWarningsWithOptions rebuilds per-target warnings from Stats and used
+// to drop every targeted warning from report.Warnings, on the assumption the
+// rebuild covered them. Anything without a rebuild counterpart was therefore
+// unreachable from the default table while JSON reported it -- so the format
+// most people use was the one that hid the answer.
+func TestTableWarningsCoverTheSameTargetsAsJSON(t *testing.T) {
+	target := reportTarget("60", "udp", 4, false)
+	// Healthy enough that no Stats field produces a rebuilt line, so the only
+	// thing that can surface this endpoint is the targeted warning itself.
+	target.Stats = benchmark.Statistics{
+		Total: 4, Successes: 4, UsableResponses: 4, Scored: 4, SuccessRate: 1, UsableRate: 1,
+		MedianMS: 5, P95MS: 6, MinMS: 4, MaxMS: 7, ScoreMS: 5.4,
+	}
+	report := benchmark.Report{
+		Seed: 1, SampleSize: 4, Queries: 4, QueryTypes: []uint16{1},
+		Targets:  []benchmark.TargetResult{target},
+		Rankings: []benchmark.Ranking{{Protocol: "udp", TargetID: target.Target.ID(), Rank: 1}},
+		Warnings: []benchmark.Warning{
+			benchmark.TargetWarning(target.Target, "is not recommendation-eligible yet"),
+			benchmark.RunWarning("a run-level note"),
+		},
+	}
+
+	compact := compactWarnings(report)
+	joined := strings.Join(compact, "\n")
+	if !strings.Contains(joined, "not recommendation-eligible") {
+		t.Fatalf("the table dropped a targeted warning JSON keeps:\n%s", joined)
+	}
+	if !strings.Contains(joined, "a run-level note") {
+		t.Fatalf("the table dropped a run-level warning:\n%s", joined)
+	}
+
+	// At most one line per endpoint. An endpoint whose Stats already produced
+	// a rebuilt line must not also carry its targeted warning, or a 50-target
+	// run drowns the table -- which is what the compact form exists to stop.
+	// Two healthy endpoints, so neither is collapsed into a protocol summary.
+	first := reportTarget("61", "udp", 4, false)
+	first.Stats = benchmark.Statistics{Total: 4, Successes: 4, UsableResponses: 4, Scored: 4, SuccessRate: 1, UsableRate: 1}
+	second := reportTarget("62", "udp", 4, false)
+	second.Stats = benchmark.Statistics{Total: 4, Successes: 3, Failures: 1, UsableResponses: 3, Scored: 3, SuccessRate: 0.75, UsableRate: 0.75}
+	noisyReport := report
+	noisyReport.Targets = []benchmark.TargetResult{first, second}
+	noisyReport.Warnings = []benchmark.Warning{
+		benchmark.TargetWarning(first.Target, "only reachable through the targeted warning"),
+		benchmark.TargetWarning(second.Target, "must not be added beside its rebuilt line"),
+	}
+	lines := compactWarnings(noisyReport)
+	joined = strings.Join(lines, "\n")
+	for address, want := range map[string]int{"192.0.2.61": 1, "192.0.2.62": 1} {
+		count := 0
+		for _, line := range lines {
+			if strings.Contains(line, address) {
+				count++
+			}
+		}
+		if count != want {
+			t.Fatalf("%s produced %d warning lines, want %d:\n%s", address, count, want, joined)
+		}
+	}
+	// The endpoint with no rebuilt line is surfaced by its targeted warning;
+	// the one with a rebuilt line keeps the rebuilt text, not both.
+	if !strings.Contains(joined, "only reachable through the targeted warning") {
+		t.Fatalf("a targeted warning with no rebuild counterpart was dropped:\n%s", joined)
+	}
+	if strings.Contains(joined, "must not be added beside its rebuilt line") {
+		t.Fatalf("a targeted warning was added beside an existing rebuilt line:\n%s", joined)
+>>>>>>> origin/main
 	}
 }
