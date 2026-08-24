@@ -132,11 +132,25 @@ func TestDNSSECAppearsInJSONAndCSV(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(csvOutput.String()), "\n")
-	if !strings.HasSuffix(lines[0], ",dnssec_verdict") {
-		t.Fatalf("CSV header does not append the DNSSEC column: %s", lines[0])
+	// The column's position is owned by TestCSVHeaderIsAppendOnly; this test
+	// only cares that the verdict is published and carries the right value.
+	// Asserting it was last stopped being true the moment anything else was
+	// appended after it.
+	headers := strings.Split(lines[0], ",")
+	verdictColumn := -1
+	for index, name := range headers {
+		if name == "dnssec_verdict" {
+			verdictColumn = index
+		}
 	}
-	if !strings.HasSuffix(lines[1], ",validating") || !strings.HasSuffix(lines[4], ",") {
-		t.Fatalf("CSV verdict column = %q / %q", lines[1], lines[4])
+	if verdictColumn < 0 {
+		t.Fatalf("CSV header has no DNSSEC column: %s", lines[0])
+	}
+	if got := strings.Split(lines[1], ",")[verdictColumn]; got != "validating" {
+		t.Fatalf("CSV verdict for the validating target = %q", got)
+	}
+	if got := strings.Split(lines[4], ",")[verdictColumn]; got != "" {
+		t.Fatalf("CSV verdict for the unprobed target = %q, want empty", got)
 	}
 }
 

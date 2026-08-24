@@ -71,8 +71,14 @@ type JSONProfileTransport struct {
 }
 
 type JSONResult struct {
-	Target       JSONTarget                  `json:"target"`
-	Stats        benchmark.Statistics        `json:"stats"`
+	Target JSONTarget           `json:"target"`
+	Stats  benchmark.Statistics `json:"stats"`
+	// Status is the same verdict the table prints, lowercased. Without it
+	// every machine consumer re-derives it, and this project's own dashboard
+	// already derived it differently -- inventing a "measured" tier where the
+	// tool reports ineligible -- so two consumers of one run printed different
+	// labels for the same endpoint.
+	Status       string                      `json:"status"`
 	OpenError    string                      `json:"open_error,omitempty"`
 	Incomplete   bool                        `json:"incomplete,omitempty"`
 	DNSSEC       *benchmark.DNSSECAssessment `json:"dnssec,omitempty"`
@@ -133,7 +139,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 				TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
 				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: dialAddress,
 			},
-			Stats: result.Stats, OpenError: redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()]), Incomplete: result.Incomplete,
+			Stats: result.Stats, Status: statusValue(result), OpenError: redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()]), Incomplete: result.Incomplete,
 			DNSSEC: redactDNSSEC(result, options.RedactSystem, redactedIDs[result.Target.ID()]),
 		}
 		if raw {
@@ -215,6 +221,14 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 		"min_ms", "max_ms", "mad_ms", "cold_median_ms", "score_ms", "ci_low_ms", "ci_high_ms", "open_error", "reconnects", "incomplete",
 		"endpoint_url", "tls_server_name", "tls_identity_source", "bootstrap_mode", "bootstrap_addresses", "dial_address",
 		"corpus_mode", "corpus_zone", "corpus_nonce", "local", "dnssec_verdict",
+		// Appended for v0.4.0. Columns may only ever be added at the end.
+		"answers", "answer_rate", "status",
+		// Run identity. CSV is the only trivially appendable format and the
+		// natural home for a weekly series, but no column said which run a row
+		// came from: append two weeks into one file and every row was undated
+		// and unattributable. It was also the only format not reproducible
+		// from its own contents.
+		"started_at", "seed", "sample_size", "query_types", "speedns_version", "corpus_sha256",
 	}); err != nil {
 		return err
 	}
@@ -238,6 +252,13 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 			formatFloat(stats.ColdMedianMS), formatFloat(stats.ScoreMS), formatFloat(stats.CILowMS), formatFloat(stats.CIHighMS), csvCell(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), strconv.Itoa(stats.Reconnects), strconv.FormatBool(result.Incomplete),
 			csvCell(metadata.EndpointURL), csvCell(metadata.TLSServerName), csvCell(metadata.TLSIdentitySource), csvCell(metadata.BootstrapMode), csvCell(bootstrapAddressesCSV(metadata.BootstrapAddresses)), csvCell(dialAddress),
 			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce), strconv.FormatBool(result.Target.Resolver.Local), csvCell(dnssecVerdict(result)),
+			strconv.Itoa(stats.Answers), formatFloat(stats.AnswerRate), csvCell(statusValue(result)),
+			csvCell(csvStartedAt(report)), strconv.FormatInt(report.Seed, 10), strconv.Itoa(report.SampleSize),
+			// Pipe-separated so the value survives a comma-delimited file,
+			// matching how rcode_counts already renders NOERROR:5.
+			csvCell(strings.ReplaceAll(queryTypes(report.QueryTypes), ",", "|")),
+			csvCell(csvProvenanceField(report, func(p *benchmark.RunProvenance) string { return p.Version })),
+			csvCell(csvProvenanceField(report, func(p *benchmark.RunProvenance) string { return p.CorpusSHA256 })),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -715,6 +736,31 @@ func tableProtocols(report benchmark.Report, options TableOptions) []catalog.Pro
 	return append(protocols, remaining...)
 }
 
+// statusValue is the machine-readable form of resultStatus: the same verdict,
+// lowercased and hyphenated, so a consumer never has to re-derive it or match
+// on display text.
+// csvStartedAt renders the run's start time, or empty when the report carries
+// none, so a row is always parseable.
+func csvStartedAt(report benchmark.Report) string {
+	if report.StartedAt.IsZero() {
+		return ""
+	}
+	return report.StartedAt.UTC().Format(time.RFC3339)
+}
+
+// csvProvenanceField reads one provenance value. Provenance is an optional
+// pointer and a report without it is valid.
+func csvProvenanceField(report benchmark.Report, read func(*benchmark.RunProvenance) string) string {
+	if report.Provenance == nil {
+		return ""
+	}
+	return read(report.Provenance)
+}
+
+func statusValue(result benchmark.TargetResult) string {
+	return strings.ReplaceAll(strings.ToLower(resultStatus(result)), " ", "-")
+}
+
 func resultStatus(result benchmark.TargetResult) string {
 	if result.Incomplete {
 		return "INCOMPLETE"
@@ -765,6 +811,17 @@ func scoreText(result benchmark.TargetResult) string {
 	return latencyText(result.Stats.ScoreMS)
 }
 
+// answersText shows how many usable responses carried an actual record, with
+// the rate beside it. NODATA is usable and scored, so without this a resolver
+// answering everything with an empty answer section reads identically to a
+// working one on the success and usable columns.
+func answersText(stats benchmark.Statistics) string {
+	if stats.UsableResponses == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%d (%.0f%%)", stats.Answers, stats.AnswerRate*100)
+}
+
 func rankText(report benchmark.Report, targetID string) string {
 	rank := rankFor(report, targetID)
 	if rank == 0 {
@@ -812,7 +869,7 @@ func comparisonRowWithOptions(report benchmark.Report, result benchmark.TargetRe
 	if details {
 		metadata := result.Target.EndpointMetadata()
 		row = append(row,
-			latencyText(result.Stats.ColdMedianMS), latencyText(result.Stats.MADMS),
+			answersText(result.Stats), latencyText(result.Stats.ColdMedianMS), latencyText(result.Stats.MADMS),
 			strconv.Itoa(result.Stats.Scored), strconv.Itoa(result.Stats.Failures),
 			strconv.Itoa(result.Stats.ResolverFailures), strconv.Itoa(result.Stats.Divergent), strconv.Itoa(result.Stats.Truncated), strconv.Itoa(result.Stats.Reconnects),
 			rcodeCountsText(result.Stats.RCodeCounts), endpointURLText(metadata.EndpointURL), tlsServerNameText(metadata.TLSServerName),
@@ -1324,7 +1381,7 @@ func summaryHeaders() []string {
 func comparisonHeaders(details bool) []string {
 	headers := []string{"Rank", "Owner", "Address", "Policy", "Min", "Median", "P95", "Success", "Usable", "Score", "Score 95% CI"}
 	if details {
-		headers = append(headers, "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "Reconnects", "RCodes", "Endpoint", "TLSName", "TLSSource", "Bootstrap", "BootstrapAddrs", "Dial")
+		headers = append(headers, "Answers", "Cold", "MAD", "Scored", "Failed", "ResolverFail", "Divergent", "Truncated", "Reconnects", "RCodes", "Endpoint", "TLSName", "TLSSource", "Bootstrap", "BootstrapAddrs", "Dial")
 	}
 	return append(headers, "Tie", "Status")
 }

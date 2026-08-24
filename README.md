@@ -281,6 +281,13 @@ recommendation-eligible result is `QUALIFIED`. The summary block calls that same
 `INELIGIBLE` target `PROVISIONAL` when it is still the best-ranked one for its
 protocol; the report prints a legend whenever any of these appears.
 
+`Answers` counts responses that carried an actual record rather than NODATA.
+NODATA is usable and is scored, which is correct, but it means `Usable 100%`
+spans everything from a working resolver down to one answering every query with
+an empty answer section. On the default `A,AAAA` corpus a real resolver returns
+a record only around 45% of the time, so a low answer rate is normal and is
+disclosed rather than penalised.
+
 Every table shows `Score 95% CI`, the deterministic bootstrap interval behind
 the score, beside the score itself. At the default sample that interval is often
 a large fraction of the point estimate, and reading the score without it invites
@@ -442,6 +449,22 @@ it dropped in a warning. The deliberate consequence is that a cache-miss run
 does not compare transports: measure one transport per invocation and compare
 the runs. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
 using the mode, especially for ownership, traffic, and abuse limits.
+
+### What a default run sends
+
+A default run measures the ten bundled profiles across their declared
+transports and sends roughly **8,650 DNS queries** in total: about 206 per
+resolver/transport target — 3 cold probes, 3 warm-ups and 200 measured
+exchanges, since `--sample 100` over the default `A,AAAA` types is 200 queries.
+
+That load is not spread evenly. Four of the ten bundled profiles are DNS4EU
+addresses, so the smallest of the four operators absorbs roughly 38% of the
+total. Narrow the run with `--protocol`, `--sample`, or `--no-defaults` plus
+`--resolver` when you do not need the whole catalog, and prefer a smaller
+`--sample` for repeated or scheduled runs.
+
+[`CACHE_MISS.md`](CACHE_MISS.md) states the separate, much smaller budget for
+`--cache-miss`, which sends 200 reserved-zone queries.
 
 ## System resolver baseline
 

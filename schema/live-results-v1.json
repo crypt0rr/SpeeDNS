@@ -152,7 +152,7 @@
       "required": ["protocol", "status", "endpoint", "stats"],
       "properties": {
         "protocol": {"$ref": "#/$defs/protocol"},
-        "status": {"type": "string", "enum": ["recommended", "measured", "ineligible", "failed"]},
+        "status": {"type": "string", "enum": ["recommended", "measured", "ineligible", "failed", "incomplete", "not-comparable"]},
         "endpoint": {"$ref": "#/$defs/endpoint"},
         "stats": {"$ref": "#/$defs/stats"}
       }
