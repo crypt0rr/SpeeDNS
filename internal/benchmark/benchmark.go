@@ -1390,8 +1390,26 @@ func makeRankings(results []TargetResult) []Ranking {
 	}
 	var rankings []Ranking
 	for protocol, indexes := range byProtocol {
+		// Targets whose score intervals overlap are indistinguishable, and
+		// ordering them by raw score makes the headline result a coin flip:
+		// four runs of one command at one seed produced three different orders,
+		// and the target with the worst median in every run took rank one
+		// twice. The instability is entirely in the 0.40 x p95 term -- over the
+		// same observations the median interval is 9-14% of its estimate while
+		// the p95 interval is 66-143%.
+		//
+		// So overlapping members are ordered by median instead. This changes no
+		// measured value; it only settles the presentation order of rows the
+		// tool has already declared indistinguishable, using the most stable
+		// statistic it has.
 		sort.Slice(indexes, func(i, j int) bool {
 			left, right := results[indexes[i]], results[indexes[j]]
+			if confidenceIntervalsOverlap(left.Stats, right.Stats) {
+				if left.Stats.MedianMS != right.Stats.MedianMS {
+					return left.Stats.MedianMS < right.Stats.MedianMS
+				}
+				return left.Target.ID() < right.Target.ID()
+			}
 			if left.Stats.ScoreMS != right.Stats.ScoreMS {
 				return left.Stats.ScoreMS < right.Stats.ScoreMS
 			}
