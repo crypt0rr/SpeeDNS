@@ -1341,6 +1341,9 @@ func compactWarnings(report benchmark.Report) []string {
 func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []string {
 	warnings := make([]string, 0)
 	handled := make(map[string]bool)
+	// Endpoints that already contributed a line, so a targeted warning does
+	// not add a second one for the same endpoint.
+	rebuilt := make(map[string]bool)
 	if ipv6Warning, targets := ipv6UnavailableWarning(report); ipv6Warning != "" {
 		warnings = append(warnings, ipv6Warning)
 		for _, result := range targets {
@@ -1424,16 +1427,32 @@ func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []st
 			parts = append(parts, "local resolver; cache-hit latency excludes the upstream cost, so it is not ranked or recommended")
 		}
 		if len(parts) > 0 {
+			rebuilt[result.Target.ID()] = true
 			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabelWithOptions(result, redactSystem), strings.Join(parts, "; ")))
 		}
 	}
 	redactedIDs := redactedTargetIDs(report, redactSystem)
 	for _, warning := range report.Warnings {
-		// Per-target warnings are rebuilt above as one compact line per
-		// endpoint; only run-level warnings are carried through verbatim.
-		if warning.Targeted() {
+		// Run-level warnings are carried through verbatim.
+		if !warning.Targeted() {
+			warnings = append(warnings, safetext.Escape(renderWarning(report, warning, redactSystem, redactedIDs)))
 			continue
 		}
+		// A targeted warning used to be dropped unconditionally, on the
+		// assumption that the rebuild above already covered it. Anything the
+		// rebuild has no counterpart for -- the recommendation-eligibility
+		// diagnosis, for one -- was therefore unreachable from the default
+		// table while JSON reported it, so the format most people use was the
+		// one that hid the answer.
+		//
+		// Carrying it through only when the endpoint produced no compact line
+		// keeps the table to one line per endpoint, which is what the compact
+		// form exists for.
+		id := warning.Target.ID()
+		if handled[id] || rebuilt[id] {
+			continue
+		}
+		rebuilt[id] = true
 		warnings = append(warnings, safetext.Escape(renderWarning(report, warning, redactSystem, redactedIDs)))
 	}
 	return warnings
