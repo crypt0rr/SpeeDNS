@@ -21,3 +21,10 @@ __pycache__/
 # the source archive and the module zip.
 /CODEREVIEW.md
 
+# Scratch build output. A committed binary is unreviewable, bloats every clone,
+# and cannot be removed from the Go module zip once proxy.golang.org fetches a
+# tag, so the ignore is broad on purpose.
+/.gotmp/
+/speedns-*
+*.exe
+
