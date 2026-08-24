@@ -135,6 +135,17 @@ in the additive `local` field on the target and CSV in a trailing `local`
 column, so a consumer can tell a missing rank caused by non-comparability
 apart from one caused by a failure.
 
+Targets whose 95% score confidence intervals overlap are ordered among
+themselves by median latency rather than by score. The score is 60% median and
+40% p95, and p95 is by far the less stable half: over the same observations the
+median interval is 9-14% of its point estimate while the p95 interval is
+66-143%. Ordering indistinguishable targets by score therefore made the
+presented order a function of run-to-run noise -- four runs of one command at
+one seed produced three different orders, and the target with the worst median
+in every run took rank one twice. Using the median settles that order with the
+most stable statistic available. No measured value changes, and targets whose
+intervals do not overlap are still ranked by score.
+
 ## Confidence intervals and ties
 
 Confidence intervals use a deterministic bootstrap seeded from the run seed
