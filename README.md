@@ -273,11 +273,19 @@ The available transports are:
 | `doq` | Dedicated DNS over QUIC using RFC 9250 |
 
 SpeeDNS does not silently fall back from one protocol to another. The table
-shows the complete selected resolver/protocol matrix: an unsupported transport
-is shown as `—`, an unavailable transport is `FAILED`, a transport-valid result
-that cannot qualify is `INELIGIBLE`, an interrupted target is `INCOMPLETE`, a
-resolver on the local host is `NOT COMPARABLE`, and a recommendation-eligible
-result is `QUALIFIED`.
+shows the complete selected resolver/protocol matrix: a transport the resolver
+does not offer is `NO ENDPOINT`, an unavailable transport is `FAILED`, a
+transport-valid result that cannot qualify is `INELIGIBLE`, an interrupted
+target is `INCOMPLETE`, a resolver on the local host is `NOT COMPARABLE`, and a
+recommendation-eligible result is `QUALIFIED`. The summary block calls that same
+`INELIGIBLE` target `PROVISIONAL` when it is still the best-ranked one for its
+protocol; the report prints a legend whenever any of these appears.
+
+Every table shows `Score 95% CI`, the deterministic bootstrap interval behind
+the score, beside the score itself. At the default sample that interval is often
+a large fraction of the point estimate, and reading the score without it invites
+false precision. `Min` is the fastest observed exchange — the path-length floor,
+and the part of a result least likely to transfer to another network.
 
 ## Default resolvers
 
