@@ -209,7 +209,7 @@ func TestRecommendationRequiresUsableResponses(t *testing.T) {
 	}
 }
 
-func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
+func TestPairedEffectsAreDeterministicAndProtocolScoped(t *testing.T) {
 	observation := func(name string, latency float64) Observation {
 		return Observation{Name: name, QType: dns.TypeA, Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: latency}
 	}
@@ -316,9 +316,16 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 	if fewEffect.MedianDeltaMS != 0 || fewEffect.CILowMS != 0 || fewEffect.CIHighMS != 0 || fewEffect.Indistinguishable {
 		t.Fatalf("below-minimum effect reported a difference: %#v", fewEffect)
 	}
+	// A resolver alone in its policy string used to be its own reference,
+	// producing a self-comparison that told the reader nothing. It is now
+	// compared against the protocol's rank-one target like every other member,
+	// and its policy string survives as a label on the row.
 	protectiveEffect := find(protective.ID())
-	if !protectiveEffect.Reference || protectiveEffect.Policy != "protective" || protectiveEffect.Samples != 1 {
-		t.Fatalf("policy-local effect = %#v", protectiveEffect)
+	if protectiveEffect.Reference || protectiveEffect.Policy != "protective" {
+		t.Fatalf("single-policy target must not be its own reference: %#v", protectiveEffect)
+	}
+	if protectiveEffect.ReferenceTargetID != reference.ID() {
+		t.Fatalf("single-policy target compared against %q, want the protocol winner", protectiveEffect.ReferenceTargetID)
 	}
 	missingEffect := find(missing.ID())
 	if missingEffect.Samples != 0 || missingEffect.Reason != "no shared scored samples" {
@@ -355,8 +362,11 @@ func TestPairedEffectsAreDeterministicAndPolicyLocal(t *testing.T) {
 	if low, high := bootstrapPairedCI([]float64{1, 3}, 1); low > high {
 		t.Fatalf("paired interval inverted = %v/%v", low, high)
 	}
-	if pairedBootstrapSeed(1, catalog.UDP, "unfiltered", "a", "b") == pairedBootstrapSeed(1, catalog.UDP, "unfiltered", "a", "c") {
+	if pairedBootstrapSeed(1, catalog.UDP, "a", "b") == pairedBootstrapSeed(1, catalog.UDP, "a", "c") {
 		t.Fatal("paired bootstrap seed ignored target identity")
+	}
+	if pairedBootstrapSeed(1, catalog.UDP, "a", "b") == pairedBootstrapSeed(1, catalog.TCP, "a", "b") {
+		t.Fatal("paired bootstrap seed ignored protocol")
 	}
 }
 

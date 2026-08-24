@@ -1549,3 +1549,98 @@ func TestCacheMissQueriesAskEachGeneratedNameOnce(t *testing.T) {
 		t.Fatalf("warm-cache produced %d queries, want the 20x2 cross-product", len(warm))
 	}
 }
+
+// TestPairedLatencyDeltasRequireAMatchingResponseClass covers the guard that
+// replaces the policy grouping key.
+//
+// Grouping paired effects by policy was meant to stop a filtering resolver
+// being compared against an unfiltered one. It did that by refusing most
+// comparisons entirely, including all the safe ones. The real hazard is
+// narrower and per-observation: a resolver that sinkholes a name answers from
+// its own blocklist in microseconds while the reference performs a real
+// recursion, so that pair measures the filtering policy, not the speed.
+// Requiring both observations to share a response class removes exactly those
+// pairs and leaves every other comparison intact.
+func TestPairedLatencyDeltasRequireAMatchingResponseClass(t *testing.T) {
+	sample := func(name string, class string, latency float64) Observation {
+		return Observation{
+			Name: name, QType: dns.TypeA, Success: true, Usable: true,
+			RCode: dns.RcodeSuccess, ResponseClass: class, LatencyMS: latency,
+		}
+	}
+	reference := TargetResult{
+		Target: testTarget(catalog.UDP, "reference"),
+		Observations: []Observation{
+			sample("real.example.", "answer", 20),
+			sample("blocked.example.", "answer", 22),
+			sample("absent.example.", "nodata", 18),
+		},
+	}
+	// A filtering resolver: it answers "blocked" from its blocklist, which is
+	// both a different class and far faster than a real recursion.
+	filtering := TargetResult{
+		Target: testTarget(catalog.UDP, "filtering"),
+		Observations: []Observation{
+			sample("real.example.", "answer", 25),
+			sample("blocked.example.", "nxdomain", 1),
+			sample("absent.example.", "nodata", 19),
+		},
+	}
+
+	deltas := pairedLatencyDeltas(filtering, reference)
+	if len(deltas) != 2 {
+		t.Fatalf("deltas = %v, want the two same-class pairs only", deltas)
+	}
+	for _, delta := range deltas {
+		if delta < 0 {
+			t.Fatalf("a sinkholed pair leaked into the deltas: %v", deltas)
+		}
+	}
+
+	// With the guard removed the blocklist hit would contribute -21 ms and
+	// make the filtering resolver look dramatically faster than it is.
+	sum := 0.0
+	for _, delta := range deltas {
+		sum += delta
+	}
+	if sum != 6 {
+		t.Fatalf("delta sum = %v, want 5 + 1 from the two comparable pairs", sum)
+	}
+}
+
+// TestPairedEffectsSkipLocalResolvers pins an exclusion that protocol-only
+// grouping made necessary. A resolver on the local host is measured but never
+// ranked, and its cache-hit latency hides the upstream resolution it forwards.
+// Under the old policy grouping a loopback stub landed in its own policy group
+// and compared only against itself; grouping by protocol would otherwise pair
+// it against the protocol winner and present that comparison as meaningful.
+func TestPairedEffectsSkipLocalResolvers(t *testing.T) {
+	sample := func(name string, latency float64) Observation {
+		return Observation{
+			Name: name, QType: dns.TypeA, Success: true, Usable: true,
+			RCode: dns.RcodeSuccess, ResponseClass: "answer", LatencyMS: latency,
+		}
+	}
+	observations := make([]Observation, 0, MinimumRecommendedSamples)
+	for index := 0; index < MinimumRecommendedSamples; index++ {
+		observations = append(observations, sample(fmt.Sprintf("q%02d.example.", index), 20))
+	}
+
+	remote := testTarget(catalog.UDP, "remote")
+	stub := testTarget(catalog.UDP, "stub")
+	stub.Resolver.Local = true
+
+	effects := calculatePairedEffects([]TargetResult{
+		{Target: remote, Stats: Statistics{Scored: MinimumRecommendedSamples, ScoreMS: 2}, Observations: observations},
+		{Target: stub, Stats: Statistics{Scored: MinimumRecommendedSamples, ScoreMS: 1}, Observations: observations},
+	}, []Ranking{{Protocol: catalog.UDP, TargetID: remote.ID(), Rank: 1}}, 42)
+
+	for _, effect := range effects {
+		if effect.TargetID == stub.ID() || effect.ReferenceTargetID == stub.ID() {
+			t.Fatalf("a local resolver reached the paired effects: %#v", effect)
+		}
+	}
+	if len(effects) != 1 || effects[0].TargetID != remote.ID() {
+		t.Fatalf("paired effects = %#v, want only the remote target", effects)
+	}
+}

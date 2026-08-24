@@ -107,36 +107,44 @@ func pairedPolicyReport(effects []benchmark.PairedEffect, targets []benchmark.Ta
 	}
 }
 
-func TestPairedEffectsOmitSingletonPolicyGroups(t *testing.T) {
+func TestPairedEffectsOmitTargetsAloneInTheirProtocolGroup(t *testing.T) {
 	first := reportTarget("paired-first", catalog.UDP, 2, true)
 	second := reportTarget("paired-second", catalog.UDP, 2, false)
 	lonelyPolicy := reportTarget("paired-filtered", catalog.UDP, 2, false)
 	lonelyPolicy.Target.Resolver.Policy = "filtered"
 	lonelyProtocol := reportTarget("paired-tcp", catalog.TCP, 2, false)
+	// A second protocol with one measured target, so the summary line exercises
+	// its plural form as well as the singular one below.
+	lonelyDoH := reportTarget("paired-doh", catalog.DoH, 2, false)
 	effects := []benchmark.PairedEffect{
 		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: first.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 2, Reference: true},
 		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: second.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 2, MedianDeltaMS: 1, CILowMS: 0.5, CIHighMS: 1.5},
-		{Protocol: catalog.UDP, Policy: "filtered", TargetID: lonelyPolicy.Target.ID(), ReferenceTargetID: lonelyPolicy.Target.ID(), Samples: 2, Reference: true},
+		// A different policy string no longer isolates a target: it is compared
+		// against the protocol's reference like any other member.
+		{Protocol: catalog.UDP, Policy: "filtered", TargetID: lonelyPolicy.Target.ID(), ReferenceTargetID: first.Target.ID(), Samples: 2, MedianDeltaMS: 2, CILowMS: 1, CIHighMS: 3},
 		{Protocol: catalog.TCP, Policy: "unfiltered", TargetID: lonelyProtocol.Target.ID(), ReferenceTargetID: lonelyProtocol.Target.ID(), Samples: 2, Reference: true},
+		{Protocol: catalog.DoH, Policy: "unfiltered", TargetID: lonelyDoH.Target.ID(), ReferenceTargetID: lonelyDoH.Target.ID(), Samples: 2, Reference: true},
 	}
-	run := pairedPolicyReport(effects, []benchmark.TargetResult{first, second, lonelyPolicy, lonelyProtocol})
+	run := pairedPolicyReport(effects, []benchmark.TargetResult{first, second, lonelyPolicy, lonelyProtocol, lonelyDoH})
 
 	var table bytes.Buffer
 	if err := WriteTableWithOptions(&table, run, TableOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	text := table.String()
-	if !strings.Contains(text, "  omitted 2 targets without a policy-comparable peer (--details lists them)") {
+	if !strings.Contains(text, "  omitted 2 targets alone in their protocol group (--details lists them)") {
 		t.Fatalf("paired table missing singleton summary: %s", text)
 	}
 	pairedBlock := text[strings.Index(text, "Paired latency effects"):]
-	for _, omittedAddress := range []string{"192.0.2.paired-filtered", "192.0.2.paired-tcp"} {
+	for _, omittedAddress := range []string{"192.0.2.paired-tcp", "192.0.2.paired-doh"} {
 		if strings.Contains(pairedBlock, omittedAddress) {
-			t.Fatalf("paired table kept singleton row %q: %s", omittedAddress, pairedBlock)
+			t.Fatalf("paired table kept a row alone in its protocol group %q: %s", omittedAddress, pairedBlock)
 		}
 	}
-	if !strings.Contains(pairedBlock, "192.0.2.paired-second") {
-		t.Fatalf("paired table dropped a comparable row: %s", pairedBlock)
+	for _, keptAddress := range []string{"192.0.2.paired-second", "192.0.2.paired-filtered"} {
+		if !strings.Contains(pairedBlock, keptAddress) {
+			t.Fatalf("paired table dropped a comparable row %q: %s", keptAddress, pairedBlock)
+		}
 	}
 
 	var details bytes.Buffer
@@ -145,12 +153,12 @@ func TestPairedEffectsOmitSingletonPolicyGroups(t *testing.T) {
 	}
 	detailText := details.String()
 	detailBlock := detailText[strings.Index(detailText, "Paired latency effects"):]
-	for _, listedAddress := range []string{"192.0.2.paired-filtered", "192.0.2.paired-tcp", "192.0.2.paired-second"} {
+	for _, listedAddress := range []string{"192.0.2.paired-filtered", "192.0.2.paired-tcp", "192.0.2.paired-doh", "192.0.2.paired-second"} {
 		if !strings.Contains(detailBlock, listedAddress) {
 			t.Fatalf("detailed paired table hid %q: %s", listedAddress, detailBlock)
 		}
 	}
-	if strings.Contains(detailBlock, "policy-comparable") {
+	if strings.Contains(detailBlock, "--details lists them") {
 		t.Fatalf("detailed paired table omitted singleton rows: %s", detailBlock)
 	}
 
@@ -164,7 +172,7 @@ func TestPairedEffectsOmitSingletonPolicyGroups(t *testing.T) {
 		}
 	}
 
-	if err := WriteTableWithOptions(contentFailWriter{needle: "policy-comparable"}, run, TableOptions{}); err == nil {
+	if err := WriteTableWithOptions(contentFailWriter{needle: "protocol group"}, run, TableOptions{}); err == nil {
 		t.Fatal("singleton paired summary writer failure was not returned")
 	}
 }
@@ -182,7 +190,7 @@ func TestPairedEffectsWithOnlySingletonGroupsRenderSummaryOnly(t *testing.T) {
 	}
 	text := table.String()
 	pairedBlock := text[strings.Index(text, "Paired latency effects"):]
-	if !strings.Contains(pairedBlock, "  omitted 1 target without a policy-comparable peer (--details lists them)") {
+	if !strings.Contains(pairedBlock, "  omitted 1 target alone in its protocol group (--details lists them)") {
 		t.Fatalf("single singleton summary missing: %s", pairedBlock)
 	}
 	if strings.Contains(pairedBlock, "Interpretation") {

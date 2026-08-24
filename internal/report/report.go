@@ -1009,25 +1009,27 @@ func pairedInterpretation(effect benchmark.PairedEffect, color bool) string {
 	return "SLOWER"
 }
 
-type pairedPolicyGroup struct {
-	protocol catalog.Protocol
-	policy   string
-}
-
-// pairedGroupSizes counts the effects in each protocol/policy group. A group
-// with a single member has no policy-comparable peer, so its only row is a
-// reference self-comparison that carries no information.
-func pairedGroupSizes(effects []benchmark.PairedEffect) map[pairedPolicyGroup]int {
-	sizes := make(map[pairedPolicyGroup]int, len(effects))
+// pairedGroupSizes counts the effects in each protocol group, matching the
+// grouping the benchmark uses. A group with a single member has no peer to
+// compare against, so its only row is a reference self-comparison that carries
+// no information.
+//
+// This keys on protocol alone. It used to include the policy string, and would
+// now collapse rows that are genuine comparisons: the benchmark groups by
+// protocol, so two resolvers with different policy strings are compared
+// against each other and both rows are real.
+func pairedGroupSizes(effects []benchmark.PairedEffect) map[catalog.Protocol]int {
+	sizes := make(map[catalog.Protocol]int, len(effects))
 	for _, effect := range effects {
-		sizes[pairedPolicyGroup{protocol: effect.Protocol, policy: effect.Policy}]++
+		sizes[effect.Protocol]++
 	}
 	return sizes
 }
 
 // pairedEffectRows returns the rendered paired-effect rows and the number of
-// targets that were omitted because they had no policy-comparable peer. The
-// detailed view keeps every row; the JSON section always keeps every entry.
+// targets that were omitted because their protocol had no other measured
+// target to compare against. The detailed view keeps every row; the JSON
+// section always keeps every entry.
 func pairedEffectRows(report benchmark.Report, options TableOptions) ([][]string, int) {
 	effects := append([]benchmark.PairedEffect(nil), report.PairedEffects...)
 	sort.SliceStable(effects, func(i, j int) bool {
@@ -1043,7 +1045,7 @@ func pairedEffectRows(report benchmark.Report, options TableOptions) ([][]string
 	rows := make([][]string, 0, len(effects))
 	omitted := 0
 	for _, effect := range effects {
-		if !options.Details && sizes[pairedPolicyGroup{protocol: effect.Protocol, policy: effect.Policy}] == 1 {
+		if !options.Details && sizes[effect.Protocol] == 1 {
 			omitted++
 			continue
 		}
@@ -1063,7 +1065,7 @@ func writePairedEffects(writer io.Writer, report benchmark.Report, options Table
 		return nil
 	}
 	rows, omitted := pairedEffectRows(report, options)
-	if _, err := io.WriteString(writer, "\nPaired latency effects (target - reference; policy-local reference)\n"); err != nil {
+	if _, err := io.WriteString(writer, "\nPaired latency effects (target - reference; reference is the protocol's best-ranked target)\n"); err != nil {
 		return err
 	}
 	if len(rows) > 0 {
@@ -1072,7 +1074,7 @@ func writePairedEffects(writer io.Writer, report benchmark.Report, options Table
 		}
 	}
 	if omitted > 0 {
-		if _, err := fmt.Fprintf(writer, "  omitted %s without a policy-comparable peer (--details lists them)\n", targetCountText(omitted)); err != nil {
+		if _, err := fmt.Fprintf(writer, "  omitted %s (--details lists them)\n", targetCountText(omitted)); err != nil {
 			return err
 		}
 	}
@@ -1225,9 +1227,9 @@ const tableColumnPadding = 2
 // grammatical for a single hidden row.
 func targetCountText(count int) string {
 	if count == 1 {
-		return "1 target"
+		return "1 target alone in its protocol group"
 	}
-	return fmt.Sprintf("%d targets", count)
+	return fmt.Sprintf("%d targets alone in their protocol group", count)
 }
 
 func ipv6EndpointCountText(count int) string {
