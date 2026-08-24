@@ -28,3 +28,9 @@ __pycache__/
 /speedns-*
 *.exe
 
+# Scratch output. Named patterns like these are a blacklist and will always
+# lag the next kind of scratch file, which is why TestTrackedFilesAreIntended
+# checks the property rather than the names.
+*.log
+*.diff
+
