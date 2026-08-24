@@ -1644,3 +1644,74 @@ func TestPairedEffectsSkipLocalResolvers(t *testing.T) {
 		t.Fatalf("paired effects = %#v, want only the remote target", effects)
 	}
 }
+
+// TestSampleSizeCountsNamesInBothCorpusShapes pins the number the report
+// publishes as run.sample_size.
+//
+// It used to be derived as len(queries)/len(QueryTypes), which assumes the warm
+// cross-product. Cache-miss mode asks each generated name one question, so that
+// divisor halved the reported sample size under the default --type A,AAAA and
+// rounded down for odd corpora -- a wrong number in the versioned JSON
+// contract, contradicting the corpus the run actually measured.
+func TestSampleSizeCountsNamesInBothCorpusShapes(t *testing.T) {
+	// An odd corpus, so an off-by-rounding is visible rather than absorbed.
+	names := make([]string, 0, 7)
+	for index := 0; index < 7; index++ {
+		names = append(names, fmt.Sprintf("speedns-test-%04d.example.com", index))
+	}
+
+	cacheMiss, err := buildQueries(Options{Domains: names, QueryTypes: []uint16{1, 28}, Sample: 7, Seed: 3, CacheMiss: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := distinctQueryNames(cacheMiss); got != 7 {
+		t.Fatalf("cache-miss sample size = %d, want 7 names", got)
+	}
+	if len(cacheMiss) != 7 {
+		t.Fatalf("cache-miss produced %d queries for 7 names", len(cacheMiss))
+	}
+
+	warm, err := buildQueries(Options{Domains: names, QueryTypes: []uint16{1, 28}, Sample: 7, Seed: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := distinctQueryNames(warm); got != 7 {
+		t.Fatalf("warm sample size = %d, want 7 names", got)
+	}
+	if len(warm) != 14 {
+		t.Fatalf("warm produced %d queries, want the 7x2 cross-product", len(warm))
+	}
+
+	// Through Run, because the published number is assigned there and a
+	// helper-level test cannot see a wrong formula at the assignment site.
+	restore := newFactory
+	t.Cleanup(func() { newFactory = restore })
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return &scriptedFactory{open: func(int, context.Context) (transport.Session, error) {
+			return minimalSession{}, nil
+		}}, nil
+	}
+	for _, testCase := range []struct {
+		name      string
+		cacheMiss bool
+		want      int
+	}{
+		{"cache-miss corpus", true, 7},
+		{"warm corpus", false, 7},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			options := validBenchmarkOptions()
+			options.Domains = names
+			options.QueryTypes = []uint16{1, 28}
+			options.Sample = 7
+			options.CacheMiss = testCase.cacheMiss
+			report, err := Run(context.Background(), []catalog.Target{testTarget(catalog.UDP, "one")}, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.SampleSize != testCase.want {
+				t.Fatalf("report.SampleSize = %d, want %d names", report.SampleSize, testCase.want)
+			}
+		})
+	}
+}

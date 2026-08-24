@@ -289,7 +289,7 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 	report := Report{
 		StartedAt:  started,
 		Seed:       opts.Seed,
-		SampleSize: len(queries) / len(opts.QueryTypes),
+		SampleSize: distinctQueryNames(queries),
 		Queries:    len(queries),
 		QueryTypes: append([]uint16(nil), opts.QueryTypes...),
 	}
@@ -355,6 +355,22 @@ func validateOptions(opts Options) error {
 		return errors.New("concurrency must be positive")
 	}
 	return nil
+}
+
+// distinctQueryNames counts the domain names a query list covers.
+//
+// SampleSize used to be derived as len(queries)/len(QueryTypes), which assumes
+// every name is asked once per query type. Cache-miss mode stopped building
+// that cross-product -- it asks each generated name exactly one question,
+// because the first answer caches the name -- so the divisor silently halved
+// the reported sample size under the default --type A,AAAA. Counting the names
+// is correct for both shapes and cannot drift apart from the builder again.
+func distinctQueryNames(queries []Query) int {
+	names := make(map[string]struct{}, len(queries))
+	for _, query := range queries {
+		names[query.Name] = struct{}{}
+	}
+	return len(names)
 }
 
 func buildQueries(opts Options) ([]Query, error) {

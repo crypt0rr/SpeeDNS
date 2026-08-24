@@ -212,10 +212,15 @@ summarizes them as an unavailable IPv6 path and the default protocol
 comparisons replace those endpoint rows with a hidden-endpoint count; partial
 IPv6 failures remain visible per endpoint.
 .PP
-The default table also omits paired latency effects for targets that are alone
-in their protocol and policy group, because such a row compares a target with
-itself, and counts them below the block instead. The --details view restores
-every hidden row, and JSON output is unchanged in both views.
+Paired latency effects compare every measured target against the best-ranked
+target of the same protocol. A pair is formed only where both resolvers
+returned the same response class, so a filtering resolver answering from its
+blocklist is never compared against a real recursion. Resolvers on the local
+host are excluded, since they are never ranked. The default table omits a
+target that is the only measured member of its protocol, because such a row
+compares a target with itself, and counts those below the block instead. The
+--details view restores every hidden row, and JSON output is unchanged in both
+views.
 .PP
 A qualified recommendation requires at least 20 scored comparable samples and
 99 percent usable responses. A short run may show a provisional winner instead.

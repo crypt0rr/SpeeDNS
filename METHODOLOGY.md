@@ -41,15 +41,7 @@ reports the DNS transaction time only.
 Warm latency is measured from immediately before a DNS exchange until the
 validated response or error returns. Per-query deadline setup and post-exchange
 bookkeeping, such as the reconnect check, fall outside the timed section. TCP,
-DoT, and any recovered stream connection are not closed before the timer stops.
-A query that follows a TCP, DoT, or DoQ reconnect is recorded as a reconnect
-sample and excluded from ordinary warm-latency scoring; its reconnect count and
-selected dial address remain visible in detailed output and machine-readable
-results. DoQ sessions use TLS 1.3 with ALPN `doq`, an explicit keepalive period
-equal to the configured timeout, and a maximum idle timeout of twice that
-timeout. The failed exchange that caused the reconnect is counted once and is
-never retried.
-validated response or error returns. TCP, DoT, and any recovered stream
+DoT, and any recovered stream
 connection are not closed before the timer stops. A query that follows a TCP,
 DoT, DoH, or DoQ reconnect is recorded as a reconnect sample and excluded from
 ordinary warm-latency scoring; its reconnect count and selected dial address
@@ -203,14 +195,7 @@ target was slower. A deterministic bootstrap of those paired deltas provides
 the 95% confidence interval. When the interval contains zero, the report says
 `NO CLEAR DIFFERENCE`: the observed ranking difference is not distinguishable
 from noise in this run. These effects explain the existing score and never
-change ranking order. A protocol with a single measured target has no peer to
-compare against, so its only row would be a self-comparison; the default table
-counts those targets in one line below the block and `--details` lists them
-again.
-JSON exposes them in the additive `paired_effects` section, always including
-every entry, while the human table shows them below the protocol comparisons
-and CSV retains its aggregate one-row-per-target schema.
-from noise in this run.
+change ranking order.
 
 A paired comparison requires at least 20 paired observations, the same minimum
 sample count the recommendation gate uses. Below that floor no delta and no
@@ -221,16 +206,15 @@ consumer matching on it does not break when the threshold changes; the sample
 count is in the same record.
 
 A target that is the only measured member of its protocol has no peer to be
-paired against, so it is its own reference and its row carries no
-information. The human table omits those rows and reports how many were omitted;
-`--details` and the `paired_effects` JSON section keep every entry, so the
-detailed view remains a complete record of what was measured.
-A one-sample or few-sample run measures cold-path noise, so it must not be
-presented as a directional `FASTER` or `SLOWER` verdict under a 95% confidence
-interval heading. These effects explain the existing score and never
-change ranking order. JSON exposes them in the additive `paired_effects`
-section; the human table shows them below the protocol comparisons, while CSV
-retains its aggregate one-row-per-target schema.
+paired against, so it is its own reference and its row carries no information.
+The human table omits those rows and reports how many were omitted; `--details`
+and the `paired_effects` JSON section keep every entry, so the detailed view
+remains a complete record of what was measured. A one-sample or few-sample run
+measures cold-path noise, so it must not be presented as a directional `FASTER`
+or `SLOWER` verdict under a 95% confidence interval heading. JSON exposes these
+effects in the additive `paired_effects` section; the human table shows them
+below the protocol comparisons, while CSV retains its aggregate
+one-row-per-target schema.
 
 ## Interruption and diagnostics
 
@@ -426,10 +410,6 @@ have external routes. Hostname-only custom endpoints remain available in
 `auto` and `both`, while explicit family selection requires literals so the
 benchmark does not include an unmeasured bootstrap lookup. Explicit `4`, `6`,
 and `both` stay exact filters, loopback included.
-
-route. Hostname-only custom endpoints remain available in `auto` and `both`,
-while explicit family selection requires literals so the benchmark does not
-include an unmeasured bootstrap lookup.
 
 Auto-detection treats the two families differently. An RFC 1918 IPv4 address
 counts as IPv4 availability because NAT makes a private v4 address an ordinary
