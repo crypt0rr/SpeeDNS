@@ -466,6 +466,64 @@ total. Narrow the run with `--protocol`, `--sample`, or `--no-defaults` plus
 [`CACHE_MISS.md`](CACHE_MISS.md) states the separate, much smaller budget for
 `--cache-miss`, which sends 200 reserved-zone queries.
 
+## Comparing two runs
+
+`speedns diff` compares two saved JSON reports and reports what each resolver
+did differently — whether it was reachable, which response codes it returned,
+whether it answered with a record, and its DNSSEC verdict.
+
+```sh
+speedns run --seed 11 --format json --output week33.json
+# a week later
+speedns run --seed 11 --format json --output week34.json
+speedns diff week33.json week34.json
+```
+
+**Pin `--seed`.** Without it each run picks a fresh seed, which selects
+different names, and the diff will always refuse.
+
+### It never compares latency
+
+Not median, p95, score, rank, or any interval. The difference between two runs
+is dominated by the network path and the time of day, and no field in a report
+records either, so no threshold computed from two reports can bound it. Six
+identical back-to-back runs on one host moved a target's p95 by 248% and its
+score by 50% with nothing changed, while every categorical count stayed
+identical. To compare resolver speed, measure the resolvers together in one
+run, where they share the same conditions.
+
+### It refuses more often than it answers
+
+Both runs must have asked the same questions. When they did not, `diff` names
+the fields that differ, shows no count from either report, and exits 3:
+
+```
+RUNS NOT COMPARABLE
+  run.seed                     7 -> 99
+      a different seed selects different names and a different query order, so
+      the two runs asked different questions
+```
+
+A refusal is not a fault in either run. The seed, sample size, query types,
+corpus, timeout, concurrency, address family, DNSSEC setting and feature
+version must all match. A `--cache-miss` run is never comparable with anything,
+including another one: its names are generated fresh each time.
+
+### Gating a change in CI
+
+`--require` takes named conditions and exits 4 when one does not hold:
+
+```sh
+speedns diff last.json now.json --require no-new-failed-targets --require no-dnssec-regression
+```
+
+Available: `no-new-failed-targets`, `no-removed-targets`, `target-set-identical`,
+`no-dnssec-regression`, `no-behaviour-change`. There is deliberately no
+threshold form such as `--fail-if p95>+20%`: the quantity it would read moves by
+more than that between identical runs, so it would fire on nothing. For an
+absolute latency bar use `speedns run --assert p95<=50ms`, which measures and
+gates in one place.
+
 ## System resolver baseline
 
 Use `--include-system` to include the resolver configured by the operating system:

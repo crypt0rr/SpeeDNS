@@ -480,3 +480,45 @@ instruction and still filters every profile, explicit ones included. When
 `auto` drops bundled addresses the run emits a warning naming the detected
 families and the number of addresses removed, so the reduced comparison table
 is visible rather than silent.
+
+## Comparing two runs
+
+`speedns diff` answers one question about two saved reports: did any resolver
+behave differently? It reports what each resolver did and never how fast it did
+it.
+
+That boundary is not caution, it is what the evidence supports. The confound
+between two runs is not sampling noise but an unobserved variable -- which
+anycast site answered, over which transit, at what time of day -- and a report
+contains no field that records it, so no threshold computed from two reports
+can bound it. Measured on one host, six byte-identical back-to-back runs moved
+one target's p95 by 248% and its composite score by 50%, while every
+categorical count was identical across all six. Two runs thirteen hours apart
+with identical settings drifted by different amounts per target, so the drift
+cancels against neither an absolute baseline nor a reference target. The sound
+way to compare resolver speed is to measure the resolvers together in one run,
+where synchronized query rounds expose them to the same conditions.
+
+A comparison proceeds only when both runs asked the same questions. The seed,
+sample size, queries per target, query types, corpus mode and digest, timeout,
+concurrency, address family, DNSSEC setting and feature version must all match.
+Each of those decides what was measured rather than how it was reported, so a
+difference means the two runs answered different questions. A cache-miss run is
+refused unconditionally, including against another cache-miss run: its names are
+generated fresh per run, so no two of them asked the same names, and an equal
+nonce would prove the second run read the first run's cached answers.
+
+Counts are compared against a floor of `max(2, 1% of responses)`. The 1% is the
+budget the recommendation gate already declares acceptable, and the floor of two
+is empirical: the observed run-to-run amplitude of every categorical count
+across identical runs was zero to one responses.
+
+Two suppressions exist because a categorical field can still be a threshold on
+a noisy measurement. A status flip from `qualified` to `ineligible` that turns
+on a sub-floor movement in usable responses is a one-response crossing of the
+99% bar, not a behaviour change, and is disclosed rather than reported. A flip
+that turns on `scored` is suppressed because `scored` excludes divergent
+responses, which are decided by a plurality vote over the other targets present
+-- a property of the cohort rather than of the resolver. Every suppression is
+named in the output; silence would leave a reader unable to tell "nothing
+changed" from "this was not checked".

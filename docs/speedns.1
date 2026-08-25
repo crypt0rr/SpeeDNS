@@ -258,6 +258,41 @@ Every table shows
 beside the score, and
 .B Min ,
 the fastest observed exchange.
+.SH DIFF
+.B speedns diff BASELINE.json CURRENT.json
+compares two saved JSON reports and reports what each resolver did
+differently: reachability, response codes, whether it answered with a record,
+and its DNSSEC verdict.
+.PP
+It never compares latency \(em not median, p95, score, rank, or any interval.
+The difference between two runs is dominated by the network path and the time
+of day, which no field in a report records, so no threshold computed from two
+reports can bound it. To compare resolver speed, measure the resolvers together
+in one run.
+.PP
+Both runs must have asked the same questions. The seed, sample size, query
+types, corpus, timeout, concurrency, address family, DNSSEC setting and feature
+version must match, and a
+.B --cache-miss
+run is never comparable with anything. When they do not match the diff is
+declined, no count from either report is shown, and the exit status is 3.
+.TP
+.B --format table|json
+Choose human-readable or machine-readable output. Defaults to table. There is
+no CSV form: a comparison is not a per-target row set.
+.TP
+.B --require CONDITION
+Exit 4 unless a named condition holds. Repeatable. Accepts
+.IR no-new-failed-targets ,
+.IR no-removed-targets ,
+.IR target-set-identical ,
+.IR no-dnssec-regression ,
+and
+.IR no-behaviour-change .
+There is no threshold form, because the quantity one would read moves by more
+than any useful threshold between identical runs. Use
+.B --assert
+on a run for an absolute bar.
 .SH EXIT STATUS
 .TP
 .B 0

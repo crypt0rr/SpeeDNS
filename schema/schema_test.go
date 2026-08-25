@@ -268,3 +268,35 @@ func gitOutput(t *testing.T, root string, args ...string) string {
 	}
 	return string(output)
 }
+
+// TestCompareV1IsEmbeddedJSONSchema mirrors the report and live-results checks:
+// the diff schema must be embedded, parse, and hand out an independent copy.
+func TestCompareV1IsEmbeddedJSONSchema(t *testing.T) {
+	contents := CompareV1()
+	if len(contents) == 0 {
+		t.Fatal("compare schema is empty")
+	}
+	var document map[string]any
+	if err := json.Unmarshal(contents, &document); err != nil {
+		t.Fatalf("compare schema is not valid JSON: %v", err)
+	}
+	for _, key := range []string{"$schema", "$id", "title", "type", "$defs", "properties"} {
+		if _, ok := document[key]; !ok {
+			t.Fatalf("compare schema has no %q", key)
+		}
+	}
+	if id, _ := document["$id"].(string); !strings.HasSuffix(id, "compare-v1.json") {
+		t.Fatalf("compare schema $id = %q", id)
+	}
+	// The diff must not be able to publish a latency field: that is the whole
+	// claim boundary of the feature, and a schema that permitted one would let
+	// a later change ship it silently.
+	if strings.Contains(string(contents), "median_ms") || strings.Contains(string(contents), "p95_ms") ||
+		strings.Contains(string(contents), "score_ms") {
+		t.Fatal("the compare schema names a latency field; the diff must not publish one")
+	}
+	contents[0] = 'X'
+	if CompareV1()[0] == 'X' {
+		t.Fatal("CompareV1 handed out its backing array")
+	}
+}
