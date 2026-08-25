@@ -193,7 +193,7 @@ func TestMainAndCommands(t *testing.T) {
 		commands[command.Name()] = command
 	}
 	sort.Strings(names)
-	if got, want := strings.Join(names, ","), "completion,corpus,resolvers,run,version"; got != want {
+	if got, want := strings.Join(names, ","), "completion,corpus,diff,resolvers,run,version"; got != want {
 		t.Fatalf("root subcommands = %q, want %q", got, want)
 	}
 	runCommand := commands["run"]

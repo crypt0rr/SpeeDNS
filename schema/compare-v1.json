@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/crypt0rr/SpeeDNS/schema/compare-v1.json",
+  "title": "SpeeDNS run diff v1",
+  "description": "The output of `speedns diff`. A comparison is a different document from a report: it has two run identities, no results and no rankings, so it carries its own schema rather than a version of report-v1. It deliberately contains no latency field of any kind.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "comparable", "baseline", "current", "blockers", "findings", "not_compared", "disclosures", "warnings", "compared"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "comparable": {"type": "boolean"},
+    "baseline": {"$ref": "#/$defs/side"},
+    "current": {"$ref": "#/$defs/side"},
+    "blockers": {"type": "array", "items": {"$ref": "#/$defs/blocker"}},
+    "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+    "not_compared": {"type": "array", "items": {"$ref": "#/$defs/suppression"}},
+    "disclosures": {"type": "array", "items": {"$ref": "#/$defs/disclosure"}},
+    "warnings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["added", "removed"],
+      "properties": {
+        "added": {"type": "array", "items": {"type": "string"}},
+        "removed": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "compared": {"type": "integer", "minimum": 0}
+  },
+  "$defs": {
+    "side": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string"},
+        "started_at": {"type": "string"}
+      }
+    },
+    "blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "baseline", "current", "reason"],
+      "properties": {
+        "field": {"type": "string"},
+        "baseline": {"type": "string"},
+        "current": {"type": "string"},
+        "reason": {"type": "string"}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "target_id", "detail"],
+      "properties": {
+        "code": {"type": "string", "enum": ["PRESENCE", "OPEN", "FAILED", "QUERIES", "USABLE", "ANSWERS", "TRUNCATED", "RCODE", "STATUS", "DNSSEC"]},
+        "target_id": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    },
+    "suppression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "scope", "detail"],
+      "properties": {
+        "reason": {"type": "string", "enum": ["boundary-crossing", "peer-relative", "probe-incomplete", "denominator-mismatch", "local-position", "redacted-identity", "incomplete-target"]},
+        "scope": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    },
+    "disclosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "detail"],
+      "properties": {
+        "reason": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    }
+  }
+}

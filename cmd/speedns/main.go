@@ -23,6 +23,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/compare"
 	"github.com/crypt0rr/SpeeDNS/internal/domains"
 	"github.com/crypt0rr/SpeeDNS/internal/report"
 	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
@@ -106,6 +107,10 @@ func exitCodeForError(err error) int {
 		return 0
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return 130
+	case errors.Is(err, compare.ErrRunsNotComparable):
+		// Distinct from ErrNoComparableResults, which means one run produced
+		// nothing rankable; this means two runs measured different things.
+		return 3
 	case errors.Is(err, benchmark.ErrNoComparableResults):
 		return 3
 	case errors.Is(err, ErrAssertionsFailed):
@@ -731,6 +736,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newResolversCommand())
 	root.AddCommand(newCorpusCommand())
 	root.AddCommand(newCompletionCommand())
+	root.AddCommand(newDiffCommand())
 	root.AddCommand(newVersionCommand())
 	return root
 }

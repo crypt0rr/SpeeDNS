@@ -84,7 +84,9 @@ func TestManPageDocumentsEveryExitStatus(t *testing.T) {
 func TestManPageDocumentsEachFlagOnce(t *testing.T) {
 	entry := regexp.MustCompile(`(?m)^\.TP\n\.B (--[a-z][a-z0-9-]*)`)
 	counts := make(map[string]int)
-	for _, match := range entry.FindAllStringSubmatch(manPage(t), -1) {
+	// Scoped to OPTIONS: a subcommand section may document its own --format,
+	// which is a different flag rather than a duplicate entry.
+	for _, match := range entry.FindAllStringSubmatch(optionsSection(t), -1) {
 		counts[match[1]]++
 	}
 	if len(counts) == 0 {
@@ -105,10 +107,50 @@ func TestManPageDocumentsEachFlagOnce(t *testing.T) {
 // manPageEntries splits the OPTIONS list into one body per documented flag.
 func manPageEntries(t *testing.T) map[string]string {
 	t.Helper()
-	entry := regexp.MustCompile(`(?ms)^\.TP\n\.B (--[a-z][a-z0-9-]*)[^\n]*\n(.*?)(?:\n\.TP|\z)`)
+	return optionEntries(t, optionsSection(t))
+}
+
+// optionsSection returns the OPTIONS section alone.
+//
+// These guards are about the flags of the root command, and the page also
+// documents subcommand flags in their own sections -- `speedns diff` has its
+// own --format, which is not a duplicate of the root one and is not a root flag
+// at all. Scoping to the section keeps each guard asking the question it means.
+func optionsSection(t *testing.T) string {
+	t.Helper()
+	page := manPage(t)
+	start := strings.Index(page, ".SH OPTIONS")
+	if start < 0 {
+		t.Fatal("docs/speedns.1 has no OPTIONS section")
+	}
+	rest := page[start+len(".SH OPTIONS"):]
+	if end := strings.Index(rest, "\n.SH "); end >= 0 {
+		return rest[:end]
+	}
+	return rest
+}
+
+// optionEntries splits a section into one body per documented flag.
+//
+// It splits rather than matching a regexp with a trailing "\n.TP" delimiter.
+// That delimiter CONSUMES the marker that starts the next entry, and Go's
+// regexp scans on from the end of each match, so every second entry was
+// skipped: on a 25-entry OPTIONS section the old pattern reported 13. Both
+// guards built on this were therefore checking half the page.
+func optionEntries(t *testing.T, section string) map[string]string {
+	t.Helper()
+	header := regexp.MustCompile(`^\.B (--[a-z][a-z0-9-]*)`)
 	entries := make(map[string]string)
-	for _, match := range entry.FindAllStringSubmatch(manPage(t), -1) {
-		entries[match[1]] = match[2]
+	for _, chunk := range strings.Split(section, "\n.TP\n") {
+		match := header.FindStringSubmatch(chunk)
+		if match == nil {
+			continue
+		}
+		body := chunk
+		if newline := strings.IndexByte(chunk, '\n'); newline >= 0 {
+			body = chunk[newline+1:]
+		}
+		entries[match[1]] = body
 	}
 	if len(entries) == 0 {
 		t.Fatal("no option entries found; the entry pattern no longer matches the page")
@@ -147,7 +189,15 @@ func TestManPageStatesEveryDefault(t *testing.T) {
 	entries := manPageEntries(t)
 	var missing []string
 	newRootCommand().Flags().VisitAll(func(flag *pflag.Flag) {
-		if flag.Hidden || flag.DefValue == "" || flag.DefValue == "false" || flag.DefValue == "0" {
+		// An empty string, a false boolean, a zero, or an empty repeatable
+		// list are all the ABSENCE of an option rather than a value a reader
+		// needs told. "[]" is what pflag reports for an unset --assert or
+		// --resolver.
+		switch flag.DefValue {
+		case "", "false", "0", "[]":
+			return
+		}
+		if flag.Hidden {
 			return
 		}
 		body, documented := entries["--"+flag.Name]
