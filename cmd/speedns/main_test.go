@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2247,5 +2248,76 @@ func TestOnNetworkResolversAreDisclosedAndRedacted(t *testing.T) {
 	if err := runBenchmark(context.Background(), &failing); err == nil ||
 		!strings.Contains(err.Error(), "inventory unavailable") {
 		t.Fatalf("inventory failure = %v", err)
+	}
+}
+
+// TestProvenanceRecordsFamilyAndDNSSEC pins two settings that change WHAT was
+// measured rather than how it was reported.
+//
+// --family decides which targets exist at all, and --dnssec sets the EDNS(0) DO
+// bit on every measured query, changing the wire format. Neither was recorded,
+// so two reports could describe different experiments while looking identical
+// in their provenance -- which any tool comparing runs has to be able to tell.
+//
+// The recorded value is what the user asked for, not what it resolved to:
+// "auto" on a host with no IPv6 selects a different target set than "auto" on
+// one with IPv6, and both record "auto". Comparing target sets is what catches
+// that; this field records intent.
+func TestProvenanceRecordsFamilyAndDNSSEC(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		family     string
+		dnssec     bool
+		wantFamily string
+	}{
+		{"explicit v4", "4", false, "4"},
+		{"explicit v6 with dnssec", "6", true, "6"},
+		{"auto records the request", "auto", false, "auto"},
+		{"both", "both", true, "both"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// An explicit family filters by address literal, so the resolver
+			// has to be in the family being requested.
+			resolver := "lab=udp://127.0.0.1:53"
+			if testCase.family == "6" {
+				resolver = "lab=udp://[::1]:53"
+			}
+			config := &cliConfig{
+				protocols: "udp", resolverFlags: []string{resolver}, noDefaults: true,
+				sample: 3, seed: 1, queryTypes: "A", timeout: time.Second, concurrency: 1,
+				format: "json", family: testCase.family, dnssec: testCase.dnssec,
+				output: filepath.Join(t.TempDir(), "run.json"),
+			}
+			if err := runBenchmark(context.Background(), config); err != nil {
+				t.Fatal(err)
+			}
+			content, err := os.ReadFile(config.output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var report struct {
+				Run struct {
+					Provenance struct {
+						Family string `json:"family"`
+						DNSSEC bool   `json:"dnssec"`
+					} `json:"provenance"`
+				} `json:"run"`
+			}
+			if err := json.Unmarshal(content, &report); err != nil {
+				t.Fatal(err)
+			}
+			if report.Run.Provenance.Family != testCase.wantFamily {
+				t.Fatalf("family = %q, want %q", report.Run.Provenance.Family, testCase.wantFamily)
+			}
+			if report.Run.Provenance.DNSSEC != testCase.dnssec {
+				t.Fatalf("dnssec = %v, want %v", report.Run.Provenance.DNSSEC, testCase.dnssec)
+			}
+		})
 	}
 }

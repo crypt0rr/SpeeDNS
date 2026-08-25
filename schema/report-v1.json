@@ -133,7 +133,9 @@
         "corpus_sha256",
         "timeout_ms",
         "concurrency",
-        "duration_ms"
+        "duration_ms",
+        "family",
+        "dnssec"
       ],
       "properties": {
         "speedns_version": {
@@ -181,6 +183,12 @@
         "duration_ms": {
           "type": "number",
           "minimum": 0
+        },
+        "family": {
+          "type": "string"
+        },
+        "dnssec": {
+          "type": "boolean"
         }
       }
     },
