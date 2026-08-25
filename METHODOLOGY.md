@@ -414,8 +414,18 @@ resolver that answers every query but reconnects for each one has all of its
 samples excluded from warm-latency scoring, so it is unranked while being
 entirely healthy; requiring a ranking would fail that run.
 
-Numeric assertions are evaluated against the rank-one target of every protocol
-that produced a ranking -- one target per protocol, chosen deterministically.
+An assertion prefixed with `SUBJECT:` is evaluated against every measured
+endpoint of the named resolver instead of against the winners. That is a
+deliberately different question: an unqualified assertion asks whether the best
+resolver is good enough, while a subject-qualified one asks whether a specific
+resolver still meets a bar, which is what a monitoring gate usually means. All
+of the subject's endpoints are checked rather than its best, so a resolver
+degrading on one transport cannot pass on the strength of another. A subject
+that matches no measured endpoint fails rather than passing silently, and the
+name is validated against the selected resolvers before any query is sent.
+
+Unqualified numeric assertions are evaluated against the rank-one target of
+every protocol that produced a ranking -- one target per protocol, chosen deterministically.
 Confidence-interval tie-group members are deliberately not included: tie
 membership depends on bootstrap interval overlap, so it moves with sample size
 and network noise, and a threshold applied to the whole group would pass or

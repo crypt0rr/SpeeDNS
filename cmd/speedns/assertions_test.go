@@ -392,3 +392,134 @@ func TestAssertionComparisonAtExactEquality(t *testing.T) {
 		})
 	}
 }
+
+// TestSubjectQualifiedAssertions covers the gate that was previously
+// inexpressible: "our resolver degraded".
+//
+// Numeric assertions apply to the rank-one target of each ranked protocol, so
+// a threshold could only ever describe whoever happened to win. If your
+// resolver was not rank one nothing checked it; if it was, you were silently
+// asserting about whatever wins tomorrow instead.
+func TestSubjectQualifiedAssertions(t *testing.T) {
+	fast := assertTarget("fast", catalog.UDP, false, benchmark.Statistics{
+		Total: 30, Successes: 30, UsableResponses: 30, Scored: 30,
+		SuccessRate: 1, UsableRate: 1, P95MS: 10, MedianMS: 8, ScoreMS: 9,
+	})
+	// The subject: healthy, but slower, and NOT rank one.
+	mine := assertTarget("mine", catalog.UDP, false, benchmark.Statistics{
+		Total: 30, Successes: 30, UsableResponses: 30, Scored: 30,
+		SuccessRate: 1, UsableRate: 1, P95MS: 90, MedianMS: 80, ScoreMS: 84,
+	})
+	report := benchmark.Report{
+		Targets: []benchmark.TargetResult{fast, mine},
+		Rankings: []benchmark.Ranking{
+			{Protocol: catalog.UDP, TargetID: fast.Target.ID(), Rank: 1},
+			{Protocol: catalog.UDP, TargetID: mine.Target.ID(), Rank: 2},
+		},
+	}
+
+	mustParse := func(expression string) []assertion {
+		t.Helper()
+		parsed, err := parseAssertions([]string{expression})
+		if err != nil {
+			t.Fatalf("parse %q: %v", expression, err)
+		}
+		return parsed
+	}
+
+	// The subject is checked even though it is not rank one -- the whole point.
+	err := evaluateAssertions(report, mustParse("mine:p95<50ms"))
+	if err == nil || !strings.Contains(err.Error(), "has p95=90.000ms") {
+		t.Fatalf("a subject that misses its threshold must fail: %v", err)
+	}
+	// And it passes on its own merits, not the winner's.
+	if err := evaluateAssertions(report, mustParse("mine:p95<200ms")); err != nil {
+		t.Fatalf("a subject that meets its threshold must pass: %v", err)
+	}
+	// An unqualified assertion still means the rank-one target, so the slow
+	// subject does not affect it.
+	if err := evaluateAssertions(report, mustParse("p95<50ms")); err != nil {
+		t.Fatalf("an unqualified assertion must still apply to rank one only: %v", err)
+	}
+
+	// Every endpoint of the subject is checked, not just its best: a resolver
+	// offering two transports is two measurements, and one degrading silently
+	// is the failure mode #106 removed for whole protocols.
+	slowDoH := assertTarget("mine", catalog.DoH, false, benchmark.Statistics{
+		Total: 30, Successes: 30, UsableResponses: 30, Scored: 30,
+		SuccessRate: 1, UsableRate: 1, P95MS: 400, MedianMS: 380, ScoreMS: 388,
+	})
+	twoTransports := report
+	twoTransports.Targets = []benchmark.TargetResult{mine, slowDoH}
+	twoTransports.Rankings = []benchmark.Ranking{
+		{Protocol: catalog.UDP, TargetID: mine.Target.ID(), Rank: 1},
+		{Protocol: catalog.DoH, TargetID: slowDoH.Target.ID(), Rank: 1},
+	}
+	err = evaluateAssertions(twoTransports, mustParse("mine:p95<100ms"))
+	if err == nil || !strings.Contains(err.Error(), "/doh has p95=400") {
+		t.Fatalf("every endpoint of the subject must be checked: %v", err)
+	}
+
+	// A subject that matched at selection but produced no measured result is a
+	// failure, never a silent pass.
+	empty := benchmark.Report{Rankings: report.Rankings}
+	if err := evaluateAssertions(empty, mustParse("mine:p95<50ms")); err == nil ||
+		!strings.Contains(err.Error(), `no measured endpoint matches "mine"`) {
+		t.Fatalf("an unmatched subject must fail: %v", err)
+	}
+}
+
+// TestSubjectAssertionParsingAndValidation pins the syntax and the up-front
+// name check. A typo must be invalid input, not a benchmark that runs to
+// completion and then reports the resolver lost.
+func TestSubjectAssertionParsingAndValidation(t *testing.T) {
+	parsed, err := parseAssertions([]string{"cloudflare-1111:p95<=25ms", "usable>=0.99"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed[0].subject != "cloudflare-1111" || parsed[0].metric != "p95" || parsed[0].operator != "<=" {
+		t.Fatalf("subject assertion parsed as %#v", parsed[0])
+	}
+	if parsed[1].subject != "" {
+		t.Fatalf("an unqualified assertion must carry no subject: %#v", parsed[1])
+	}
+
+	for _, testCase := range []struct{ expression, wants string }{
+		{":p95<5ms", "subject is empty"},
+		{"mine:bogus<5ms", "unsupported metric"},
+		{"mine:p95<abc", "invalid"},
+	} {
+		if _, err := parseAssertions([]string{testCase.expression}); err == nil ||
+			!strings.Contains(err.Error(), testCase.wants) {
+			t.Fatalf("parse %q = %v, want an error mentioning %q", testCase.expression, err, testCase.wants)
+		}
+	}
+	// winner= already names a resolver, so a subject on it is a contradiction
+	// and says so specifically rather than complaining about the metric.
+	if _, err := parseAssertions([]string{"mine:winner=other"}); err == nil ||
+		!strings.Contains(err.Error(), "winner already names a resolver") {
+		t.Fatalf("a subject on winner= = %v", err)
+	}
+
+	// The name is validated against selected targets before any query.
+	targets := []catalog.Target{
+		{Resolver: catalog.ResolverProfile{ID: "custom-cf", Name: "cf"}, Protocol: catalog.UDP, Address: "1.1.1.1"},
+	}
+	for _, spelling := range []string{"custom-cf", "cf", "custom-cf@1.1.1.1/udp"} {
+		checks, err := parseAssertions([]string{spelling + ":p95<50ms"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateAssertionTargets(checks, targets); err != nil {
+			t.Fatalf("%q should be an accepted spelling: %v", spelling, err)
+		}
+	}
+	typo, err := parseAssertions([]string{"typo:p95<50ms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAssertionTargets(typo, targets); err == nil ||
+		!strings.Contains(err.Error(), "no selected resolver matches") {
+		t.Fatalf("a typo'd subject must be invalid input: %v", err)
+	}
+}

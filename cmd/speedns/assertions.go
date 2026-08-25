@@ -24,6 +24,13 @@ type assertion struct {
 	operator string
 	value    float64
 	winner   string
+	// subject names the resolver an assertion is about. Empty means the
+	// rank-one target of each ranked protocol, which is what an unqualified
+	// assertion has always meant. A named subject is what makes "our resolver
+	// degraded" expressible: without it a gate can only ever describe whoever
+	// happens to win, which is a different question and changes answer as the
+	// field moves.
+	subject string
 }
 
 type assertionKind uint8
@@ -56,12 +63,26 @@ func parseAssertion(value string) (assertion, error) {
 	if !ok {
 		return assertion{}, fmt.Errorf("invalid --assert %q: expected METRIC[operator]VALUE or winner=PROFILE-ID", value)
 	}
+	subject := ""
+	// A subject prefix binds the assertion to one resolver: SUBJECT:METRIC[op]VALUE.
+	// Split before lowercasing, because a resolver ID is case-sensitive while a
+	// metric name is not.
+	if index := strings.Index(left, ":"); index >= 0 {
+		subject = strings.TrimSpace(left[:index])
+		left = left[index+1:]
+		if subject == "" {
+			return assertion{}, fmt.Errorf("invalid --assert %q: subject is empty; use SUBJECT:METRIC[operator]VALUE", value)
+		}
+	}
 	left = strings.ToLower(strings.TrimSpace(left))
 	right = strings.TrimSpace(right)
 	if left == "" || right == "" {
 		return assertion{}, fmt.Errorf("invalid --assert %q: metric and value are required", value)
 	}
 	if left == "winner" {
+		if subject != "" {
+			return assertion{}, fmt.Errorf("invalid --assert %q: winner already names a resolver, so it takes no subject", value)
+		}
 		if operator != "=" || strings.ContainsAny(right, " \t\r\n=") {
 			return assertion{}, fmt.Errorf("invalid --assert %q: winner uses winner=PROFILE-ID", value)
 		}
@@ -77,7 +98,7 @@ func parseAssertion(value string) (assertion, error) {
 	if err != nil {
 		return assertion{}, fmt.Errorf("invalid --assert %q: %w", value, err)
 	}
-	return assertion{raw: raw, kind: numericAssertion, metric: left, operator: operator, value: threshold}, nil
+	return assertion{raw: raw, kind: numericAssertion, metric: left, operator: operator, value: threshold, subject: subject}, nil
 }
 
 func splitAssertion(value string) (left, operator, right string, ok bool) {
@@ -124,18 +145,27 @@ func parseLatencyMilliseconds(value string) (float64, error) {
 // is, telling the user their resolver did not win when it was never measured.
 func validateAssertionTargets(assertions []assertion, targets []catalog.Target) error {
 	for _, check := range assertions {
+		// A named resolver is checked before any query is sent, so a typo is
+		// invalid input rather than a gate that runs the whole benchmark and
+		// then reports the resolver lost. Both forms name one: winner= names
+		// the expected winner, and a subject prefix names what the threshold
+		// is about.
+		wanted := check.winner
 		if check.kind != winnerAssertion {
+			wanted = check.subject
+		}
+		if wanted == "" {
 			continue
 		}
 		matched := false
 		for _, target := range targets {
-			if targetMatchesID(target, check.winner) {
+			if targetMatchesID(target, wanted) {
 				matched = true
 				break
 			}
 		}
 		if !matched {
-			return fmt.Errorf("invalid --assert %q: no selected resolver matches %q; use a profile id such as the ones listed by \"speedns resolvers\" or a target id", check.raw, check.winner)
+			return fmt.Errorf("invalid --assert %q: no selected resolver matches %q; use a profile id such as the ones listed by \"speedns resolvers\" or a target id", check.raw, wanted)
 		}
 	}
 	return nil
@@ -155,6 +185,15 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 		reasons = append(reasons, fmt.Sprintf("no %s endpoint returned a usable DNS response", protocol))
 	}
 	for _, check := range assertions {
+		// A subject-qualified assertion names its own endpoints, so it is
+		// evaluated whether or not anything was ranked. Checking the winners
+		// map first would report "no ranked protocol winners" for a resolver
+		// the caller named explicitly, which describes the run rather than the
+		// thing they asked about.
+		if check.subject != "" {
+			reasons = append(reasons, subjectAssertionReasons(report, check)...)
+			continue
+		}
 		if len(winners) == 0 {
 			reasons = append(reasons, fmt.Sprintf("%s has no ranked protocol winners", check.raw))
 			continue
@@ -241,6 +280,38 @@ func deadProtocols(report benchmark.Report) []catalog.Protocol {
 	return dead
 }
 
+// subjectAssertionReasons evaluates a subject-qualified assertion against every
+// measured endpoint of the named resolver.
+//
+// Every endpoint, not the best one: a resolver offering UDP and DoH is two
+// measurements, and a gate saying "our resolver's p95 stays under 50 ms" means
+// both of them. Reporting only the best would let one transport degrade
+// silently, which is the failure mode #106 removed for whole protocols.
+//
+// A subject that matches nothing is a failure rather than a silent pass. The
+// name is validated against the selected targets before any query is sent, so
+// reaching here with no match means the resolver was selected but produced no
+// measurable result at all.
+func subjectAssertionReasons(report benchmark.Report, check assertion) []string {
+	reasons := make([]string, 0)
+	matched := false
+	for _, result := range report.Targets {
+		if !targetMatchesID(result.Target, check.subject) {
+			continue
+		}
+		matched = true
+		actual, ok := assertionMetricValue(result, check.metric)
+		if !ok || !assertionComparison(actual, check.operator, check.value) {
+			reasons = append(reasons, fmt.Sprintf("%s: %s has %s=%s",
+				check.raw, result.Target.ID(), check.metric, assertionActualText(check.metric, actual)))
+		}
+	}
+	if !matched {
+		reasons = append(reasons, fmt.Sprintf("%s: no measured endpoint matches %q", check.raw, check.subject))
+	}
+	return reasons
+}
+
 // rankOneWinners returns the single rank-one target of each protocol.
 //
 // reportWinners deliberately admits every confidence-interval tie-group member,
@@ -301,7 +372,13 @@ func winnerMatches(result benchmark.TargetResult, expected string) bool {
 }
 
 func targetMatchesID(target catalog.Target, expected string) bool {
-	return target.ID() == expected || target.Resolver.ID == expected
+	// The display name is accepted because --resolver cf=udp://... records the
+	// profile as "custom-cf": a user who names a resolver on the command line
+	// would otherwise have to discover a prefix the tool added, and would most
+	// naturally type the name they just chose.
+	return target.ID() == expected ||
+		target.Resolver.ID == expected ||
+		target.Resolver.Name == expected
 }
 
 func assertionMetricValue(result benchmark.TargetResult, metric string) (float64, bool) {

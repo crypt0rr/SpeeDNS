@@ -706,6 +706,25 @@ meaning and accepts any confidence-interval tie-group member:
 ./speedns --protocol udp,doh --assert winner=quad9-9999
 ```
 
+Prefix an assertion with a resolver name to gate on that resolver specifically:
+
+```sh
+./speedns --assert 'cloudflare-1111:p95<=25ms'
+./speedns --no-defaults --resolver mine=udp://192.0.2.53:53 --assert 'mine:usable>=0.99'
+```
+
+Without a prefix an assertion applies to the rank-one target of each ranked
+protocol, which answers "is the best resolver good enough". With one it applies
+to every measured endpoint of the named resolver, which answers "did *our*
+resolver degrade" — a different question, and the one a monitoring gate usually
+means. Every endpoint is checked rather than only the best, so a resolver that
+degrades on one transport cannot pass on the strength of another.
+
+The name may be a profile id, the name given to `--resolver`, or a full target
+id. It is validated against the selected resolvers before any query is sent, so
+a typo exits 2 as invalid input rather than running the benchmark and reporting
+that the resolver lost.
+
 A protocol whose endpoints all returned no usable DNS response fails the gate
 with status 4, so a completely unreachable transport cannot pass silently.
 `--protocol udp,doq` where every DoQ endpoint is unreachable now exits 4 rather
