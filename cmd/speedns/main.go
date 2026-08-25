@@ -1035,6 +1035,8 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		CorpusSHA256:  domains.CorpusDigest(domainList),
 		Timeout:       config.timeout,
 		Concurrency:   effectiveConcurrency,
+		Family:        string(family),
+		DNSSEC:        config.dnssec,
 	}
 	if len(skippedDomains) > 0 {
 		// The corpus digest and entry count in provenance describe the names

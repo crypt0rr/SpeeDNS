@@ -221,6 +221,13 @@ type RunProvenance struct {
 	CorpusSHA256  string
 	Timeout       time.Duration
 	Concurrency   int
+	// Family and DNSSEC record two settings that change WHAT was measured
+	// rather than how it was reported, so a reader -- or a tool comparing two
+	// runs -- cannot tell whether two reports describe the same experiment
+	// without them. Family decides which targets exist at all; DNSSEC sets the
+	// EDNS(0) DO bit, changing the wire format of every measured query.
+	Family string
+	DNSSEC bool
 }
 
 // PairedEffect describes the latency difference between a target and the

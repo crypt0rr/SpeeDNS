@@ -52,6 +52,8 @@ type JSONProvenance struct {
 	CorpusSHA256   string             `json:"corpus_sha256"`
 	TimeoutMS      int64              `json:"timeout_ms"`
 	Concurrency    int                `json:"concurrency"`
+	Family         string             `json:"family"`
+	DNSSEC         bool               `json:"dnssec"`
 	DurationMS     float64            `json:"duration_ms"`
 }
 
@@ -176,6 +178,8 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 			CorpusEntries:  report.Provenance.CorpusEntries,
 			CorpusSHA256:   report.Provenance.CorpusSHA256,
 			TimeoutMS:      report.Provenance.Timeout.Milliseconds(),
+			Family:         report.Provenance.Family,
+			DNSSEC:         report.Provenance.DNSSEC,
 			Concurrency:    report.Provenance.Concurrency,
 			DurationMS:     durationMilliseconds(report.StartedAt, report.FinishedAt),
 		}
