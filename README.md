@@ -177,6 +177,12 @@ Inspect the bundled resolver catalog without running a benchmark:
 ./speedns resolvers
 ```
 
+Compare two saved runs and see what changed about the resolvers themselves:
+
+```sh
+./speedns diff last-week.json this-week.json
+```
+
 Show a profile-level transport view for the same resolver/address. This is
 useful when comparing the cost of enabling encrypted transports; it includes
 the existing score confidence interval and does not replace per-protocol
@@ -187,6 +193,11 @@ rankings:
 ```
 
 ## How the comparison works
+
+This section is about comparing resolvers **within one run**, which is the
+sound way to compare their speed: every resolver is measured against the same
+names in the same conditions. Comparing two separate runs is a different and
+much narrower question — see [Comparing two runs](#comparing-two-runs).
 
 The complete ranking methodology, scoring denominators, confidence intervals,
 interruption behavior, and reproducibility limits are documented in
@@ -657,6 +668,21 @@ cache-miss results auditable without downloading anything at runtime. The
 `--redact-system` option replaces interface names with `redacted` along with
 other local resolver details; CSV output is unchanged.
 
+### Diff output
+
+`speedns diff` writes a table by default and `--format json` for machines. That
+JSON has its own contract, [`schema/compare-v1.json`](schema/compare-v1.json),
+with its own `schema_version`: a comparison is a different document from a
+report — two run identities, no results, no rankings — so it is not a version
+of `report-v1.json`.
+
+There is no CSV form for a diff. A comparison is not a per-target row set with
+stable columns, and the report CSV's append-only contract is not forked.
+
+The two fields a machine consumer needs first are `comparable` and `blockers`.
+When `comparable` is false the document carries no count from either report,
+exactly like the table.
+
 ### Scheduled live results
 
 The project also runs a scheduled, non-blocking smoke check against one
@@ -753,6 +779,13 @@ partial report. A second interrupt exits immediately.
 
 ### Assertions for automation
 
+There are two gates, and they answer different questions. `--assert` on a run
+checks an **absolute bar** against what was just measured: is this resolver
+fast enough, right now. `--require` on a [diff](#gating-a-change-in-ci) checks
+that **nothing changed** between two saved runs. Reach for the first when you
+have a threshold in mind, and the second when you want to be told that a
+resolver started behaving differently.
+
 Use repeatable `--assert` flags when a benchmark should act as a CI or
 monitoring gate. Numeric assertions are checked against the rank-one target of
 every protocol that produced a ranking — one target per protocol, so the gate
@@ -809,6 +842,8 @@ and status `130` for interruption take precedence.
 - If a resolver receives DNS messages but returns `SERVFAIL`, `REFUSED`, or another resolver error, it can have a high transport success rate but a low usable-response rate and will not be recommended.
 - Compare resolvers with similar policies when answer behavior matters. Protective, ad-blocking, and unfiltered services may intentionally return different response classes.
 - Use `--details` to inspect connection errors, response counters, and RCODEs for a failing endpoint.
+- If `speedns diff` always answers `RUNS NOT COMPARABLE` on `run.seed`, pin `--seed` on both runs. Without it each run picks a fresh seed, which selects a different sample of names, so the two runs never asked the same questions.
+- If `speedns diff` reports nothing while latency clearly moved, that is the design. It compares what each resolver did, never how fast — see [It never compares latency](#it-never-compares-latency). To compare speed, measure the resolvers together in one run.
 
 ## Privacy and platform support
 
