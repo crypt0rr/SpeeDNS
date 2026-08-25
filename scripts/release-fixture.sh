@@ -151,27 +151,38 @@ fi
 
 cask_file="${fixture_dir}/first/speedns.rb"
 
-# Homebrew's cask style requires on_arm before on_intel, so the four blocks are
-# not emitted in the order the checksums are read. A mis-paired checksum would
-# hand one platform another archive's digest, and brew would refuse to install
-# on exactly that platform while every other one kept working.
+# Each arch block must carry the archive for the platform its ENCLOSING stanzas
+# name. Checking only that a sha256 matches the asset named on the url line
+# beside it is not enough: swapping two whole blocks keeps every sha/url pair
+# self-consistent while serving, say, the Linux arm64 archive to Apple Silicon.
+# Homebrew would verify that checksum happily, install it, and the binary would
+# not run. So the platform is derived from the on_macos/on_linux and
+# on_arm/on_intel stanzas the block sits inside, never from the url itself.
 pairs_checked=0
-while read -r checksum platform; do
-	expected="$(awk -v target="SpeeDNS_${version}_${platform}.tar.gz" \
+while read -r checksum asset stanza_platform; do
+	if [[ "${asset}" != "${stanza_platform}" ]]; then
+		echo "cask serves the ${asset} archive under the ${stanza_platform} stanzas" >&2
+		exit 1
+	fi
+	expected="$(awk -v target="SpeeDNS_${version}_${asset}.tar.gz" \
 		'$2 == target { print $1; exit }' "${fixture_dir}/first/checksums.txt")"
 	if [[ "${checksum}" != "${expected}" ]]; then
-		echo "cask pairs ${platform} with the wrong checksum" >&2
+		echo "cask pairs ${asset} with the wrong checksum" >&2
 		exit 1
 	fi
 	pairs_checked=$((pairs_checked + 1))
 done < <(awk '
+	/^  on_macos do$/ { operating_system = "darwin"; next }
+	/^  on_linux do$/ { operating_system = "linux"; next }
+	/^    on_arm do$/ { architecture = "arm64"; next }
+	/^    on_intel do$/ { architecture = "amd64"; next }
 	/^ *sha256 "/ { split($0, parts, "\""); pending = parts[2]; next }
 	/^ *url "/ && pending != "" {
 		match($0, /SpeeDNS_#\{version\}_[a-z0-9_]+\.tar\.gz/)
 		asset = substr($0, RSTART, RLENGTH)
 		sub(/^SpeeDNS_#\{version\}_/, "", asset)
 		sub(/\.tar\.gz$/, "", asset)
-		print pending, asset
+		print pending, asset, operating_system "_" architecture
 		pending = ""
 	}
 ' "${cask_file}")
@@ -180,6 +191,26 @@ done < <(awk '
 if [[ "${pairs_checked}" -ne 4 ]]; then
 	echo "expected 4 checksum/platform pairs in the cask, found ${pairs_checked}" >&2
 	exit 1
+fi
+# Four blocks that each match their own stanzas still leaves room for two of
+# them to name the same platform, which would drop a platform silently.
+distinct_platforms="$(grep -oE 'SpeeDNS_#\{version\}_[a-z0-9_]+\.tar\.gz' "${cask_file}" | sort -u | wc -l)"
+if [[ "${distinct_platforms}" -ne 4 ]]; then
+	echo "cask covers ${distinct_platforms} distinct platforms, expected 4" >&2
+	exit 1
+fi
+
+# A cask is Ruby, and the generator emits it as text: an unbalanced quote or a
+# dropped trailing comma produces a file every assertion here still passes and
+# `brew install` cannot load. Both CI runners ship Ruby; skip loudly elsewhere.
+if command -v ruby >/dev/null 2>&1; then
+	if ! ruby -c "${cask_file}" >/dev/null 2>&1; then
+		echo "generated Homebrew cask is not valid Ruby" >&2
+		ruby -c "${cask_file}" >&2 || true
+		exit 1
+	fi
+else
+	echo "note: ruby is unavailable, skipping cask syntax check" >&2
 fi
 
 # The remaining checks encode what `brew style` enforces, so a regression is
