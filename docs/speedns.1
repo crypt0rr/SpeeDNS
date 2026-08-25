@@ -165,7 +165,15 @@ or
 Rates are between 0 and 1; latencies accept a bare number of milliseconds or a
 Go duration such as
 .IR 50ms .
-Numeric checks apply to the rank-one target of each ranked protocol;
+An expression may be prefixed with
+.IR SUBJECT: ,
+naming a resolver by profile id, by the name given to
+.BR --resolver ,
+or by target id. The check then applies to every measured endpoint of that
+resolver rather than to the winners, which is how a gate expresses "did our
+resolver degrade". An unmatched subject is invalid input.
+.PP
+Unqualified numeric checks apply to the rank-one target of each ranked protocol;
 .I winner=
 accepts any confidence-interval tie-group member.
 A protocol whose endpoints all returned no usable DNS response also fails,
