@@ -228,6 +228,49 @@ check_macos_archives() {
 	done
 }
 
+# README.md tells macOS users to expect a Gatekeeper prompt, and issue #51 tracks
+# replacing that with real notarization. Both are only worth anything if the
+# shipped binaries actually match the claim, so the signing state is measured
+# rather than assumed. codesign exists only on macOS, so this runs in native
+# mode, where both darwin archives are still present in dist.
+#
+# Go ad-hoc signs darwin/arm64 because Apple Silicon refuses to execute an
+# unsigned binary; that signature carries no certificate and cannot satisfy
+# notarization. darwin/amd64 carries no signature at all. Neither is notarized.
+#
+# Set SPEEDNS_EXPECT_NOTARIZED=true once a Developer ID signature is in place:
+# the check then enforces the opposite and Gatekeeper acceptance with it.
+check_macos_signing() {
+	local expect_notarized="${SPEEDNS_EXPECT_NOTARIZED:-false}"
+	local goarch archive binary description
+	if ! command -v codesign >/dev/null 2>&1; then
+		echo "codesign is required to check the macOS signing state" >&2
+		exit 1
+	fi
+	for goarch in amd64 arm64; do
+		archive="$(require_artifact "*darwin*_${goarch}.tar.gz")"
+		binary="$(extract_archive "${archive}" "signing-${goarch}")"
+		description="$(codesign --display --verbose=4 "${binary}" 2>&1 || true)"
+		if [[ "${expect_notarized}" == true ]]; then
+			if ! grep -q '^Authority=Developer ID Application' <<<"${description}"; then
+				echo "darwin ${goarch} carries no Developer ID signature" >&2
+				exit 1
+			fi
+			if ! spctl --assess --type execute "${binary}" >/dev/null 2>&1; then
+				echo "darwin ${goarch} is signed but Gatekeeper still rejects it" >&2
+				exit 1
+			fi
+			echo "darwin ${goarch}: Developer ID signed and accepted by Gatekeeper" >&2
+			continue
+		fi
+		if grep -q '^Authority=' <<<"${description}"; then
+			echo "darwin ${goarch} now carries a signing authority; set SPEEDNS_EXPECT_NOTARIZED=true, update the Gatekeeper note in README.md, and close issue #51" >&2
+			exit 1
+		fi
+		echo "darwin ${goarch}: no signing authority, as README.md documents (#51)" >&2
+	done
+}
+
 check_macos_native() {
 	local machine goarch archive binary
 	machine="$(uname -m)"
@@ -239,6 +282,7 @@ check_macos_native() {
 	archive="$(require_artifact "*darwin*_${goarch}.tar.gz")"
 	binary="$(extract_archive "${archive}" "macos-native")"
 	"${binary}" version | grep -q '^speedns '
+	check_macos_signing
 }
 
 case "${mode}" in
