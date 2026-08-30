@@ -79,6 +79,12 @@ jobs:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: bash scripts/publish-homebrew-cask.sh "${RUNNER_TEMP}/speedns.rb" "${RELEASE_TAG}"
 
+      - name: Validate published Homebrew tap
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/validate-homebrew-tap.sh "${RELEASE_TAG}"
+
       - name: Upload cask evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
