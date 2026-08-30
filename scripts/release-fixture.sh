@@ -245,4 +245,6 @@ if bash "${root_dir}/scripts/compare-release-artifacts.sh" \
 	exit 1
 fi
 
+bash "${root_dir}/scripts/homebrew-tap-fixture.sh"
+
 echo "release script fixture passed"

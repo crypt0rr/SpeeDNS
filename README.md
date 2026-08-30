@@ -82,6 +82,36 @@ brew upgrade --cask speedns
 brew uninstall --cask speedns
 ```
 
+If `brew update` reports that the SpeeDNS tap has unstaged changes, preserve the
+diagnostics before repairing the local checkout:
+
+```sh
+tap_dir="$(brew --repo crypt0rr/speedns)"
+git -C "${tap_dir}" status --short --branch
+git -C "${tap_dir}" diff --name-status
+git -C "${tap_dir}" diff -- Casks/speedns.rb Casks/SpeeDNS.rb
+git -C "${tap_dir}" ls-tree -r --name-only HEAD | sort -f | uniq -di
+```
+
+The current tap should contain only `Casks/speedns.rb`. Keep a backup of the
+affected checkout, then retap it cleanly:
+
+```sh
+tap_dir="$(brew --repo crypt0rr/speedns)"
+backup_dir="${tap_dir}.backup.$(date +%Y%m%d%H%M%S)"
+cp -a "${tap_dir}" "${backup_dir}"
+brew untap crypt0rr/speedns
+brew tap crypt0rr/speedns
+git -C "$(brew --repo crypt0rr/speedns)" status --short
+brew update
+brew upgrade
+```
+
+The backup remains available if the local diff needs investigation. If a fresh
+tap is still dirty, include the saved `git status` and `git diff` output when
+reporting the problem; do not discard the backup or reset it before collecting
+those details.
+
 The macOS binaries are not yet Apple-signed or notarized. On
 first use, macOS may show a Gatekeeper warning. If you trust the release,
 open **System Settings → Privacy & Security**, select **Open Anyway**, and
