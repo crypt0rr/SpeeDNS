@@ -274,3 +274,52 @@ func TestTieGroupsOrderByMedian(t *testing.T) {
 		t.Fatalf("equal scores must break ties by target ID, got %q first", stable[0].TargetID)
 	}
 }
+
+func TestRankingsArePermutationInvariantWithChainedOverlaps(t *testing.T) {
+	target := func(address string, median, score, low, high float64) TargetResult {
+		return TargetResult{
+			Target: testTarget(catalog.UDP, address),
+			Stats: Statistics{
+				Total: 40, Successes: 40, UsableResponses: 40, Scored: 40,
+				SuccessRate: 1, UsableRate: 1,
+				MedianMS: median, P95MS: score * 2, ScoreMS: score,
+				CILowMS: low, CIHighMS: high,
+			},
+		}
+	}
+	// A overlaps B, B overlaps C, and A does not overlap C. A pairwise
+	// comparator that switches between median and score therefore has a cycle:
+	// A < B, B < C, and C < A. The score-order leader is C; only C/B are in
+	// its leader-anchored tie group, and B's lower median is presented first.
+	base := []TargetResult{
+		target("a", 10, 50, 45, 55),
+		target("b", 20, 40, 25, 50),
+		target("c", 30, 30, 20, 35),
+	}
+	wantIDs := []string{
+		testTarget(catalog.UDP, "b").ID(),
+		testTarget(catalog.UDP, "c").ID(),
+		testTarget(catalog.UDP, "a").ID(),
+	}
+	wantTies := []bool{true, true, false}
+
+	permutations := [][]int{
+		{0, 1, 2}, {0, 2, 1}, {1, 0, 2},
+		{1, 2, 0}, {2, 0, 1}, {2, 1, 0},
+	}
+	for _, permutation := range permutations {
+		results := make([]TargetResult, len(base))
+		for index, source := range permutation {
+			results[index] = base[source]
+		}
+		rankings := makeRankings(results)
+		if len(rankings) != len(wantIDs) {
+			t.Fatalf("permutation %v produced %d rankings, want %d", permutation, len(rankings), len(wantIDs))
+		}
+		for index, wantID := range wantIDs {
+			if rankings[index].TargetID != wantID || rankings[index].Tie != wantTies[index] {
+				t.Fatalf("permutation %v rank %d = %#v, want target %q tie %t", permutation, index+1, rankings[index], wantID, wantTies[index])
+			}
+		}
+	}
+}

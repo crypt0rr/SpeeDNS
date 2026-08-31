@@ -541,13 +541,7 @@ func prepareTargets(ctx context.Context, orderedTargets []catalog.Target, querie
 				target := orderedTargets[index]
 				runner := newTargetRunner(ctx, target, queries, opts)
 				runners[index] = runner
-				runner.prepare(ctx)
-				emitProgress(opts, Progress{
-					Protocol:         target.Protocol,
-					Phase:            ProgressPreparing,
-					TargetsCompleted: int(preparedTargets.Add(1)),
-					TargetsTotal:     len(orderedTargets),
-				})
+				runner.prepareCold(ctx)
 			}
 		}()
 	}
@@ -565,6 +559,70 @@ dispatch:
 	}
 	close(jobs)
 	wg.Wait()
+	if ctx.Err() != nil {
+		// A cancellation during cold preparation may leave some dispatched
+		// runners without a second phase. They are still real work items and
+		// must be represented as incomplete, but no new network activity should
+		// begin after cancellation.
+		for index, wasDispatched := range dispatched {
+			if !wasDispatched {
+				continue
+			}
+			runner := runners[index]
+			if runner != nil && !runner.finished {
+				runner.abort(ctx.Err())
+			}
+			emitProgress(opts, Progress{
+				Protocol:         orderedTargets[index].Protocol,
+				Phase:            ProgressPreparing,
+				TargetsCompleted: int(preparedTargets.Add(1)),
+				TargetsTotal:     len(orderedTargets),
+			})
+		}
+		return runners, dispatched
+	}
+
+	// Cold probes and reusable measured-session preparation are separate
+	// barriers. Opening a warm session inside the cold phase lets a healthy
+	// target's connection age while a blocked target spends several timeout
+	// periods on its cold probes; that can turn the first measured exchange
+	// into an avoidable reconnect. Every dispatched target is already known at
+	// this point, so the second phase can queue all of them without changing
+	// dispatch semantics or starting network work after cancellation.
+	warmJobs := make(chan int, len(orderedTargets))
+	for index, wasDispatched := range dispatched {
+		if wasDispatched {
+			warmJobs <- index
+		}
+	}
+	close(warmJobs)
+	var warmWG sync.WaitGroup
+	warmWorkers := opts.Concurrency
+	if warmWorkers <= 0 {
+		warmWorkers = 1
+	}
+	if warmWorkers > len(orderedTargets) {
+		warmWorkers = len(orderedTargets)
+	}
+	for worker := 0; worker < warmWorkers; worker++ {
+		warmWG.Add(1)
+		go func() {
+			defer warmWG.Done()
+			for index := range warmJobs {
+				runner := runners[index]
+				if runner != nil {
+					runner.prepareWarm(ctx)
+					emitProgress(opts, Progress{
+						Protocol:         orderedTargets[index].Protocol,
+						Phase:            ProgressPreparing,
+						TargetsCompleted: int(preparedTargets.Add(1)),
+						TargetsTotal:     len(orderedTargets),
+					})
+				}
+			}
+		}()
+	}
+	warmWG.Wait()
 	return runners, dispatched
 }
 
@@ -665,6 +723,13 @@ func newTargetRunner(ctx context.Context, target catalog.Target, queries []Query
 }
 
 func (runner *targetRunner) prepare(ctx context.Context) bool {
+	if !runner.prepareCold(ctx) {
+		return false
+	}
+	return runner.prepareWarm(ctx)
+}
+
+func (runner *targetRunner) prepareCold(ctx context.Context) bool {
 	if runner.finished {
 		return false
 	}
@@ -707,6 +772,13 @@ func (runner *targetRunner) prepare(ctx context.Context) bool {
 		}
 	}
 
+	return true
+}
+
+func (runner *targetRunner) prepareWarm(ctx context.Context) bool {
+	if runner.finished {
+		return false
+	}
 	session, err := runner.factory.Open(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1410,44 +1482,48 @@ func makeRankings(results []TargetResult) []Ranking {
 	}
 	var rankings []Ranking
 	for protocol, indexes := range byProtocol {
-		// Targets whose score intervals overlap are indistinguishable, and
-		// ordering them by raw score makes the headline result a coin flip:
-		// four runs of one command at one seed produced three different orders,
-		// and the target with the worst median in every run took rank one
-		// twice. The instability is entirely in the 0.40 x p95 term -- over the
-		// same observations the median interval is 9-14% of its estimate while
-		// the p95 interval is 66-143%.
-		//
-		// So overlapping members are ordered by median instead. This changes no
-		// measured value; it only settles the presentation order of rows the
-		// tool has already declared indistinguishable, using the most stable
-		// statistic it has.
+		// Establish a strict score order first. The confidence-interval overlap
+		// relation is not transitive, so choosing median or score independently
+		// for every pair would not define a valid sort order: A can compare before
+		// B, B before C, and C before A. The score-order leader is the only
+		// anchor used for the tie decision; its overlapping members are then
+		// presented by median. Targets outside that leader tie group retain the
+		// strict score order.
 		sort.Slice(indexes, func(i, j int) bool {
 			left, right := results[indexes[i]], results[indexes[j]]
-			if confidenceIntervalsOverlap(left.Stats, right.Stats) {
-				if left.Stats.MedianMS != right.Stats.MedianMS {
-					return left.Stats.MedianMS < right.Stats.MedianMS
-				}
-				return left.Target.ID() < right.Target.ID()
-			}
 			if left.Stats.ScoreMS != right.Stats.ScoreMS {
 				return left.Stats.ScoreMS < right.Stats.ScoreMS
 			}
 			return left.Target.ID() < right.Target.ID()
 		})
 		leader := results[indexes[0]].Stats
-		leaderTie := false
-		protocolRankingStart := len(rankings)
-		for rank, index := range indexes {
-			tie := false
-			if rank > 0 && confidenceIntervalsOverlap(leader, results[index].Stats) {
-				tie = true
-				leaderTie = true
+		tieGroup := make([]int, 0, len(indexes))
+		remaining := make([]int, 0, len(indexes))
+		for _, index := range indexes {
+			if confidenceIntervalsOverlap(leader, results[index].Stats) {
+				tieGroup = append(tieGroup, index)
+				continue
 			}
+			remaining = append(remaining, index)
+		}
+		// A median/ID sort is safe within one explicitly selected group: both
+		// keys define a total order and no pair outside the group participates.
+		sort.Slice(tieGroup, func(i, j int) bool {
+			left, right := results[tieGroup[i]], results[tieGroup[j]]
+			if left.Stats.MedianMS != right.Stats.MedianMS {
+				return left.Stats.MedianMS < right.Stats.MedianMS
+			}
+			return left.Target.ID() < right.Target.ID()
+		})
+		orderedIndexes := append(tieGroup, remaining...)
+		protocolRankingStart := len(rankings)
+		leaderTie := len(tieGroup) > 1
+		for rank, index := range orderedIndexes {
+			tie := rank < len(tieGroup) && leaderTie
 			results[index].Stats.Tie = tie
 			rankings = append(rankings, Ranking{Protocol: protocol, TargetID: results[index].Target.ID(), Rank: rank + 1, Tie: tie})
 		}
-		results[indexes[0]].Stats.Tie = leaderTie
+		results[tieGroup[0]].Stats.Tie = leaderTie
 		rankings[protocolRankingStart].Tie = leaderTie
 	}
 	sort.Slice(rankings, func(i, j int) bool {

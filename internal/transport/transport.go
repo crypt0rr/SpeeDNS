@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -661,13 +662,18 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH HTTP status %s", response.Status)
 	}
-	if contentType := response.Header.Get("Content-Type"); contentType != "" && !strings.Contains(strings.ToLower(contentType), "application/dns-message") {
+	contentType := response.Header.Get("Content-Type")
+	mediaType, _, contentTypeErr := mime.ParseMediaType(contentType)
+	if contentTypeErr != nil || !strings.EqualFold(mediaType, "application/dns-message") {
 		drainHTTPBody(response.Body)
 		return nil, fmt.Errorf("DoH returned content type %q", contentType)
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, doHMaxResponseBodyBytes))
+	body, err := io.ReadAll(io.LimitReader(response.Body, doHMaxResponseBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > doHMaxResponseBodyBytes {
+		return nil, fmt.Errorf("DoH response body exceeds %d bytes", doHMaxResponseBodyBytes)
 	}
 	message := new(dns.Msg)
 	if err := message.Unpack(body); err != nil {
