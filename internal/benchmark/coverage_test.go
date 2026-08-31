@@ -1302,6 +1302,24 @@ func TestPrepareTargetsEdges(t *testing.T) {
 		t.Fatalf("unbounded-concurrency preparation = %#v/%#v", runners, dispatched)
 	}
 
+	// A worker count larger than the target group is clamped before the warm
+	// phase starts. This also exercises the successful two-phase path for a
+	// single target.
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return &fakeFactory{opens: []fakeOpen{
+			{session: &fakeSession{}},
+			{session: &fakeSession{}},
+			{session: &fakeSession{}},
+			{session: &fakeSession{}},
+		}}, nil
+	}
+	runners, dispatched = prepareTargets(context.Background(), []catalog.Target{testTarget(catalog.UDP, "clamped")}, nil, Options{
+		QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 2,
+	})
+	if len(runners) != 1 || !dispatched[0] || !runners[0].ready {
+		t.Fatalf("clamped-concurrency preparation = %#v/%#v", runners, dispatched)
+	}
+
 	// Cancelling while the only worker is still opening a session stops
 	// dispatching, so later targets never get a runner at all.
 	released := make(chan struct{})
@@ -1326,6 +1344,56 @@ func TestPrepareTargetsEdges(t *testing.T) {
 	runners, dispatched = prepareTargets(ctx, blocked, nil, Options{QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1})
 	if !dispatched[0] || dispatched[1] || runners[1] != nil {
 		t.Fatalf("cancelled preparation dispatched too much: %#v/%#v", runners, dispatched)
+	}
+}
+
+func TestPrepareTargetsAbortsCompletedColdRunnersAfterCancellation(t *testing.T) {
+	restore := newFactory
+	t.Cleanup(func() { newFactory = restore })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fastColdDone := make(chan struct{})
+	var fastColdQueries atomic.Int32
+	var fastColdOnce sync.Once
+	fastColdSession := func() transport.Session {
+		return &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+			if fastColdQueries.Add(1) == 3 {
+				fastColdOnce.Do(func() { close(fastColdDone) })
+			}
+			return replyFor(name, qtype), nil
+		}}
+	}
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+		if target.Address == "fast" {
+			return &fakeFactory{opens: []fakeOpen{
+				{session: fastColdSession()},
+				{session: fastColdSession()},
+				{session: fastColdSession()},
+				{session: &fakeSession{}},
+			}}, nil
+		}
+		return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+			if index == 0 {
+				<-fastColdDone
+				// Give the fast worker time to return from prepareCold before
+				// cancellation makes the post-phase cleanup abort it.
+				time.Sleep(25 * time.Millisecond)
+				cancel()
+			}
+			return minimalSession{}, nil
+		}}, nil
+	}
+
+	targets := []catalog.Target{testTarget(catalog.TCP, "fast"), testTarget(catalog.TCP, "slow")}
+	runners, dispatched := prepareTargets(ctx, targets, nil, Options{
+		QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 2,
+	})
+	if !dispatched[0] || !dispatched[1] || runners[0] == nil || runners[1] == nil {
+		t.Fatalf("cancellation preparation dispatch = %#v/%#v", runners, dispatched)
+	}
+	if !runners[0].finished || !runners[0].result.Incomplete {
+		t.Fatalf("completed cold runner was not aborted after cancellation: %#v", runners[0].result)
 	}
 }
 
@@ -1421,6 +1489,85 @@ func TestPreparationIsConcurrentBoundedAndDeterministic(t *testing.T) {
 	}
 	if !reflect.DeepEqual(shape(first), shape(second)) {
 		t.Fatalf("seeded run was not deterministic: %#v != %#v", shape(first), shape(second))
+	}
+}
+
+// agingWarmSession models a stream session that reconnects when it has been
+// idle for too long. The real TCP and DoT transports expose the same
+// diagnostic after a stale connection is recovered. Keeping the fixture at
+// the benchmark seam makes this a deterministic scheduler regression test.
+type agingWarmSession struct {
+	opened      time.Time
+	idleLimit   time.Duration
+	reconnected bool
+}
+
+func (s *agingWarmSession) Query(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	s.reconnected = time.Since(s.opened) > s.idleLimit
+	return replyFor(name, qtype), nil
+}
+
+func (s *agingWarmSession) Close() error { return nil }
+
+func (s *agingWarmSession) LastQueryReconnected() bool { return s.reconnected }
+
+type agingFactory struct {
+	slow  bool
+	opens atomic.Int32
+}
+
+func (f *agingFactory) Open(ctx context.Context) (transport.Session, error) {
+	index := f.opens.Add(1) - 1
+	if f.slow && index == 0 {
+		select {
+		case <-time.After(150 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if index == 3 {
+		return &agingWarmSession{opened: time.Now(), idleLimit: 50 * time.Millisecond}, nil
+	}
+	return &fakeSession{}, nil
+}
+
+func TestPreparationBarrierPreventsWarmSessionAging(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+
+	fastFactory := &agingFactory{}
+	slowFactory := &agingFactory{slow: true}
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+		if target.Address == "slow" {
+			return slowFactory, nil
+		}
+		return fastFactory, nil
+	}
+
+	targets := []catalog.Target{
+		testTarget(catalog.TCP, "fast"),
+		testTarget(catalog.TCP, "slow"),
+	}
+	options := Options{
+		Domains:     []string{"measured.example"},
+		QueryTypes:  []uint16{dns.TypeA},
+		Sample:      1,
+		Seed:        42,
+		Timeout:     time.Second,
+		Concurrency: 2,
+	}
+
+	report, err := Run(context.Background(), targets, options)
+	if err != nil {
+		t.Fatalf("barrier benchmark failed: %v", err)
+	}
+	fast, ok := report.ResultFor(targets[0].ID())
+	if !ok {
+		t.Fatal("fast target result missing")
+	}
+	if fast.Stats.Reconnects != 0 || len(fast.Observations) != 1 || fast.Observations[0].Reconnected {
+		t.Fatalf("fast target warm session aged before measurement: stats=%#v observations=%#v", fast.Stats, fast.Observations)
 	}
 }
 

@@ -29,7 +29,11 @@ never used concurrently. Preparing targets one after another would have made a
 target's cold probes start systematically later, and left its warm session
 idle for longer, the further down the ordered catalog it sat; bounded parallel
 preparation shrinks that positional bias by the concurrency factor. Results
-and rankings stay in target-identity order regardless of which preparation
+preparation has a barrier between the cold probes and the reusable measured
+sessions: all dispatched targets finish cold preparation before any target's
+warm session is opened. This prevents a blocked target's cold-probe timeout
+from aging a healthy target's connection before measurement. Results and
+rankings stay in target-identity order regardless of which preparation
 finished first. There is no transport fallback.
 
 Three excluded warm-up queries are sent before the measured phase. Encrypted
@@ -189,10 +193,14 @@ would for a failure rate of 1. No out-of-range sentinel is used, because a
 replicate score the score function cannot produce would inflate the reported
 upper bound and change which targets are reported as tied.
 
-Rank order is deterministic: score first, then target ID. A target is in the
-leader's tie group when its 95% bootstrap interval overlaps the leader's
-interval. The leader is marked as tied too, so the tie is visible from either
-row.
+Rank order is deterministic. SpeeDNS first orders eligible targets by score,
+then target ID, and selects that order's leader. A target is in the leader's
+tie group when its 95% bootstrap interval overlaps the leader's interval.
+Members of that one leader-anchored group are presented by median, then target
+ID; targets outside it keep the score/ID order. The leader is marked as tied
+too, so the tie is visible from either row. The group is deliberately anchored
+to one leader: interval overlap is not transitive, and treating every pair as
+a separate sort decision would not define a stable order.
 
 Every output surfaces that flag. The human table has a `Tie` column in the
 recommendation summary and in each per-protocol comparison; a tied row reads

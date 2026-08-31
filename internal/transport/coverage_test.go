@@ -480,7 +480,7 @@ func TestDoHQueryAllResponseBranches(t *testing.T) {
 			return nil, err
 		}
 		response, _ := replyFor(query.Question[0].Name, query.Question[0].Qtype, 0).Pack()
-		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(response)), Request: request}, nil
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": []string{"application/dns-message"}}, Body: io.NopCloser(bytes.NewReader(response)), Request: request}, nil
 	})
 	session := doHTestSession(validTransport)
 	response, err := session.Query(context.Background(), "example.com", dns.TypeA)
@@ -499,14 +499,14 @@ func TestDoHQueryAllResponseBranches(t *testing.T) {
 			return &http.Response{StatusCode: 200, Status: "200 OK", Header: http.Header{"Content-Type": []string{"text/plain"}}, Body: io.NopCloser(strings.NewReader("x")), Request: request}, nil
 		}},
 		{"body read", func(request *http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Status: "200 OK", Header: make(http.Header), Body: errorBody{}, Request: request}, nil
+			return &http.Response{StatusCode: 200, Status: "200 OK", Header: http.Header{"Content-Type": []string{"application/dns-message"}}, Body: errorBody{}, Request: request}, nil
 		}},
 		{"unpack", func(request *http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader("bad")), Request: request}, nil
+			return &http.Response{StatusCode: 200, Status: "200 OK", Header: http.Header{"Content-Type": []string{"application/dns-message"}}, Body: io.NopCloser(strings.NewReader("bad")), Request: request}, nil
 		}},
 		{"validation", func(request *http.Request) (*http.Response, error) {
 			body, _ := replyFor("other.example", dns.TypeA, 0).Pack()
-			return &http.Response{StatusCode: 200, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), Request: request}, nil
+			return &http.Response{StatusCode: 200, Status: "200 OK", Header: http.Header{"Content-Type": []string{"application/dns-message"}}, Body: io.NopCloser(bytes.NewReader(body)), Request: request}, nil
 		}},
 	}
 	for _, tc := range cases {
@@ -523,6 +523,41 @@ func TestDoHQueryAllResponseBranches(t *testing.T) {
 	packSessionQuery = packQuery
 	if _, err := (&doHSession{client: &http.Client{}, transport: &http.Transport{}, endpoint: "://bad"}).Query(context.Background(), "example.com", dns.TypeA); err == nil {
 		t.Fatal("expected DoH request construction error")
+	}
+}
+
+func TestDoHQueryRequiresExactContentTypeAndBodyLimit(t *testing.T) {
+	validBody, err := replyFor("example.com", dns.TypeA, 0).Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name        string
+		contentType string
+		body        []byte
+		wantError   string
+	}{
+		{name: "missing", body: validBody, wantError: "content type"},
+		{name: "lookalike suffix", contentType: "application/dns-messageevil", body: validBody, wantError: "content type"},
+		{name: "lookalike parameter", contentType: "text/plain; note=application/dns-message", body: validBody, wantError: "content type"},
+		{name: "malformed", contentType: "application/dns-message; bad", body: validBody, wantError: "content type"},
+		{name: "oversized", contentType: "APPLICATION/DNS-MESSAGE; charset=binary", body: append(validBody, make([]byte, doHMaxResponseBodyBytes-len(validBody)+1)...), wantError: "exceeds"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := doHTestSession(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{tc.contentType}},
+					Body:       io.NopCloser(bytes.NewReader(tc.body)),
+					Request:    request,
+				}, nil
+			}))
+			if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("DoH response error = %v, want %q", err, tc.wantError)
+			}
+		})
 	}
 }
 

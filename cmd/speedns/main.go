@@ -1411,11 +1411,16 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 		return os.Stdout, func(bool) error { return nil }, nil
 	}
 	info, err := statOutputPath(path)
+	var existingMode fs.FileMode
+	preserveExistingMode := false
 	switch {
 	case err == nil && info.IsDir():
 		return nil, nil, fmt.Errorf("output path is a directory: %s", path)
 	case err == nil && !info.Mode().IsRegular():
 		return directOutputWriter(path, false)
+	case err == nil:
+		existingMode = info.Mode().Perm()
+		preserveExistingMode = true
 	case err != nil && !errors.Is(err, os.ErrNotExist):
 		return nil, nil, fmt.Errorf("inspect output path: %w", err)
 	}
@@ -1450,11 +1455,18 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 			_ = removeOutputFile(temporaryPath)
 			return fmt.Errorf("close output file: %w", err)
 		}
-		// Permissions are best effort: a platform that refuses the change
-		// still leaves a complete report behind, just with the restrictive
-		// temporary-file mode.
-		if mode, ok := probeOrdinaryFileMode(temporaryPath + outputProbeSuffix); ok {
-			_ = chmodOutputFile(temporaryPath, mode)
+		if preserveExistingMode {
+			if err := chmodOutputFile(temporaryPath, existingMode); err != nil {
+				_ = removeOutputFile(temporaryPath)
+				return fmt.Errorf("preserve output file mode: %w", err)
+			}
+		} else {
+			// Permissions for a new path are best effort: a platform that refuses
+			// the change still leaves a complete report behind, just with the
+			// restrictive temporary-file mode.
+			if mode, ok := probeOrdinaryFileMode(temporaryPath + outputProbeSuffix); ok {
+				_ = chmodOutputFile(temporaryPath, mode)
+			}
 		}
 		if err := renameOutputFile(temporaryPath, path); err != nil {
 			_ = removeOutputFile(temporaryPath)

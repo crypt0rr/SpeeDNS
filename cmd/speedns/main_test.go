@@ -1872,6 +1872,76 @@ func TestOutputWriterMatchesOrdinaryFileMode(t *testing.T) {
 	}
 }
 
+func TestOutputWriterPreservesExistingFileMode(t *testing.T) {
+	for _, mode := range []fs.FileMode{0o600, 0o640, 0o664} {
+		t.Run(fmt.Sprintf("%04o", mode), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "report.json")
+			if err := os.WriteFile(path, []byte("old"), mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			writer, finalize, err := outputWriter(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(writer, "new\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := finalize(true); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != mode {
+				t.Fatalf("replacement mode = %04o, want %04o", got, mode)
+			}
+			content, err := os.ReadFile(path)
+			if err != nil || string(content) != "new\n" {
+				t.Fatalf("replacement content = %q/%v", content, err)
+			}
+		})
+	}
+}
+
+func TestOutputWriterRefusesToBroadenModeWhenPreservationFails(t *testing.T) {
+	oldChmod := chmodOutputFile
+	t.Cleanup(func() { chmodOutputFile = oldChmod })
+	chmodOutputFile = func(string, fs.FileMode) error { return errors.New("chmod failed") }
+
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writer, finalize, err := outputWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(writer, "new\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(true); err == nil || !strings.Contains(err.Error(), "preserve output file mode") {
+		t.Fatalf("mode preservation error = %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("failed replacement changed mode to %04o", info.Mode().Perm())
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != "old" {
+		t.Fatalf("failed replacement changed content to %q/%v", content, err)
+	}
+}
+
 func TestOutputWriterKeepsReportWhenPermissionsCannotBeSet(t *testing.T) {
 	oldProbe := createOutputProbeFile
 	oldChmod := chmodOutputFile
