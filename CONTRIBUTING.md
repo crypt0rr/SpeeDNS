@@ -5,7 +5,7 @@ read-only, offline by default, and useful on both macOS and Linux.
 
 ## Before opening a pull request
 
-Install Go 1.25 or newer, then run the local quality gates from the repository
+Install Go 1.26 or newer, then run the local quality gates from the repository
 root:
 
 ```sh

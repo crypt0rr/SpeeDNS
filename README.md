@@ -117,7 +117,7 @@ first use, macOS may show a Gatekeeper warning. If you trust the release,
 open **System Settings → Privacy & Security**, select **Open Anyway**, and
 then run `speedns` again. Do not disable Gatekeeper globally.
 
-To build from source, install [Go 1.25 or newer](https://go.dev/dl/):
+To build from source, install [Go 1.26 or newer](https://go.dev/dl/):
 
 ```sh
 git clone https://github.com/crypt0rr/SpeeDNS.git
