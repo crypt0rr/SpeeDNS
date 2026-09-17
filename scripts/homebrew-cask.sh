@@ -44,17 +44,15 @@ sha_linux_amd64="$(checksum_for "${linux_amd64}")"
 sha_linux_arm64="$(checksum_for "${linux_arm64}")"
 
 # arch_block emits one on_arm/on_intel stanza. Homebrew's cask style orders
-# on_arm before on_intel and aligns a continuation argument under the first
-# argument of the call it continues, so `verified:` sits at the column where
-# the url string starts. brew style rejects any other placement.
+# on_arm before on_intel. The direct HTTPS URL uses Homebrew's default URL
+# verification behaviour; the deprecated `verified:` parameter is not needed.
 arch_block() {
 	local stanza="$1"
 	local checksum="$2"
 	local platform="$3"
 	printf '    %s do\n' "${stanza}"
 	printf '      sha256 "%s"\n' "${checksum}"
-	printf '      url "https://github.com/crypt0rr/SpeeDNS/releases/download/v#{version}/SpeeDNS_#{version}_%s.tar.gz",\n' "${platform}"
-	printf '%s\n' '          verified: "github.com/crypt0rr/SpeeDNS/releases/download"'
+	printf '      url "https://github.com/crypt0rr/SpeeDNS/releases/download/v#{version}/SpeeDNS_#{version}_%s.tar.gz"\n' "${platform}"
 	printf '    end\n'
 }
 

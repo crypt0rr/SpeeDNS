@@ -148,6 +148,15 @@ if grep -Fq 'license "' "${fixture_dir}/first/speedns.rb"; then
 	echo "generated Homebrew cask contains unsupported license stanza" >&2
 	exit 1
 fi
+if grep -Fq 'verified:' "${fixture_dir}/first/speedns.rb"; then
+	echo "generated Homebrew cask contains deprecated verified: parameter" >&2
+	exit 1
+fi
+url_lines="$(grep -cE '^      url "[^"]+"$' "${fixture_dir}/first/speedns.rb")"
+if [[ "${url_lines}" -ne 4 ]]; then
+	echo "generated Homebrew cask has ${url_lines} direct URL stanzas, expected 4" >&2
+	exit 1
+fi
 
 cask_file="${fixture_dir}/first/speedns.rb"
 
@@ -219,12 +228,6 @@ fi
 stanza_order="$(grep -oE 'on_(macos|linux|arm|intel) do' "${cask_file}" | tr '\n' ' ')"
 if [[ "${stanza_order}" != "on_macos do on_arm do on_intel do on_linux do on_arm do on_intel do " ]]; then
 	echo "cask stanzas are out of the order brew style requires: ${stanza_order}" >&2
-	exit 1
-fi
-# A continuation argument aligns under the first argument of the call it
-# continues, which puts `verified:` at the column where the url string starts.
-if [[ "$(grep -cE '^ {10}verified: "' "${cask_file}")" -ne 4 ]]; then
-	echo "cask verified: lines are not aligned under the url argument" >&2
 	exit 1
 fi
 # Stanzas within one group take no blank line between them, and a block body
