@@ -15,6 +15,15 @@ printf '%s\n' \
 	'  version "0.6.3-fixture"' \
 	'end' >"${cask_file}"
 fake_cask_content="$(base64 <"${cask_file}" | tr -d '\n')"
+deprecated_cask_file="${fixture_dir}/deprecated-speedns.rb"
+printf '%s\n' \
+	'# generated fixture' \
+	'cask "speedns" do' \
+	'  version "0.6.3-fixture"' \
+	'  url "https://example.test/speedns.tar.gz",' \
+	'      verified: "example.test"' \
+	'end' >"${deprecated_cask_file}"
+deprecated_cask_content="$(base64 <"${deprecated_cask_file}" | tr -d '\n')"
 
 fake_gh="${fake_bin}/gh"
 cat >"${fake_gh}" <<'EOF'
@@ -100,6 +109,13 @@ common_env=(
 env "${common_env[@]}" FAKE_TAP_MODE=clean \
 	bash "${root_dir}/scripts/validate-homebrew-tap.sh" v0.6.3-fixture example/tap
 
+if env "${common_env[@]}" FAKE_TAP_MODE=clean \
+	FAKE_CASK_CONTENT_B64="${deprecated_cask_content}" \
+	bash "${root_dir}/scripts/validate-homebrew-tap.sh" v0.6.3-fixture example/tap; then
+	echo "deprecated verified: cask was unexpectedly accepted by validation" >&2
+	exit 1
+fi
+
 if env "${common_env[@]}" FAKE_TAP_MODE=legacy \
 	bash "${root_dir}/scripts/validate-homebrew-tap.sh" v0.6.3-fixture example/tap; then
 	echo "legacy cask path was unexpectedly accepted" >&2
@@ -118,6 +134,18 @@ env "${common_env[@]}" FAKE_TAP_MODE=clean \
 	bash "${root_dir}/scripts/publish-homebrew-cask.sh" "${cask_file}" \
 	v0.6.3-fixture example/tap
 grep -Fq 'PUT repos/example/tap/contents/Casks/speedns.rb' "${fake_log}"
+
+: >"${fake_log}"
+if env "${common_env[@]}" FAKE_TAP_MODE=clean \
+	bash "${root_dir}/scripts/publish-homebrew-cask.sh" "${deprecated_cask_file}" \
+	v0.6.3-fixture example/tap; then
+	echo "deprecated verified: cask was unexpectedly published" >&2
+	exit 1
+fi
+if [[ -s "${fake_log}" ]]; then
+	echo "publisher contacted GitHub before rejecting deprecated verified: cask" >&2
+	exit 1
+fi
 
 : >"${fake_log}"
 if env "${common_env[@]}" FAKE_TAP_MODE=legacy \

@@ -64,6 +64,10 @@ if ! printf '%s\n' "${cask_content}" | grep -Fqx -- 'cask "speedns" do'; then
 	echo "${canonical_path} does not declare cask speedns" >&2
 	exit 1
 fi
+if printf '%s\n' "${cask_content}" | grep -Fq 'verified:'; then
+	echo "${canonical_path} contains deprecated Homebrew verified: parameter" >&2
+	exit 1
+fi
 if ! printf '%s\n' "${cask_content}" | grep -Fqx -- "  version \"${version}\""; then
 	echo "${canonical_path} does not declare version ${version}" >&2
 	exit 1

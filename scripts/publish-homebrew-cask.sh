@@ -22,6 +22,10 @@ if [[ ! -f "${cask_file}" ]]; then
 	echo "cask file does not exist: ${cask_file}" >&2
 	exit 1
 fi
+if grep -Fq 'verified:' "${cask_file}"; then
+	echo "cask contains deprecated Homebrew verified: parameter; refusing to publish" >&2
+	exit 1
+fi
 : "${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is required}"
 if ! command -v gh >/dev/null 2>&1; then
 	echo "gh is required to publish the Homebrew cask" >&2
