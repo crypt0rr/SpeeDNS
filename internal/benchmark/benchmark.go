@@ -982,14 +982,15 @@ func markDivergence(results []TargetResult) []DivergenceDetail {
 
 		classes := make([]string, 0, len(counts))
 		maxCount := 0
-		for class, count := range counts {
+		for _, count := range counts {
 			if count > maxCount {
 				maxCount = count
-				classes = classes[:0]
-			} else if count < maxCount {
-				continue
 			}
-			classes = append(classes, class)
+		}
+		for class, count := range counts {
+			if count == maxCount {
+				classes = append(classes, class)
+			}
 		}
 		sort.Strings(classes)
 
