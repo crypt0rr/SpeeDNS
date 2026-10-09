@@ -55,6 +55,18 @@ func (f *fakeOutputFile) Sync() error  { return f.syncErr }
 func (f *fakeOutputFile) Close() error { return f.closeErr }
 func (f *fakeOutputFile) Name() string { return f.name }
 
+type fakeOutputPathInfo struct {
+	mode  fs.FileMode
+	isDir bool
+}
+
+func (fakeOutputPathInfo) Name() string        { return "output" }
+func (fakeOutputPathInfo) Size() int64         { return 0 }
+func (f fakeOutputPathInfo) Mode() fs.FileMode { return f.mode }
+func (fakeOutputPathInfo) ModTime() time.Time  { return time.Time{} }
+func (f fakeOutputPathInfo) IsDir() bool       { return f.isDir }
+func (fakeOutputPathInfo) Sys() any            { return nil }
+
 type progressSignalWriter struct {
 	bytes.Buffer
 	signal chan struct{}
@@ -302,6 +314,111 @@ func TestCLIParsersAndOutputHelpers(t *testing.T) {
 	}
 	values = nil
 	sort.Strings(values)
+}
+
+func TestOutputWriterRejectsSymlinkDestinations(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		hasReferent bool
+	}{
+		{name: "to existing file", hasReferent: true},
+		{name: "dangling"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			directory := t.TempDir()
+			link := filepath.Join(directory, "report.json")
+			referent := filepath.Join(directory, "referent.json")
+			const original = "keep this referent"
+			if tc.hasReferent {
+				if err := os.WriteFile(referent, []byte(original), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(filepath.Base(referent), link); err != nil {
+				if errors.Is(err, os.ErrPermission) {
+					t.Skipf("creating symlinks is unavailable: %v", err)
+				}
+				t.Fatalf("create output symlink: %v", err)
+			}
+
+			if _, _, err := outputWriter(link); err == nil || !strings.Contains(err.Error(), "output path is a symlink") {
+				t.Fatalf("symlink destination error = %v", err)
+			}
+			linkInfo, err := os.Lstat(link)
+			if err != nil || linkInfo.Mode()&fs.ModeSymlink == 0 {
+				t.Fatalf("output symlink was changed: %v/%v", linkInfo, err)
+			}
+			if target, err := os.Readlink(link); err != nil || target != filepath.Base(referent) {
+				t.Fatalf("output symlink target = %q/%v", target, err)
+			}
+			if tc.hasReferent {
+				content, err := os.ReadFile(referent)
+				if err != nil || string(content) != original {
+					t.Fatalf("symlink referent = %q/%v", content, err)
+				}
+			} else if _, err := os.Stat(referent); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("dangling symlink referent unexpectedly exists: %v", err)
+			}
+		})
+	}
+}
+
+func TestIsProcFDOutputPathRequiresCanonicalAbsolutePath(t *testing.T) {
+	for _, path := range []string{
+		"proc/self/fd/1",
+		"/tmp/output.json",
+		"/proc/self/fd/./1",
+		"/proc/self/fd/1/2",
+		"/proc/self/fd/+1",
+		"/proc/self/fd/01",
+		"/proc/self/fd/not-a-number",
+	} {
+		if isProcFDOutputPath(filepath.FromSlash(path)) {
+			t.Errorf("isProcFDOutputPath(%q) = true, want false", path)
+		}
+	}
+	if filepath.Separator == '/' && !isProcFDOutputPath(filepath.FromSlash("/proc/self/fd/1")) {
+		t.Fatal("canonical absolute proc fd path was not recognized")
+	}
+}
+
+func TestRunBenchmarkRejectsSymlinkOutput(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		return fakeCLIReport(), nil
+	}
+
+	directory := t.TempDir()
+	referent := filepath.Join(directory, "referent.json")
+	const original = "keep this report"
+	if err := os.WriteFile(referent, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(directory, "report.json")
+	if err := os.Symlink(filepath.Base(referent), link); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("creating symlinks is unavailable: %v", err)
+		}
+		t.Fatalf("create output symlink: %v", err)
+	}
+
+	config := cliConfigForTest(t)
+	config.output = link
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "output path is a symlink") {
+		t.Fatalf("run output symlink error = %v", err)
+	}
+	linkInfo, err := os.Lstat(link)
+	if err != nil || linkInfo.Mode()&fs.ModeSymlink == 0 {
+		t.Fatalf("run changed output symlink: %v/%v", linkInfo, err)
+	}
+	if target, err := os.Readlink(link); err != nil || target != filepath.Base(referent) {
+		t.Fatalf("run output symlink target = %q/%v", target, err)
+	}
+	content, err := os.ReadFile(referent)
+	if err != nil || string(content) != original {
+		t.Fatalf("run symlink referent = %q/%v", content, err)
+	}
 }
 
 func TestActiveInterfaceNamesAreBestEffortAndSorted(t *testing.T) {
@@ -1299,25 +1416,72 @@ func TestRunBenchmarkSuppressesDependencyLogsForMachineFormats(t *testing.T) {
 
 func TestOutputWriterErrorPaths(t *testing.T) {
 	oldStat := statOutputPath
+	oldLstat := lstatOutputPath
+	oldOpen := openOutputFile
 	oldCreate := createTempOutputFile
 	oldRemove := removeOutputFile
 	oldRename := renameOutputFile
 	t.Cleanup(func() {
 		statOutputPath = oldStat
+		lstatOutputPath = oldLstat
+		openOutputFile = oldOpen
 		createTempOutputFile = oldCreate
 		removeOutputFile = oldRemove
 		renameOutputFile = oldRename
 	})
 
-	statOutputPath = func(string) (os.FileInfo, error) { return nil, errors.New("stat failed") }
-	if _, _, err := outputWriter("stat-target"); err == nil || !strings.Contains(err.Error(), "stat failed") {
-		t.Fatalf("stat output error = %v", err)
+	lstatOutputPath = func(string) (os.FileInfo, error) { return nil, errors.New("lstat failed") }
+	if _, _, err := outputWriter("stat-target"); err == nil || !strings.Contains(err.Error(), "lstat failed") {
+		t.Fatalf("inspect output error = %v", err)
 	}
-	statOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	lstatOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
 	createTempOutputFile = func(string, string) (outputFileHandle, error) { return nil, errors.New("create failed") }
 	if _, _, err := outputWriter("create-target"); err == nil || !strings.Contains(err.Error(), "create failed") {
 		t.Fatalf("create output error = %v", err)
 	}
+
+	// Proc descriptor paths are symlinks too, but they retain direct-write
+	// behavior. Use a synthetic Lstat result so this branch is covered on
+	// systems with POSIX path syntax even when /proc itself is unavailable.
+	if filepath.Separator == '/' {
+		lstatOutputPath = func(string) (os.FileInfo, error) {
+			return fakeOutputPathInfo{mode: fs.ModeSymlink}, nil
+		}
+		statOutputPath = func(string) (os.FileInfo, error) { return nil, errors.New("stat failed") }
+		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "stat failed") {
+			t.Fatalf("proc descriptor inspection error = %v", err)
+		}
+		statOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+		openOutputFile = func(string) (outputFileHandle, error) { return nil, errors.New("open failed") }
+		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "open failed") {
+			t.Fatalf("dangling proc descriptor open error = %v", err)
+		}
+
+		// The successful descriptor inspection path must remain covered on
+		// POSIX systems that do not provide Linux procfs in the test runner.
+		statOutputPath = func(string) (os.FileInfo, error) {
+			return fakeOutputPathInfo{mode: 0o600}, nil
+		}
+		procFile := &fakeOutputFile{name: "proc-descriptor"}
+		openOutputFile = func(string) (outputFileHandle, error) { return procFile, nil }
+		writer, finalize, err := outputWriter("/proc/self/fd/1")
+		if err != nil || writer != procFile {
+			t.Fatalf("regular proc descriptor writer = %#v/%v", writer, err)
+		}
+		if err := finalize(true); err != nil {
+			t.Fatalf("regular proc descriptor finalize error = %v", err)
+		}
+
+		statOutputPath = func(string) (os.FileInfo, error) {
+			return fakeOutputPathInfo{mode: fs.ModeDir, isDir: true}, nil
+		}
+		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "output path is a directory") {
+			t.Fatalf("directory proc descriptor error = %v", err)
+		}
+	}
+	lstatOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	statOutputPath = oldStat
+	openOutputFile = oldOpen
 
 	newFile := func() *fakeOutputFile { return &fakeOutputFile{name: "temporary"} }
 	createTempOutputFile = func(string, string) (outputFileHandle, error) { return newFile(), nil }

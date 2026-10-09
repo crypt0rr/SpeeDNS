@@ -677,9 +677,12 @@ run leaves the previous file untouched, and the replacement gets the
 permissions an ordinary shell redirection would produce, narrowed by your
 umask. Destinations that cannot be replaced
 that way are written in place instead, so `--output /dev/null`, a named pipe,
-`/proc/self/fd/1`, and a writable file in a directory that rejects new entries
-all work; an in-place destination can keep partial output after a failed run.
-A destination that is a directory is rejected.
+and a writable file in a directory that rejects new entries all work. On
+systems that expose them, `/proc/self/fd/N` descriptor paths are also written
+in place. Other symlink destinations, including dangling symlinks, are rejected
+before writing, leaving the link and its referent unchanged. An in-place
+destination can keep partial output after a failed run. A destination that is
+a directory is rejected.
 
 The versioned JSON contract is published as
 [`schema/report-v1.json`](schema/report-v1.json). It describes the current
