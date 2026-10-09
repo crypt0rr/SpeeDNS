@@ -56,14 +56,15 @@ func (f *fakeOutputFile) Close() error { return f.closeErr }
 func (f *fakeOutputFile) Name() string { return f.name }
 
 type fakeOutputPathInfo struct {
-	mode fs.FileMode
+	mode  fs.FileMode
+	isDir bool
 }
 
 func (fakeOutputPathInfo) Name() string        { return "output" }
 func (fakeOutputPathInfo) Size() int64         { return 0 }
 func (f fakeOutputPathInfo) Mode() fs.FileMode { return f.mode }
 func (fakeOutputPathInfo) ModTime() time.Time  { return time.Time{} }
-func (fakeOutputPathInfo) IsDir() bool         { return false }
+func (f fakeOutputPathInfo) IsDir() bool       { return f.isDir }
 func (fakeOutputPathInfo) Sys() any            { return nil }
 
 type progressSignalWriter struct {
@@ -1454,6 +1455,28 @@ func TestOutputWriterErrorPaths(t *testing.T) {
 		openOutputFile = func(string) (outputFileHandle, error) { return nil, errors.New("open failed") }
 		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "open failed") {
 			t.Fatalf("dangling proc descriptor open error = %v", err)
+		}
+
+		// The successful descriptor inspection path must remain covered on
+		// POSIX systems that do not provide Linux procfs in the test runner.
+		statOutputPath = func(string) (os.FileInfo, error) {
+			return fakeOutputPathInfo{mode: 0o600}, nil
+		}
+		procFile := &fakeOutputFile{name: "proc-descriptor"}
+		openOutputFile = func(string) (outputFileHandle, error) { return procFile, nil }
+		writer, finalize, err := outputWriter("/proc/self/fd/1")
+		if err != nil || writer != procFile {
+			t.Fatalf("regular proc descriptor writer = %#v/%v", writer, err)
+		}
+		if err := finalize(true); err != nil {
+			t.Fatalf("regular proc descriptor finalize error = %v", err)
+		}
+
+		statOutputPath = func(string) (os.FileInfo, error) {
+			return fakeOutputPathInfo{mode: fs.ModeDir, isDir: true}, nil
+		}
+		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "output path is a directory") {
+			t.Fatalf("directory proc descriptor error = %v", err)
 		}
 	}
 	lstatOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
