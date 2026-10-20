@@ -163,10 +163,10 @@ jobs:
       # only that two throwaway builds agree, never that the artifacts this job
       # goes on to publish are reproducible.
       - name: Build reproducibility reference
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
-          version: 'v2.18.2'
+          version: 'v2.18.3'
           args: release --clean --skip=publish --skip=sign
 
       - name: Save reproducibility reference
@@ -178,10 +178,10 @@ jobs:
         run: bash scripts/release-fixture.sh
 
       - name: Build release artifacts once
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
-          version: 'v2.18.2'
+          version: 'v2.18.3'
           args: release --clean --skip=publish
         env:
           COSIGN_YES: 'true'
@@ -208,7 +208,7 @@ jobs:
 
       - name: Upload release verification evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: speedns-release-verification
           path: |
