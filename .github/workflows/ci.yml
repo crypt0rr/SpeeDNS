@@ -96,7 +96,7 @@ jobs:
 
       - name: Upload coverage profile
         if: success()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-${{ matrix.os }}
           path: ${{ runner.temp }}/speedns.coverprofile
@@ -208,7 +208,7 @@ jobs:
           done
 
       - name: Upload cross-build binaries
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: speedns-cross-builds
           path: dist/
@@ -248,10 +248,10 @@ jobs:
         run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
       - name: Build GoReleaser snapshot
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
-          version: 'v2.18.2'
+          version: 'v2.18.3'
           args: release --snapshot --clean --skip=sign
 
       - name: Smoke-test Linux archives and packages
@@ -263,7 +263,7 @@ jobs:
         run: bash scripts/artifact-smoke.sh macos-archives dist
 
       - name: Upload GoReleaser snapshot
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: speedns-goreleaser-snapshot
           path: dist/
@@ -279,7 +279,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Download GoReleaser snapshot
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: speedns-goreleaser-snapshot
           path: dist

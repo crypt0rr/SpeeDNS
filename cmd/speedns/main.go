@@ -1329,6 +1329,7 @@ type outputFileHandle interface {
 }
 
 var statOutputPath = os.Stat
+var lstatOutputPath = os.Lstat
 var createTempOutputFile = func(directory, pattern string) (outputFileHandle, error) {
 	return os.CreateTemp(directory, pattern)
 }
@@ -1400,17 +1401,55 @@ func directOutputWriter(path string, syncOnCommit bool) (io.Writer, outputFinali
 	return file, finalize, nil
 }
 
+// isProcFDOutputPath recognizes the descriptor aliases the CLI documents as
+// output destinations. These procfs entries are symlinks by design, but they
+// refer to already-open descriptors and must be written through in place.
+// Other symlink destinations are rejected so an atomic rename cannot silently
+// replace the link itself.
+func isProcFDOutputPath(path string) bool {
+	const prefix = "/proc/self/fd/"
+	if !filepath.IsAbs(path) {
+		return false
+	}
+	cleanPath := filepath.Clean(path)
+	if cleanPath != path || !strings.HasPrefix(cleanPath, prefix) {
+		return false
+	}
+	descriptor := strings.TrimPrefix(cleanPath, prefix)
+	if strings.ContainsRune(descriptor, filepath.Separator) {
+		return false
+	}
+	value, err := strconv.ParseUint(descriptor, 10, 64)
+	return err == nil && strconv.FormatUint(value, 10) == descriptor
+}
+
 // outputWriter replaces a regular destination atomically: the report is
 // written to a temporary file in the destination directory and renamed over
 // the target only after a successful run. Destinations that cannot be
 // replaced that way are written in place instead. That covers non-regular
-// files such as /dev/null, named pipes, and /proc file descriptors, plus a
-// writable regular file inside a directory that rejects new entries.
+// files such as /dev/null and named pipes, writable regular files inside
+// directories that reject new entries, and /proc/self/fd/N descriptor paths.
 func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 	if strings.TrimSpace(path) == "" || path == "-" {
 		return os.Stdout, func(bool) error { return nil }, nil
 	}
-	info, err := statOutputPath(path)
+	info, err := lstatOutputPath(path)
+	if err == nil && info.Mode()&fs.ModeSymlink != 0 {
+		if !isProcFDOutputPath(path) {
+			return nil, nil, fmt.Errorf("output path is a symlink: %s", path)
+		}
+		// Descriptor paths are pseudo-links used to address an already-open
+		// file, pipe or device. Preserve the existing direct-write behavior
+		// rather than trying to create a temporary entry beside a procfs link.
+		info, err = statOutputPath(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("inspect output path: %w", err)
+		}
+		if err == nil && info.IsDir() {
+			return nil, nil, fmt.Errorf("output path is a directory: %s", path)
+		}
+		return directOutputWriter(path, err == nil && info.Mode().IsRegular())
+	}
 	var existingMode fs.FileMode
 	preserveExistingMode := false
 	switch {
