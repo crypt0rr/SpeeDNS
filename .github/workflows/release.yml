@@ -163,7 +163,7 @@ jobs:
       # only that two throwaway builds agree, never that the artifacts this job
       # goes on to publish are reproducible.
       - name: Build reproducibility reference
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
           version: 'v2.18.3'
@@ -178,7 +178,7 @@ jobs:
         run: bash scripts/release-fixture.sh
 
       - name: Build release artifacts once
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7
         with:
           distribution: goreleaser
           version: 'v2.18.3'
