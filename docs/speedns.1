@@ -91,7 +91,10 @@ Opt in to bounded random names below the reserved example.com zone. It cannot
 be combined with --domains or --full. Each resolver is measured exactly once
 and each generated name is asked exactly one question, because a resolver holds
 one cache across its transports and addresses and caches a negative answer for
-the whole name. Dropped endpoints are named in a report warning. A cache-miss
+the whole name. Profiles that share an address or a TLS name (a DoH URL host or
+a server_name) count as one resolver, measured over the earliest declared
+profile's first transport at its earliest declared address. Dropped endpoints
+are named in a report warning. A cache-miss
 run therefore cannot produce a sound transport comparison, and speedns diff
 refuses cache-miss reports by design. The rules keep any name from being asked
 twice at one resolver; they do not prove the resolver recursed, because a

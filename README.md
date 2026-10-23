@@ -529,6 +529,13 @@ a name SpeeDNS generated earlier in the run. Read
 [`CACHE_MISS.md`](CACHE_MISS.md) before using the mode, especially for
 ownership, traffic, and abuse limits.
 
+A resolver here is a server, not a profile: profiles that share an address or
+a TLS name (a DoH URL host or a `server_name`) count as one, so two
+`--resolver` flags aimed at one server, or the two bundled Google profiles, are
+measured once. The endpoint kept is the earliest declared profile's first
+transport at its earliest declared address, which is IPv4 for every bundled
+resolver.
+
 ### What a default run sends
 
 A default run measures the ten bundled profiles across their declared
@@ -543,7 +550,7 @@ total. Narrow the run with `--protocol`, `--sample`, or `--no-defaults` plus
 `--sample` for repeated or scheduled runs.
 
 [`CACHE_MISS.md`](CACHE_MISS.md) states the separate, much smaller budget for
-`--cache-miss`, which sends 200 reserved-zone queries.
+`--cache-miss`, which sends 180 reserved-zone queries.
 
 ## Comparing two runs
 

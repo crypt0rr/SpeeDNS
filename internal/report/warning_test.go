@@ -179,3 +179,18 @@ func TestRedactedWarningsUseWarningAttribution(t *testing.T) {
 		t.Fatalf("redacted default table lost the compact per-target warning: %s", table.String())
 	}
 }
+
+// TestIsSystemTargetIsTheRedactionRule pins that the exported check and the
+// one redaction uses are the same rule, so a warning the CLI builds outside
+// this package counts exactly the endpoints --redact-system would redact.
+func TestIsSystemTargetIsTheRedactionRule(t *testing.T) {
+	for _, id := range []string{"system-192-168-1-1", "system-stub-127-0-0-53", "system-resolver-1-10-0-0-1", "systemd", "google-8888", "custom-system"} {
+		target := catalog.Target{Resolver: catalog.ResolverProfile{ID: id}}
+		if IsSystemTarget(target) != isSystemTarget(target) {
+			t.Fatalf("IsSystemTarget(%q) = %v, but redaction treats it as %v", id, IsSystemTarget(target), isSystemTarget(target))
+		}
+		if got, want := IsSystemTarget(target), strings.HasPrefix(id, "system-"); got != want {
+			t.Fatalf("IsSystemTarget(%q) = %v, want %v", id, got, want)
+		}
+	}
+}

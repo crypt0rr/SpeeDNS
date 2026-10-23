@@ -22,11 +22,13 @@ The mode has deliberate limits:
 
 The 20-name limit means up to 20 measured DNS queries per resolver, because
 cache-miss mode asks each generated name exactly one question and measures each
-resolver once. A default run against the bundled catalog therefore sends 200
-reserved-zone queries — fewer than the same command sent before, since a
-resolver is no longer measured once per transport and address. Keep runs
-occasional and use only the reserved zone supplied by SpeeDNS. Do not replace
-it with a third-party zone or automate repeated high-volume runs.
+resolver once. A default run against the bundled catalog therefore sends 180
+reserved-zone queries: its ten profiles reach nine resolvers, because both
+Google profiles answer as `dns.google`. That is fewer than the same command
+sent before, since a resolver is no longer measured once per transport,
+address and profile. Keep runs occasional and use only the reserved zone
+supplied by SpeeDNS. Do not replace it with a third-party zone or automate
+repeated high-volume runs.
 
 ## Usage
 
@@ -67,10 +69,32 @@ however it is reached. Two consequences follow, and cache-miss mode now
 enforces both rather than reporting them.
 
 **Each resolver is measured once.** Cache-miss mode keeps one endpoint per
-resolver — its earliest declared transport at its lowest-sorting address — and
-names the endpoints it dropped in a report warning. Without this, selecting two
-protocols meant the second measured a warm cache for every name the first had
-already resolved.
+resolver and names every endpoint it dropped in a report warning. Without
+this, selecting two protocols meant the second measured a warm cache for every
+name the first had already resolved.
+
+A resolver here is a server, not a profile. Two profiles that share an
+address, on any port, or a TLS identity — a DoH URL host or a `server_name`,
+compared without regard to case or a trailing dot — reach the same server, so
+they count as one resolver, and so does every profile linked to them through
+another shared address or name. Two `--resolver` flags aimed at one server
+therefore count once, and so do the bundled `google-8888` and `google-8844`,
+which both answer as `dns.google`. Nothing beyond those identical endpoints is
+inferred: profiles that answer on different addresses and names stay separate
+even when one operator runs both. The rule errs towards dropping, because a
+dropped endpoint is named in the warning while a warm read measured as a miss
+is not disclosed anywhere: two independent resolvers on different ports of
+one address, or DoH services told apart only by their URL path, are measured
+as one. Under `--redact-system` a dropped system resolver endpoint is counted
+in the warning rather than named.
+
+The endpoint kept for a resolver is chosen by an explicit rule: the earliest
+declared profile, its first transport in the documented order (UDP, TCP, DoH,
+DoT, DoQ), at its earliest declared address. Every bundled profile declares
+its IPv4 address first, so a dual-stack run measures every bundled resolver
+over IPv4. The kept endpoint used to be the one whose target ID sorted first,
+which measured Cloudflare over IPv4 and the other bundled resolvers over IPv6
+and so compared address families by accident of string order.
 
 **Each name is asked one question.** The generated names normally produce
 NXDOMAIN, and a resolver caches that negative answer for the *name*, not for

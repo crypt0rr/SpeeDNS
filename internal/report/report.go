@@ -378,6 +378,13 @@ func isSystemTarget(target catalog.Target) bool {
 	return strings.HasPrefix(target.Resolver.ID, "system-")
 }
 
+// IsSystemTarget reports whether --redact-system treats target as a system
+// resolver endpoint. It is exported so text built outside this package, such
+// as the CLI's cache-miss warning, applies the same rule rather than a copy.
+func IsSystemTarget(target catalog.Target) bool {
+	return isSystemTarget(target)
+}
+
 func redactedTargetIDs(report benchmark.Report, redact bool) map[string]string {
 	if !redact {
 		return nil

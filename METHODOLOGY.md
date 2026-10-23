@@ -63,7 +63,7 @@ target, being 3 cold probes, 3 warm-ups and 200 measured exchanges, over the ten
 bundled profiles and the transports they declare. The load is not even. Four of
 the ten bundled profiles are DNS4EU addresses, so the smallest of the four
 operators receives roughly 38% of the total. `CACHE_MISS.md` states the
-separate reserved-zone budget for `--cache-miss`, which is 200 queries.
+separate reserved-zone budget for `--cache-miss`, which is 180 queries.
 
 Each target also records how many of its usable responses carried an actual
 record rather than NODATA, published as `answers` and `answer_rate`. Like
@@ -436,8 +436,8 @@ documented in [`CACHE_MISS.md`](CACHE_MISS.md).
 A resolver holds one cache, shared across every transport it offers and every
 address it answers on, so any second lookup of a generated name at that
 resolver is a warm read. Cache-miss mode therefore measures each resolver
-exactly once — keeping its earliest declared transport at its lowest-sorting
-address, and naming the dropped endpoints in a warning — and asks each
+exactly once — keeping one endpoint per resolver, chosen by the rule below,
+and naming the dropped endpoints in a warning — and asks each
 generated name exactly one question, rotating the selected query types across
 the corpus rather than pairing them per name. A resolver caches an NXDOMAIN for
 the name rather than for the query type, so asking one name for both `A` and
@@ -453,6 +453,18 @@ requires measuring one name twice at one resolver. Separate runs cannot stand
 in for that either -- each generates fresh names, and cross-run latency is
 dominated by the network conditions at the time of each run, which no report
 captures -- so `speedns diff` refuses every cache-miss report.
+
+A resolver here is a server rather than a profile. Profiles that share an
+address, on any port, or a TLS identity (a DoH URL host or a `server_name`,
+compared without regard to case or a trailing dot) are one resolver, as is any
+profile linked to them by another shared address or name, so two `--resolver`
+flags at one server and the bundled `google-8888` and `google-8844`, both
+`dns.google`, are measured once. Nothing beyond those identical endpoints is
+inferred. The endpoint kept is the earliest declared profile's first transport
+in the documented protocol order at its earliest declared address. The bundled
+catalog declares IPv4 first, so a dual-stack run measures every bundled
+resolver over IPv4; the kept endpoint used to be the lowest-sorting target ID,
+which split the bundled resolvers between the two families by string order.
 
 `--profile-view` groups the measured target rows by resolver profile and
 address, then lists each available selected transport side by side in a

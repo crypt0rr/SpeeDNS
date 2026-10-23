@@ -3,6 +3,7 @@ package catalog
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -383,5 +384,72 @@ func TestBundledDoHServerNamesMatchTheirURLHost(t *testing.T) {
 			t.Errorf("resolver %q DoH server_name = %q, want the URL host %q",
 				profile.ID, spec.ServerName, endpoint.Hostname())
 		}
+	}
+}
+
+// TestCacheKeysNameTheServerNotTheProfile pins what cache-miss mode compares
+// to decide that two profiles reach one cache: every address, the DoH URL host,
+// and the server_name of each encrypted transport, canonicalized so spelling
+// cannot split one server into two. A server_name on UDP or TCP is never sent,
+// so it identifies nothing and is left out.
+func TestCacheKeysNameTheServerNotTheProfile(t *testing.T) {
+	profile := ResolverProfile{
+		ID:        "lab",
+		Addresses: []string{"192.0.2.1", "[2001:DB8::1]", "Resolver.Example.TEST."},
+		Transports: map[Protocol]TransportSpec{
+			UDP: {Port: 53, ServerName: "ignored.example.test"},
+			TCP: {Port: 53},
+			DoH: {Port: 443, URL: "https://DoH.Example.test/dns-query", ServerName: "doh-tls.example.test"},
+			DoT: {Port: 853, ServerName: " DoT.example.test "},
+			DoQ: {Port: 853, ServerName: "dot.example.test"},
+		},
+	}
+	want := []string{
+		"host:doh-tls.example.test", "host:doh.example.test", "host:dot.example.test",
+		"host:resolver.example.test", "ip:192.0.2.1", "ip:2001:db8::1",
+	}
+	if got := profile.CacheKeys(); !slices.Equal(got, want) {
+		t.Fatalf("CacheKeys() = %q, want %q", got, want)
+	}
+
+	// Without a configured server_name the DoH URL host is the identity. An
+	// unparsable URL contributes nothing rather than a key no server has;
+	// Validate rejects it before a run, so only a hand-built profile has one.
+	bare := ResolverProfile{Addresses: []string{"192.0.2.2"}, Transports: map[Protocol]TransportSpec{
+		DoH: {URL: "https://[2001:db8::2]/dns-query"},
+	}}
+	if got := bare.CacheKeys(); !slices.Equal(got, []string{"ip:192.0.2.2", "ip:2001:db8::2"}) {
+		t.Fatalf("DoH URL host key = %q", got)
+	}
+	broken := ResolverProfile{Addresses: []string{"192.0.2.3"}, Transports: map[Protocol]TransportSpec{
+		DoH: {URL: "https://bad host/dns-query"},
+	}}
+	if got := broken.CacheKeys(); !slices.Equal(got, []string{"ip:192.0.2.3"}) {
+		t.Fatalf("unparsable DoH URL keys = %q", got)
+	}
+}
+
+// TestBundledCacheKeysJoinOnlyTheGooglePair records which bundled profiles
+// cache-miss mode treats as one cache. google-8888 and google-8844 share the
+// DoH URL host and DoT server_name dns.google, so they are one service; every
+// other bundled profile answers on its own addresses and names, and treating
+// those as shared would be guesswork. A catalog change that joins another
+// pair changes what a default cache-miss run measures and what CACHE_MISS.md
+// says it sends, so this test makes that a deliberate edit.
+func TestBundledCacheKeysJoinOnlyTheGooglePair(t *testing.T) {
+	owners := map[string]string{}
+	var shared []string
+	for _, profile := range DefaultResolvers() {
+		for _, key := range profile.CacheKeys() {
+			if owner, seen := owners[key]; seen {
+				shared = append(shared, fmt.Sprintf("%s+%s:%s", owner, profile.ID, key))
+				continue
+			}
+			owners[key] = profile.ID
+		}
+	}
+	want := []string{"google-8888+google-8844:host:dns.google"}
+	if !slices.Equal(shared, want) {
+		t.Fatalf("bundled profiles sharing a cache key = %q, want %q", shared, want)
 	}
 }
