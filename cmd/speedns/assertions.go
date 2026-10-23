@@ -68,8 +68,11 @@ func parseAssertion(value string) (assertion, error) {
 	subject := ""
 	// A subject prefix binds the assertion to one resolver: SUBJECT:METRIC[op]VALUE.
 	// Split before lowercasing, because a resolver ID is case-sensitive while a
-	// metric name is not.
-	if index := strings.Index(left, ":"); index >= 0 {
+	// metric name is not. Split at the LAST colon: no metric name contains one,
+	// but a target ID carries its address, so the first colon of
+	// cloudflare-1111@2606:4700:4700::1111/doh is inside the IPv6 literal and
+	// splitting there reported an "unsupported metric" for every IPv6 target.
+	if index := strings.LastIndex(left, ":"); index >= 0 {
 		subject = strings.TrimSpace(left[:index])
 		left = left[index+1:]
 		if subject == "" {

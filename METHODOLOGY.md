@@ -772,9 +772,10 @@ it.
 
 That boundary is not caution, it is what the evidence supports. The confound
 between two runs is not sampling noise but an unobserved variable -- which
-anycast site answered, over which transit, at what time of day -- and a report
-contains no field that records it, so no threshold computed from two reports
-can bound it. Measured on one host, six byte-identical back-to-back runs moved
+anycast site answered, over which transit, under what load at that time of
+day. A report records when it ran, in `started_at`, but no field records those
+path conditions, so no threshold computed from two reports can bound them.
+Measured on one host, six byte-identical back-to-back runs moved
 one target's p95 by 248% and its composite score by 50%, while every
 categorical count was identical across all six. Two runs thirteen hours apart
 with identical settings drifted by different amounts per target, so the drift

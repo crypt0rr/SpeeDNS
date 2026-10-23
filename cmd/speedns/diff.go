@@ -27,9 +27,10 @@ func newDiffCommand() *cobra.Command {
 			"differently: reachability, response codes, whether it answered, and its\n" +
 			"DNSSEC verdict.\n\n" +
 			"It never compares latency. The difference between two runs is dominated by\n" +
-			"the network path and the time of day, which no field in a report records, so\n" +
-			"no threshold computed from two reports can bound it. To compare resolver\n" +
-			"speed, measure the resolvers together in one run.\n\n" +
+			"the network path and the time of day. A report records when it ran, but not\n" +
+			"which path or anycast site answered or how loaded they were, so no threshold\n" +
+			"computed from two reports can bound it. To compare resolver speed, measure\n" +
+			"the resolvers together in one run.\n\n" +
 			"Both runs must have asked the same questions. When they did not, the diff is\n" +
 			"declined with the fields that differ and exits 3.",
 		Args: cobra.ExactArgs(2),
@@ -45,9 +46,13 @@ func newDiffCommand() *cobra.Command {
 }
 
 func runDiff(stdout io.Writer, baselinePath, currentPath, format, output string, required []string) error {
-	if format != "table" && format != "json" {
+	// Case-insensitive, as run's --format is: --format JSON asks for the same
+	// document on either command. The error still echoes what was typed.
+	normalized := strings.ToLower(format)
+	if normalized != "table" && normalized != "json" {
 		return fmt.Errorf("unsupported output format %q (choose table or json)", format)
 	}
+	format = normalized
 	baseline, err := compare.Load(baselinePath)
 	if err != nil {
 		return err

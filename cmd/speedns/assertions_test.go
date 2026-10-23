@@ -586,6 +586,60 @@ func TestSubjectAssertionParsingAndValidation(t *testing.T) {
 			t.Fatalf("%q should be an accepted spelling: %v", spelling, err)
 		}
 	}
+
+	// A target ID carries its address, so an IPv6 or zoned link-local target
+	// puts colons inside the subject. The split must keep them there: the first
+	// colon used to end the subject, leaving "db8::53/udp:p95" as the metric.
+	ipv6Targets := []catalog.Target{
+		{Resolver: catalog.ResolverProfile{ID: "custom-v6", Name: "v6"}, Protocol: catalog.UDP, Address: "2001:db8::53"},
+		{Resolver: catalog.ResolverProfile{ID: "custom-ll", Name: "ll"}, Protocol: catalog.DoT, Address: "fe80::1%eth0"},
+	}
+	for _, testCase := range []struct{ expression, subject, metric string }{
+		{"custom-v6@2001:db8::53/udp:p95<50ms", "custom-v6@2001:db8::53/udp", "p95"},
+		{"custom-ll@fe80::1%eth0/dot:USABLE>=0.99", "custom-ll@fe80::1%eth0/dot", "usable"},
+		{" custom-v6@2001:db8::53/udp : median<=10", "custom-v6@2001:db8::53/udp", "median"},
+	} {
+		checks, err := parseAssertions([]string{testCase.expression})
+		if err != nil {
+			t.Fatalf("parse %q: %v", testCase.expression, err)
+		}
+		if checks[0].subject != testCase.subject || checks[0].metric != testCase.metric {
+			t.Fatalf("parse %q = subject %q metric %q, want %q and %q",
+				testCase.expression, checks[0].subject, checks[0].metric, testCase.subject, testCase.metric)
+		}
+		if err := validateAssertionTargets(checks, ipv6Targets, nil, false); err != nil {
+			t.Fatalf("%q should name a selected target: %v", testCase.expression, err)
+		}
+	}
+	// The parsed subject is the whole target ID, so evaluation reads that
+	// endpoint rather than one of its namesakes.
+	measured := benchmark.Report{Targets: []benchmark.TargetResult{{
+		Target: ipv6Targets[0],
+		Stats:  benchmark.Statistics{Total: 30, Successes: 30, UsableResponses: 30, Scored: 30, SuccessRate: 1, UsableRate: 1, P95MS: 10},
+	}}}
+	for expression, passes := range map[string]bool{
+		"custom-v6@2001:db8::53/udp:p95<50ms": true,
+		"custom-v6@2001:db8::53/udp:p95<5ms":  false,
+	} {
+		checks, err := parseAssertions([]string{expression})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = evaluateAssertions(measured, checks)
+		if passes && err != nil {
+			t.Fatalf("%q must pass on p95=10ms: %v", expression, err)
+		}
+		if !passes && (err == nil || !strings.Contains(err.Error(), "custom-v6@2001:db8::53/udp has p95=10.000ms")) {
+			t.Fatalf("%q must fail naming the IPv6 target: %v", expression, err)
+		}
+	}
+	// A target ID with no metric after it still fails loudly, naming the
+	// fragment it could not read rather than passing.
+	if _, err := parseAssertions([]string{"custom-v6@2001:db8::53/udp<50ms"}); err == nil ||
+		!strings.Contains(err.Error(), "unsupported metric") {
+		t.Fatalf("a target ID without a metric = %v", err)
+	}
+
 	typo, err := parseAssertions([]string{"typo:p95<50ms"})
 	if err != nil {
 		t.Fatal(err)

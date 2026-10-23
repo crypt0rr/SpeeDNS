@@ -1539,12 +1539,9 @@ func writeProfileView(writer io.Writer, report benchmark.Report, options TableOp
 // tableColumnPadding is the number of spaces kept between two columns.
 const tableColumnPadding = 2
 
-// writeAlignedTable renders a table whose columns line up by display width.
-// Counting runes, as text/tabwriter does, shears every column to the right of
-// an East Asian owner name and drifts the other way for combining marks, so
-// cells are measured in terminal cells instead. Zero-width ANSI colour codes
-// from styledStatus are discounted the same way. The trailing column is never
-// padded, so no line carries trailing whitespace.
+// tableMargin indents a report table below its section heading.
+const tableMargin = "  "
+
 // targetCountText and ipv6EndpointCountText keep the collapsed summary lines
 // grammatical for a single hidden row.
 func targetCountText(count int) string {
@@ -1561,11 +1558,38 @@ func ipv6EndpointCountText(count int) string {
 	return fmt.Sprintf("%d IPv6 endpoints", count)
 }
 
+// writeAlignedTable renders a table whose columns line up by display width.
+// Counting runes, as text/tabwriter does, shears every column to the right of
+// an East Asian owner name and drifts the other way for combining marks, so
+// cells are measured in terminal cells instead. Zero-width ANSI colour codes
+// from styledStatus are discounted the same way. The trailing column is never
+// padded, so no line carries trailing whitespace.
 func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
+	return writeMarginTable(writer, tableMargin, headers, rows)
+}
+
+// WriteAlignedTable renders headers and rows exactly as the report's own
+// tables are rendered, but at the left margin: a report indents each table
+// below its section heading, and a standalone listing such as `speedns
+// resolvers` has no heading to indent below. It is exported so the CLI aligns
+// its listings by the same display-width measurement instead of fixed printf
+// widths that a long IPv6 address list overflows.
+//
+// Cells are written as given. The report's builders escape untrusted text with
+// safetext before it reaches a table; a caller of this function must do the
+// same for any cell it did not author, or a terminal control sequence in it
+// reaches the terminal intact.
+func WriteAlignedTable(writer io.Writer, headers []string, rows [][]string) error {
+	return writeMarginTable(writer, "", headers, rows)
+}
+
+// writeMarginTable is the body both share; margin prefixes the first cell of
+// every line, header included.
+func writeMarginTable(writer io.Writer, margin string, headers []string, rows [][]string) error {
 	lines := make([][]string, 0, len(rows)+1)
-	lines = append(lines, indentedCells(headers))
+	lines = append(lines, indentedCells(headers, margin))
 	for _, row := range rows {
-		lines = append(lines, indentedCells(row))
+		lines = append(lines, indentedCells(row, margin))
 	}
 	widths := tableColumnWidths(lines)
 	// Pad short rows to the header width. A row with fewer cells than the
@@ -1586,10 +1610,12 @@ func writeAlignedTable(writer io.Writer, headers []string, rows [][]string) erro
 	return nil
 }
 
-// indentedCells copies values and indents the first cell by the table margin.
-func indentedCells(values []string) []string {
+// indentedCells copies values and indents the first cell by margin. The copy
+// matters even without a margin: short rows are padded in place afterwards,
+// which must not write into the caller's slices.
+func indentedCells(values []string, margin string) []string {
 	cells := append([]string(nil), values...)
-	cells[0] = "  " + cells[0]
+	cells[0] = margin + cells[0]
 	return cells
 }
 

@@ -223,6 +223,172 @@ func TestMainAndCommands(t *testing.T) {
 	}
 }
 
+// TestResolversListingUsesTheDocumentedOrderAndAligns pins the listing to the
+// conventions every report follows: transports in udp, tcp, doh, dot, doq
+// order rather than sorted as strings, a header naming each column, and
+// columns aligned however long a profile's IPv6 address list is.
+func TestResolversListingUsesTheDocumentedOrderAndAligns(t *testing.T) {
+	every := map[catalog.Protocol]catalog.TransportSpec{}
+	for _, protocol := range []catalog.Protocol{catalog.DoQ, catalog.DoT, catalog.TCP, catalog.DoH, catalog.UDP} {
+		every[protocol] = catalog.TransportSpec{}
+	}
+	rows := resolverListing([]catalog.ResolverProfile{{
+		ID: "lab", Owner: "Lab", Policy: "unfiltered", Addresses: []string{"192.0.2.53", "2001:db8::53"}, Transports: every,
+	}})
+	if want := []string{"lab", "Lab", "192.0.2.53,2001:db8::53", "unfiltered", "udp,tcp,doh,dot,doq"}; !slices.Equal(rows[0], want) {
+		t.Fatalf("listing row = %q, want %q", rows[0], want)
+	}
+
+	command := newResolversCommand()
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetArgs(nil)
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != len(catalog.DefaultResolvers())+1 {
+		t.Fatalf("listing has %d lines for %d profiles:\n%s", len(lines), len(catalog.DefaultResolvers()), output.String())
+	}
+	header := lines[0]
+	if !strings.HasPrefix(header, "Profile ") {
+		t.Fatalf("listing header = %q", header)
+	}
+	var starts []int
+	for _, name := range []string{"Owner", "Addresses", "Policy", "Transports"} {
+		start := strings.Index(header, name)
+		if start < 0 {
+			t.Fatalf("listing header %q lacks %s", header, name)
+		}
+		starts = append(starts, start)
+	}
+	for _, line := range lines[1:] {
+		// Every column starts where its heading does: one cell earlier is
+		// padding and the cell itself is text. The bundled values are ASCII,
+		// so a byte offset is a cell offset.
+		for _, start := range starts {
+			if textwidth.Display(line) <= start || line[start-1] != ' ' || line[start] == ' ' {
+				t.Fatalf("listing row is not aligned with column %d of the header:\n%s\n%s", start, header, line)
+			}
+		}
+		if strings.HasSuffix(line, " ") {
+			t.Fatalf("listing row carries trailing whitespace: %q", line)
+		}
+		var protocols []catalog.Protocol
+		for _, name := range strings.Split(line[starts[len(starts)-1]:], ",") {
+			protocols = append(protocols, catalog.Protocol(name))
+		}
+		if !slices.IsSortedFunc(protocols, catalog.CompareProtocols) {
+			t.Fatalf("transports are not in the documented order: %q", line)
+		}
+	}
+}
+
+// TestCorpusCommandShowsTheLicenseNote checks the attribution the metadata
+// asks redistributors to keep is printed with the rest of the provenance, and
+// that optional lines are left out when the metadata has no value for them.
+func TestCorpusCommandShowsTheLicenseNote(t *testing.T) {
+	embedded, err := data.VerifyCorpus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	command := newCorpusCommand()
+	command.SetOut(&output)
+	command.SetArgs(nil)
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if embedded.LicenseNote == "" || !strings.Contains(output.String(), "\nLicense note: "+embedded.LicenseNote+"\n") {
+		t.Fatalf("corpus output does not carry the license note %q:\n%s", embedded.LicenseNote, output.String())
+	}
+
+	oldVerifyCorpus := verifyCorpusFunc
+	t.Cleanup(func() { verifyCorpusFunc = oldVerifyCorpus })
+	verifyCorpusFunc = func() (data.CorpusMetadata, error) {
+		return data.CorpusMetadata{Source: "fixture", ListID: "L", RetrievedAt: "2026-01-01", Entries: 1, SHA256: "00"}, nil
+	}
+	output.Reset()
+	command = newCorpusCommand()
+	command.SetOut(&output)
+	command.SetArgs(nil)
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "License note:") || strings.Contains(output.String(), "Source URL:") {
+		t.Fatalf("metadata without a note or URL printed an empty line for them:\n%s", output.String())
+	}
+}
+
+// TestCommandsRejectStrayArguments pins #246. A leaf command accepted any
+// positional argument, so "speedns run json" -- --format with its dashes
+// forgotten -- ran a full public benchmark instead of failing as a typo. Every
+// command that takes no argument must now exit 2 before anything is measured
+// or printed.
+func TestCommandsRejectStrayArguments(t *testing.T) {
+	engineCalls := countEngineCalls(t)
+	for _, args := range [][]string{
+		{"run", "json"},
+		{"run", "--format", "json", "out.json"},
+		{"json"},
+		{"version", "stray"},
+		{"resolvers", "x"},
+		{"corpus", "x"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := newRootCommand()
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+			root.SetArgs(args)
+			err := root.Execute()
+			if err == nil || !strings.Contains(err.Error(), "unknown command") {
+				t.Fatalf("speedns %s = %v, want an unknown-command error", strings.Join(args, " "), err)
+			}
+			if code := exitCodeForError(err); code != 2 {
+				t.Fatalf("exit code = %d, want 2", code)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("a rejected command wrote %q", output.String())
+			}
+			if *engineCalls != 0 {
+				t.Fatalf("the benchmark ran %d time(s) for a stray argument", *engineCalls)
+			}
+		})
+	}
+
+	// The same through main, which is what turns the error into the status.
+	// main prints to the process's standard error, so it is pointed at a file
+	// for the call: the message is checked there instead of leaking into the
+	// test log.
+	stderrPath := filepath.Join(t.TempDir(), "stderr")
+	stderr, err := os.Create(stderrPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldArgs, oldExit, oldStderr := os.Args, exit, os.Stderr
+	t.Cleanup(func() { os.Args, exit, os.Stderr = oldArgs, oldExit, oldStderr })
+	status := -1
+	exit = func(code int) { status = code }
+	os.Args = []string{"speedns", "run", "json"}
+	os.Stderr = stderr
+	main()
+	os.Stderr = oldStderr
+	if err := stderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if status != 2 || *engineCalls != 0 {
+		t.Fatalf("speedns run json exited %d after %d benchmark(s), want 2 and none", status, *engineCalls)
+	}
+	message, err := os.ReadFile(stderrPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `unknown command "json" for "speedns run"`; !strings.Contains(string(message), want) {
+		t.Fatalf("speedns run json printed %q, want %q", message, want)
+	}
+}
+
 func TestExitCodeForError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -953,6 +1119,8 @@ func TestTableColorDetectionHonorsTTYAndOverrides(t *testing.T) {
 	oldDetector := terminalDetector
 	t.Cleanup(func() { terminalDetector = oldDetector })
 	terminalDetector = func(*os.File) bool { return true }
+	// The colour cases must not depend on the NO_COLOR of whoever runs them.
+	t.Setenv("NO_COLOR", "")
 	if !tableColorEnabled(&cliConfig{}) {
 		t.Fatal("expected color for an interactive default table")
 	}
@@ -961,6 +1129,111 @@ func TestTableColorDetectionHonorsTTYAndOverrides(t *testing.T) {
 	}
 	if tableColorEnabled(&cliConfig{output: "result.txt"}) {
 		t.Fatal("file output should not receive terminal color")
+	}
+	// no-color.org: a NO_COLOR that is present and not empty disables colour
+	// whatever it says, even "0", on a terminal and on --output -.
+	for _, value := range []string{"1", "0", "false"} {
+		t.Setenv("NO_COLOR", value)
+		if tableColorEnabled(&cliConfig{}) || tableColorEnabled(&cliConfig{output: "-"}) {
+			t.Fatalf("NO_COLOR=%q left colour on", value)
+		}
+	}
+	// An empty or absent NO_COLOR leaves the decision to the terminal.
+	t.Setenv("NO_COLOR", "")
+	if !tableColorEnabled(&cliConfig{}) {
+		t.Fatal("an empty NO_COLOR must keep colour on")
+	}
+	if err := os.Unsetenv("NO_COLOR"); err != nil {
+		t.Fatal(err)
+	}
+	if !tableColorEnabled(&cliConfig{output: "-"}) {
+		t.Fatal("an unset NO_COLOR must keep colour on")
+	}
+}
+
+// TestNoColorReachesTheTableReport checks the wiring rather than the
+// predicate: the table writer must receive the decision NO_COLOR made.
+func TestNoColorReachesTheTableReport(t *testing.T) {
+	countEngineCalls(t)
+	oldDetector, oldTable, oldOutputWriter, oldProgress := terminalDetector, writeTableReport, outputWriterFunc, progressWriterFunc
+	t.Cleanup(func() {
+		terminalDetector, writeTableReport, outputWriterFunc, progressWriterFunc = oldDetector, oldTable, oldOutputWriter, oldProgress
+	})
+	terminalDetector = func(*os.File) bool { return true }
+	progressWriterFunc = func() io.Writer { return io.Discard }
+	outputWriterFunc = func(string) (io.Writer, outputFinalizer, error) {
+		return io.Discard, func(bool) error { return nil }, nil
+	}
+	var coloured []bool
+	writeTableReport = func(_ io.Writer, _ benchmark.Report, options report.TableOptions) error {
+		coloured = append(coloured, options.Color)
+		return nil
+	}
+	for _, value := range []string{"1", ""} {
+		t.Setenv("NO_COLOR", value)
+		config := cliConfigForTest(t)
+		config.format = "table"
+		if err := runBenchmark(context.Background(), config); err != nil {
+			t.Fatalf("NO_COLOR=%q run: %v", value, err)
+		}
+	}
+	if len(coloured) != 2 || coloured[0] || !coloured[1] {
+		t.Fatalf("table colour for NO_COLOR=1 then empty = %v, want [false true]", coloured)
+	}
+}
+
+// TestInertFlagCombinationsWarn covers options a run accepts but whose effect
+// the rest of the command line rules out. They used to be dropped without a
+// word; they are warned about on standard error and otherwise change nothing,
+// because rejecting them would break a wrapper that always passes them.
+func TestInertFlagCombinationsWarn(t *testing.T) {
+	engineCalls := countEngineCalls(t)
+	oldWarningWriter := warningWriterFunc
+	t.Cleanup(func() { warningWriterFunc = oldWarningWriter })
+	var warnings bytes.Buffer
+	warningWriterFunc = func() io.Writer { return &warnings }
+
+	rawWarning := "warning: --raw only adds per-query observations to JSON output; it has no effect on %s output\n"
+	sampleWarning := "warning: --cache-miss-sample has no effect without --cache-miss\n"
+	for _, testCase := range []struct {
+		name     string
+		args     []string
+		warnings string
+	}{
+		{name: "raw with csv", args: []string{"--format", "csv", "--raw"}, warnings: fmt.Sprintf(rawWarning, "csv")},
+		{name: "raw with table", args: []string{"--format", "Table", "--raw"}, warnings: fmt.Sprintf(rawWarning, "table")},
+		{name: "raw with json", args: []string{"--format", "JSON", "--raw"}},
+		{name: "sample without cache-miss", args: []string{"--format", "json", "--cache-miss-sample", "5"}, warnings: sampleWarning},
+		// Given explicitly at its default value, it is still asked for.
+		{name: "default sample without cache-miss", args: []string{"--format", "json", "--cache-miss-sample", "20"}, warnings: sampleWarning},
+		{name: "sample with cache-miss", args: []string{"--format", "json", "--cache-miss", "--cache-miss-sample", "5"}},
+		{name: "neither", args: []string{"--format", "json"}},
+		{name: "both", args: []string{"--format", "csv", "--raw", "--cache-miss-sample", "5"}, warnings: fmt.Sprintf(rawWarning, "csv") + sampleWarning},
+	} {
+		for _, prefix := range [][]string{nil, {"run"}} {
+			t.Run(strings.TrimSpace(strings.Join(prefix, " ")+" "+testCase.name), func(t *testing.T) {
+				warnings.Reset()
+				calls := *engineCalls
+				args := append(append([]string(nil), prefix...),
+					"--no-defaults", "--resolver", "lab=udp://127.0.0.1:53", "--protocol", "udp",
+					"--sample", "1", "--seed", "7", "--type", "A", "--family", "4",
+					"--output", filepath.Join(t.TempDir(), "report.out"))
+				if !slices.Contains(testCase.args, "--cache-miss") {
+					args = append(args, "--domains", cliDomainFile(t))
+				}
+				root := newRootCommand()
+				root.SetArgs(append(args, testCase.args...))
+				if err := root.Execute(); err != nil {
+					t.Fatalf("an inert option must not fail the run: %v", err)
+				}
+				if *engineCalls != calls+1 {
+					t.Fatal("an inert option must not stop the benchmark")
+				}
+				if warnings.String() != testCase.warnings {
+					t.Fatalf("warnings = %q, want %q", warnings.String(), testCase.warnings)
+				}
+			})
+		}
 	}
 }
 

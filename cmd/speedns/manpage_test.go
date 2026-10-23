@@ -118,16 +118,87 @@ func manPageEntries(t *testing.T) map[string]string {
 // at all. Scoping to the section keeps each guard asking the question it means.
 func optionsSection(t *testing.T) string {
 	t.Helper()
-	page := manPage(t)
-	start := strings.Index(page, ".SH OPTIONS")
+	return manPageSection(t, manPage(t), "OPTIONS")
+}
+
+// manPageSection returns the named .SH section of page alone.
+func manPageSection(t *testing.T, page, name string) string {
+	t.Helper()
+	start := strings.Index(page, ".SH "+name+"\n")
 	if start < 0 {
-		t.Fatal("docs/speedns.1 has no OPTIONS section")
+		t.Fatalf("docs/speedns.1 has no %s section", name)
 	}
-	rest := page[start+len(".SH OPTIONS"):]
+	rest := page[start+len(".SH "+name):]
 	if end := strings.Index(rest, "\n.SH "); end >= 0 {
 		return rest[:end]
 	}
 	return rest
+}
+
+// subcommandFlagSections names the section documenting each subcommand that
+// has flags of its own. run shares the root command's flag set, which OPTIONS
+// documents; diff has its own section, whose --format is a different flag
+// from the root one.
+var subcommandFlagSections = map[string]string{"run": "OPTIONS", "diff": "DIFF"}
+
+// TestManPageDocumentsEverySubcommand walks the command tree rather than a
+// hand-kept list, so a new subcommand or a new subcommand flag cannot ship
+// undocumented. The root-only guards above never saw a subcommand: diff was
+// missing from SYNOPSIS and COMMANDS, and its --output from the DIFF section,
+// while every one of them passed.
+func TestManPageDocumentsEverySubcommand(t *testing.T) {
+	page := manPage(t)
+	synopsis := manPageSection(t, page, "SYNOPSIS")
+	commands := manPageSection(t, page, "COMMANDS")
+	for _, command := range newRootCommand().Commands() {
+		if command.Hidden {
+			continue
+		}
+		name := command.Name()
+		// Entries are ".B speedns NAME", optionally followed by arguments.
+		entry := regexp.MustCompile(`(?m)^\.B speedns ` + regexp.QuoteMeta(name) + `( |$)`)
+		if !entry.MatchString(synopsis) {
+			t.Errorf("docs/speedns.1 SYNOPSIS does not show speedns %s", name)
+		}
+		if !entry.MatchString(commands) {
+			t.Errorf("docs/speedns.1 COMMANDS does not describe speedns %s", name)
+		}
+
+		real := make(map[string]*pflag.Flag)
+		command.LocalFlags().VisitAll(func(flag *pflag.Flag) {
+			if !flag.Hidden {
+				real["--"+flag.Name] = flag
+			}
+		})
+		section, documented := subcommandFlagSections[name]
+		if !documented {
+			if len(real) > 0 {
+				t.Errorf("speedns %s has flags but no man-page section is known to document them; add one to subcommandFlagSections", name)
+			}
+			continue
+		}
+		entries := optionEntries(t, manPageSection(t, page, section))
+		for flagName, flag := range real {
+			body, found := entries[flagName]
+			if !found {
+				t.Errorf("docs/speedns.1 %s does not document speedns %s %s", section, name, flagName)
+				continue
+			}
+			// The same rule as TestManPageStatesEveryDefault.
+			switch flag.DefValue {
+			case "", "false", "0", "[]":
+			default:
+				if !strings.Contains(body, flag.DefValue) {
+					t.Errorf("docs/speedns.1 %s does not state the default %q of speedns %s %s", section, flag.DefValue, name, flagName)
+				}
+			}
+		}
+		for flagName := range entries {
+			if real[flagName] == nil {
+				t.Errorf("docs/speedns.1 %s documents %s, which speedns %s does not have", section, flagName, name)
+			}
+		}
+	}
 }
 
 // optionEntries splits a section into one body per documented flag.

@@ -46,7 +46,8 @@ still selects how many of those names are measured. Keep `--sample` at least
 as large as `--cache-miss-sample`, which the default of 100 already is: a
 larger `--sample` simply measures every generated name. A smaller `--sample`
 measures only that many generated names, and the report warns that the corpus
-was truncated.
+was truncated. Without `--cache-miss`, `--cache-miss-sample` has no effect,
+and SpeeDNS says so in a warning on standard error.
 Because each name is asked one question, the corpus size is also the scored
 sample count, and the default of 20 is the minimum the paired confidence
 intervals need. The report labels the corpus mode, zone, and

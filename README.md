@@ -233,6 +233,9 @@ Inspect the bundled resolver catalog without running a benchmark:
 ./speedns resolvers
 ```
 
+It prints one row per profile below a header, with each profile's transports in
+the benchmark order `udp,tcp,doh,dot,doq`.
+
 Compare two saved runs and see what changed about the resolvers themselves:
 
 ```sh
@@ -515,8 +518,9 @@ before using it. Show the source and integrity metadata with:
 ```
 
 The corpus is a pinned Tranco snapshot. Its source, list ID, retrieval date,
-checksum, and attribution note are shipped with the program; benchmarking does
-not download or refresh the list.
+checksum, and attribution note are shipped with the program, and
+`speedns corpus` prints every one of them, the license note included;
+benchmarking does not download or refresh the list.
 
 ## Custom domain lists
 
@@ -546,9 +550,10 @@ It cannot be combined with `--domains` or `--full`. The generated names are a
 corpus that `--sample` still draws from, so keep `--sample` at least as large
 as `--cache-miss-sample`, which the default of 100 already is; a smaller
 `--sample` measures only that many generated names and the report warns that
-the corpus was truncated. Cache-miss results are kept in their own run and
-ranking population; they are never mixed with the normal embedded warm-cache
-corpus.
+the corpus was truncated. Without `--cache-miss`, `--cache-miss-sample` has no
+effect, and SpeeDNS says so in a warning on standard error. Cache-miss results
+are kept in their own run and ranking population; they are never mixed with
+the normal embedded warm-cache corpus.
 
 Because a resolver holds one cache across every transport and address it
 offers, cache-miss mode measures each resolver exactly once and asks each
@@ -613,8 +618,9 @@ generator has, so it survives a JSON reader that parses numbers as doubles.
 ### It never compares latency
 
 Not median, p95, score, rank, or any interval. The difference between two runs
-is dominated by the network path and the time of day, and no field in a report
-records either, so no threshold computed from two reports can bound it. Six
+is dominated by the network path and the time of day. A report records when it
+ran, in `started_at`, but not which path or anycast site answered or how loaded
+they were, so no threshold computed from two reports can bound it. Six
 identical back-to-back runs on one host moved a target's p95 by 248% and its
 score by 50% with nothing changed, while every categorical count stayed
 identical. To compare resolver speed, measure the resolvers together in one
@@ -809,6 +815,10 @@ For scripts and other tools, use JSON or CSV:
 ./speedns --format json --raw --output result-with-samples.json
 ```
 
+`--raw` adds the per-query observations to JSON only. Table and CSV output have
+no place for them, so with either one `--raw` has no effect and SpeeDNS says so
+in a warning on standard error.
+
 `--output` replaces a regular file atomically: the report is written next to
 the destination and renamed over it only when the run succeeds, so a failed
 run leaves the previous file untouched, and the replacement gets the
@@ -926,11 +936,12 @@ scoring, as [METHODOLOGY.md](METHODOLOGY.md) describes.
 
 ### Diff output
 
-`speedns diff` writes a table by default and `--format json` for machines. That
-JSON has its own contract, [`schema/compare-v1.json`](schema/compare-v1.json),
-with its own `schema_version`: a comparison is a different document from a
-report — two run identities, no results, no rankings — so it is not a version
-of `report-v1.json`.
+`speedns diff` writes a table by default and `--format json` for machines; as
+for a run, the format is case-insensitive. That JSON has its own contract,
+[`schema/compare-v1.json`](schema/compare-v1.json), with its own
+`schema_version`: a comparison is a different document from a report — two run
+identities, no results, no rankings — so it is not a version of
+`report-v1.json`.
 
 There is no CSV form for a diff. A comparison is not a per-target row set with
 stable columns, and the report CSV's append-only contract is not forked.
@@ -974,13 +985,18 @@ Useful flags include:
 --concurrency 4    maximum concurrent target preparations, measured DNS exchanges and DNSSEC probes per protocol
 --format table|json|csv
 --output PATH       write output to a file, /dev/null, or a pipe
---no-color          disable terminal colors
+--no-color          disable terminal colors (so does a non-empty NO_COLOR)
 --redact-system     hide local system resolver details in reports
 --dnssec            opt in to DNSSEC probing (DO bit plus two pinned probes)
 --profile-view      show same-resolver transport costs and score confidence
 --assert EXPR       enforce a benchmark condition (repeatable)
 --family 4|6|both|auto  choose resolver address family (default: auto)
 ```
+
+Table output is colored only on an interactive terminal. `--no-color`, an
+`--output` file, or a `NO_COLOR` environment variable set to any non-empty
+value turns color off, following [no-color.org](https://no-color.org); an
+empty `NO_COLOR` leaves it on.
 
 For table runs, SpeeDNS writes progress only to standard error so the report
 stream stays clean. In an interactive terminal it starts with one updating
@@ -1022,8 +1038,9 @@ That caps the log at five lines per phase and protocol. A phase whose totals
 are small or empty still reports its final counters once, and the lines carry
 counters only: no ETA and no resolver addresses.
 
-JSON and CSV runs remain completely silent on standard error. Progress never
-changes benchmark measurements or report contents.
+JSON and CSV runs write no progress, so their standard error carries only
+warnings, such as one about an option the chosen output ignores, and errors.
+Progress never changes benchmark measurements or report contents.
 
 Transport-library diagnostics, such as a Linux QUIC socket-buffer warning, use
 the same standard-error channel. Interactive progress briefly clears its
@@ -1044,7 +1061,9 @@ diagnostic report so you can inspect endpoint failures, resolver errors, and
 warnings. The command returns a distinct non-zero status:
 
 - `0` — comparison completed successfully;
-- `2` — invalid input or configuration;
+- `2` — invalid input or configuration, including a stray argument to a
+  command that takes none, such as `speedns run json` with the dashes of
+  `--format` forgotten, which is refused before anything is measured;
 - `3` — no comparable DNS results were produced;
 - `4` — a requested benchmark assertion failed;
 - `130` — interrupted by the user or operating system.
@@ -1111,11 +1130,14 @@ straight after a reconnect, since neither kind is a scored latency sample.
 compared as usual.
 
 The name may be a profile id, the name given to `--resolver`, or a full target
-id. It is validated against the selected resolvers before any query is sent, so
-a typo exits 2 as invalid input rather than running the benchmark and reporting
-that the resolver lost. Under `--cache-miss` a name that matches only endpoints
-the mode dropped because they share a cache, such as `google-8844`, is invalid
-input (status 2) too, and the error names the endpoint measured instead.
+id. A target id may carry an IPv6 address, as in
+`cloudflare-1111@2606:4700:4700::1111/doh:p95<50ms`: the name ends at the last
+colon, since no metric name contains one. It is validated against the selected
+resolvers before any query is sent, so a typo exits 2 as invalid input rather
+than running the benchmark and reporting that the resolver lost. Under
+`--cache-miss` a name that matches only endpoints the mode dropped because they
+share a cache, such as `google-8844`, is invalid input (status 2) too, and the
+error names the endpoint measured instead.
 
 A protocol whose endpoints all returned no usable DNS response fails the gate
 with status 4, so a completely unreachable transport cannot pass silently.
