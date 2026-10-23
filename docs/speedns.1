@@ -174,7 +174,17 @@ naming a resolver by profile id, by the name given to
 .BR --resolver ,
 or by target id. The check then applies to every measured endpoint of that
 resolver rather than to the winners, which is how a gate expresses "did our
-resolver degrade". An unmatched subject is invalid input.
+resolver degrade". An unmatched subject is invalid input. A subject endpoint
+with no scored latency samples fails every
+.IR median ,
+.IR p95 ,
+and
+.I score
+check whatever the operator, because there is no latency to compare;
+.I usable
+and
+.I success
+are still compared as rates.
 .PP
 Unqualified numeric checks apply to the rank-one target of each ranked protocol;
 .I winner=
@@ -292,10 +302,22 @@ Exit 4 unless a named condition holds. Repeatable. Accepts
 .IR no-dnssec-regression ,
 and
 .IR no-behaviour-change .
-There is no threshold form, because the quantity one would read moves by more
-than any useful threshold between identical runs. Use
+Every condition that does not hold is named on standard error, in the order
+given. There is no threshold form, because the quantity one would read moves by
+more than any useful threshold between identical runs. Use
 .B --assert
 on a run for an absolute bar.
+.IP
+.I no-new-failed-targets
+fails when a target that answered in the baseline answers nothing in the
+current run or newly cannot open a session, and when a target measured only in
+the current run failed every query and is neither local nor interrupted. A
+recovery passes.
+.IP
+When no endpoint was compared, because every target was interrupted, local,
+redacted, or present in only one run, and no condition failed, the exit status
+is 3 and the message counts the targets each reason excluded: a gate that read
+nothing does not pass. A refusal outranks every condition.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -305,11 +327,17 @@ The comparison completed successfully.
 Input or configuration was invalid.
 .TP
 .B 3
-The run finished but produced no comparable DNS results.
+The run finished but produced no comparable DNS results. For
+.BR "speedns diff" ,
+the two runs were not comparable, or a
+.B --require
+gate compared no endpoint.
 .TP
 .B 4
-A requested benchmark assertion did not hold. The ordinary report is written
-before this status is returned.
+A requested benchmark assertion or
+.B diff --require
+condition did not hold. The ordinary report or diff is written before this
+status is returned.
 .TP
 .B 130
 The run was interrupted. SpeeDNS reports

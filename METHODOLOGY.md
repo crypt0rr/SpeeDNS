@@ -432,6 +432,17 @@ degrading on one transport cannot pass on the strength of another. A subject
 that matches no measured endpoint fails rather than passing silently, and the
 name is validated against the selected resolvers before any query is sent.
 
+A subject endpoint with no scored latency samples fails every `median`, `p95`
+and `score` assertion, whatever the operator. Those statistics are only
+computed from scored samples and stay zero without one, so comparing them would
+let a resolver that timed out, refused every query or answered only `SERVFAIL`
+pass an upper bound, and would report a fabricated `0.000ms` against a lower
+one. The structural rule above does not catch this case: it skips local
+resolvers and stays quiet while any other endpoint of the protocol answers.
+`usable` and `success` are rates over every measured query, so they keep their
+ordinary meaning. Unqualified assertions are unaffected, because a rank-one
+target always has scored samples.
+
 Unqualified numeric assertions are evaluated against the rank-one target of
 every protocol that produced a ranking -- one target per protocol, chosen deterministically.
 Confidence-interval tie-group members are deliberately not included: tie
@@ -530,3 +541,24 @@ responses, which are decided by a plurality vote over the other targets present
 -- a property of the cohort rather than of the resolver. Every suppression is
 named in the output; silence would leave a reader unable to tell "nothing
 changed" from "this was not checked".
+
+The `--require` conditions read the findings, so they inherit every
+suppression. A gate that measured and failed exits 4; a gate that could not
+evaluate exits 3 and never 0. A refused comparison is the first case of the
+second kind. The other is a comparable pair in which no endpoint was compared
+because every target was incomplete on either side, local, redacted, or
+present in only one run. Every condition then reads an empty set of paired
+findings, so a pass would describe nothing, and the gate exits 3 with a count
+of the targets each reason excluded. A condition that fails on such a pair
+still exits 4, because a target missing from one run is a real finding that
+needs no pairing. Every condition that does not hold is reported, in the order
+given, rather than only the first.
+
+`no-new-failed-targets` asks whether the current run introduced a failed
+target. The findings it reads are two-way, because a recovery is a behaviour
+change. The condition is not two-way: it fails only when a target with
+successes in the baseline has none in the current run, when a target that
+opened in the baseline cannot open now, or when a target measured only in the
+current run failed every query and is neither local nor interrupted. A recovery
+passes, since a baseline saved during an outage would otherwise fail the gate
+exactly when the resolver came back.

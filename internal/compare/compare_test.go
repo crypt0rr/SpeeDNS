@@ -362,6 +362,92 @@ func TestRequireEvaluatesNamedConditions(t *testing.T) {
 	}
 }
 
+// TestNoNewFailedTargetsReadsDirection pins #230. OPEN and FAILED findings are
+// reported both ways, because a recovery is a behaviour change; the gate must
+// not read them both ways, or a baseline saved during an outage fails CI the
+// moment the resolver comes back. A dead target that only the current run has
+// is a failure the run introduced, unless it is local or interrupted.
+func TestNoNewFailedTargetsReadsDirection(t *testing.T) {
+	dead := func(result *Result) {
+		result.Stats.Successes, result.Stats.UsableResponses, result.Stats.Answers, result.Stats.Scored = 0, 0, 0, 0
+		result.Stats.RCodeCounts = map[string]int{}
+	}
+	added := func(change func(*Result)) func(*Report, *Report) {
+		return func(_, current *Report) {
+			extra := baseReport("").Results[0]
+			extra.Target = Target{ID: "b@9.9.9.9/udp", Address: "9.9.9.9", Protocol: "udp"}
+			change(&extra)
+			current.Results = append(current.Results, extra)
+		}
+	}
+	for _, testCase := range []struct {
+		name   string
+		mutate func(baseline, current *Report)
+		// finding is a code the diff must still report, so the direction is
+		// read by the gate rather than dropped from the findings.
+		finding string
+		detail  string // empty means the condition passes
+	}{
+		{name: "recovery from dead", mutate: func(b, _ *Report) { dead(&b.Results[0]) }, finding: "FAILED"},
+		{name: "open error cleared", mutate: func(b, _ *Report) {
+			dead(&b.Results[0])
+			b.Results[0].OpenError = "dial udp: i/o timeout"
+		}, finding: "OPEN"},
+		{name: "open error cleared while still failing", mutate: func(b, c *Report) {
+			dead(&b.Results[0])
+			dead(&c.Results[0])
+			b.Results[0].OpenError = "dial udp: i/o timeout"
+		}, finding: "OPEN"},
+		{name: "dead in both runs", mutate: func(b, c *Report) { dead(&b.Results[0]); dead(&c.Results[0]) }},
+		{name: "removed target is not a new failure", mutate: func(_, c *Report) {
+			c.Results[0].Target.ID = "b@9.9.9.9/udp"
+		}, finding: "PRESENCE"},
+		{name: "healthy added target", mutate: added(func(*Result) {}), finding: "PRESENCE"},
+		{name: "dead added local target", mutate: added(func(r *Result) {
+			dead(r)
+			r.Target.Local = true
+		}), finding: "PRESENCE"},
+		{name: "dead added interrupted target", mutate: added(func(r *Result) {
+			dead(r)
+			r.Incomplete = true
+		}), finding: "PRESENCE"},
+		{name: "healthy to dead", mutate: func(_, c *Report) { dead(&c.Results[0]) },
+			finding: "FAILED", detail: "a@1.1.1.1/udp: successes 40 -> 0"},
+		{name: "open error appeared", mutate: func(_, c *Report) { c.Results[0].OpenError = "connection refused" },
+			finding: "OPEN", detail: "a@1.1.1.1/udp: opened -> connection refused"},
+		{name: "dead added target", mutate: added(dead),
+			finding: "PRESENCE", detail: "b@9.9.9.9/udp: only in the current run, with successes 0 of 40"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			baseline, current := baseReport("a.json"), baseReport("b.json")
+			testCase.mutate(&baseline, &current)
+			diff := Compare(baseline, current)
+			if testCase.finding != "" {
+				reported := false
+				for _, finding := range diff.Findings {
+					reported = reported || finding.Code == testCase.finding
+				}
+				if !reported {
+					t.Fatalf("the diff must still report %s: %#v", testCase.finding, diff.Findings)
+				}
+			}
+			results, err := Require(diff, []string{"no-new-failed-targets"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if testCase.detail == "" {
+				if !results[0].Passed {
+					t.Fatalf("must pass, failed with %q", results[0].Detail)
+				}
+				return
+			}
+			if results[0].Passed || results[0].Detail != testCase.detail {
+				t.Fatalf("result = %#v, want a failure with %q", results[0], testCase.detail)
+			}
+		})
+	}
+}
+
 // TestOutputNeverNamesALatencyStatistic is the claim boundary, enforced.
 // Latency is the one thing this feature must never report, in any format.
 func TestOutputNeverNamesALatencyStatistic(t *testing.T) {

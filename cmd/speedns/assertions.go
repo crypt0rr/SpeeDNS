@@ -300,6 +300,18 @@ func subjectAssertionReasons(report benchmark.Report, check assertion) []string 
 			continue
 		}
 		matched = true
+		// With no scored sample, median, p95 and score keep their zero value
+		// rather than measuring anything, so comparing them would let a
+		// resolver that timed out, refused or answered only SERVFAIL pass an
+		// upper bound and print p95=0.000ms against a lower one. A missing
+		// measurement fails whatever the operator. Only this path needs it: a
+		// rank-one winner always has scored samples, while deadProtocols skips
+		// a local subject and stays quiet while any peer on its protocol is
+		// alive.
+		if isLatencyMetric(check.metric) && result.Stats.Scored == 0 {
+			reasons = append(reasons, fmt.Sprintf("%s: %s has no scored latency samples", check.raw, result.Target.ID()))
+			continue
+		}
 		actual, ok := assertionMetricValue(result, check.metric)
 		if !ok || !assertionComparison(actual, check.operator, check.value) {
 			reasons = append(reasons, fmt.Sprintf("%s: %s has %s=%s",
@@ -396,6 +408,12 @@ func assertionMetricValue(result benchmark.TargetResult, metric string) (float64
 	default:
 		return 0, false
 	}
+}
+
+// isLatencyMetric reports whether metric is read from scored latency samples,
+// as opposed to the usable and success rates every measured query counts in.
+func isLatencyMetric(metric string) bool {
+	return metric == "median" || metric == "p95" || metric == "score"
 }
 
 func assertionComparison(actual float64, operator string, expected float64) bool {

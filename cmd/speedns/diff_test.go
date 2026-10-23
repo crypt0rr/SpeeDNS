@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/crypt0rr/SpeeDNS/internal/compare"
 )
 
 // writeDiffFixture writes a minimal comparable report and returns its path.
@@ -237,3 +239,194 @@ func TestDiffOutputFileFailures(t *testing.T) {
 type failingDiffWriter struct{}
 
 func (failingDiffWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+// diffTarget is one results[] entry for writeDiffFixture: a healthy UDP target
+// unless a change says otherwise.
+func diffTarget(id string, changes ...func(result, stats map[string]any)) any {
+	stats := map[string]any{
+		"total": 40, "successes": 40, "usable_responses": 40, "answers": 20, "scored": 40,
+		"rcode_counts": map[string]int{"NOERROR": 40},
+	}
+	result := map[string]any{
+		"target": map[string]any{"id": id, "address": "192.0.2.1", "protocol": "udp"},
+		"status": "qualified",
+		"stats":  stats,
+	}
+	for _, change := range changes {
+		change(result, stats)
+	}
+	return result
+}
+
+func deadDiffTarget(_, stats map[string]any) {
+	stats["successes"], stats["usable_responses"], stats["answers"], stats["scored"] = 0, 0, 0, 0
+	stats["rcode_counts"] = map[string]int{}
+}
+
+func incompleteDiffTarget(result, _ map[string]any) { result["incomplete"] = true }
+
+func localDiffTarget(result, _ map[string]any) { result["target"].(map[string]any)["local"] = true }
+
+// TestDiffRequireFailsClosed pins #230 end to end through the exit status, the
+// only signal a CI gate reads: a gate that compared nothing exits 3 rather
+// than passing, a recovery is not a new failure, and every failed condition is
+// named in the order the flags gave them.
+func TestDiffRequireFailsClosed(t *testing.T) {
+	reportWith := func(name string, results ...any) string {
+		return writeDiffFixture(t, name, func(d map[string]any) { d["results"] = results })
+	}
+	for _, testCase := range []struct {
+		name              string
+		baseline, current []any
+		required          []string
+		exit              int
+		// message is the exact error text; empty when the exit is 0.
+		message string
+	}{
+		{
+			name:     "every current target incomplete",
+			baseline: []any{diffTarget("a@1.1.1.1/udp"), diffTarget("b@9.9.9.9/udp")},
+			current: []any{
+				diffTarget("a@1.1.1.1/udp", incompleteDiffTarget, deadDiffTarget),
+				diffTarget("b@9.9.9.9/udp", incompleteDiffTarget),
+			},
+			required: []string{"no-new-failed-targets"},
+			exit:     3,
+			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (2 incomplete-target)",
+		},
+		{
+			name:     "incomplete baseline",
+			baseline: []any{diffTarget("a@1.1.1.1/udp", incompleteDiffTarget)},
+			current:  []any{diffTarget("a@1.1.1.1/udp")},
+			required: []string{"no-behaviour-change"},
+			exit:     3,
+			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (1 incomplete-target)",
+		},
+		{
+			name:     "every target local or redacted",
+			baseline: []any{diffTarget("stub@127.0.0.1/udp", localDiffTarget), diffTarget("system-redacted-1")},
+			current:  []any{diffTarget("stub@127.0.0.1/udp", localDiffTarget), diffTarget("system-redacted-1", deadDiffTarget)},
+			required: []string{"no-new-failed-targets", "target-set-identical"},
+			exit:     3,
+			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (1 local-position, 1 redacted-identity)",
+		},
+		{
+			// Disjoint target sets compare nothing; a condition that passes
+			// over them still read nothing, and the summary says why.
+			name:     "only unpaired targets",
+			baseline: []any{diffTarget("a@1.1.1.1/udp")},
+			current:  []any{diffTarget("b@9.9.9.9/udp")},
+			required: []string{"no-new-failed-targets"},
+			exit:     3,
+			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (2 present in only one run)",
+		},
+		{
+			name:     "neither run has a target",
+			required: []string{"no-behaviour-change"},
+			exit:     3,
+			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (neither run has a target)",
+		},
+		{
+			// A PRESENCE failure needs no pairing, so it is a real failure
+			// and keeps status 4 even though nothing was compared.
+			name:     "a presence failure stands without a comparison",
+			baseline: []any{diffTarget("a@1.1.1.1/udp")},
+			current:  []any{diffTarget("b@9.9.9.9/udp")},
+			required: []string{"no-new-failed-targets", "no-removed-targets"},
+			exit:     4,
+			message:  "assertion failed: --require no-removed-targets: a@1.1.1.1/udp is absent from the current run",
+		},
+		{
+			// Without --require the diff is a report, not a gate.
+			name:     "no gate, no refusal",
+			baseline: []any{diffTarget("a@1.1.1.1/udp", incompleteDiffTarget)},
+			current:  []any{diffTarget("a@1.1.1.1/udp")},
+		},
+		{
+			name:     "recovery",
+			baseline: []any{diffTarget("a@1.1.1.1/udp", deadDiffTarget)},
+			current:  []any{diffTarget("a@1.1.1.1/udp")},
+			required: []string{"no-new-failed-targets"},
+		},
+		{
+			name: "open error cleared",
+			baseline: []any{diffTarget("a@1.1.1.1/udp", deadDiffTarget, func(result, _ map[string]any) {
+				result["open_error"] = "dial udp: i/o timeout"
+			})},
+			current:  []any{diffTarget("a@1.1.1.1/udp")},
+			required: []string{"no-new-failed-targets"},
+		},
+		{
+			name:     "healthy to dead",
+			baseline: []any{diffTarget("a@1.1.1.1/udp")},
+			current:  []any{diffTarget("a@1.1.1.1/udp", deadDiffTarget)},
+			required: []string{"no-new-failed-targets"},
+			exit:     4,
+			message:  "assertion failed: --require no-new-failed-targets: a@1.1.1.1/udp: successes 40 -> 0",
+		},
+		{
+			name:     "new dead target only in the current run",
+			baseline: []any{diffTarget("a@1.1.1.1/udp")},
+			current:  []any{diffTarget("a@1.1.1.1/udp"), diffTarget("b@9.9.9.9/udp", deadDiffTarget)},
+			required: []string{"no-new-failed-targets"},
+			exit:     4,
+			message:  "assertion failed: --require no-new-failed-targets: b@9.9.9.9/udp: only in the current run, with successes 0 of 40",
+		},
+		{
+			name:     "two failing conditions in flag order",
+			baseline: []any{diffTarget("a@1.1.1.1/udp"), diffTarget("b@9.9.9.9/udp")},
+			current:  []any{diffTarget("a@1.1.1.1/udp", deadDiffTarget)},
+			required: []string{"no-removed-targets", "no-dnssec-regression", "no-new-failed-targets"},
+			exit:     4,
+			message: "assertion failed: --require no-removed-targets: b@9.9.9.9/udp is absent from the current run; " +
+				"--require no-new-failed-targets: a@1.1.1.1/udp: successes 40 -> 0",
+		},
+		{
+			name:     "two failing conditions in the other order",
+			baseline: []any{diffTarget("a@1.1.1.1/udp"), diffTarget("b@9.9.9.9/udp")},
+			current:  []any{diffTarget("a@1.1.1.1/udp", deadDiffTarget)},
+			required: []string{"no-new-failed-targets", "no-removed-targets"},
+			exit:     4,
+			message: "assertion failed: --require no-new-failed-targets: a@1.1.1.1/udp: successes 40 -> 0; " +
+				"--require no-removed-targets: b@9.9.9.9/udp is absent from the current run",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := runDiff(&out, reportWith("baseline.json", testCase.baseline...),
+				reportWith("current.json", testCase.current...), "table", "", testCase.required)
+			if got := exitCodeForError(err); got != testCase.exit {
+				t.Fatalf("exit = %d, want %d (error %v)", got, testCase.exit, err)
+			}
+			if testCase.exit == 0 {
+				return
+			}
+			if err.Error() != testCase.message {
+				t.Fatalf("error = %q\nwant    %q", err, testCase.message)
+			}
+			if testCase.exit == 3 && !errors.Is(err, compare.ErrNothingCompared) {
+				t.Fatalf("a gate with nothing compared must be ErrNothingCompared: %v", err)
+			}
+			// The diff is written before any verdict, so the reader can see
+			// what was and was not compared.
+			if !strings.Contains(out.String(), "endpoint(s) compared.") {
+				t.Fatalf("the diff must be written before the gate's verdict:\n%s", out.String())
+			}
+		})
+	}
+
+	// A refusal outranks every condition, including failing ones and a diff
+	// that would compare nothing: the runs measured different things.
+	t.Run("a refusal outranks failed conditions", func(t *testing.T) {
+		baseline := reportWith("baseline.json", diffTarget("a@1.1.1.1/udp"))
+		current := writeDiffFixture(t, "refused.json", func(d map[string]any) {
+			d["run"].(map[string]any)["seed"] = 99
+			d["results"] = []any{diffTarget("b@9.9.9.9/udp", deadDiffTarget, incompleteDiffTarget)}
+		})
+		err := runDiff(&bytes.Buffer{}, baseline, current, "table", "",
+			[]string{"no-new-failed-targets", "target-set-identical", "no-removed-targets"})
+		if !errors.Is(err, compare.ErrRunsNotComparable) || errors.Is(err, ErrAssertionsFailed) || exitCodeForError(err) != 3 {
+			t.Fatalf("a refused diff must exit 3 as not comparable, got %v (%d)", err, exitCodeForError(err))
+		}
+	})
+}
