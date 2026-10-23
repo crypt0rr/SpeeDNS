@@ -45,6 +45,8 @@ import (
 // possibly after its number has been reused by another file.
 var openOutputDescriptor = func(descriptor int, path string) (outputDescriptorHandle, bool, error) {
 	if flags, err := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0); err == nil && flags&unix.FD_CLOEXEC != 0 {
+		// Reported exactly as a closed descriptor would be, Op included: to the
+		// caller a number it never handed over is not open, whoever holds it.
 		return nil, false, &os.PathError{Op: "dup", Path: path, Err: syscall.EBADF}
 	}
 	// The fork lock keeps a concurrent fork from inheriting the duplicate

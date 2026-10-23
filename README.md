@@ -758,7 +758,7 @@ receives the report. The descriptor must be one SpeeDNS inherited from the
 shell or whatever started it, must be open for writing and must not be a
 directory, so `--output /dev/fd/0 < file` is refused. A number nobody handed
 to SpeeDNS counts as closed even when SpeeDNS uses it internally: the Go
-runtime holds descriptors of its own, usually 3 and 4, so `--output /dev/fd/3`
+runtime holds descriptors of its own, such as 3 (and 4 on Linux), so `--output /dev/fd/3`
 without a `3>` redirection fails before the first query instead of writing the
 report into them. Descriptors 0, 1 and 2 are never found closed: the Go
 runtime opens any of them that is closed at startup on `/dev/null`, so
