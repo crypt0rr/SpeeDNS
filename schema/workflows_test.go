@@ -342,6 +342,13 @@ func renovateTracks(t *testing.T, managers []renovateCustomManager, file, text, 
 // command, quoted in single quotes as README.md and the workflows write it.
 var cosignIdentity = regexp.MustCompile(`--(?:certificate-identity-regexp|cert-identity-regex) '([^']+)'`)
 
+// cosignIssuer is the certificate issuer argument of a cosign command.
+var cosignIssuer = regexp.MustCompile(`--certificate-oidc-issuer[ =](\S+)`)
+
+// githubActionsIssuer issues the OIDC tokens a GitHub-hosted workflow signs
+// with, and so every SpeeDNS release signature's certificate.
+const githubActionsIssuer = "https://token.actions.githubusercontent.com"
+
 // TestHomebrewWorkflowVerifiesChecksumsBeforeTheCask guards the order that
 // makes the Homebrew channel as trustworthy as the documented manual check.
 // Every sha256 in the cask comes from the release's checksums.txt, an asset
@@ -356,8 +363,12 @@ func TestHomebrewWorkflowVerifiesChecksumsBeforeTheCask(t *testing.T) {
 	if !ok {
 		t.Fatal("homebrew.yml has no publish job")
 	}
-	if !strings.Contains(job.If, "github.event.release.prerelease") {
-		t.Errorf("homebrew.yml publish job does not skip prerelease events: if: %q", job.If)
+	// The exact expression, not a mention of the field: the inverted
+	// `if: ${{ github.event.release.prerelease }}` names it just as well and
+	// would publish only prereleases.
+	if job.If != homebrewSkipsPrereleases {
+		t.Errorf("homebrew.yml publish job has if: %q, want %q so that prerelease events are skipped and dispatches are not",
+			job.If, homebrewSkipsPrereleases)
 	}
 
 	installer, verify, generate := -1, -1, -1
@@ -405,5 +416,159 @@ func TestHomebrewWorkflowVerifiesChecksumsBeforeTheCask(t *testing.T) {
 		if identity[1] != used[1] {
 			t.Errorf("README.md documents signer identity %q but homebrew.yml requires %q; the policies must match", identity[1], used[1])
 		}
+	}
+
+	// cosign refuses a keyless bundle when no issuer is given, but the
+	// identity regex alone says nothing about who issued the certificate.
+	// Both halves of the policy are pinned, in README.md and here alike.
+	documentedIssuers := cosignIssuer.FindAllStringSubmatch(string(readme), -1)
+	usedIssuers := cosignIssuer.FindAllStringSubmatch(job.Steps[verify].Run, -1)
+	if len(documentedIssuers) == 0 || len(usedIssuers) == 0 {
+		t.Errorf("README.md and homebrew.yml must both pass --certificate-oidc-issuer %s; found %d and %d",
+			githubActionsIssuer, len(documentedIssuers), len(usedIssuers))
+	}
+	for _, issuer := range append(documentedIssuers, usedIssuers...) {
+		if issuer[1] != githubActionsIssuer {
+			t.Errorf("cosign is told to accept certificates from issuer %q, want %q", issuer[1], githubActionsIssuer)
+		}
+	}
+}
+
+// homebrewSkipsPrereleases is the publish job's if:. The event-name clause
+// admits dispatches, which carry no release payload.
+const homebrewSkipsPrereleases = "${{ github.event_name != 'release' || !github.event.release.prerelease }}"
+
+// homebrewConcurrencyGroup puts every run that can write the tap in one group
+// and each prerelease event in a group of its own. Concurrency is resolved for
+// the run before the publish job's if: skips a prerelease, so in the shared
+// group that no-op run would take the single pending slot and cancel a stable
+// run already waiting there. Compared exactly, because swapping the operands
+// or dropping the event-name clause still mentions every part.
+const homebrewConcurrencyGroup = "${{ (github.event_name == 'release' && github.event.release.prerelease) && " +
+	"format('homebrew-prerelease-{0}', github.run_id) || 'homebrew-tap' }}"
+
+// TestHomebrewWorkflowSerialisesTapWrites keeps two publications from
+// interleaving their read and write of the tap's single cask, without letting
+// a skipped prerelease run displace a stable one.
+func TestHomebrewWorkflowSerialisesTapWrites(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "homebrew.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Concurrency struct {
+			Group            string `yaml:"group"`
+			CancelInProgress any    `yaml:"cancel-in-progress"`
+		} `yaml:"concurrency"`
+	}
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		t.Fatalf("homebrew.yml: %v", err)
+	}
+	if document.Concurrency.Group != homebrewConcurrencyGroup {
+		t.Errorf("homebrew.yml concurrency group is %q, want %q", document.Concurrency.Group, homebrewConcurrencyGroup)
+	}
+	// cancel-in-progress would let a newer release stop a publication part
+	// way, after it wrote the tap but before it validated what it wrote.
+	if cancel := fmt.Sprint(document.Concurrency.CancelInProgress); cancel != "false" {
+		t.Errorf("homebrew.yml sets cancel-in-progress %s, want false", cancel)
+	}
+}
+
+// releaseTagCheck extracts the expression a valid_release_tag() function
+// matches, together with the C locale that keeps [0-9] to the ASCII digits.
+var releaseTagCheck = regexp.MustCompile(`valid_release_tag\(\) \{\s*local LC_ALL=C\s*\[\[ "\$1" =~ (\S+) \]\]\s*\}`)
+
+// TestReleaseTagShapeIsTheSameEverywhere keeps the copies of the release tag
+// check from drifting apart. Each release script is standalone, so each
+// carries its own valid_release_tag(), and release.yml checks the same shape
+// before it builds. A copy that accepted more than the others would let a tag
+// through one step that a later step, or the cask's Ruby string, then trips
+// over.
+func TestReleaseTagShapeIsTheSameEverywhere(t *testing.T) {
+	sources := map[string]string{}
+	scripts, err := filepath.Glob(filepath.Join("..", "scripts", "*.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, script := range scripts {
+		content, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(content), "valid_release_tag()") {
+			sources["scripts/"+filepath.Base(script)] = string(content)
+		}
+	}
+	for _, step := range releaseWorkflow(t).Jobs["release"].Steps {
+		if strings.Contains(step.Run, "valid_release_tag()") {
+			sources[".github/workflows/release.yml"] = step.Run
+		}
+	}
+	for _, required := range []string{
+		".github/workflows/release.yml",
+		"scripts/homebrew-cask.sh",
+		"scripts/publish-homebrew-cask.sh",
+		"scripts/validate-homebrew-tap.sh",
+		"scripts/validate-published-release.sh",
+	} {
+		if _, ok := sources[required]; !ok {
+			t.Errorf("%s no longer defines valid_release_tag(); update this test if the check moved", required)
+		}
+	}
+
+	for source, content := range sources {
+		match := releaseTagCheck.FindStringSubmatch(content)
+		if match == nil {
+			t.Errorf("%s defines valid_release_tag() without `local LC_ALL=C` and a single [[ =~ ]] test", source)
+			continue
+		}
+		if match[1] != releaseTagShape {
+			t.Errorf("%s checks release tags against %s, want %s", source, match[1], releaseTagShape)
+		}
+	}
+
+	// The shape itself. Bash's ERE and Go's RE2 agree on this expression, so
+	// these are the tags the scripts accept and refuse.
+	shape := regexp.MustCompile(releaseTagShape)
+	for _, tag := range []string{"v0.6.9", "v10.20.30", "v1.0.0-rc.1", "v1.0.0-beta-2"} {
+		if !shape.MatchString(tag) {
+			t.Errorf("release tag shape refuses %q", tag)
+		}
+	}
+	for _, tag := range []string{"v0.7", "0.7.0", "v0.7.0 ", "v0.7.0;id", "v0.7.0#{`id`}", `v0.7.0";system("id");"`, "v1.0.0-rc_1", "v1.0.0-"} {
+		if shape.MatchString(tag) {
+			t.Errorf("release tag shape accepts %q", tag)
+		}
+	}
+}
+
+// releaseTagShape is vMAJOR.MINOR.PATCH[-PRERELEASE].
+const releaseTagShape = `^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`
+
+// TestReleaseWorkflowExplainsAMissingTagSelectionScript covers a release
+// that runs this workflow against an older tree. A dispatch runs release.yml
+// from the branch it starts on but every script from the checked-out tag, and
+// tags cut before scripts/previous-stable-tag.sh existed do not have it. The
+// step must say so before it runs the script, not stop with a bare exit 127.
+func TestReleaseWorkflowExplainsAMissingTagSelectionScript(t *testing.T) {
+	const invocation = "bash scripts/previous-stable-tag.sh"
+	const guard = "[[ ! -f scripts/previous-stable-tag.sh ]]"
+	found := false
+	for _, step := range releaseWorkflow(t).Jobs["release"].Steps {
+		at := strings.Index(step.Run, invocation)
+		if at < 0 {
+			continue
+		}
+		found = true
+		guarded := strings.Index(step.Run, guard)
+		if guarded < 0 || guarded > at {
+			t.Errorf("release.yml runs %s without first checking %s:\n%s", invocation, guard, step.Run)
+		}
+		if !strings.Contains(step.Run, "RELEASE_CHECKLIST.md") {
+			t.Errorf("release.yml does not point a missing previous-stable-tag.sh at RELEASE_CHECKLIST.md:\n%s", step.Run)
+		}
+	}
+	if !found {
+		t.Fatal("release.yml no longer runs scripts/previous-stable-tag.sh; update this test")
 	}
 }

@@ -76,9 +76,14 @@ done
 printf '%s %s %s%s\n' "${method}" "${endpoint}" "${jq_filter}" "${sha_field}" >>"${FAKE_GH_LOG}"
 
 # GitHub wraps the base64 in a contents response every 60 characters, so the
-# fake does too rather than serving a single line no real response has.
+# fake does too rather than serving a single line no real response has. A
+# cask too large to pass through the environment is read from a file.
 serve_cask_content() {
-	printf '%s\n' "${FAKE_CASK_CONTENT_B64}" | fold -w 60
+	if [[ -n "${FAKE_CASK_CONTENT_B64_FILE:-}" ]]; then
+		fold -w 60 <"${FAKE_CASK_CONTENT_B64_FILE}"
+	else
+		printf '%s\n' "${FAKE_CASK_CONTENT_B64}" | fold -w 60
+	fi
 }
 
 case "${endpoint}" in
@@ -244,6 +249,28 @@ for case_spec in 'v0.6.9 1' 'v0.7.0 0' 'v0.7.1 0' 'v0.10.0 0'; do
 		exit 1
 	fi
 done
+
+# A current cask larger than a pipe buffer, with its version line near the
+# top. The publisher must read past that line: under pipefail, a reader that
+# stopped at it would fail the printf feeding it with SIGPIPE and abort the
+# publication of a perfectly good upgrade.
+large_cask_b64="${fixture_dir}/large-cask.b64"
+{
+	printf '%s\n' '# generated fixture' 'cask "speedns" do' '  version "0.7.0"'
+	awk 'BEGIN { for (i = 0; i < 32768; i++) print "  # padding that outgrows any pipe buffer" }'
+	printf '%s\n' 'end'
+} | base64 | tr -d '\n' >"${large_cask_b64}"
+printf '\n' >>"${large_cask_b64}"
+: >"${fake_log}"
+env "${common_env[@]}" FAKE_TAP_MODE=clean \
+	FAKE_CASK_CONTENT_B64_FILE="${large_cask_b64}" \
+	bash "${root_dir}/scripts/publish-homebrew-cask.sh" "${cask_file}" \
+	v0.7.1 example/tap
+if ! grep -Fqx 'PUT repos/example/tap/contents/Casks/speedns.rb .commit.sha sha=fixture-sha' "${fake_log}"; then
+	echo "v0.7.1 over a large 0.7.0 cask did not update the cask in place" >&2
+	cat "${fake_log}" >&2
+	exit 1
+fi
 
 # A cask with no readable version cannot be ordered, so it is not replaced
 # unless the override is set.

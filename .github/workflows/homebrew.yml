@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing published v* tag
+        description: Existing published stable vMAJOR.MINOR.PATCH tag
         required: true
         type: string
       allow_downgrade:
@@ -16,12 +16,20 @@ on:
         default: false
         type: boolean
 
-# One group for every tag, not one per tag: the tap holds a single cask, so two
-# runs for different releases must not interleave their read and write of it.
-# GitHub keeps at most one run pending per group and cancels an older pending
-# run when a newer one arrives; re-dispatch the newest tag if that happens.
+# One group for every run that can write the tap, not one per tag: the tap
+# holds a single cask, so two runs for different releases must not interleave
+# their read and write of it. GitHub keeps at most one run pending per group
+# and cancels an older pending run when a newer one arrives; re-dispatch the
+# newest tag if that happens.
+#
+# Prerelease events get a group of their own. Concurrency applies to the whole
+# run before the publish job's if: skips it, so in the shared group a
+# prerelease published while a stable run waits would cancel that stable run
+# and then do nothing, leaving its cask unpublished. A dispatch carries no
+# release payload and always joins the shared group;
+# validate-published-release.sh refuses a prerelease tag there.
 concurrency:
-  group: homebrew-tap
+  group: ${{ (github.event_name == 'release' && github.event.release.prerelease) && format('homebrew-prerelease-{0}', github.run_id) || 'homebrew-tap' }}
   cancel-in-progress: false
 
 permissions:

@@ -67,8 +67,10 @@ if current_blob="$(GH_TOKEN="${HOMEBREW_TAP_TOKEN}" gh api "repos/${repository}/
 	current_found=true
 	current_sha="$(printf '%s\n' "${current_blob}" | sed -n 1p)"
 	current_cask="$(printf '%s\n' "${current_blob}" | sed 1d | tr -d '\n' | base64 --decode)"
+	# awk reads to the end rather than exiting at the first match: under
+	# pipefail, an early exit could fail printf with SIGPIPE on a large cask.
 	current_version="$(printf '%s\n' "${current_cask}" |
-		awk -F'"' '/^[[:space:]]*version "[^"]*"[[:space:]]*$/ { print $2; exit }')"
+		awk -F'"' '!found && /^[[:space:]]*version "[^"]*"[[:space:]]*$/ { print $2; found = 1 }')"
 fi
 
 # Homebrew upgrades whenever the tap's version differs from the installed one,

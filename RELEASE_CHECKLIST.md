@@ -17,8 +17,10 @@ and verification instructions are in `README.md`.
 1. Merge the release candidate PR.
 2. Confirm CI, CodeQL, Go security, GoReleaser snapshot, and native macOS
    artifact smoke checks are green.
-3. Create and push an annotated `v*` tag from the intended commit, or start the
-   release workflow manually with an existing `v*` tag.
+3. Create and push an annotated `vMAJOR.MINOR.PATCH` tag (or
+   `vMAJOR.MINOR.PATCH-PRERELEASE` for a prerelease) from the intended commit,
+   or start the release workflow manually with an existing tag of that shape.
+   The workflow rejects any other `v*` tag before it builds anything.
 4. Approve the protected `release` environment when GitHub requests it.
 5. Review the generated release evidence, then publish the GitHub draft from
    the release page. Publishing triggers the Homebrew workflow; wait for that
@@ -47,3 +49,14 @@ below it, v0.5.2. Its Homebrew run fails rather than move the tap back to the
 older version. To publish an older release to the tap deliberately, for example
 after withdrawing a newer one, run the Homebrew workflow manually with the tag
 and `allow_downgrade` selected.
+
+The release workflow runs the scripts in the tag's own tree. A tag push also
+runs the tag's own `release.yml`; a dispatch runs `release.yml` from the branch
+it is started on, but still checks the tag out. The previous-tag choice above
+arrived in v0.6.9, so a maintenance branch cut before v0.6.9 must first
+cherry-pick it: the "Select the previous tag for release notes" step in
+`release.yml` and `scripts/previous-stable-tag.sh`. Without them, a tag push
+still measures the notes from the highest stable tag overall (v0.6.1..v0.5.3),
+and a dispatch from `main` fails at that step because the tag has no
+`scripts/previous-stable-tag.sh`. A dispatch from `main` that re-runs any
+stable tag up to v0.6.8 fails at the same step, for the same reason.
