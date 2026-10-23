@@ -317,20 +317,23 @@ func TestFairProgressEventsCoverPreparationAndFailedExchanges(t *testing.T) {
 	if opens != 1 || len(result) != 1 || len(result[0].Observations) != len(queries) {
 		t.Fatalf("fair progress fixture opens/results = %d/%d observations %d", opens, len(result), len(result[0].Observations))
 	}
-	if len(events) != 6 {
-		t.Fatalf("fair progress events = %#v, want initial/preparation, measuring rounds, and complete", events)
+	if len(events) != 7 {
+		t.Fatalf("fair progress events = %#v, want initial/cold/preparation, measuring rounds, and complete", events)
 	}
 	if events[0].Phase != ProgressPreparing || events[0].TargetsCompleted != 0 || events[0].TargetsTotal != 1 {
 		t.Fatalf("initial preparation event = %#v", events[0])
 	}
-	if events[1].Phase != ProgressPreparing || events[1].TargetsCompleted != 1 || events[1].TargetsTotal != 1 {
-		t.Fatalf("completed preparation event = %#v", events[1])
+	if events[1].Phase != ProgressPreparing || events[1].ColdCompleted != 1 || events[1].TargetsCompleted != 0 || events[1].TargetsTotal != 1 {
+		t.Fatalf("cold preparation event = %#v", events[1])
 	}
-	if events[2].Phase != ProgressMeasuring || events[2].ExchangesCompleted != 0 || events[2].ExchangesTotal != 2 {
-		t.Fatalf("initial measuring event = %#v", events[2])
+	if events[2].Phase != ProgressPreparing || events[2].TargetsCompleted != 1 || events[2].TargetsTotal != 1 {
+		t.Fatalf("completed preparation event = %#v", events[2])
 	}
-	if events[4].ExchangesCompleted != 2 || events[4].ExchangesTotal != 2 {
-		t.Fatalf("failed exchanges were not counted as completed work = %#v", events[4])
+	if events[3].Phase != ProgressMeasuring || events[3].ExchangesCompleted != 0 || events[3].ExchangesTotal != 2 {
+		t.Fatalf("initial measuring event = %#v", events[3])
+	}
+	if events[5].ExchangesCompleted != 2 || events[5].ExchangesTotal != 2 {
+		t.Fatalf("failed exchanges were not counted as completed work = %#v", events[5])
 	}
 	last := events[len(events)-1]
 	if last.Phase != ProgressComplete || last.ExchangesCompleted != 2 || last.ExchangesTotal != 2 {
@@ -353,20 +356,25 @@ func TestFairProgressEventsReportOpenFailures(t *testing.T) {
 	if len(result) != 1 || result[0].OpenError == "" || len(result[0].Observations) != 1 {
 		t.Fatalf("open failure result = %#v", result)
 	}
-	if len(events) != 4 {
-		t.Fatalf("open failure progress = %#v, want preparation, measuring, and complete events", events)
+	if len(events) != 5 {
+		t.Fatalf("open failure progress = %#v, want preparation, cold, measuring, and complete events", events)
 	}
 	if events[0].Phase != ProgressPreparing || events[0].TargetsCompleted != 0 {
 		t.Fatalf("open failure initial event = %#v", events[0])
 	}
-	if events[1].Phase != ProgressPreparing || events[1].TargetsCompleted != 1 {
-		t.Fatalf("open failure preparation event = %#v", events[1])
+	// A target whose factory failed still finished its cold attempt: the
+	// counter reports finished attempts, not successful ones.
+	if events[1].Phase != ProgressPreparing || events[1].ColdCompleted != 1 || events[1].TargetsCompleted != 0 {
+		t.Fatalf("open failure cold event = %#v", events[1])
 	}
-	if events[2].Phase != ProgressMeasuring || events[2].ExchangesTotal != 0 {
-		t.Fatalf("open failure measuring event = %#v", events[2])
+	if events[2].Phase != ProgressPreparing || events[2].TargetsCompleted != 1 {
+		t.Fatalf("open failure preparation event = %#v", events[2])
 	}
-	if events[3].Phase != ProgressComplete || events[3].TargetsCompleted != 1 {
-		t.Fatalf("open failure complete event = %#v", events[3])
+	if events[3].Phase != ProgressMeasuring || events[3].ExchangesTotal != 0 {
+		t.Fatalf("open failure measuring event = %#v", events[3])
+	}
+	if events[4].Phase != ProgressComplete || events[4].TargetsCompleted != 1 {
+		t.Fatalf("open failure complete event = %#v", events[4])
 	}
 }
 
@@ -1860,5 +1868,224 @@ func TestSampleSizeCountsNamesInBothCorpusShapes(t *testing.T) {
 				t.Fatalf("report.SampleSize = %d, want %d names", report.SampleSize, testCase.want)
 			}
 		})
+	}
+}
+
+// TestColdProgressIsReportedBeforeTheColdBarrierOpens pins the cold-phase
+// counter. Every target finishes its cold probes before any warm session
+// opens, and the only per-target emit used to sit after the warm phase, so a
+// run whose unreachable endpoints spent minutes timing out their cold probes
+// read "preparing 0/N" for all of it.
+//
+// One target's first cold Open blocks until the progress callback has seen a
+// cold event. Only the healthy target can have produced it, so a scheduler
+// that reports nothing inside the barrier never releases the blocked one and
+// the guard fails the test instead of letting it hang.
+func TestColdProgressIsReportedBeforeTheColdBarrierOpens(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+		if target.Address == "blocked" {
+			return &scriptedFactory{open: func(index int, _ context.Context) (transport.Session, error) {
+				if index == 0 {
+					select {
+					case <-release:
+					case <-time.After(10 * time.Second):
+						t.Error("no cold progress was reported while another target's cold probe was blocked")
+						releaseOnce.Do(func() { close(release) })
+					}
+				}
+				return &fakeSession{}, nil
+			}}, nil
+		}
+		return &fakeFactory{opens: []fakeOpen{
+			{session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}}, {session: &fakeSession{}},
+		}}, nil
+	}
+
+	var mu sync.Mutex
+	var events []Progress
+	releasedByCold := false
+	results := runProtocol(context.Background(), []catalog.Target{testTarget(catalog.UDP, "blocked"), testTarget(catalog.UDP, "healthy")},
+		[]Query{{Name: "a.example", QType: dns.TypeA}}, Options{
+			QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 2,
+			OnProgress: func(progress Progress) {
+				mu.Lock()
+				defer mu.Unlock()
+				events = append(events, progress)
+				if progress.Phase == ProgressPreparing && progress.ColdCompleted > 0 {
+					releaseOnce.Do(func() {
+						releasedByCold = true
+						close(release)
+					})
+				}
+			},
+		})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !releasedByCold {
+		t.Fatalf("the blocked cold probe was released without a cold progress event: %#v", events)
+	}
+	if len(results) != 2 || len(results[0].Observations) != 1 || len(results[1].Observations) != 1 {
+		t.Fatalf("both targets should be measured once the barrier opens: %#v", results)
+	}
+	firstCold, firstPrepared := -1, -1
+	maxCold, maxPrepared := 0, 0
+	for index, event := range events {
+		if event.TargetsCompleted > event.TargetsTotal || event.ColdCompleted > event.TargetsTotal {
+			t.Fatalf("event %d overran its total: %#v", index, event)
+		}
+		if event.Phase != ProgressPreparing {
+			continue
+		}
+		if event.ColdCompleted > 0 && firstCold < 0 {
+			firstCold = index
+		}
+		if event.TargetsCompleted > 0 && firstPrepared < 0 {
+			firstPrepared = index
+		}
+		maxCold = max(maxCold, event.ColdCompleted)
+		maxPrepared = max(maxPrepared, event.TargetsCompleted)
+	}
+	if firstCold < 0 || events[firstCold].ColdCompleted != 1 || firstPrepared < firstCold {
+		t.Fatalf("cold progress must arrive before any warm-phase emit: %#v", events)
+	}
+	if maxCold != 2 || maxPrepared != 2 {
+		t.Fatalf("final cold/prepared counts = %d/%d, want 2/2", maxCold, maxPrepared)
+	}
+	if last := events[len(events)-1]; last.Phase != ProgressComplete || events[len(events)-2].Phase != ProgressMeasuring {
+		t.Fatalf("event sequence must still end with measuring then complete: %#v", events)
+	}
+}
+
+// TestSilentTargetPacesEveryMeasuredRound pins the wall-clock cost that
+// METHODOLOGY.md documents for an unresponsive target. Opening a UDP session
+// sends nothing, so a target that never answers is still ready and enters
+// measurement, and every measured round then waits out its full timeout. The
+// healthy target is the one paying: it may not start round j until the silent
+// target's round j-1 has timed out.
+//
+// The ordering assertion holds by construction of the round barrier, not by
+// timing. The elapsed-time check is only a lower bound, which a deadline can
+// never undercut, so it cannot flake on a slow host.
+func TestSilentTargetPacesEveryMeasuredRound(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+
+	const timeout = 20 * time.Millisecond
+	queries := []Query{
+		{Name: "a.example", QType: dns.TypeA}, {Name: "b.example", QType: dns.TypeA},
+		{Name: "c.example", QType: dns.TypeA}, {Name: "d.example", QType: dns.TypeA},
+	}
+	var silentReturned, healthyRounds atomic.Int32
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+		session := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+			if strings.HasSuffix(name, ".example") {
+				round := healthyRounds.Add(1)
+				if returned := silentReturned.Load(); returned < round-1 {
+					t.Errorf("healthy round %d started while the silent target's round %d was still waiting", round, returned+1)
+				}
+			}
+			return replyFor(name, qtype), nil
+		}}
+		if target.Address == "silent" {
+			session = &fakeSession{query: func(ctx context.Context, name string, _ uint16) (*dns.Msg, error) {
+				<-ctx.Done()
+				if strings.HasSuffix(name, ".example") {
+					silentReturned.Add(1)
+				}
+				return nil, ctx.Err()
+			}}
+		}
+		return &fakeFactory{opens: []fakeOpen{{session: session}, {session: session}, {session: session}, {session: session}}}, nil
+	}
+
+	var mu sync.Mutex
+	var measuringStarted, measuringEnded time.Time
+	results := runProtocol(context.Background(), []catalog.Target{testTarget(catalog.UDP, "healthy"), testTarget(catalog.UDP, "silent")}, queries, Options{
+		QueryTypes: []uint16{dns.TypeA}, Timeout: timeout, Concurrency: 2,
+		OnProgress: func(progress Progress) {
+			mu.Lock()
+			defer mu.Unlock()
+			if progress.Phase != ProgressMeasuring {
+				return
+			}
+			if progress.ExchangesCompleted == 0 {
+				measuringStarted = time.Now()
+			}
+			if progress.ExchangesCompleted == progress.ExchangesTotal {
+				measuringEnded = time.Now()
+			}
+		},
+	})
+
+	if len(results) != 2 {
+		t.Fatalf("results = %#v", results)
+	}
+	healthy, silent := results[0], results[1]
+	if silent.Target.Address != "silent" || len(silent.Observations) != len(queries) || len(healthy.Observations) != len(queries) {
+		t.Fatalf("both targets must be measured in every round: healthy %d, silent %d observations", len(healthy.Observations), len(silent.Observations))
+	}
+	for _, observation := range silent.Observations {
+		if observation.Success || !strings.Contains(observation.Error, context.DeadlineExceeded.Error()) {
+			t.Fatalf("silent observation = %#v, want a timeout", observation)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if elapsed, floor := measuringEnded.Sub(measuringStarted), time.Duration(len(queries))*timeout; elapsed < floor {
+		t.Fatalf("measured phase took %v, want at least queries × timeout = %v", elapsed, floor)
+	}
+}
+
+// TestRunInterruptedAfterTheLastGroupIsComplete pins the engine behaviour the
+// CLI's interrupt warning relies on. An interrupt that lands on the last
+// group's completion event, after every measured round and before statistics
+// and rankings are computed, still makes Run return the cancellation -- which
+// is what keeps the exit status at 130 -- but no target is left incomplete and
+// the report is ranked. That is the evidence the CLI reads when it says the
+// results are complete, so this test must fail if the engine ever starts
+// marking such targets incomplete.
+func TestRunInterruptedAfterTheLastGroupIsComplete(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return dnssecFactory(&fakeSession{}), nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	targets := []catalog.Target{
+		testTarget(catalog.UDP, "1"), testTarget(catalog.UDP, "2"),
+		testTarget(catalog.TCP, "3"), testTarget(catalog.TCP, "4"),
+	}
+	report, err := Run(ctx, targets, Options{
+		Domains: []string{"measured.example"}, QueryTypes: []uint16{dns.TypeA}, Sample: 1, Seed: 3,
+		Timeout: time.Second, Concurrency: 2,
+		OnProgress: func(progress Progress) {
+			// Progress events are emitted on Run's goroutine, so the cancel
+			// lands before the group's results are handed back.
+			if progress.Protocol == catalog.TCP && progress.Phase == ProgressComplete {
+				cancel()
+			}
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want the cancellation", err)
+	}
+	if len(report.Targets) != len(targets) || len(report.Rankings) != len(targets) {
+		t.Fatalf("report targets/rankings = %d/%d, want every target measured and ranked", len(report.Targets), len(report.Rankings))
+	}
+	for _, result := range report.Targets {
+		if result.Incomplete || len(result.Observations) != 1 || !result.Observations[0].Success {
+			t.Fatalf("%s = %+v, want a complete measured target", result.Target.ID(), result)
+		}
 	}
 }

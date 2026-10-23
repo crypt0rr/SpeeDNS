@@ -623,6 +623,71 @@ func TestNonInteractiveProgressReportsMilestones(t *testing.T) {
 	}
 }
 
+// TestProgressShowsTheColdBarrierAndTheDNSSECPhase covers the two stretches
+// that used to look stuck: the cold-probe barrier, during which no target can
+// finish preparing, and the opt-in DNSSEC probes after measurement. Cold
+// progress folds into the preparation milestones, so a redirected log still
+// prints at most five preparing lines, and the prepared count keeps its
+// meaning once warm sessions open.
+func TestProgressShowsTheColdBarrierAndTheDNSSECPhase(t *testing.T) {
+	targets := []catalog.Target{{Protocol: catalog.UDP, Address: "192.0.2.1"}, {Protocol: catalog.UDP, Address: "192.0.2.2"}}
+	events := []benchmark.Progress{
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 2, ColdCompleted: 1},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsTotal: 2, ColdCompleted: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsCompleted: 1, TargetsTotal: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressPreparing, TargetsCompleted: 2, TargetsTotal: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 2, TargetsTotal: 2, ExchangesTotal: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressMeasuring, TargetsCompleted: 2, TargetsTotal: 2, ExchangesCompleted: 2, ExchangesTotal: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressDNSSEC, TargetsCompleted: 2, TargetsTotal: 2, ExchangesCompleted: 2, ExchangesTotal: 2, DNSSECTotal: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressDNSSEC, TargetsCompleted: 2, TargetsTotal: 2, ExchangesCompleted: 2, ExchangesTotal: 2, DNSSECCompleted: 1, DNSSECTotal: 2},
+		{Protocol: catalog.UDP, Phase: benchmark.ProgressComplete, TargetsCompleted: 2, TargetsTotal: 2, ExchangesCompleted: 2, ExchangesTotal: 2},
+	}
+
+	var logOutput bytes.Buffer
+	logProgress := newProgressRenderer(&logOutput, false, []catalog.Protocol{catalog.UDP}, targets)
+	for _, event := range events {
+		logProgress.Update(event)
+	}
+	want := "progress udp: preparing 0/2 targets\n" +
+		"progress udp: preparing 0/2 targets (cold probes 1/2)\n" +
+		"progress udp: preparing 0/2 targets (cold probes 2/2)\n" +
+		"progress udp: preparing 1/2 targets\n" +
+		"progress udp: preparing 2/2 targets\n" +
+		"progress udp: measuring 0/2 exchanges\n" +
+		"progress udp: measuring 2/2 exchanges\n" +
+		"progress udp: dnssec probes 0/2 targets\n" +
+		"progress udp: dnssec probes 1/2 targets\n" +
+		"tested udp 2/2 targets\n"
+	if got := logOutput.String(); got != want {
+		t.Fatalf("non-TTY progress = %q, want %q", got, want)
+	}
+
+	var tty bytes.Buffer
+	ttyProgress := newProgressRenderer(&tty, true, []catalog.Protocol{catalog.UDP}, targets)
+	ttyProgress.refreshInterval = time.Hour
+	ttyProgress.Start()
+	lines := make([]string, 0, len(events))
+	for _, event := range events {
+		ttyProgress.Update(event)
+		lines = append(lines, tty.String())
+		tty.Reset()
+	}
+	ttyProgress.Finish()
+	for index, want := range map[int]string{
+		1: "udp preparing 0/2 (cold probes 1/2)",
+		3: "udp preparing 1/2 |",
+		8: "udp dnssec probes 1/2",
+	} {
+		if !strings.Contains(lines[index], want) {
+			t.Fatalf("TTY line after event %d = %q, want %q", index, lines[index], want)
+		}
+	}
+	if strings.Contains(lines[3], "cold") {
+		t.Fatalf("cold progress outlived the cold barrier: %q", lines[3])
+	}
+}
+
 func TestNonInteractiveProgressReportsFinalStateForSmallAndEmptyTotals(t *testing.T) {
 	var small bytes.Buffer
 	smallProgress := newProgressRenderer(&small, false, []catalog.Protocol{catalog.TCP}, []catalog.Target{{Protocol: catalog.TCP}})
@@ -1775,6 +1840,70 @@ func TestRunBenchmarkWarnsWhenSampleTruncatesCacheMissCorpus(t *testing.T) {
 	}
 }
 
+// TestCacheMissDefaultSampleRaisesNoOversizeWarning runs the real engine,
+// because the stubbed engines above cannot see the warning it adds. The
+// generated corpus holds at most 20 names and the default --sample is 100, so
+// every documented cache-miss invocation used to carry "requested sample of
+// 100 domains exceeds the normalized corpus size". Clamping the engine's
+// sample must not change what is measured or recorded: sample_size and the
+// corpus fields stay exactly what an unclamped run reported.
+func TestCacheMissDefaultSampleRaisesNoOversizeWarning(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	server := &dns.Server{PacketConn: conn, NotifyStartedFunc: func() { close(started) }, Handler: dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+		reply := new(dns.Msg)
+		reply.SetRcode(request, dns.RcodeNameError)
+		_ = writer.WriteMsg(reply)
+	})}
+	go func() { _ = server.ActivateAndServe() }()
+	<-started
+	t.Cleanup(func() { _ = server.Shutdown() })
+
+	oldEngine := runBenchmarkEngine
+	oldNonce := newCacheMissNonceFunc
+	t.Cleanup(func() {
+		runBenchmarkEngine = oldEngine
+		newCacheMissNonceFunc = oldNonce
+	})
+	var captured benchmark.Options
+	runBenchmarkEngine = func(ctx context.Context, targets []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		captured = options
+		return benchmark.Run(ctx, targets, options)
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+
+	for _, sample := range []int{benchmark.DefaultSample, 30} {
+		config := &cliConfig{
+			protocols: "udp", resolverFlags: []string{"lab=udp://" + conn.LocalAddr().String()}, noDefaults: true,
+			cacheMiss: true, cacheMissSample: 10, sample: sample, seed: 7, queryTypes: "A", timeout: time.Second,
+			concurrency: 4, format: "json", family: "4", output: filepath.Join(t.TempDir(), "cache.json"),
+		}
+		// A loopback resolver is measured but never ranked, so this run has
+		// nothing comparable; the report is still written and is what matters.
+		if err := runBenchmark(context.Background(), config); !errors.Is(err, benchmark.ErrNoComparableResults) {
+			t.Fatalf("--sample %d: run error = %v", sample, err)
+		}
+		if captured.Sample != 10 {
+			t.Fatalf("--sample %d reached the engine as %d, want the 10-name corpus", sample, captured.Sample)
+		}
+		content, err := os.ReadFile(config.output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(content), "requested sample") || strings.Contains(string(content), "truncated the generated cache-miss corpus") {
+			t.Fatalf("--sample %d raised a sample warning on a full cache-miss corpus: %s", sample, content)
+		}
+		for _, expected := range []string{"\"sample_size\": 10", "\"queries_per_target\": 10", "\"corpus_entries\": 10"} {
+			if !strings.Contains(string(content), expected) {
+				t.Fatalf("--sample %d report missing %q: %s", sample, expected, content)
+			}
+		}
+	}
+}
+
 func TestParseQueryTypesRejectsZoneTransferAndPseudoTypes(t *testing.T) {
 	rejected := []struct {
 		name     string
@@ -1844,9 +1973,6 @@ func TestParseQueryTypesRejectsZoneTransferAndPseudoTypes(t *testing.T) {
 	}
 }
 
-// TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured pins the disclosure that
-// only the first measured protocol group observes a genuine cache miss: every
-// group replays the same generated names against the same resolver cache.
 // TestCacheMissMeasuresEachResolverExactlyOnce pins the #108 fix. A resolver
 // holds one cache across every transport and address it offers, so measuring it
 // twice makes the second measurement a warm read of a name the first already
@@ -2183,6 +2309,67 @@ func TestErrorMessageRendersInterruptionInPlainLanguage(t *testing.T) {
 	}
 	if code := exitCodeForError(context.Canceled); code != 130 {
 		t.Fatalf("interruption exit code = %d, want 130", code)
+	}
+}
+
+// TestInterruptWarningFollowsTheReportEvidence pins the warning an
+// interrupted run carries. The engine returns the cancellation whenever the
+// run context was cancelled, including after every target had finished and
+// only statistics were left, and the CLI used to call every such report
+// "interrupted before all targets completed" -- telling an operator to
+// distrust a complete, ranked report. The exit status and the precedence of
+// the interrupt over assertions are the documented contract and must not move.
+func TestInterruptWarningFollowsTheReportEvidence(t *testing.T) {
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	const (
+		completeWarning   = "interrupt received after measurement completed; results are complete"
+		incompleteWarning = "benchmark interrupted before all targets completed"
+	)
+	for _, tc := range []struct {
+		name  string
+		shape func([]benchmark.TargetResult) []benchmark.TargetResult
+		want  string
+	}{
+		{name: "complete", shape: func(results []benchmark.TargetResult) []benchmark.TargetResult { return results }, want: completeWarning},
+		{name: "incomplete target", shape: func(results []benchmark.TargetResult) []benchmark.TargetResult {
+			results[0].Incomplete = true
+			return results
+		}, want: incompleteWarning},
+		{name: "missing target", shape: func([]benchmark.TargetResult) []benchmark.TargetResult { return nil }, want: incompleteWarning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+				report := fakeCLIReport()
+				results := make([]benchmark.TargetResult, 0, len(targets))
+				for _, target := range targets {
+					result := report.Targets[0]
+					result.Target = target
+					results = append(results, result)
+				}
+				report.Targets = tc.shape(results)
+				report.Rankings = []benchmark.Ranking{{Protocol: targets[0].Protocol, TargetID: targets[0].ID(), Rank: 1}}
+				return report, context.Canceled
+			}
+			config := cliConfigForTest(t)
+			// A failing assertion proves the interrupt still takes precedence:
+			// a complete report is not a reason to start evaluating them.
+			config.assertions = []string{"p95<1ms"}
+			config.output = filepath.Join(t.TempDir(), "interrupted.json")
+			err := runBenchmark(context.Background(), config)
+			if !errors.Is(err, context.Canceled) || exitCodeForError(err) != 130 {
+				t.Fatalf("interrupted run returned %v (exit %d), want context.Canceled and 130", err, exitCodeForError(err))
+			}
+			content, readErr := os.ReadFile(config.output)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			for _, warning := range []string{completeWarning, incompleteWarning} {
+				if strings.Contains(string(content), warning) != (warning == tc.want) {
+					t.Fatalf("report warnings disagree with the evidence, want only %q: %s", tc.want, content)
+				}
+			}
+		})
 	}
 }
 

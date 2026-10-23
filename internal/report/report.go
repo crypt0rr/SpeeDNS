@@ -265,8 +265,12 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 			csvCell(report.CorpusMode), csvCell(report.CorpusZone), csvCell(report.CorpusNonce), strconv.FormatBool(result.Target.Resolver.Local), csvCell(dnssecVerdict(result)),
 			strconv.Itoa(stats.Answers), formatFloat(stats.AnswerRate), csvCell(statusValue(result)),
 			csvCell(csvStartedAt(report)), strconv.FormatInt(report.Seed, 10), strconv.Itoa(report.SampleSize),
-			// Pipe-separated so the value survives a comma-delimited file,
-			// matching how rcode_counts already renders NOERROR:5.
+			// Pipe-separated by convention. The CSV writer quotes any cell
+			// holding a comma, so the delimiter is not what keeps the columns
+			// aligned: rcode_counts is comma-joined and bootstrap_addresses is
+			// semicolon-joined, and both parse correctly with an RFC 4180
+			// reader. The three encodings are documented and fixed, because
+			// the CSV contract only ever appends.
 			csvCell(strings.ReplaceAll(queryTypes(report.QueryTypes), ",", "|")),
 			csvCell(csvProvenanceField(report, func(p *benchmark.RunProvenance) string { return p.Version })),
 			csvCell(csvProvenanceField(report, func(p *benchmark.RunProvenance) string { return p.CorpusSHA256 })),
@@ -862,7 +866,9 @@ func scoreText(result benchmark.TargetResult) string {
 // answersText shows how many usable responses carried an actual record, with
 // the rate beside it. NODATA is usable and scored, so without this a resolver
 // answering everything with an empty answer section reads identically to a
-// working one on the success and usable columns.
+// working one on the success and usable columns. The rate is AnswerRate, whose
+// denominator is every measured query, as for the success and usable rates,
+// so it is not the share of the usable responses counted beside it.
 func answersText(stats benchmark.Statistics) string {
 	if stats.UsableResponses == 0 {
 		return "—"

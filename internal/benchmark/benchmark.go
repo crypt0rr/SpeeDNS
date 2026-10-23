@@ -78,15 +78,19 @@ type Options struct {
 
 // ProgressPhase identifies the kind of work represented by a progress event.
 // Preparation includes connection setup, cold probes, and warm-up queries;
-// measuring includes only the scored query exchanges.
+// measuring includes only the scored query exchanges; the DNSSEC phase covers
+// the opt-in validation probes that a --dnssec run sends after measurement.
 type ProgressPhase string
 
 const (
 	ProgressPreparing ProgressPhase = "preparing"
 	ProgressMeasuring ProgressPhase = "measuring"
+	ProgressDNSSEC    ProgressPhase = "dnssec"
 	ProgressComplete  ProgressPhase = "complete"
 )
 
+// Progress is an in-process event for the CLI's progress line. It is never
+// serialized, so adding a counter here changes no report contract.
 type Progress struct {
 	Protocol           catalog.Protocol
 	Phase              ProgressPhase
@@ -94,6 +98,18 @@ type Progress struct {
 	TargetsTotal       int
 	ExchangesCompleted int
 	ExchangesTotal     int
+	// ColdCompleted counts targets whose cold probes have finished,
+	// successfully or not. Every target finishes its cold probes before any
+	// warm session opens, so TargetsCompleted cannot move during that
+	// barrier; without a counter of its own a run with unreachable endpoints
+	// read "preparing 0/N" for as long as their probes took to time out.
+	ColdCompleted int
+	// DNSSECCompleted counts targets whose two DNSSEC probes have finished,
+	// out of DNSSECTotal targets that were ready to be probed. The probe
+	// workers report it concurrently, so successive events may carry it out
+	// of order; a renderer keeps the maximum, as it does for preparation.
+	DNSSECCompleted int
+	DNSSECTotal     int
 }
 
 type Query struct {
@@ -165,6 +181,12 @@ type Statistics struct {
 	// A,AAAA corpus a real resolver answers with a record only about 45% of
 	// the time, so the two columns a reader treats as "did it work" cannot
 	// tell those apart without this.
+	//
+	// AnswerRate is Answers divided by Total, the measured queries, exactly
+	// like SuccessRate, FailureRate, UsableRate and ResolverFailureRate -- not
+	// by UsableResponses. A failed, unusable or NXDOMAIN query lowers it too;
+	// Answers/UsableResponses is the share of usable responses that carried a
+	// record.
 	Answers    int     `json:"answers"`
 	AnswerRate float64 `json:"answer_rate"`
 }
@@ -483,8 +505,23 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 		}
 		// The opt-in DNSSEC probes run after every measured round so their
 		// extra queries cannot appear in, or perturb, the latency samples.
-		for _, runner := range ready {
-			runner.probeDNSSEC(ctx)
+		// An interrupted run skips the phase: its targets are about to be
+		// marked incomplete, and no new network work starts after a cancel.
+		if opts.DNSSEC && len(ready) > 0 && ctx.Err() == nil {
+			dnssecProgress := func(probed int) {
+				emitProgress(opts, Progress{
+					Protocol:           orderedTargets[0].Protocol,
+					Phase:              ProgressDNSSEC,
+					TargetsCompleted:   len(runners),
+					TargetsTotal:       len(orderedTargets),
+					ExchangesCompleted: completedExchanges,
+					ExchangesTotal:     exchangesTotal,
+					DNSSECCompleted:    probed,
+					DNSSECTotal:        len(ready),
+				})
+			}
+			dnssecProgress(0)
+			probeDNSSECTargets(ctx, ready, opts.Concurrency, dnssecProgress)
 		}
 	}
 	if ctx.Err() != nil {
@@ -530,9 +567,13 @@ func prepareTargets(ctx context.Context, orderedTargets []catalog.Target, querie
 	}
 	jobs := make(chan int)
 	var wg sync.WaitGroup
-	// Preparation progress counts finished attempts, successful or not, in
-	// completion order. That is the meaning the sequential loop already had.
-	var preparedTargets atomic.Int32
+	// Both counters count finished attempts, successful or not, in completion
+	// order. preparedTargets is a target's whole preparation and can only move
+	// after the cold barrier below; coldTargets moves inside the barrier, which
+	// lasts several timeouts for every unreachable target. They stay separate
+	// because the renderer keeps each counter monotonic and bounded by
+	// TargetsTotal, so counting a target twice in one counter would overrun it.
+	var preparedTargets, coldTargets atomic.Int32
 	for worker := 0; worker < workers; worker++ {
 		wg.Add(1)
 		go func() {
@@ -542,6 +583,12 @@ func prepareTargets(ctx context.Context, orderedTargets []catalog.Target, querie
 				runner := newTargetRunner(ctx, target, queries, opts)
 				runners[index] = runner
 				runner.prepareCold(ctx)
+				emitProgress(opts, Progress{
+					Protocol:      target.Protocol,
+					Phase:         ProgressPreparing,
+					TargetsTotal:  len(orderedTargets),
+					ColdCompleted: int(coldTargets.Add(1)),
+				})
 			}
 		}()
 	}
