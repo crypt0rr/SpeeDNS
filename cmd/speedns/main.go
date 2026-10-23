@@ -810,7 +810,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.Int64Var(&config.seed, "seed", 0, "random seed (0 chooses and prints a new seed)")
 	flags.StringVar(&config.queryTypes, "type", "A,AAAA", "comma-separated DNS record types; zone-transfer, meta and pseudo-record types are rejected")
 	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout; every measured round waits for its slowest target, up to this long")
-	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum concurrent target preparations, measured exchanges and DNSSEC probes per protocol; n silent targets cost about ceil(n/concurrency) timeouts per round")
+	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum concurrent target preparations, measured exchanges and DNSSEC probes per protocol; each group of up to this many silent targets adds about one timeout per round")
 	flags.BoolVar(&config.includeSystem, "include-system", false, "include the configured system resolver as a baseline")
 	flags.StringVar(&config.format, "format", "table", "output format: table, json, or csv")
 	flags.StringVar(&config.output, "output", "", "write output to a file instead of stdout")

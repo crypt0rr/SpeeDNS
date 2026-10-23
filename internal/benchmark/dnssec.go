@@ -86,12 +86,13 @@ type DNSSECAssessment struct {
 }
 
 // probeDNSSECTargets probes every ready runner through at most concurrency
-// workers and calls probed with the running count after each target.
+// workers and calls probed with the running count after each target that
+// gained a verdict.
 //
 // The probes used to run one target at a time. Each probe can take a full
-// timeout, and every target that answered its warm-ups is probed -- including
-// one whose warm-ups all timed out -- so a phase that ignored the pool cost up
-// to ready × 2 × timeout of wall-clock time with nothing on the progress line.
+// timeout, and every prepared target is probed, including one whose warm-ups
+// all timed out, so a phase that ignored the pool cost up to
+// ready × 2 × timeout of wall-clock time with nothing on the progress line.
 // Each runner is still taken by exactly one worker and its two probes stay
 // sequential on its own session, because a session is never used
 // concurrently. Every outcome lands in that runner's own result, so the
@@ -125,22 +126,31 @@ func probeDNSSECTargets(ctx context.Context, runners []*targetRunner, concurrenc
 // probeDNSSEC runs the pinned probes on the already warmed session, after all
 // measured rounds for the target, so it can never influence latency samples.
 // The probe names are never added to the measured query matrix. It reports
-// whether both probes ran.
+// whether both probes ran to completion before any interrupt and the target
+// gained a verdict.
 func (runner *targetRunner) probeDNSSEC(ctx context.Context) bool {
 	if !runner.opts.DNSSEC || !runner.ready || runner.session == nil || ctx.Err() != nil {
 		return false
 	}
 	names := runner.opts.DNSSECProbe.withDefaults()
 	signed := runner.dnssecProbe(ctx, DNSSECRoleSigned, names.Signed)
-	// An interrupt during the signed probe must not start the bogus one. Its
-	// cancelled context would fail at once, and the verdict would then call
-	// the resolver inconclusive over a probe the operator cut short. The
-	// target is left without a verdict, like every target the pool had not
-	// reached yet, and is marked incomplete with them.
+	// An interrupt during either probe leaves the target without a verdict,
+	// like every target the pool had not reached yet, and it is marked
+	// incomplete with them. A probe the operator cut short fails with the
+	// cancellation, and the verdict would then call the resolver
+	// inconclusive for a reason that was not the resolver's. After the signed
+	// probe the check also keeps the bogus one from starting on a cancelled
+	// context.
 	if ctx.Err() != nil {
 		return false
 	}
 	bogus := runner.dnssecProbe(ctx, DNSSECRoleBogus, names.Bogus)
+	// A bogus probe that answered just before the interrupt is dropped too:
+	// from here it cannot be told apart from one the interrupt cut short, and
+	// the target is incomplete either way.
+	if ctx.Err() != nil {
+		return false
+	}
 	assessment := assessDNSSEC(signed, bogus)
 	runner.result.DNSSEC = &assessment
 	return true

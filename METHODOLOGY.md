@@ -304,20 +304,25 @@ completed before cancellation, but it is marked `INCOMPLETE`, excluded from
 rankings, and reported with its cancellation diagnostic. Only a target that was
 never handed to a worker is absent from the report.
 
-In practice that means an interrupted run lists every selected target. Targets
-are prepared concurrently, so all of them normally reach a worker within the
-first moments of a run, and an interrupt has to arrive before preparation
-begins for any of them to be missing. An interrupted report is therefore the
-full comparison set with every entry marked `INCOMPLETE`, not a shortened
-list.
+Protocol groups are measured one after another, so what an interrupted report
+lists depends on the group the interrupt reached. A group that had already
+finished keeps its complete results and its rankings. Within the group being
+measured, targets are prepared concurrently, so all of them normally reach a
+worker within the first moments of that group, and an interrupt has to arrive
+before the group's preparation begins for any of them to be missing. That
+group is therefore listed in full, with every target still being measured
+marked `INCOMPLETE`, not as a shortened list. A group the interrupt arrived
+before is never dispatched, and its targets are absent from the report.
 
-An interrupt can also land after the last measured round, while statistics and
-rankings are still being computed. That report is complete and ranked, and its
-warning says so -- `interrupt received after measurement completed; results are
-complete` -- instead of `benchmark interrupted before all targets completed`,
-which a report carries only when some selected target is incomplete or missing.
-Either way the run exits with status 130 and assertions are not evaluated,
-because the operator asked it to stop.
+An interrupt can also land after the last protocol group has finished, while
+statistics and rankings are still being computed. That report is complete and
+ranked, and its warning says so -- `interrupt received after measurement
+completed; results are complete` -- instead of `benchmark interrupted before
+all targets completed`, which a report carries whenever some selected target
+is incomplete or missing. An interrupt during the last group's `--dnssec`
+probes is still before completion: that group's prepared targets are marked
+`INCOMPLETE`. Either way the run exits with status 130 and assertions are not
+evaluated, because the operator asked it to stop.
 
 JSON contains the structured result and optional raw observations. CSV keeps
 the aggregate schema and carries these diagnostics in its `reconnects` and
@@ -423,9 +428,9 @@ after all of its measured rounds have finished. The CD (checking disabled) bit
 is never set, because the point of the probe is to observe validation rather
 than to suppress it. Up to `--concurrency` targets are probed at once; a
 target's two probes run one after the other on its own measured session, and
-no probe is sent after an interrupt. A target whose probes the interrupt cut
-short gets no verdict, like the targets not yet reached, and is marked
-incomplete with them.
+no probe is sent after an interrupt. A target the interrupt reaches before
+both of its probes have finished gets no verdict, whichever probe was cut
+short, like the targets not yet reached, and is marked incomplete with them.
 
 The two probe names are pinned constants in `internal/benchmark/dnssec.go`:
 
