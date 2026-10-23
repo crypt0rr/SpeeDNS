@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/crypt0rr/SpeeDNS/internal/compare"
@@ -40,7 +41,7 @@ func newDiffCommand() *cobra.Command {
 	command.Flags().StringVar(&format, "format", "table", "output format: table or json")
 	command.Flags().StringVar(&output, "output", "", "write the diff to a file instead of standard output")
 	command.Flags().StringArrayVar(&required, "require", nil,
-		"fail with status 4 unless a named condition holds: "+strings.Join(compare.RequireNames(), ", "))
+		"fail with status 4 unless a named condition holds, or 3 if no endpoint was compared: "+strings.Join(compare.RequireNames(), ", "))
 	return command
 }
 
@@ -76,12 +77,61 @@ func runDiff(stdout io.Writer, baselinePath, currentPath, format, output string,
 	if !diff.Comparable() {
 		return compare.ErrRunsNotComparable
 	}
+	// Every failed condition is named, in the order given, the way run
+	// --assert reports every failed assertion: naming only the first would
+	// cost a CI user one re-run per failure to learn the rest.
+	failed := make([]string, 0, len(results))
 	for _, result := range results {
 		if !result.Passed {
-			return fmt.Errorf("%w: --require %s: %s", ErrAssertionsFailed, result.Name, result.Detail)
+			failed = append(failed, fmt.Sprintf("--require %s: %s", result.Name, result.Detail))
 		}
 	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%w: %s", ErrAssertionsFailed, strings.Join(failed, "; "))
+	}
+	// A failure above read a real finding -- a target present in only one run
+	// is reported without pairing -- so it stands even when nothing was
+	// compared. A pass over zero compared endpoints describes nothing: no
+	// condition examined a single paired count, so reporting it as a pass
+	// would be a gate that could not evaluate saying everything is fine.
+	if len(required) > 0 && diff.Compared == 0 {
+		return fmt.Errorf("%w: no --require condition can pass (%s)",
+			compare.ErrNothingCompared, notComparedSummary(diff))
+	}
 	return nil
+}
+
+// notComparedSummary names why a diff compared no endpoint, counting each
+// reason, so a refused gate says what to fix rather than only that it refused.
+// With nothing compared the only suppressions are the per-target ones that
+// precede pairing, and every remaining target was present in one run only.
+func notComparedSummary(diff compare.Diff) string {
+	counts := make(map[string]int)
+	for _, suppression := range diff.Suppressions {
+		counts[suppression.Reason]++
+	}
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	parts := make([]string, 0, len(reasons)+1)
+	for _, reason := range reasons {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[reason], reason))
+	}
+	unpaired := 0
+	for _, finding := range diff.Findings {
+		if finding.Code == "PRESENCE" {
+			unpaired++
+		}
+	}
+	if unpaired > 0 {
+		parts = append(parts, fmt.Sprintf("%d present in only one run", unpaired))
+	}
+	if len(parts) == 0 {
+		return "neither run has a target"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // emitDiff writes the diff to a file when one was named, and to stdout

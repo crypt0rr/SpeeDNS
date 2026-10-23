@@ -469,6 +469,78 @@ func TestSubjectQualifiedAssertions(t *testing.T) {
 	}
 }
 
+// TestSubjectLatencyAssertionsRequireScoredSamples pins #226. A subject with no
+// scored sample keeps median, p95 and score at their zero value, so comparing
+// them let a resolver that answered nothing pass `mine:p95<50ms` while the same
+// report labelled it FAILED. A healthy ranked peer on the same protocol keeps
+// deadProtocols quiet, which is exactly the run where only the subject check
+// stands between a dead resolver and exit 0.
+func TestSubjectLatencyAssertionsRequireScoredSamples(t *testing.T) {
+	fast := assertTarget("fast", catalog.UDP, false, benchmark.Statistics{
+		Total: 30, Successes: 30, UsableResponses: 30, Scored: 30,
+		SuccessRate: 1, UsableRate: 1, P95MS: 10, MedianMS: 8, ScoreMS: 9,
+	})
+	timedOut := benchmark.Statistics{Total: 30, Failures: 30, FailureRate: 1}
+	subjects := []benchmark.TargetResult{
+		assertTarget("dead", catalog.UDP, false, timedOut),
+		// A local resolver is never ranked and deadProtocols skips it, so
+		// nothing else in the gate would notice it being down.
+		assertTarget("stub", catalog.UDP, true, timedOut),
+		// Every query was answered, so success is perfect, but SERVFAIL is
+		// not usable and nothing was scored.
+		assertTarget("servfail", catalog.UDP, false, benchmark.Statistics{
+			Total: 30, Successes: 30, ResolverFailures: 30, SuccessRate: 1, ResolverFailureRate: 1,
+		}),
+	}
+	report := benchmark.Report{
+		Targets:  append([]benchmark.TargetResult{fast}, subjects...),
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: fast.Target.ID(), Rank: 1}},
+	}
+	evaluate := func(expression string) error {
+		t.Helper()
+		parsed, err := parseAssertions([]string{expression})
+		if err != nil {
+			t.Fatalf("parse %q: %v", expression, err)
+		}
+		return evaluateAssertions(report, parsed)
+	}
+
+	for _, subject := range subjects {
+		// The lower bound matters as much as the upper ones: p95>=1ms used to
+		// fail with a fabricated p95=0.000ms instead of saying nothing was
+		// measured.
+		for _, bar := range []string{"p95<50ms", "median<=10", "score<100ms", "p95>=1ms", "p95=0"} {
+			expression := subject.Target.Resolver.ID + ":" + bar
+			err := evaluate(expression)
+			if !errors.Is(err, ErrAssertionsFailed) || exitCodeForError(err) != 4 {
+				t.Fatalf("%s must fail with status 4 when nothing was scored, got %v", expression, err)
+			}
+			want := fmt.Sprintf("%s: %s has no scored latency samples", expression, subject.Target.ID())
+			if err.Error() != ErrAssertionsFailed.Error()+": "+want {
+				t.Fatalf("%s error = %q, want exactly %q", expression, err, want)
+			}
+		}
+	}
+
+	// usable and success are counted over every measured query, so they keep
+	// their numeric meaning without scored samples: the SERVFAIL-only subject
+	// still has a perfect success rate, and a dead one still reports its real
+	// usable rate rather than a missing measurement.
+	if err := evaluate("servfail:success>=0.99"); err != nil {
+		t.Fatalf("success must still be read without scored samples: %v", err)
+	}
+	if err := evaluate("dead:usable>=0"); err != nil {
+		t.Fatalf("usable must still be read without scored samples: %v", err)
+	}
+	if err := evaluate("stub:usable>=0.5"); err == nil || !strings.Contains(err.Error(), "has usable=0.000") {
+		t.Fatalf("a usable bar must keep failing on the measured rate: %v", err)
+	}
+	// The healthy peer is unaffected, qualified or not.
+	if err := evaluate("fast:p95<50ms"); err != nil {
+		t.Fatalf("a scored subject must still pass on its own merits: %v", err)
+	}
+}
+
 // TestSubjectAssertionParsingAndValidation pins the syntax and the up-front
 // name check. A typo must be invalid input, not a benchmark that runs to
 // completion and then reports the resolver lost.

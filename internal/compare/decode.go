@@ -25,6 +25,12 @@ import (
 // rankable.
 var ErrRunsNotComparable = errors.New("runs not comparable")
 
+// ErrNothingCompared reports that two comparable runs had no endpoint the diff
+// could pair -- every target was incomplete, local, redacted, or present in
+// only one run -- so a --require condition that passed did so without reading
+// a single count. Like a refusal, it means the gate could not evaluate.
+var ErrNothingCompared = errors.New("nothing compared")
+
 // Report is the subset of a published report this package reads.
 //
 // The gated provenance fields are pointers on purpose. A report written before

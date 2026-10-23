@@ -20,7 +20,14 @@ type RequireResult struct {
 // right tool for it -- speedns run --assert p95<=50ms.
 var requireConditions = map[string]func(Diff) (bool, string){
 	"no-new-failed-targets": func(d Diff) (bool, string) {
-		return noFindingWithCode(d, "FAILED", "OPEN")
+		before, after := d.Baseline.resultByID(), d.Current.resultByID()
+		for _, finding := range d.Findings {
+			current, inCurrent := after[finding.TargetID]
+			if detail, failed := newlyFailed(finding, before[finding.TargetID], current, inCurrent); failed {
+				return false, fmt.Sprintf("%s: %s", finding.TargetID, detail)
+			}
+		}
+		return true, "no target stopped answering or failed to open, and no added target failed outright"
 	},
 	"no-removed-targets": func(d Diff) (bool, string) {
 		for _, finding := range d.Findings {
@@ -31,7 +38,12 @@ var requireConditions = map[string]func(Diff) (bool, string){
 		return true, "every baseline target is present in the current run"
 	},
 	"target-set-identical": func(d Diff) (bool, string) {
-		return noFindingWithCode(d, "PRESENCE")
+		for _, finding := range d.Findings {
+			if finding.Code == "PRESENCE" {
+				return false, fmt.Sprintf("%s: %s", finding.TargetID, finding.Detail)
+			}
+		}
+		return true, "both runs measured the same targets"
 	},
 	"no-dnssec-regression": func(d Diff) (bool, string) {
 		for _, finding := range d.Findings {
@@ -59,9 +71,10 @@ func RequireNames() []string {
 	return names
 }
 
-// Require evaluates named conditions against a diff. It is an error to call it
-// on a diff that is not comparable: a gate that cannot evaluate must not report
-// a pass, and the caller exits 3 for that case instead.
+// Require evaluates named conditions against a diff. Its results decide nothing
+// on a diff that is not comparable, and a pass decides nothing on a diff that
+// compared no endpoint: a gate that cannot evaluate must not report a pass, so
+// the caller exits 3 for both instead.
 func Require(diff Diff, names []string) ([]RequireResult, error) {
 	results := make([]RequireResult, 0, len(names))
 	for _, name := range names {
@@ -75,15 +88,30 @@ func Require(diff Diff, names []string) ([]RequireResult, error) {
 	return results, nil
 }
 
-func noFindingWithCode(diff Diff, codes ...string) (bool, string) {
-	wanted := make(map[string]bool, len(codes))
-	for _, code := range codes {
-		wanted[code] = true
-	}
-	for _, finding := range diff.Findings {
-		if wanted[finding.Code] {
-			return false, fmt.Sprintf("%s: %s", finding.TargetID, finding.Detail)
+// newlyFailed reports whether a finding records a target the current run lost.
+//
+// OPEN and FAILED are reported in both directions, because the diff answers
+// whether a resolver behaved differently and a recovery is a difference. It is
+// not a failure, though: a baseline saved during an outage would otherwise fail
+// the gate exactly when the resolver came back. So only the healthy-to-failed
+// direction counts here, and the findings themselves stay two-way.
+//
+// A target present only in the current run has no baseline to regress from,
+// but one that failed every query is a failed target the run introduced, and
+// passing it would let a dead resolver into a gated set unnoticed. Local and
+// interrupted targets are exempt, as they are from every paired comparison: a
+// local resolver is never compared, and an interrupted target has proved
+// nothing. Redacted identities never reach PRESENCE.
+func newlyFailed(finding Finding, baseline, current Result, inCurrent bool) (string, bool) {
+	switch finding.Code {
+	case "FAILED":
+		return finding.Detail, baseline.Stats.Successes > 0 && current.Stats.Successes == 0
+	case "OPEN":
+		return finding.Detail, baseline.OpenError == "" && current.OpenError != ""
+	case "PRESENCE":
+		if inCurrent && current.Stats.Successes == 0 && !current.Incomplete && !current.Target.Local {
+			return fmt.Sprintf("%s, with successes 0 of %d", finding.Detail, current.Stats.Total), true
 		}
 	}
-	return true, "no target became unreachable"
+	return "", false
 }

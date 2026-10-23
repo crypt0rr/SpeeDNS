@@ -107,9 +107,10 @@ func exitCodeForError(err error) int {
 		return 0
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return 130
-	case errors.Is(err, compare.ErrRunsNotComparable):
+	case errors.Is(err, compare.ErrRunsNotComparable), errors.Is(err, compare.ErrNothingCompared):
 		// Distinct from ErrNoComparableResults, which means one run produced
-		// nothing rankable; this means two runs measured different things.
+		// nothing rankable; these mean two runs measured different things, or
+		// shared no endpoint a --require gate could read.
 		return 3
 	case errors.Is(err, benchmark.ErrNoComparableResults):
 		return 3

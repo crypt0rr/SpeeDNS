@@ -552,7 +552,9 @@ including another one: its names are generated fresh each time.
 
 ### Gating a change in CI
 
-`--require` takes named conditions and exits 4 when one does not hold:
+`--require` takes named conditions and exits 4 when one does not hold. Every
+condition that does not hold is named on standard error, in the order given, so
+one run shows every failure:
 
 ```sh
 speedns diff last.json now.json --require no-new-failed-targets --require no-dnssec-regression
@@ -564,6 +566,20 @@ threshold form such as `--fail-if p95>+20%`: the quantity it would read moves by
 more than that between identical runs, so it would fire on nothing. For an
 absolute latency bar use `speedns run --assert p95<=50ms`, which measures and
 gates in one place.
+
+`no-new-failed-targets` asks whether the current run introduced a failed
+target. It fails when a target that answered in the baseline answers nothing
+now, or newly cannot open a session, and when a target that only the current
+run measured failed every query, unless that target is on the local host or was
+interrupted. A recovery still appears in the diff but passes the gate, so a
+baseline saved during an outage does not fail CI when the resolver comes back.
+
+A gate that compared nothing cannot pass. When no endpoint was compared,
+because every target was interrupted, on the local host, redacted, or present
+in only one run, and no condition failed, `diff --require` exits 3 and counts
+the targets each reason excluded. A condition that fails without a comparison,
+such as `no-removed-targets` for a target missing from the current run, still
+exits 4, and a refusal outranks every condition.
 
 ## System resolver baseline
 
@@ -807,6 +823,10 @@ warnings. The command returns a distinct non-zero status:
 - `4` — a requested benchmark assertion failed;
 - `130` — interrupted by the user or operating system.
 
+`speedns diff` uses `3` for runs that are not comparable or a `--require` gate
+that compared no endpoint, and `4` for a failed `--require` condition; see
+[Comparing two runs](#comparing-two-runs).
+
 An interrupted run reports `interrupted` on standard error and still writes the
 partial report. A second interrupt exits immediately.
 
@@ -843,6 +863,16 @@ to every measured endpoint of the named resolver, which answers "did *our*
 resolver degrade" — a different question, and the one a monitoring gate usually
 means. Every endpoint is checked rather than only the best, so a resolver that
 degrades on one transport cannot pass on the strength of another.
+
+An endpoint of the subject with no scored latency samples fails every `median`,
+`p95` and `score` assertion with status 4, whichever way the comparison points:
+there is no latency to compare, so `mine:p95<50ms` cannot pass on a resolver
+that is down, and `mine:p95>=1ms` says so instead of reporting `p95=0.000ms`.
+That covers an endpoint that timed out, refused every query or answered only
+`SERVFAIL`, and also one whose every usable answer was divergent or arrived
+straight after a reconnect, since neither kind is a scored latency sample.
+`usable` and `success` are rates over every measured query, so they are still
+compared as usual.
 
 The name may be a profile id, the name given to `--resolver`, or a full target
 id. It is validated against the selected resolvers before any query is sent, so

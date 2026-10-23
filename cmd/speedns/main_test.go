@@ -24,6 +24,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/data"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/compare"
 	"github.com/crypt0rr/SpeeDNS/internal/report"
 	"github.com/crypt0rr/SpeeDNS/internal/systemdns"
 	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
@@ -228,6 +229,10 @@ func TestExitCodeForError(t *testing.T) {
 		{name: "success", want: 0},
 		{name: "invalid", err: errors.New("invalid configuration"), want: 2},
 		{name: "no comparable", err: benchmark.ErrNoComparableResults, want: 3},
+		{name: "runs not comparable", err: compare.ErrRunsNotComparable, want: 3},
+		// A gate that compared nothing could not evaluate, so it shares the
+		// refusal's status rather than passing or claiming a failure.
+		{name: "nothing compared", err: fmt.Errorf("%w: 0 endpoint(s) compared", compare.ErrNothingCompared), want: 3},
 		{name: "assertion failed", err: ErrAssertionsFailed, want: 4},
 		{name: "canceled", err: context.Canceled, want: 130},
 		{name: "deadline", err: context.DeadlineExceeded, want: 130},
