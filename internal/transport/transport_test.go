@@ -338,3 +338,142 @@ func TestUDPFactoryRejectsMalformedEndpoint(t *testing.T) {
 		t.Fatalf("malformed UDP endpoint error = %v", err)
 	}
 }
+
+// TestUDPFactoryKeepsZonedLinkLocalLiteral covers a link-local nameserver such
+// as the one a router announces over RDNSS. net.ParseIP rejects the zone, so
+// the literal went to the resolver, which returned it without the zone, and
+// every UDP query then went to an undialable fe80:: address while TCP to the
+// same zoned literal worked.
+func TestUDPFactoryKeepsZonedLinkLocalLiteral(t *testing.T) {
+	oldResolve := resolveUDPAddress
+	t.Cleanup(func() { resolveUDPAddress = oldResolve })
+	lookups := 0
+	resolveUDPAddress = func(context.Context, string) (string, error) {
+		lookups++
+		return "fe80::1", nil
+	}
+	for _, tc := range []struct {
+		address string
+		want    string
+	}{
+		{"fe80::1%en0", "[fe80::1%en0]:53"},
+		{"fe80::1%12", "[fe80::1%12]:53"},
+		{"[fe80::53%eth0]", "[fe80::53%eth0]:53"},
+	} {
+		factory, err := NewFactory(catalog.Target{
+			Protocol: catalog.UDP, Address: tc.address, Spec: catalog.TransportSpec{Port: 53},
+		}, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := factory.Open(context.Background())
+		if err != nil {
+			t.Fatalf("Open(%q) = %v", tc.address, err)
+		}
+		if got := session.(*udpSession).DialAddress(); got != tc.want {
+			t.Fatalf("UDP dial address for %q = %q, want %q", tc.address, got, tc.want)
+		}
+	}
+	if lookups != 0 {
+		t.Fatalf("zoned literals consulted the resolver %d times, want 0", lookups)
+	}
+}
+
+// serveUDPReplies answers every query that reaches a 127.0.0.1 socket with
+// the datagrams reply builds for it, in order.
+func serveUDPReplies(t *testing.T, reply func(query *dns.Msg) [][]byte) string {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buffer := make([]byte, 4096)
+		for {
+			n, address, err := conn.ReadFromUDP(buffer)
+			if err != nil {
+				return
+			}
+			query := new(dns.Msg)
+			if query.Unpack(buffer[:n]) != nil || len(query.Question) != 1 {
+				continue
+			}
+			for _, datagram := range reply(query) {
+				_, _ = conn.WriteToUDP(datagram, address)
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = conn.Close()
+		<-done
+	})
+	return conn.LocalAddr().String()
+}
+
+func packedReply(t *testing.T, query *dns.Msg, mutate func(*dns.Msg)) []byte {
+	t.Helper()
+	response := replyFor(query.Question[0].Name, query.Question[0].Qtype, query.Id)
+	if mutate != nil {
+		mutate(response)
+	}
+	packed, err := response.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return packed
+}
+
+// The UDP exchange reads the raw datagram so it can see bytes after the DNS
+// message; everything else ExchangeContext did must still hold.
+func TestUDPSessionExchangeBranches(t *testing.T) {
+	cases := []struct {
+		name      string
+		reply     func(*dns.Msg) [][]byte
+		wantError string
+	}{
+		{name: "valid", reply: func(query *dns.Msg) [][]byte {
+			return [][]byte{packedReply(t, query, nil)}
+		}},
+		{name: "stale reply is skipped", reply: func(query *dns.Msg) [][]byte {
+			stale := packedReply(t, query, func(m *dns.Msg) { m.Id = query.Id + 1 })
+			return [][]byte{stale, packedReply(t, query, nil)}
+		}},
+		{name: "trailing byte", wantError: "trailing data", reply: func(query *dns.Msg) [][]byte {
+			return [][]byte{append(packedReply(t, query, nil), 0)}
+		}},
+		{name: "malformed", wantError: "dns:", reply: func(query *dns.Msg) [][]byte {
+			malformed := packedReply(t, query, nil)[:dnsHeaderLength]
+			return [][]byte{append(malformed, 0xc0)}
+		}},
+		{name: "signed", wantError: dns.ErrSecret.Error(), reply: func(query *dns.Msg) [][]byte {
+			return [][]byte{packedReply(t, query, func(m *dns.Msg) { m.SetTsig("key.example.", dns.HmacSHA256, 300, time.Now().Unix()) })}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			address := serveUDPReplies(t, tc.reply)
+			session := &udpSession{address: address, timeout: time.Second}
+			response, err := session.Query(context.Background(), "example.com", dns.TypeA)
+			if tc.wantError == "" {
+				if err != nil || response == nil {
+					t.Fatalf("UDP query = %v/%v", response, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("UDP query error = %v, want one containing %q", err, tc.wantError)
+			}
+		})
+	}
+
+	if _, err := (&udpSession{address: "no-port", timeout: time.Second}).Query(context.Background(), "example.com", dns.TypeA); err == nil {
+		t.Fatal("expected a UDP dial error for an address without a port")
+	}
+	address := serveUDPReplies(t, func(*dns.Msg) [][]byte { return nil })
+	unpackable := strings.Repeat("a", 64) + ".example"
+	if _, err := (&udpSession{address: address, timeout: time.Second}).Query(context.Background(), unpackable, dns.TypeA); err == nil {
+		t.Fatal("expected a UDP write error for a query that cannot be packed")
+	}
+}

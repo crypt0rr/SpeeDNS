@@ -91,12 +91,22 @@ func frameMessage(message *dns.Msg) []byte {
 	return framed
 }
 
-func queueReplyAfterQuery(c *scriptedConn) {
-	if c.writeCalls != 2 {
-		return
+// unframeQuery decodes one write that carries a whole length-prefixed query,
+// which is how every framed transport sends a request.
+func unframeQuery(p []byte) (*dns.Msg, bool) {
+	if len(p) < 2 || int(binary.BigEndian.Uint16(p[:2])) != len(p)-2 {
+		return nil, false
 	}
 	query := new(dns.Msg)
-	if err := query.Unpack(c.lastWrite); err != nil {
+	if err := query.Unpack(p[2:]); err != nil || len(query.Question) != 1 {
+		return nil, false
+	}
+	return query, true
+}
+
+func queueReplyAfterQuery(c *scriptedConn) {
+	query, ok := unframeQuery(c.lastWrite)
+	if !ok {
 		return
 	}
 	c.readBuf.Write(frameMessage(replyFor(query.Question[0].Name, query.Question[0].Qtype, query.Id)))
@@ -276,8 +286,13 @@ func TestStreamSessionFramingAndAllErrors(t *testing.T) {
 	}
 	session, conn := valid()
 	response, err := session.Query(context.Background(), "example.com", dns.TypeA)
-	if err != nil || response == nil || conn.writeCalls != 2 {
+	if err != nil || response == nil || conn.writeCalls != 1 {
 		t.Fatalf("stream success = %#v/%v, writes=%d", response, err, conn.writeCalls)
+	}
+	// RFC 7766 section 8: the length prefix and the message leave in one
+	// write, so a DoT query is one TLS record rather than two.
+	if _, ok := unframeQuery(conn.lastWrite); !ok {
+		t.Fatalf("the single write is not a whole framed query: %x", conn.lastWrite)
 	}
 
 	cases := []struct {
@@ -295,8 +310,7 @@ func TestStreamSessionFramingAndAllErrors(t *testing.T) {
 			withPackSession(t, func(*dns.Msg) ([]byte, error) { return make([]byte, 65536), nil })
 			return &streamSession{conn: &scriptedConn{}, timeout: time.Second}
 		}},
-		{"prefix write", func() *streamSession { return &streamSession{conn: &scriptedConn{writeErrAt: 1}, timeout: time.Second} }},
-		{"payload write", func() *streamSession { return &streamSession{conn: &scriptedConn{writeErrAt: 2}, timeout: time.Second} }},
+		{"write", func() *streamSession { return &streamSession{conn: &scriptedConn{writeErrAt: 1}, timeout: time.Second} }},
 		{"prefix read", func() *streamSession {
 			return &streamSession{conn: &scriptedConn{readErr: errors.New("prefix read failed")}, timeout: time.Second}
 		}},
@@ -420,19 +434,26 @@ func TestDoHFactorySessionAndRedirects(t *testing.T) {
 	if err != nil || fallback.(*doHFactory).dialAddr != "dns.example:443" || fallback.(*doHFactory).serverName != "dns.example" {
 		t.Fatalf("DoH fallback factory = %#v/%v", fallback, err)
 	}
-	legacy := &doHFactory{url: "https://dns.example/dns-query", dialAddr: "dns.example:443", timeout: time.Second}
-	legacySession, err := legacy.Open(context.Background())
+	// Open dials, so a factory whose single address is unreachable fails
+	// there, as DoT and DoQ do. A closed loopback port keeps the test offline.
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = legacySession.Close()
-	session, err := dohFactory.Open(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	closedAddress := closed.Addr().String()
+	_ = closed.Close()
+	legacy := &doHFactory{url: "https://dns.example/dns-query", dialAddr: closedAddress, timeout: time.Second}
+	if _, err := legacy.Open(context.Background()); err == nil || !strings.Contains(err.Error(), closedAddress) {
+		t.Fatalf("DoH open against a closed port = %v", err)
 	}
-	doh := session.(*doHSession)
+	doh := dohFactory.newSession()
 	if doh.client.Timeout != time.Second || !doh.client.Transport.(*http.Transport).ForceAttemptHTTP2 {
 		t.Fatal("DoH client configuration missing")
+	}
+	// The h2 health check that retires a silently dead connection: a ping
+	// after one timeout of silence, the connection closed after another.
+	if h2 := doh.transport.HTTP2; h2 == nil || h2.SendPingTimeout != time.Second || h2.PingTimeout != time.Second {
+		t.Fatalf("DoH HTTP/2 health check = %#v", h2)
 	}
 	dialCtx, cancelDial := context.WithCancel(context.Background())
 	cancelDial()
@@ -568,6 +589,7 @@ type fakeDoQStream struct {
 	closeErr    error
 	deadlineErr error
 	deadlines   []time.Time
+	cancelReads []quic.StreamErrorCode
 	onWrite     func([]byte)
 }
 
@@ -588,6 +610,9 @@ func (s *fakeDoQStream) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 func (s *fakeDoQStream) Close() error { return s.closeErr }
+func (s *fakeDoQStream) CancelRead(code quic.StreamErrorCode) {
+	s.cancelReads = append(s.cancelReads, code)
+}
 func (s *fakeDoQStream) SetDeadline(deadline time.Time) error {
 	s.deadlines = append(s.deadlines, deadline)
 	return s.deadlineErr
@@ -609,11 +634,8 @@ func (c *fakeDoQConn) CloseWithError(quic.ApplicationErrorCode, string) error {
 func newFakeDoQStream() (*fakeDoQStream, *fakeDoQConn) {
 	stream := &fakeDoQStream{}
 	stream.onWrite = func(p []byte) {
-		if stream.writeCalls != 2 {
-			return
-		}
-		query := new(dns.Msg)
-		if query.Unpack(p) != nil {
+		query, ok := unframeQuery(p)
+		if !ok {
 			return
 		}
 		stream.readBuf.Write(frameMessage(replyFor(query.Question[0].Name, query.Question[0].Qtype, 0)))
@@ -690,11 +712,8 @@ func TestDoQFactoryAndSessionAllBranches(t *testing.T) {
 		{"open stream", func() *doqSession {
 			return &doqSession{conn: &fakeDoQConn{openErr: errors.New("open stream")}, timeout: time.Second}
 		}},
-		{"prefix write", func() *doqSession {
+		{"write", func() *doqSession {
 			return &doqSession{conn: &fakeDoQConn{stream: &fakeDoQStream{writeErrAt: 1}}, timeout: time.Second}
-		}},
-		{"payload write", func() *doqSession {
-			return &doqSession{conn: &fakeDoQConn{stream: &fakeDoQStream{writeErrAt: 2}}, timeout: time.Second}
 		}},
 		{"close", func() *doqSession {
 			return &doqSession{conn: &fakeDoQConn{stream: &fakeDoQStream{closeErr: errors.New("close stream")}}, timeout: time.Second}

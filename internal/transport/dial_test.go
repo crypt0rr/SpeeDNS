@@ -291,12 +291,9 @@ func TestDoHFactoryUsesBootstrapCandidates(t *testing.T) {
 	if got := dohFactory.connectionPlan.addresses; len(got) != 2 || got[0] != "127.0.0.2:443" || got[1] != "127.0.0.1:443" {
 		t.Fatalf("DoH bootstrap plan = %#v", got)
 	}
-	session, err := dohFactory.Open(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := dohFactory.newSession()
 	defer session.Close()
-	transport := session.(*doHSession).client.Transport.(*http.Transport)
+	transport := session.client.Transport.(*http.Transport)
 	if transport.MaxResponseHeaderBytes != doHMaxResponseHeaderBytes {
 		t.Fatalf("DoH response header limit = %d, want %d", transport.MaxResponseHeaderBytes, doHMaxResponseHeaderBytes)
 	}
@@ -589,12 +586,8 @@ func TestDoHRedirectRequiresHTTPSOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := factory.Open(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	doh := session.(*doHSession)
+	doh := factory.(*doHFactory).newSession()
+	defer doh.Close()
 	origin, _ := url.Parse("https://dns.example/dns-query")
 	cases := []struct {
 		name string
@@ -730,5 +723,75 @@ func TestDoHSessionQueryFailureBeforeDialClearsReconnect(t *testing.T) {
 	}
 	if session.LastQueryReconnected() {
 		t.Fatal("DoH query that never dialed kept a stale reconnect flag")
+	}
+}
+
+func TestDialPlanPreferringAndAfterKeepConfiguredOrder(t *testing.T) {
+	plan := dialPlan{addresses: []string{"a:853", "b:853", "c:853"}, timeout: time.Second}
+	for _, tc := range []struct {
+		address   string
+		preferred string
+		after     string
+	}{
+		{"a:853", "a:853,b:853,c:853", "b:853"},
+		{"b:853", "b:853,a:853,c:853", "c:853"},
+		{"c:853", "c:853,a:853,b:853", "a:853"},
+		{"z:853", "a:853,b:853,c:853", "z:853"},
+		{"", "a:853,b:853,c:853", ""},
+	} {
+		preferred := plan.preferring(tc.address)
+		if got := strings.Join(preferred.addresses, ","); got != tc.preferred || preferred.timeout != plan.timeout {
+			t.Fatalf("preferring(%q) = %s/%v, want %s", tc.address, got, preferred.timeout, tc.preferred)
+		}
+		if got := plan.after(tc.address); got != tc.after {
+			t.Fatalf("after(%q) = %q, want %q", tc.address, got, tc.after)
+		}
+	}
+	if got := strings.Join(plan.addresses, ","); got != "a:853,b:853,c:853" {
+		t.Fatalf("preferring reordered the configured plan: %s", got)
+	}
+	if got := (dialPlan{addresses: []string{"a:853"}}).after("a:853"); got != "a:853" {
+		t.Fatalf("after on a single candidate = %q", got)
+	}
+}
+
+// stickyReopen starts every reconnect at the address that last connected, and
+// moves on to the next candidate only when a reconnect ran out of budget.
+func TestStickyReopenFollowsTheLastGoodCandidate(t *testing.T) {
+	plan := dialPlan{addresses: []string{"a", "b", "c"}, timeout: time.Second}
+	type outcome struct {
+		address string
+		err     error
+	}
+	var orders []string
+	var next outcome
+	reopen := stickyReopen(plan, "b", func(_ context.Context, order dialPlan) (string, string, error) {
+		orders = append(orders, strings.Join(order.addresses, ","))
+		return next.address, next.address, next.err
+	})
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	steps := []struct {
+		ctx     context.Context
+		result  outcome
+		wantRun string
+	}{
+		// Every candidate refused at once: the budget is intact, so the
+		// next reconnect still starts at the address that worked.
+		{context.Background(), outcome{err: errors.New("refused")}, "b,a,c"},
+		// The budget ran out: the next reconnect starts after b.
+		{expired, outcome{err: context.Canceled}, "b,a,c"},
+		{context.Background(), outcome{address: "a"}, "c,a,b"},
+		{context.Background(), outcome{address: "a"}, "a,b,c"},
+	}
+	for index, step := range steps {
+		next = step.result
+		conn, address, err := reopen(step.ctx)
+		if !errors.Is(err, step.result.err) || address != step.result.address || conn != step.result.address {
+			t.Fatalf("step %d returned %q/%q/%v", index, conn, address, err)
+		}
+		if got := orders[index]; got != step.wantRun {
+			t.Fatalf("step %d tried %s, want %s", index, got, step.wantRun)
+		}
 	}
 }

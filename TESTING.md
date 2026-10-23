@@ -49,7 +49,7 @@ Apart from domain normalization these harnesses are property tests, not
 panic checks. `FuzzValidateResponseMatchesRequest` asserts the biconditional
 for the anti-spoofing boundary: a response is accepted exactly when it carries
 the response flag, one question matching the requested name, type, and class
-`IN`, and a transaction ID that matches the query (or is zero on DoQ).
+`IN`, and a transaction ID that matches the query (or is zero on DoH and DoQ).
 Malformed wire data is handed to `validateResponse` instead of being skipped.
 `FuzzParseResolverFlagInvariants` asserts that an accepted `NAME=URI` flag
 yields exactly one transport for the URI scheme, with the right default port
@@ -57,3 +57,11 @@ and with TLS or HTTP settings only where the scheme needs them, so no resolver
 can silently gain a second transport. `FuzzLoadYAMLInvariants` asserts that
 every accepted resolver file revalidates unchanged. The seed corpora in
 `internal/catalog/testdata/fuzz/` pin the interesting accept and reject paths.
+
+Transport recovery runs against local fixtures bound to `127.0.0.1` only,
+because macOS runners cannot bind other loopback addresses: bootstrap
+candidates that accept a connection and never speak, a TCP proxy that silences
+an established HTTP/2 connection without closing it, and a DoQ server that
+withholds its FIN. They use timeouts of a few hundred milliseconds and assert
+outcomes, such as which query reconnected and which connections the server
+saw closed, rather than durations.

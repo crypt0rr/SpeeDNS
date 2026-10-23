@@ -65,21 +65,30 @@ connection are not closed before the timer stops. A query that follows a TCP,
 DoT, DoH, or DoQ reconnect is recorded as a reconnect sample and excluded from
 ordinary warm-latency scoring; its reconnect count and selected dial address
 remain visible in detailed output and machine-readable results. A DoH session
-reuses one pooled HTTPS connection; when that connection is gone, the HTTP
-client opens a new one transparently, so the query that pays for the new TCP,
-TLS, and HTTP handshake is the reconnect sample. The connection the session
-opens for its first exchange is the DoH equivalent of the dial the stream
-transports perform when the session is opened, and is not a reconnect. DoQ
-sessions use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to
-the configured timeout, and a maximum idle timeout of twice that timeout. The
+opens its HTTPS connection when the session is opened, as the stream
+transports do, and that connection is not a reconnect. The session reuses it;
+when it is gone, the HTTP client opens a new one transparently, so the query
+that pays for the new TCP, TLS, and HTTP handshake is the reconnect sample. An
+HTTP/2 connection that stops answering without being closed is pinged after
+one timeout of silence and dropped when the ping goes unanswered for another
+timeout, so a dead path costs DoH about as many failed queries as the other
+transports rather than one per HTTP/2 stream the server allows. DoQ sessions
+use TLS 1.3 with ALPN `doq`, an explicit keepalive period equal to the
+configured timeout, and a maximum idle timeout of twice that timeout. The
 failed exchange that caused the reconnect is counted once and is never
-retried.
+retried. A DoT or DoQ reconnect runs inside one query's deadline, so it first
+tries the bootstrap candidate the session last connected to and then the
+others in configured order; when a reconnect runs out of time, the next one
+starts at the following candidate, so a candidate that stopped answering
+cannot consume every later query's budget.
 
 Cold probes use three separate sessions. Their timer includes session opening,
 the first DNS exchange, and response validation, but stops before session
 teardown. Cold medians are reported separately and never enter the warm score.
 
-Only transport-valid DNS messages are transport successes. A response is
+Only transport-valid DNS messages are transport successes. A UDP datagram,
+TCP, DoT, or DoQ frame, or DoH body that carries bytes after the complete DNS
+message is malformed, not accepted as the message alone. A response is
 usable when it is a validated `NOERROR` response (including NODATA) or
 `NXDOMAIN`. SERVFAIL, REFUSED, truncated messages, malformed responses,
 timeouts, connection errors, and other resolver errors are not usable.

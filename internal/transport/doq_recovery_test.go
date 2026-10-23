@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -262,4 +264,96 @@ func TestDoQFactoryRecoversWithLocalFixtureAfterConnectionClose(t *testing.T) {
 func newFakeDoQStreamConn() doqConn {
 	_, conn := newFakeDoQStream()
 	return conn
+}
+
+// serveDoQCandidate answers DoQ queries on listener. mode picks the behaviour
+// of each accepted connection by its 1-based index; candidateDropsSecond
+// closes the connection on its second query instead of answering it.
+func serveDoQCandidate(t *testing.T, listener *quic.Listener, mode func(connection int32) candidateMode) {
+	t.Helper()
+	var accepts atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			go serveDoQConnection(conn, mode(accepts.Add(1)))
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-done
+	})
+}
+
+func serveDoQConnection(conn *quic.Conn, mode candidateMode) {
+	defer conn.CloseWithError(0, "")
+	for answered := 0; ; answered++ {
+		stream, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+		query, err := readFramedQuery(stream)
+		if err != nil {
+			return
+		}
+		if mode == candidateDropsSecond && answered == 1 {
+			_ = conn.CloseWithError(0, "fixture drops the connection")
+			return
+		}
+		if _, err := stream.Write(frameMessage(replyFor(query.Question[0].Name, query.Question[0].Qtype, 0))); err != nil {
+			return
+		}
+		_ = stream.Close()
+	}
+}
+
+// TestDoQReconnectReturnsToTheCandidateThatConnected is the DoQ half of the
+// sticky-reconnect fixture: a UDP black hole is the first bootstrap
+// candidate, Open gets past it with its own budget, and the reconnect after a
+// mid-session loss must go straight back to the server that answered.
+func TestDoQReconnectReturnsToTheCandidateThatConnected(t *testing.T) {
+	const serverName = "dns.example"
+	const timeout = 300 * time.Millisecond
+	certificate, roots := testServerCertificate(t, serverName)
+	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blackhole.Close() })
+	good, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{certificate},
+		NextProtos:   []string{"doq"},
+	}, &quic.Config{MaxIdleTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDoQCandidate(t, good, func(connection int32) candidateMode {
+		if connection == 1 {
+			return candidateDropsSecond
+		}
+		return candidateAnswers
+	})
+
+	factory := &doqFactory{
+		connectionPlan: dialPlan{addresses: []string{blackhole.LocalAddr().String(), good.Addr().String()}, timeout: timeout},
+		timeout:        timeout,
+		tlsConfig:      &tls.Config{MinVersion: tls.VersionTLS13, ServerName: serverName, RootCAs: roots, NextProtos: []string{"doq"}},
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	got := strings.Join(queryOutcomes(t, session, 4, timeout), ",")
+	if want := "ok,failed,reconnected,ok"; got != want {
+		t.Fatalf("DoQ queries after a mid-session loss = %s, want %s", got, want)
+	}
+	if address := session.(*doqSession).DialAddress(); address != good.Addr().String() {
+		t.Fatalf("DoQ reconnected to %q, want %q", address, good.Addr().String())
+	}
 }

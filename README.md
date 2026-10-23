@@ -420,7 +420,7 @@ Each entry in `addresses` must be an IP literal (`192.0.2.53`,
 belongs in the transport spec's `port:` field, and an address such as
 `192.0.2.53:5353` is rejected before the benchmark starts.
 
-Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order. TLS certificate validation is always enabled.
+Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order when a session opens. A DoT or DoQ session that has to reconnect during the run tries the address it last connected to first, then the others in order, and starts at the next candidate if that reconnect runs out of time. TLS certificate validation is always enabled.
 
 For a hostname-only custom encrypted endpoint, SpeeDNS uses the operating
 system resolver to find the connection address. To make bootstrap deterministic
