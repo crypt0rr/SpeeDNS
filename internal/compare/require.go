@@ -4,9 +4,15 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
-// RequireResult is the outcome of one named condition.
+// RequireResult is the outcome of one named condition. Detail is printed to
+// stderr when the condition fails, and it quotes target IDs and finding
+// details read from the two report files, so it is built from escaped text:
+// a crafted or hostile report must not reach the terminal through a gate
+// failure when the diff table beside it is escaped.
 type RequireResult struct {
 	Name   string `json:"name"`
 	Passed bool   `json:"passed"`
@@ -24,7 +30,7 @@ var requireConditions = map[string]func(Diff) (bool, string){
 		for _, finding := range d.Findings {
 			current, inCurrent := after[finding.TargetID]
 			if detail, failed := newlyFailed(finding, before[finding.TargetID], current, inCurrent); failed {
-				return false, fmt.Sprintf("%s: %s", finding.TargetID, detail)
+				return false, fmt.Sprintf("%s: %s", safetext.Escape(finding.TargetID), safetext.Escape(detail))
 			}
 		}
 		return true, "no target stopped answering or failed to open, and no added target failed outright"
@@ -32,7 +38,7 @@ var requireConditions = map[string]func(Diff) (bool, string){
 	"no-removed-targets": func(d Diff) (bool, string) {
 		for _, finding := range d.Findings {
 			if finding.Code == "PRESENCE" && strings.Contains(finding.Detail, "baseline") {
-				return false, fmt.Sprintf("%s is absent from the current run", finding.TargetID)
+				return false, fmt.Sprintf("%s is absent from the current run", safetext.Escape(finding.TargetID))
 			}
 		}
 		return true, "every baseline target is present in the current run"
@@ -40,7 +46,7 @@ var requireConditions = map[string]func(Diff) (bool, string){
 	"target-set-identical": func(d Diff) (bool, string) {
 		for _, finding := range d.Findings {
 			if finding.Code == "PRESENCE" {
-				return false, fmt.Sprintf("%s: %s", finding.TargetID, finding.Detail)
+				return false, fmt.Sprintf("%s: %s", safetext.Escape(finding.TargetID), safetext.Escape(finding.Detail))
 			}
 		}
 		return true, "both runs measured the same targets"
@@ -48,7 +54,7 @@ var requireConditions = map[string]func(Diff) (bool, string){
 	"no-dnssec-regression": func(d Diff) (bool, string) {
 		for _, finding := range d.Findings {
 			if finding.Code == "DNSSEC" && strings.Contains(finding.Detail, "-> not-validating") {
-				return false, fmt.Sprintf("%s stopped validating", finding.TargetID)
+				return false, fmt.Sprintf("%s stopped validating", safetext.Escape(finding.TargetID))
 			}
 		}
 		return true, "no target stopped validating"

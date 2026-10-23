@@ -292,17 +292,28 @@ list.
 JSON contains the structured result and optional raw observations. CSV keeps
 the aggregate schema and adds reconnect/incomplete diagnostics at the end.
 Text that SpeeDNS did not produce itself is escaped before it reaches a
-terminal or a CSV cell. Session errors quote strings chosen by the endpoint,
-such as the certificate names in an `x509` hostname mismatch, and resolver
-names, owners, and policies arrive from `--resolver`, `--resolver-file`, or
-the system resolver configuration; control characters in any of them are
+terminal, a CSV cell, or a JSON string. Session errors and DNSSEC probe errors
+quote strings chosen by the endpoint, such as the certificate names in an
+`x509` hostname mismatch or the reason phrase of a DoH HTTP/1.1 status line,
+and resolver IDs, names, owners, policies, DoH endpoint URLs, TLS server
+names, and bootstrap addresses arrive from `--resolver`, `--resolver-file`, or
+the system resolver configuration. Control characters in any of them are
 rendered as visible `\x1b`-style sequences, so neither a certificate field nor
-a configured name can rewrite the terminal. The status colours are the only
-escape sequences the table emits itself. CSV cells are escaped first and the
-formula guard runs afterwards on the escaped value: a cell beginning with
-`=`, `+`, `-`, `@`, or an escape sequence - which is how a leading tab,
-carriage return, or ESC is rendered - is prefixed with an apostrophe to
-prevent spreadsheet formula interpretation.
+a configured name can rewrite the terminal. Bidirectional controls (U+061C,
+U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) and invisible format characters
+(U+200B-U+200D, U+2060-U+2064, U+FEFF) are rendered as `\u{202e}`-style
+sequences, so they cannot reorder or hide the text around them either, and
+table column widths count format characters other than the soft hyphen as zero
+cells. JSON carries these values in the same escaped form as the table and
+CSV, so a consumer that decodes and prints a string, such as `jq -r`, gets the
+escaped text as well. The failure messages that `--assert` and
+`speedns diff --require` print to stderr escape the target IDs and finding
+details they quote. The status colours are the only escape sequences the table
+emits itself. CSV cells are escaped first and the formula guard runs
+afterwards on the escaped value: a cell beginning with `=`, `+`, `-`, `@`, or
+an escape sequence of either form - which is how a leading tab, carriage
+return, ESC, or bidirectional override is rendered - is prefixed with an
+apostrophe to prevent spreadsheet formula interpretation.
 For encrypted targets, these reports also expose the effective TLS server
 name, whether it was configured explicitly or derived from the endpoint,
 whether bootstrap came from explicit IP candidates, the target address, or

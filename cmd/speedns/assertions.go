@@ -11,6 +11,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
 // ErrAssertionsFailed is returned after a report has been written when one or
@@ -233,7 +234,12 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 	if len(reasons) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%w: %s", ErrAssertionsFailed, strings.Join(reasons, "; "))
+	// The message is printed to stderr, and the reasons quote target IDs -
+	// a resolver ID and address from --resolver-file - and the expression
+	// as given. Escaping the joined text once covers every reason, so a
+	// control character cannot reach the terminal through a failed gate when
+	// the report above it renders the same ID escaped.
+	return fmt.Errorf("%w: %s", ErrAssertionsFailed, safetext.Escape(strings.Join(reasons, "; ")))
 }
 
 // deadProtocols returns every protocol whose non-local endpoints all returned

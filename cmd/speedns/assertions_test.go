@@ -595,3 +595,34 @@ func TestSubjectAssertionParsingAndValidation(t *testing.T) {
 		t.Fatalf("a typo'd subject must be invalid input: %v", err)
 	}
 }
+
+// TestAssertionFailureReasonsEscapeTargetIDs covers the gate's stderr line. A
+// resolver ID from --resolver-file reaches it through the target ID, and the
+// report written above it renders that ID escaped, so the failure message
+// must not be the one place it arrives raw.
+func TestAssertionFailureReasonsEscapeTargetIDs(t *testing.T) {
+	slow := assertTarget("evil\x1b[2K\u202e", catalog.UDP, false, benchmark.Statistics{
+		Total: 30, Successes: 30, UsableResponses: 30, Scored: 30, SuccessRate: 1, UsableRate: 1, P95MS: 90,
+	})
+	report := benchmark.Report{
+		Targets:  []benchmark.TargetResult{slow},
+		Rankings: []benchmark.Ranking{{Protocol: catalog.UDP, TargetID: slow.Target.ID(), Rank: 1}},
+	}
+	for _, expression := range []string{"p95<50ms", slow.Target.Resolver.ID + ":p95<50ms"} {
+		checks, err := parseAssertions([]string{expression})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = evaluateAssertions(report, checks)
+		if !errors.Is(err, ErrAssertionsFailed) {
+			t.Fatalf("evaluateAssertions(%q) = %v, want a failed assertion", expression, err)
+		}
+		message := errorMessage(err)
+		if strings.ContainsAny(message, "\x1b\u202e") {
+			t.Fatalf("failure message for %q kept a raw control character: %q", expression, message)
+		}
+		if !strings.Contains(message, `evil\x1b[2K\u{202e}@192.0.2.1/udp has p95=90.000ms`) {
+			t.Fatalf("failure message for %q does not name the escaped target: %q", expression, message)
+		}
+	}
+}

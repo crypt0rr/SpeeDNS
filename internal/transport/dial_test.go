@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 )
@@ -364,6 +366,84 @@ func TestDoHQueryUsesBootstrapIPWithHostnameTLSIdentity(t *testing.T) {
 	}
 	if got := session.(*doHSession).DialAddress(); got != listener.Addr().String() {
 		t.Fatalf("DoH selected dial address = %q, want %q", got, listener.Addr().String())
+	}
+}
+
+// TestDoHStatusErrorQuotesTheEndpointReasonPhrase is the source half of the
+// reports' escaping contract, against a fake DoH endpoint on 127.0.0.1. Over
+// HTTP/1.1 the endpoint chooses the reason phrase, net/http keeps it byte for
+// byte, and the session error quotes it, so a hostile endpoint can put
+// terminal control sequences into an observation, open or DNSSEC probe error.
+// The transport records the text as received, because escaping is a rendering
+// decision made at each report sink; the escaped form checked last is the one
+// the table, JSON and CSV render.
+func TestDoHStatusErrorQuotesTheEndpointReasonPhrase(t *testing.T) {
+	const (
+		serverName = "dns.example"
+		reason     = "418 \x1b[2J\x1b[H\u202eteapot"
+	)
+	certificate, roots := testServerCertificate(t, serverName)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The server offers no ALPN protocol, so the client falls back to
+	// HTTP/1.1. Over HTTP/2 net/http builds the status text from the code
+	// alone and the endpoint cannot choose it.
+	tlsListener := tls.NewListener(listener, &tls.Config{Certificates: []tls.Certificate{certificate}})
+	t.Cleanup(func() { _ = tlsListener.Close() })
+	served := make(chan error, 1)
+	go func() {
+		conn, acceptErr := tlsListener.Accept()
+		if acceptErr != nil {
+			served <- acceptErr
+			return
+		}
+		defer conn.Close()
+		request, readErr := http.ReadRequest(bufio.NewReader(conn))
+		if readErr != nil {
+			served <- readErr
+			return
+		}
+		_, _ = io.Copy(io.Discard, request.Body)
+		_, writeErr := io.WriteString(conn, "HTTP/1.1 "+reason+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		served <- writeErr
+	}()
+
+	oldTLSConfig := newDoHTLSConfig
+	newDoHTLSConfig = func(name string) *tls.Config {
+		return &tls.Config{MinVersion: tls.VersionTLS12, ServerName: name, RootCAs: roots}
+	}
+	t.Cleanup(func() { newDoHTLSConfig = oldTLSConfig })
+
+	factory, err := newDoHFactory(catalog.Target{Address: "127.0.0.1", Spec: catalog.TransportSpec{
+		URL:                "https://dns.example/dns-query",
+		Port:               listener.Addr().(*net.TCPAddr).Port,
+		ServerName:         serverName,
+		BootstrapAddresses: []string{"127.0.0.1"},
+	}}, time.Second, QueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := factory.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	_, queryErr := session.Query(context.Background(), "example.com", dns.TypeA)
+	select {
+	case serveErr := <-served:
+		if serveErr != nil {
+			t.Fatalf("fake DoH endpoint: %v", serveErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fake DoH endpoint never answered")
+	}
+	if queryErr == nil || queryErr.Error() != "DoH HTTP status "+reason {
+		t.Fatalf("query error = %v, want the reason phrase as sent", queryErr)
+	}
+	if got, want := safetext.Escape(queryErr.Error()), `DoH HTTP status 418 \x1b[2J\x1b[H\u{202e}teapot`; got != want {
+		t.Fatalf("escaped query error = %q, want %q", got, want)
 	}
 }
 

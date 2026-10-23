@@ -127,7 +127,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 	results := make([]JSONResult, 0, len(report.Targets))
 	redactedIDs := redactedTargetIDs(report, options.RedactSystem)
 	for _, result := range report.Targets {
-		metadata := result.Target.EndpointMetadata()
+		metadata := jsonEndpointMetadata(result.Target)
 		view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
 		dialAddress := result.DialAddress
 		if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
@@ -139,9 +139,13 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 				Address: view.Address, Protocol: result.Target.Protocol, Local: result.Target.Resolver.Local,
 				EndpointURL: metadata.EndpointURL, TLSServerName: metadata.TLSServerName,
 				TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
-				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: dialAddress,
+				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: safetext.Escape(dialAddress),
 			},
-			Stats: result.Stats, Status: statusValue(result), OpenError: redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()]), Incomplete: result.Incomplete,
+			// The session error quotes endpoint-chosen text, such as the
+			// certificate names in an x509 mismatch, so it is escaped like
+			// the target metadata beside it; the CSV open_error column
+			// renders the same value.
+			Stats: result.Stats, Status: statusValue(result), OpenError: safetext.Escape(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), Incomplete: result.Incomplete,
 			DNSSEC: redactDNSSEC(result, options.RedactSystem, redactedIDs[result.Target.ID()]),
 		}
 		if raw {
@@ -152,9 +156,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 	}
 	rankings := append(make([]benchmark.Ranking, 0, len(report.Rankings)), report.Rankings...)
 	for index := range rankings {
-		if redactedID, ok := redactedIDs[rankings[index].TargetID]; ok {
-			rankings[index].TargetID = redactedID
-		}
+		rankings[index].TargetID = jsonTargetID(rankings[index].TargetID, redactedIDs)
 	}
 	warnings := renderWarnings(report, options.RedactSystem, redactedIDs)
 	var profileComparisons []JSONProfileComparison
@@ -301,15 +303,17 @@ func placeholderText(value string) string {
 // would then hand a spreadsheet a cell whose visible content starts with a
 // formula. An escape sequence therefore joins the leading characters that ask
 // for the apostrophe, which also keeps the guard stable for values that were
-// already escaped upstream. Escaping never removes bytes, so it cannot shift
-// a formula character into the leading position after the guard looked at it
-// either.
+// already escaped upstream. Both of its forms count: a leading bidirectional
+// override is rendered as \u{202e} rather than \xNN, and it can hide a formula
+// character behind it just as well. Escaping never removes bytes, so it cannot
+// shift a formula character into the leading position after the guard looked
+// at it either.
 func csvCell(value string) string {
 	value = safetext.Escape(value)
 	if value == "" {
 		return value
 	}
-	if strings.HasPrefix(value, safetext.EscapePrefix) {
+	if safetext.HasEscapePrefix(value) {
 		return "'" + value
 	}
 	switch value[0] {
@@ -401,6 +405,38 @@ func targetViewFor(target catalog.Target, redact bool, redactedID string) target
 	return view
 }
 
+// jsonEndpointMetadata returns the endpoint metadata the JSON report carries,
+// escaped. The URL, TLS server name and bootstrap candidates come from the
+// same --resolver and --resolver-file input as the name and owner that
+// targetViewFor escapes, and the table and CSV already render them escaped, so
+// a JSON consumer that decodes and prints them gets the same text. The TLS
+// identity source and bootstrap mode are left alone: EndpointMetadata only
+// ever sets them to catalog constants, never to configured text.
+func jsonEndpointMetadata(target catalog.Target) catalog.EndpointMetadata {
+	metadata := target.EndpointMetadata()
+	metadata.EndpointURL = safetext.Escape(metadata.EndpointURL)
+	metadata.TLSServerName = safetext.Escape(metadata.TLSServerName)
+	// EndpointMetadata returns its own copy of the slice, so rewriting it
+	// leaves the target untouched.
+	for index := range metadata.BootstrapAddresses {
+		metadata.BootstrapAddresses[index] = safetext.Escape(metadata.BootstrapAddresses[index])
+	}
+	return metadata
+}
+
+// jsonTargetID renders a reference to a target - in rankings, paired effects,
+// profile comparisons or divergence exclusions - exactly as results[].target.id
+// renders the target itself: redacted for a system target when redaction is
+// on, escaped otherwise. A consumer joining those sections on the ID therefore
+// matches every target, including one whose resolver ID carries control
+// characters.
+func jsonTargetID(id string, redactedIDs map[string]string) string {
+	if replacement, ok := redactedIDs[id]; ok {
+		return replacement
+	}
+	return safetext.Escape(id)
+}
+
 func redactResultText(result benchmark.TargetResult, value string, redact bool, redactedID string) string {
 	if !redact || !isSystemTarget(result.Target) || value == "" {
 		return value
@@ -467,16 +503,23 @@ func redactColdObservations(result benchmark.TargetResult, redact bool, redacted
 
 // redactDNSSEC copies the assessment before rewriting probe error text so a
 // redacted report cannot leak a local resolver address through a probe error.
+//
+// It also escapes that text, for every target and not only redacted ones. A
+// probe error is endpoint-chosen - a DoH reason phrase, a TLS diagnostic
+// quoting certificate fields - and the reason quotes it, so it gets the same
+// treatment as the observation errors in redactObservations. The table and the
+// JSON report both read the assessment from here, so they show one rendered
+// value. Redaction runs before escaping, in the same order as open_error.
 func redactDNSSEC(result benchmark.TargetResult, redact bool, redactedID string) *benchmark.DNSSECAssessment {
-	if result.DNSSEC == nil || !redact || !isSystemTarget(result.Target) {
-		return result.DNSSEC
+	if result.DNSSEC == nil {
+		return nil
 	}
 	assessment := *result.DNSSEC
 	assessment.Probes = append([]benchmark.DNSSECProbe(nil), result.DNSSEC.Probes...)
 	for index := range assessment.Probes {
-		assessment.Probes[index].Error = redactResultText(result, assessment.Probes[index].Error, true, redactedID)
+		assessment.Probes[index].Error = safetext.Escape(redactResultText(result, assessment.Probes[index].Error, redact, redactedID))
 	}
-	assessment.Reason = redactResultText(result, assessment.Reason, true, redactedID)
+	assessment.Reason = safetext.Escape(redactResultText(result, assessment.Reason, redact, redactedID))
 	return &assessment
 }
 
@@ -546,12 +589,15 @@ func divergenceForJSON(report benchmark.Report, redactedIDs map[string]string) [
 	details := make([]benchmark.DivergenceDetail, len(report.Divergence))
 	copy(details, report.Divergence)
 	for index := range details {
+		// Every query name passes domains.Normalize, which lets only IDNA
+		// ASCII through, so escaping it is defensive. The policy is
+		// configured text.
+		details[index].Name = safetext.Escape(details[index].Name)
+		details[index].Policy = safetext.Escape(details[index].Policy)
 		details[index].Classes = cloneIntMap(details[index].Classes)
 		details[index].Excluded = append([]benchmark.DivergenceExclusion(nil), details[index].Excluded...)
 		for exclusionIndex := range details[index].Excluded {
-			if replacement, ok := redactedIDs[details[index].Excluded[exclusionIndex].TargetID]; ok {
-				details[index].Excluded[exclusionIndex].TargetID = replacement
-			}
+			details[index].Excluded[exclusionIndex].TargetID = jsonTargetID(details[index].Excluded[exclusionIndex].TargetID, redactedIDs)
 		}
 	}
 	return details
@@ -563,12 +609,9 @@ func pairedEffectsForJSON(report benchmark.Report, redactedIDs map[string]string
 	}
 	effects := append([]benchmark.PairedEffect(nil), report.PairedEffects...)
 	for index := range effects {
-		if replacement, ok := redactedIDs[effects[index].TargetID]; ok {
-			effects[index].TargetID = replacement
-		}
-		if replacement, ok := redactedIDs[effects[index].ReferenceTargetID]; ok {
-			effects[index].ReferenceTargetID = replacement
-		}
+		effects[index].Policy = safetext.Escape(effects[index].Policy)
+		effects[index].TargetID = jsonTargetID(effects[index].TargetID, redactedIDs)
+		effects[index].ReferenceTargetID = jsonTargetID(effects[index].ReferenceTargetID, redactedIDs)
 	}
 	return effects
 }
@@ -617,7 +660,7 @@ func profileComparisonsForJSON(report benchmark.Report, redactedIDs map[string]s
 	for _, key := range sortedProfileGroupKeys(groups) {
 		group := groups[key]
 		view := targetViewFor(group.Target, len(redactedIDs) > 0, redactedIDs[group.Target.ID()])
-		profileID := group.Target.Resolver.ID
+		profileID := safetext.Escape(group.Target.Resolver.ID)
 		if len(redactedIDs) > 0 && isSystemTarget(group.Target) {
 			profileID = "system-redacted"
 		}
@@ -627,12 +670,8 @@ func profileComparisonsForJSON(report benchmark.Report, redactedIDs map[string]s
 			if !ok {
 				continue
 			}
-			targetID := result.Target.ID()
-			if replacement, exists := redactedIDs[targetID]; exists {
-				targetID = replacement
-			}
 			comparison.Transports = append(comparison.Transports, JSONProfileTransport{
-				Protocol: protocol, TargetID: targetID, Stats: result.Stats, Status: resultStatus(result),
+				Protocol: protocol, TargetID: jsonTargetID(result.Target.ID(), redactedIDs), Stats: result.Stats, Status: resultStatus(result),
 			})
 		}
 		comparisons = append(comparisons, comparison)
