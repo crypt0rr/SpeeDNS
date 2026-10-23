@@ -30,7 +30,7 @@ tap_branch="$(gh api "repos/${repository}" --jq .default_branch)"
 tree_paths="$(gh api "repos/${repository}/git/trees/${tap_branch}?recursive=1" \
 	--jq '.tree[] | select(.type == "blob") | .path')"
 
-if ! printf '%s\n' "${tree_paths}" | grep -Fqx -- "${canonical_path}"; then
+if ! grep -Fqx -- "${canonical_path}" <<<"${tree_paths}"; then
 	echo "${repository} does not contain ${canonical_path}" >&2
 	echo "cask paths in the tap:" >&2
 	printf '%s\n' "${tree_paths}" | grep -E '^Casks/' >&2 || true
@@ -67,15 +67,15 @@ fi
 
 cask_content="$(gh api "repos/${repository}/contents/${canonical_path}?ref=${tap_branch}" \
 	--jq .content | tr -d '\n' | base64 --decode)"
-if ! printf '%s\n' "${cask_content}" | grep -Fqx -- 'cask "speedns" do'; then
+if ! grep -Fqx -- 'cask "speedns" do' <<<"${cask_content}"; then
 	echo "${canonical_path} does not declare cask speedns" >&2
 	exit 1
 fi
-if printf '%s\n' "${cask_content}" | grep -Fq 'verified:'; then
+if grep -Fq 'verified:' <<<"${cask_content}"; then
 	echo "${canonical_path} contains deprecated Homebrew verified: parameter" >&2
 	exit 1
 fi
-if ! printf '%s\n' "${cask_content}" | grep -Fqx -- "  version \"${version}\""; then
+if ! grep -Fqx -- "  version \"${version}\"" <<<"${cask_content}"; then
 	echo "${canonical_path} does not declare version ${version}" >&2
 	exit 1
 fi

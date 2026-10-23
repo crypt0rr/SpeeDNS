@@ -60,3 +60,8 @@ still measures the notes from the highest stable tag overall (v0.6.1..v0.5.3),
 and a dispatch from `main` fails at that step because the tag has no
 `scripts/previous-stable-tag.sh`. A dispatch from `main` that re-runs any
 stable tag up to v0.6.8 fails at the same step, for the same reason.
+
+Release a backport by pushing its tag, or by a dispatch from `main` after the
+cherry-pick, never by a dispatch started from the maintenance branch: that run
+signs as `release.yml@refs/heads/<branch>`, which the documented Cosign and
+attestation identity (a `v*` tag or `main`) rejects.

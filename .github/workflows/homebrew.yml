@@ -19,8 +19,8 @@ on:
 # One group for every run that can write the tap, not one per tag: the tap
 # holds a single cask, so two runs for different releases must not interleave
 # their read and write of it. GitHub keeps at most one run pending per group
-# and cancels an older pending run when a newer one arrives; re-dispatch the
-# newest tag if that happens.
+# and cancels the older pending run when a newer one arrives. If the cancelled
+# run was for the highest version, dispatch that tag again.
 #
 # Prerelease events get a group of their own. Concurrency applies to the whole
 # run before the publish job's if: skips it, so in the shared group a

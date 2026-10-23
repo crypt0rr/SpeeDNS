@@ -499,9 +499,11 @@ func TestReleaseTagShapeIsTheSameEverywhere(t *testing.T) {
 			sources["scripts/"+filepath.Base(script)] = string(content)
 		}
 	}
-	for _, step := range releaseWorkflow(t).Jobs["release"].Steps {
+	for index, step := range releaseWorkflow(t).Jobs["release"].Steps {
 		if strings.Contains(step.Run, "valid_release_tag()") {
-			sources[".github/workflows/release.yml"] = step.Run
+			// Keyed per step: two release.yml steps defining the function
+			// must both be checked, not only the last one seen.
+			sources[fmt.Sprintf(".github/workflows/release.yml (step %d)", index+1)] = step.Run
 		}
 	}
 	for _, required := range []string{
@@ -511,7 +513,11 @@ func TestReleaseTagShapeIsTheSameEverywhere(t *testing.T) {
 		"scripts/validate-homebrew-tap.sh",
 		"scripts/validate-published-release.sh",
 	} {
-		if _, ok := sources[required]; !ok {
+		found := false
+		for source := range sources {
+			found = found || source == required || strings.HasPrefix(source, required+" (step ")
+		}
+		if !found {
 			t.Errorf("%s no longer defines valid_release_tag(); update this test if the check moved", required)
 		}
 	}

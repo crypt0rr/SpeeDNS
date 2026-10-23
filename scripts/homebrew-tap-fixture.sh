@@ -262,10 +262,14 @@ large_cask_b64="${fixture_dir}/large-cask.b64"
 } | base64 | tr -d '\n' >"${large_cask_b64}"
 printf '\n' >>"${large_cask_b64}"
 : >"${fake_log}"
-env "${common_env[@]}" FAKE_TAP_MODE=clean \
+if ! env "${common_env[@]}" FAKE_TAP_MODE=clean \
 	FAKE_CASK_CONTENT_B64_FILE="${large_cask_b64}" \
 	bash "${root_dir}/scripts/publish-homebrew-cask.sh" "${cask_file}" \
-	v0.7.1 example/tap
+	v0.7.1 example/tap; then
+	echo "publisher failed on a large current cask" >&2
+	cat "${fake_log}" >&2
+	exit 1
+fi
 if ! grep -Fqx 'PUT repos/example/tap/contents/Casks/speedns.rb .commit.sha sha=fixture-sha' "${fake_log}"; then
 	echo "v0.7.1 over a large 0.7.0 cask did not update the cask in place" >&2
 	cat "${fake_log}" >&2
