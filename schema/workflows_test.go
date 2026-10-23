@@ -65,6 +65,7 @@ type workflowStep struct {
 type workflowJob struct {
 	If          string            `yaml:"if"`
 	Uses        string            `yaml:"uses"`
+	RunsOn      any               `yaml:"runs-on"`
 	Needs       any               `yaml:"needs"`
 	Environment any               `yaml:"environment"`
 	Permissions any               `yaml:"permissions"`
@@ -648,11 +649,44 @@ func environmentName(environment any) string {
 // signingJobForbidden matches what a job able to mint OIDC tokens must not
 // run: the project's tests and anything else that executes its dependencies'
 // code (go test, go run, go generate, go tool, coverage.sh, the release
-// fixture), and the binaries a build produced, whether through
-// artifact-smoke.sh or straight from dist/. A binary copied or extracted
-// elsewhere first is beyond what a pattern can see.
-var signingJobForbidden = regexp.MustCompile(
-	`(?m)\bgo\s+(?:test|run|generate|tool)\b|scripts/(?:coverage|artifact-smoke|release-fixture)\.sh|(?:^|[;&|(]|\$\()\s*"?(?:\./)?dist/`)
+// fixture), and the binaries a build produced, through artifact-smoke.sh or
+// directly. A binary counts as run when the script has
+//
+//   - a dist/ path where a command starts: at the start of a line, after one
+//     of ; & | ( { ! or a backtick, or after if, elif, then, else, do, while,
+//     until, exec, command, time, nohup or sudo, and past any VAR=value
+//     assignments. The path may begin with ./, ../, $VAR, ${VAR} or a
+//     $(command), quoted or not, so "${GITHUB_WORKSPACE}/dist/..." and
+//     "$(pwd)/dist/..." count;
+//   - GoReleaser's per-target build directory, dist/speedns_<os>_<arch>...,
+//     named anywhere at all, which catches cd dist &&
+//     ./speedns_linux_amd64_v1/speedns and a path kept in a variable first.
+//     A release file name has the version, which always holds a dot, where a
+//     build directory has the OS, so the archives and packages do not match;
+//   - any path into a subdirectory of dist/, such as the glob dist/*/speedns;
+//   - find -exec or -execdir with the found file itself as the command.
+//
+// The second and third refuse reading those paths as well as running them.
+// That costs nothing: a signing job compares, uploads and attests only what
+// sits at the top of dist/ (archives, packages, SBOMs, checksums.txt, the
+// changelog), and once a path is in a variable nothing tells an argument from
+// a command. A top-level dist/ file read as an argument or through a
+// redirection passes, as the publish job's hashing and uploads must.
+//
+// What a static pattern cannot see is left to review: a path assembled at
+// run time from pieces such as dir=dist and "${dir}/${target}/speedns", a
+// top-level dist/ binary kept in a variable (bin=dist/speedns; "${bin}"), a
+// binary run through env, xargs, sh -c or any other command that takes it as
+// an argument, and a binary copied, moved or extracted out of dist/ first.
+var signingJobForbidden = regexp.MustCompile(`(?m)` + strings.Join([]string{
+	`\bgo\s+(?:test|run|generate|tool)\b`,
+	`scripts/(?:coverage|artifact-smoke|release-fixture)\.sh`,
+	`(?:^|[;&|({!\x60]|\b(?:if|elif|then|else|do|while|until|exec|command|time|nohup|sudo)\s)\s*` +
+		`(?:[A-Za-z_]\w*=\S*\s+)*["']?(?:\.\.?|\$\{[^}]*\}|\$\w+|\$\([^)]*\))?["']?/?dist/`,
+	`\bspeedns_[a-z0-9]+_`,
+	`\bdist/[^\s/"';|&)]+/`,
+	`-exec(?:dir)?\s+["']?\{\}`,
+}, "|"))
 
 // shellCommentLine is a run: script line holding only a comment.
 var shellCommentLine = regexp.MustCompile(`(?m)^\s*#.*$`)
@@ -738,6 +772,82 @@ func TestJobsThatCanSignRunNoTestsOrBuiltBinaries(t *testing.T) {
 	}
 }
 
+// TestSigningJobPatternTellsRunsFromReads pins what signingJobForbidden
+// catches. The test above sees only the workflows as they stand, and the
+// second review of the release split ran a binary still inside dist/ five
+// ways that the pattern let through. The publish job's own reads of dist/
+// must keep passing: they are how it compares, uploads and attests the
+// release.
+func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
+	cases := []struct {
+		name      string
+		script    string
+		forbidden bool
+	}{
+		{name: "go test", script: "go test -count=1 ./...", forbidden: true},
+		{name: "go run", script: "go run ./cmd/speedns version", forbidden: true},
+		{name: "go generate", script: "go generate ./...", forbidden: true},
+		{name: "go tool", script: "go tool cover -func=coverage.out", forbidden: true},
+		{name: "coverage gate", script: "bash scripts/coverage.sh", forbidden: true},
+		{name: "artifact smoke", script: "bash scripts/artifact-smoke.sh linux dist", forbidden: true},
+		{name: "release fixture", script: "bash scripts/release-fixture.sh", forbidden: true},
+		{name: "build directory binary", script: "dist/speedns_linux_amd64_v1/speedns version", forbidden: true},
+		{name: "dot-slash binary", script: "./dist/speedns_linux_amd64_v1/speedns version", forbidden: true},
+		{name: "workspace variable", script: `"${GITHUB_WORKSPACE}/dist/speedns_linux_amd64_v1/speedns" version`, forbidden: true},
+		{name: "pwd substitution", script: `"$(pwd)/dist/speedns_linux_amd64_v1/speedns" version`, forbidden: true},
+		{name: "cd into dist", script: "cd dist && ./speedns_linux_amd64_v1/speedns version", forbidden: true},
+		{name: "binary in a variable", script: `bin=dist/speedns_linux_amd64_v1/speedns; "${bin}" version`, forbidden: true},
+		{name: "find exec", script: `find dist -name speedns -type f -exec {} version \;`, forbidden: true},
+		{name: "find execdir", script: `find dist -name speedns -type f -execdir "{}" version \;`, forbidden: true},
+		{name: "top-level binary through a variable", script: `"${GITHUB_WORKSPACE}/dist/speedns" version`, forbidden: true},
+		{name: "top-level binary through a substitution", script: `"$(pwd)/dist/speedns" version`, forbidden: true},
+		{name: "variable quoted apart", script: `"${GITHUB_WORKSPACE}"/dist/speedns version`, forbidden: true},
+		{name: "bare variable", script: "$PWD/dist/speedns version", forbidden: true},
+		{name: "parent directory", script: "../dist/speedns version", forbidden: true},
+		{name: "after and", script: "test -x dist/speedns && dist/speedns version", forbidden: true},
+		{name: "if condition", script: "if dist/speedns version; then echo ran; fi", forbidden: true},
+		{name: "negated", script: "! ./dist/speedns version", forbidden: true},
+		{name: "assignment prefix", script: "SPEEDNS_DEBUG=1 ./dist/speedns version", forbidden: true},
+		{name: "sudo", script: "sudo ./dist/speedns version", forbidden: true},
+		{name: "command substitution", script: `version="$(dist/speedns version)"`, forbidden: true},
+		{name: "backticks", script: "version=\x60dist/speedns version\x60", forbidden: true},
+		{name: "brace group", script: "{ dist/speedns version; }", forbidden: true},
+		{name: "loop body", script: "for target in a b; do\n  dist/speedns version\ndone", forbidden: true},
+		{name: "cd into a build directory", script: "cd dist/speedns_linux_amd64_v1 && ./speedns version", forbidden: true},
+		{name: "build directory with an interpolated arch", script: `"dist/speedns_linux_${arch}_v1/speedns" version`, forbidden: true},
+		{name: "glob over build directories", script: `for binary in dist/*/speedns; do "${binary}" version; done`, forbidden: true},
+
+		{name: "reproducibility comparison", script: `bash scripts/compare-release-artifacts.sh "${RUNNER_TEMP}/speedns-repro-reference" dist`},
+		{name: "asset list check", script: "bash scripts/release-assets.sh verify dist dist/release-assets.txt"},
+		{name: "asset list read", script: "mapfile -t release_assets <dist/release-assets.txt"},
+		{name: "upload", script: `gh release upload "${RELEASE_TAG}" --clobber dist/checksums.txt dist/SpeeDNS_0.7.0_linux_amd64.tar.gz dist/speedns_0.7.0_linux_amd64.deb`},
+		{name: "upload a prerelease package", script: `gh release upload "${RELEASE_TAG}" dist/speedns_1.0.0-rc.1_linux_arm64.rpm`},
+		{name: "hash with a glob", script: "sha256sum dist/*.tar.gz dist/*.deb dist/*.sbom.json"},
+		{name: "hash through the workspace", script: `sha256sum "${GITHUB_WORKSPACE}/dist/checksums.txt"`},
+		{name: "check in a subshell", script: "(cd dist && sha256sum --check checksums.txt)"},
+		{name: "find hashing", script: `find dist -maxdepth 1 -name '*.sbom.json' -exec sha256sum {} +`},
+		{name: "compare with the reference", script: `cmp dist/checksums.txt "${RUNNER_TEMP}/speedns-repro-reference/checksums.txt"`},
+		{name: "changelog", script: "if [[ -f dist/CHANGELOG.md ]]; then\n  bash scripts/ensure-release.sh \"${RELEASE_TAG}\" dist/CHANGELOG.md\nfi"},
+		{name: "changelog in a variable", script: `changelog=dist/CHANGELOG.md; test -s "${changelog}"`},
+		{name: "signature check", script: "cosign verify-blob --bundle dist/checksums.txt.sigstore.json dist/checksums.txt"},
+		{name: "artifact metadata", script: "jq -r '.[].path' dist/artifacts.json"},
+		{name: "log redirection", script: ": >dist/release-smoke.log"},
+		{name: "go version", script: "go version"},
+		{name: "module cache", script: "go env GOMODCACHE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			found := signingJobForbidden.FindString(shellCode(tc.script))
+			if tc.forbidden && found == "" {
+				t.Fatalf("signingJobForbidden lets a job that can sign run:\n%s", tc.script)
+			}
+			if !tc.forbidden && found != "" {
+				t.Fatalf("signingJobForbidden refuses %q in a script that runs nothing it built:\n%s", strings.TrimSpace(found), tc.script)
+			}
+		})
+	}
+}
+
 // neededOutput is an expression reading another job's output, and stepOutput
 // a job output mapped from one of the job's steps.
 var (
@@ -792,17 +902,39 @@ var releaseGates = []string{
 	"scripts/artifact-smoke.sh macos-archives",
 }
 
+// githubHostedUbuntu is a standard GitHub-hosted Ubuntu runner label, such as
+// ubuntu-latest, ubuntu-24.04 or ubuntu-24.04-arm.
+var githubHostedUbuntu = regexp.MustCompile(`^ubuntu-(?:latest|[0-9]+\.[0-9]+(?:-arm)?)$`)
+
+// runnerLabels reads runs-on: as the labels a runner must carry, all of them.
+// A runner group, or any other form, yields none.
+func runnerLabels(runsOn any) []string {
+	switch value := runsOn.(type) {
+	case string:
+		return []string{value}
+	case []any:
+		labels := make([]string, 0, len(value))
+		for _, label := range value {
+			labels = append(labels, fmt.Sprint(label))
+		}
+		return labels
+	}
+	return nil
+}
+
 // TestReleaseWorkflowVerifiesOnAnotherRunnerBeforeItSigns pins how the two
 // release jobs fit together. The workflow-level token is read-only, and one
 // job, behind the protected environment, can sign. Every gate runs in a
 // read-only job, and the signing job needs one that builds the
 // reproducibility reference, so the signed build is compared with a build
 // from another runner with a cold cache, not with one that shared its
-// machine. The comparison comes before anything is uploaded. The signing job
-// builds the commit the verify job tested, recorded before any of the tag's
-// code ran, with the Go release the reference was built with: GO_VERSION is
-// a range that two runners can resolve differently, which would fail the
-// comparison on the toolchain alone.
+// machine. Both jobs run on GitHub-hosted runners, which give each job a
+// fresh machine. The comparison comes before anything is uploaded. Before it
+// builds, the signing job checks that it has the commit the verify job
+// tested, recorded before any of the tag's code ran, and it builds with the
+// Go release the reference was built with: GO_VERSION is a range that two
+// runners can resolve differently, which would fail the comparison on the
+// toolchain alone.
 func TestReleaseWorkflowVerifiesOnAnotherRunnerBeforeItSigns(t *testing.T) {
 	release := releaseWorkflow(t)
 	if release.Permissions == nil || grantsWrite(release.Permissions, "") {
@@ -857,6 +989,25 @@ func TestReleaseWorkflowVerifiesOnAnotherRunnerBeforeItSigns(t *testing.T) {
 	}
 	if stepIndex(signer, isReference) >= 0 {
 		t.Errorf("release.yml job %s builds the reproducibility reference itself; it must come from %s, on another runner", signerName, verifierName)
+	}
+
+	// A self-hosted runner can keep a build cache, a toolchain or a planted
+	// file from one job to the next, so the reference would no longer come
+	// from a fresh machine, and README.md's gh attestation verify
+	// --deny-self-hosted-runners would refuse every artifact, but only after
+	// the release was published. Every label must match: a runner has to
+	// carry all of them, so [self-hosted, ubuntu-latest] picks a self-hosted
+	// one.
+	for _, jobName := range []string{verifierName, signerName} {
+		runsOn := release.Jobs[jobName].RunsOn
+		labels := runnerLabels(runsOn)
+		hosted := len(labels) > 0
+		for _, label := range labels {
+			hosted = hosted && githubHostedUbuntu.MatchString(label)
+		}
+		if !hosted {
+			t.Errorf("release.yml job %s runs on %v; both release jobs need a GitHub-hosted ubuntu-* runner, a fresh machine for each job", jobName, runsOn)
+		}
 	}
 
 	readOnly := ""
@@ -916,47 +1067,71 @@ func TestReleaseWorkflowVerifiesOnAnotherRunnerBeforeItSigns(t *testing.T) {
 		t.Errorf("release.yml job %s does not set up Go; update this test if Go is installed another way", signerName)
 	}
 
-	// Built from the commit the verify job tested.
-	confirmed := false
-	for _, step := range signer.Steps {
+	// Built from the commit the verify job tested, and checked before the
+	// signing build. A check that merely exists is not enough: placed after
+	// the build, it lets a tag moved during the wait for approval be built
+	// and signed before it stops the job, and placed after the uploads,
+	// published and attested as well.
+	confirmedAt := -1
+	for index, step := range signer.Steps {
 		for _, value := range step.Env {
-			index, _, ok := outputSource(release, signer, fmt.Sprint(value), verifierName)
-			if !ok || !strings.Contains(verifier.Steps[index].Run, "git rev-parse HEAD") || !strings.Contains(step.Run, "git rev-parse HEAD") {
+			recorded, _, ok := outputSource(release, signer, fmt.Sprint(value), verifierName)
+			if !ok || !strings.Contains(verifier.Steps[recorded].Run, "git rev-parse HEAD") || !strings.Contains(step.Run, "git rev-parse HEAD") {
 				continue
 			}
-			confirmed = true
+			if confirmedAt < 0 {
+				confirmedAt = index
+			}
 			setup := stepIndex(verifier, func(step workflowStep) bool { return strings.HasPrefix(step.Uses, "actions/setup-go@") })
-			if setup >= 0 && index > setup {
+			if setup >= 0 && recorded > setup {
 				t.Errorf("release.yml job %s records the verified commit after setting up Go; record it before any of the tag's code runs", verifierName)
 			}
 		}
 	}
-	if !confirmed {
+	switch {
+	case confirmedAt < 0:
 		t.Errorf("release.yml job %s does not check that it builds the commit %s recorded and tested", signerName, verifierName)
+	case signed >= 0 && confirmedAt > signed:
+		t.Errorf("release.yml job %s checks that the tag still names the commit %s tested only at step %d, after the signing build at step %d; "+
+			"check it before anything is built or signed", signerName, verifierName, confirmedAt, signed)
 	}
 }
-
-// credentialWorkflows hold a write token or the release environment's
-// secrets in some job.
-var credentialWorkflows = []string{"homebrew.yml", "live-smoke.yml", "release.yml"}
 
 // gitPush matches a git invocation that pushes.
 var gitPush = regexp.MustCompile(`\bgit\b[^\n]*\spush\b`)
 
+// selfCheckouts are actions that run actions/checkout themselves, with its
+// default of persisting the token, unless the named input turns that off.
+// A workflow using one checks out in a step of its own instead.
+var selfCheckouts = map[string]struct{ input, value string }{
+	// Its checkout step runs unless repo-checkout is exactly 'false'.
+	"golang/govulncheck-action": {input: "repo-checkout", value: "false"},
+}
+
 // TestWorkflowCheckoutsDoNotPersistCredentials keeps the checkout token out of
-// .git/config. By default actions/checkout leaves it there for every later
-// step, including the tests, the built binaries and any compromised action,
-// to read; in these workflows it can write the repository. The one step that
-// pushes must therefore bring its own token.
+// .git/config, in every workflow file, so a new workflow is held to it too.
+// By default actions/checkout leaves it there for every later step, including
+// the tests, the built binaries and any compromised action, to read, and an
+// upload that includes the checkout's .git directory takes it along. Where a
+// workflow can write the repository, so can that token; elsewhere it still
+// reads the repository and, in CodeQL's case, writes security events. The
+// one step that pushes must therefore bring its own token.
 func TestWorkflowCheckoutsDoNotPersistCredentials(t *testing.T) {
 	checkouts := 0
-	for _, name := range credentialWorkflows {
-		for jobName, job := range readWorkflow(t, filepath.Join("..", ".github", "workflows", name)).Jobs {
+	for _, workflowPath := range workflowPaths(t) {
+		name := filepath.Base(workflowPath)
+		for jobName, job := range readWorkflow(t, workflowPath).Jobs {
 			for _, step := range job.Steps {
 				if strings.HasPrefix(step.Uses, "actions/checkout@") {
 					checkouts++
 					if persist := withValue(step, "persist-credentials"); persist != "false" {
 						t.Errorf("%s job %s checks out with persist-credentials %s, want false", name, jobName, persist)
+					}
+				}
+				for action, off := range selfCheckouts {
+					if strings.HasPrefix(step.Uses, action+"@") && withValue(step, off.input) != off.value {
+						t.Errorf("%s job %s runs %s, which checks out and persists the token itself unless %s is %s; check out in a step of its own instead",
+							name, jobName, action, off.input, off.value)
 					}
 				}
 				if !gitPush.MatchString(shellCode(step.Run)) {
@@ -1042,12 +1217,13 @@ func TestReleaseRPMsRecordAFixedBuildHost(t *testing.T) {
 }
 
 // TestReleaseSBOMsStayOffline keeps every SBOM behind
-// scripts/reproducible-syft.sh, which normalizes the document and confines
-// Syft's license lookup to the local module cache, and keeps Syft's online
-// enrichment out of the configuration. The wrapper refuses --enrich itself,
+// scripts/reproducible-syft.sh, which normalizes the document, confines
+// Syft's license lookup to the local module cache and names Syft's only
+// configuration file itself, and keeps Syft's online enrichment out of the
+// configuration. The wrapper refuses --enrich and a second --config itself,
 // but only when GoReleaser runs it, in the CI snapshot or during a release;
-// this finds it before either. GoReleaser's default command is syft itself,
-// with --enrich all.
+// this finds them before either. GoReleaser's default command is syft
+// itself, with --enrich all.
 func TestReleaseSBOMsStayOffline(t *testing.T) {
 	var config goreleaserConfig
 	readGoReleaserConfig(t, &config)
@@ -1059,8 +1235,14 @@ func TestReleaseSBOMsStayOffline(t *testing.T) {
 			t.Errorf(".goreleaser.yaml sboms entry %s runs %q, not ../scripts/reproducible-syft.sh", sbom.ID, sbom.Cmd)
 		}
 		for _, argument := range sbom.Args {
-			if strings.HasPrefix(strings.TrimSpace(argument), "--enrich") {
+			argument = strings.TrimSpace(argument)
+			if strings.HasPrefix(argument, "--enrich") {
 				t.Errorf(".goreleaser.yaml sboms entry %s passes %q; Syft's enrichment looks licenses up on the network", sbom.ID, argument)
+			}
+			// Syft merges every file named with --config, or -c, into the
+			// wrapper's own, enrich: lists included.
+			if strings.HasPrefix(argument, "--config") || strings.HasPrefix(argument, "-c") {
+				t.Errorf(".goreleaser.yaml sboms entry %s passes %q; reproducible-syft.sh names Syft's configuration file itself", sbom.ID, argument)
 			}
 		}
 		// The same option in the form of a variable, which GoReleaser
@@ -1087,9 +1269,16 @@ func TestReleaseWorkflowChoosesTheNotesRangeBeforeApproval(t *testing.T) {
 		index := stepIndex(job, func(step workflowStep) bool {
 			return strings.Contains(shellCode(step.Run), "bash scripts/previous-stable-tag.sh")
 		})
-		if index >= 0 {
-			chooserName, chooser = jobName, index
+		if index < 0 {
+			continue
 		}
+		// With the choice made in two jobs, map order would decide which
+		// one the checks below hold to the rule.
+		if chooserName != "" {
+			t.Fatalf("release.yml jobs %s and %s both run scripts/previous-stable-tag.sh; choose the release notes range once, in the job behind no environment",
+				chooserName, jobName)
+		}
+		chooserName, chooser = jobName, index
 	}
 	if chooserName == "" {
 		t.Fatal("release.yml no longer runs scripts/previous-stable-tag.sh; update this test")

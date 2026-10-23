@@ -21,8 +21,17 @@ jobs:
     name: Run govulncheck
     runs-on: ubuntu-latest
     steps:
+      # govulncheck-action otherwise checks the repository out itself, with
+      # actions/checkout's default of leaving the token in .git/config for
+      # every later step. Nothing here needs it there.
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Run Go vulnerability scan
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
         with:
           go-version-input: '1.26.x'
           go-package: ./...
+          repo-checkout: false
