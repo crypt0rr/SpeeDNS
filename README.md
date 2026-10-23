@@ -404,7 +404,10 @@ and warns when it drops addresses, so resolvers you name with `--resolver`,
 `--resolver-file`, or `--include-system` are always benchmarked. Hostname-only
 custom encrypted endpoints remain available in `auto` and `both`; explicit `4`
 or `6` requires IP literals so SpeeDNS does not perform an unmeasured bootstrap
-lookup to guess a family.
+lookup to guess a family. The family filter applies to `bootstrap_addresses`
+as well: under `--family 6` a DoH, DoT or DoQ transport keeps only its IPv6
+candidates (IPv4-mapped literals count as IPv4), and a transport left with no
+candidate is dropped instead of falling back to the target address.
 
 The bundled addresses are sourced from [Google Public DNS](https://developers.google.com/speed/public-dns/docs/using), [Cloudflare](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/), [Quad9](https://quad9.net/service/service-addresses-and-features/), and [DNS4EU](https://joindns4.eu/for-public).
 
@@ -419,6 +422,15 @@ Add one-off endpoints with repeatable `--resolver NAME=URI` flags. Use `--no-def
   --resolver private-doh=https://dns.example.net/dns-query \
   --resolver private-doq=quic://dns.example.net:853
 ```
+
+A `--resolver` NAME must be printable text: control characters, bidirectional
+or invisible format characters and invalid UTF-8 are rejected. A URI port, when
+given, must be 1-65535; leave it out for the protocol default, because `:0` is
+an error rather than a synonym for the default. A URI must not carry user
+credentials (`https://user:password@host/...`): reports record a DoH
+`endpoint_url` as configured, so the credentials would reach every JSON, CSV
+and `--details` output. Such a resolver is rejected with exit status `2`, and
+the error does not quote the URI.
 
 For ownership, policy, multiple addresses, or encrypted endpoints that need a specific TLS name, use a YAML profile:
 
@@ -450,7 +462,22 @@ Each entry in `addresses` must be an IP literal (`192.0.2.53`,
 belongs in the transport spec's `port:` field, and an address such as
 `192.0.2.53:5353` is rejected before the benchmark starts.
 
-Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order when a session opens. A DoT or DoQ session that has to reconnect during the run tries the address it last connected to first, then the others in order, and starts at the next candidate if that reconnect runs out of time. TLS certificate validation is always enabled.
+Validation is strict in the same way for every field, and each mistake gets
+its own error before any query is sent:
+
+- A profile must declare at least one transport.
+- `url` belongs to `doh` only; on `dot`, `doq`, `udp` or `tcp` it is rejected,
+  and a non-default port goes in `port:`.
+- `server_name` is not accepted on `udp` or `tcp`. It is stored trimmed, so the
+  TLS handshake and the report use the same name, and a blank `server_name` is
+  rejected rather than treated as unset.
+- A DoH `url` must not include user credentials.
+- `id`, `name`, `owner` and `addresses` must not contain control characters,
+  bidirectional or invisible format characters, or invalid UTF-8, so a
+  resolver prints exactly as configured in every report and `--assert`
+  subject.
+
+Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order when a session opens. Duplicate candidates are dropped by canonical address, so `2001:DB8::1` and `2001:db8::1` are tried once. A profile that lists several addresses still gets one row per address, and when its encrypted transports dial `bootstrap_addresses` those rows measure the same candidates; the report warns about such a profile, and listing one address avoids the duplicate rows. A DoT or DoQ session that has to reconnect during the run tries the address it last connected to first, then the others in order, and starts at the next candidate if that reconnect runs out of time. TLS certificate validation is always enabled.
 
 For a hostname-only custom encrypted endpoint, SpeeDNS uses the operating
 system resolver to find the connection address. To make bootstrap deterministic
@@ -483,7 +510,7 @@ not download or refresh the list.
 
 ## Custom domain lists
 
-Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. Unicode names are converted to IDNA ASCII before testing. Underscored service labels such as `_dmarc.example.com`, `_sip._tcp.example.com`, and `selector1._domainkey.example.com` are accepted unchanged, so lists paired with `--type SRV`, `--type TLSA`, or `--type TXT` work; the underscore is only allowed as the first character of a label. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, other non-letter/digit/hyphen characters, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line, and every invalid entry is reported at once rather than only the first.
+Provide one domain per line with `--domains`. Blank lines, comments beginning with `#`, and duplicate names are ignored; a trailing root dot is removed. A UTF-8 byte order mark at the start of the file, as some Windows editors write it, is ignored too. Unicode names are converted to IDNA ASCII before testing. Underscored service labels such as `_dmarc.example.com`, `_sip._tcp.example.com`, and `selector1._domainkey.example.com` are accepted unchanged, so lists paired with `--type SRV`, `--type TLSA`, or `--type TXT` work; the underscore is only allowed as the first character of a label. Names containing whitespace, wildcards, control characters, empty labels, malformed labels, other non-letter/digit/hyphen characters, or DNS-overlong names are rejected before any network activity, and custom-list errors include the source line, and every invalid entry is reported at once rather than only the first.
 
 A list is rejected as a whole by default, because the corpus size and SHA-256 recorded in the report describe what was measured. Pass `--skip-invalid-domains` to drop unusable entries and benchmark the rest: the report warns how many were dropped and why, and the recorded corpus size and checksum describe the names actually measured. A list with no usable entry still fails.
 
@@ -636,7 +663,7 @@ Use `--include-system` to include the resolver configured by the operating syste
 ./speedns --include-system
 ```
 
-This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. On Windows, it reads the per-adapter configuration through `GetAdaptersAddresses`, the same source the Windows resolver uses; adapters that are down are skipped, as are the `fec0:0:0:ffff::/64` placeholders Windows lists on adapters with no IPv6 DNS configured.
+This is read-only. On Debian/Linux, SpeeDNS reads `/etc/resolv.conf`, including a local `systemd-resolved` stub when present. On macOS, it discovers active resolver blocks, preserving their scope and interface labels, and falls back to `/etc/resolv.conf`. A block's scope comes from its `domain :` line, which makes it a split-DNS resolver for that domain; `search domain` entries only expand short names, so a default resolver that has nothing but a DHCP search domain is labelled `scope: global`. On Windows, it reads the per-adapter configuration through `GetAdaptersAddresses`, the same source the Windows resolver uses; adapters that are down are skipped, as are the `fec0:0:0:ffff::/64` placeholders Windows lists on adapters with no IPv6 DNS configured.
 
 Separate macOS scopes and separate Windows adapters remain separate targets even when they use the same address, because a laptop on Wi-Fi with a VPN up is running two different resolver paths and folding them together would hide the comparison. Link-local IPv6 nameservers keep their zone (`fe80::1%en0` on macOS, `fe80::1%12` on Windows) so they stay dialable.
 
@@ -653,6 +680,18 @@ ultimate upstream is not known to SpeeDNS. Scoped macOS entries are kept
 separate when the same address appears in more than one resolver block, since
 the scope and interface can change which DNS server answers.
 
+On Linux, when every nameserver in `/etc/resolv.conf` is a loopback stub — the
+usual systemd-resolved setup on Ubuntu and Fedora — SpeeDNS also reads
+`/run/systemd/resolve/resolv.conf` and adds each non-loopback server listed
+there as an extra profile next to the unchanged stub, named
+`System DNS (systemd-resolved default route)` with a `system-resolved-` ID, so
+the host's real upstream can be ranked against the public resolvers. That file
+lists only the servers of resolved's default-route links: split-DNS and VPN
+links that answer only their own domains, DNS-over-TLS settings and
+non-standard ports are not represented, so these profiles are measured over
+UDP and TCP on port 53. `resolvectl status` shows the full configuration. A
+missing or unreadable file adds nothing.
+
 A local stub is measured and shown, but it is never ranked and never
 recommended. It answers from its own cache, so its latency excludes the
 upstream resolution it forwards to and is not comparable with a resolver
@@ -665,7 +704,9 @@ column to `true`.
 When sharing a report that includes the system resolver, add
 `--redact-system`. It keeps the measurements and rankings but replaces local
 resolver addresses, identifying labels, selected dial addresses, and matching
-error text with redacted values in table, JSON, and CSV output. Redaction is
+error text with redacted values in table, JSON, and CSV output. A failed
+`--assert` names a system resolver on stderr by the same
+`system-redacted-N@redacted/<protocol>` ID the report uses. Redaction is
 opt-in; local diagnostics are shown by default.
 
 System resolvers are tested only over transports discoverable from the operating system configuration, normally UDP and TCP.

@@ -9,9 +9,12 @@ import (
 	"net/url"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/crypt0rr/SpeeDNS/data"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 	"gopkg.in/yaml.v3"
 )
 
@@ -162,17 +165,23 @@ func (t Target) EndpointMetadata() EndpointMetadata {
 			}
 		}
 		address = strings.Trim(strings.TrimSpace(address), "[]")
-		if net.ParseIP(address) != nil {
+		// netip, like validateAddress, because a zoned link-local literal
+		// such as "fe80::1%eth0" is dialed directly; net.ParseIP rejects the
+		// zone and would report a system-resolver lookup that never happens.
+		if _, err := netip.ParseAddr(address); err == nil {
 			metadata.BootstrapMode = BootstrapTarget
 		}
 	}
 
+	// The server name is reported exactly as the transport reads it. Validate
+	// stores it trimmed, so trimming here as well could only ever make the
+	// report disagree with the TLS handshake of an unvalidated target.
 	switch t.Protocol {
 	case DoH:
 		metadata.EndpointURL = t.Spec.URL
 		endpoint, err := url.Parse(t.Spec.URL)
 		if t.Spec.ServerName != "" {
-			metadata.TLSServerName = strings.TrimSpace(t.Spec.ServerName)
+			metadata.TLSServerName = t.Spec.ServerName
 			metadata.TLSIdentitySource = TLSIdentityConfigured
 		} else if err == nil {
 			metadata.TLSServerName = endpoint.Hostname()
@@ -180,10 +189,10 @@ func (t Target) EndpointMetadata() EndpointMetadata {
 		}
 	case DoT, DoQ:
 		if t.Spec.ServerName != "" {
-			metadata.TLSServerName = strings.TrimSpace(t.Spec.ServerName)
+			metadata.TLSServerName = t.Spec.ServerName
 			metadata.TLSIdentitySource = TLSIdentityConfigured
 		} else {
-			metadata.TLSServerName = strings.TrimSpace(t.Address)
+			metadata.TLSServerName = t.Address
 			metadata.TLSIdentitySource = TLSIdentityTarget
 		}
 	}
@@ -253,6 +262,17 @@ func Validate(profiles []ResolverProfile) error {
 		if profile.ID == "" || profile.Name == "" {
 			return fmt.Errorf("resolver %d must have id and name", i+1)
 		}
+		// The ID is checked first and reported by position, because quoting
+		// it would print the very character being rejected.
+		if err := validateLabelText(profile.ID); err != nil {
+			return fmt.Errorf("resolver %d id %w", i+1, err)
+		}
+		if err := validateLabelText(profile.Name); err != nil {
+			return fmt.Errorf("resolver %q name %w", profile.ID, err)
+		}
+		if err := validateLabelText(profile.Owner); err != nil {
+			return fmt.Errorf("resolver %q owner %w", profile.ID, err)
+		}
 		if _, exists := ids[profile.ID]; exists {
 			return fmt.Errorf("duplicate resolver id %q", profile.ID)
 		}
@@ -266,6 +286,11 @@ func Validate(profiles []ResolverProfile) error {
 			if address == "" {
 				return fmt.Errorf("resolver %q address %d is empty", profile.ID, addressIndex+1)
 			}
+			// Only a zone can carry free text, but the address is part of
+			// every target ID, so it is held to the same rule as the ID.
+			if err := validateLabelText(address); err != nil {
+				return fmt.Errorf("resolver %q address %d %w", profile.ID, addressIndex+1, err)
+			}
 			if err := validateAddress(address); err != nil {
 				return fmt.Errorf("resolver %q address %d: %w", profile.ID, addressIndex+1, err)
 			}
@@ -276,14 +301,45 @@ func Validate(profiles []ResolverProfile) error {
 			seenAddresses[addressKey] = addressIndex + 1
 			profile.Addresses[addressIndex] = address
 		}
+		// A profile with no transports expands into no target at all, so it
+		// would only ever surface as a misleading protocol-selection error or
+		// a silent gap in the report.
+		if len(profile.Transports) == 0 {
+			return fmt.Errorf("resolver %q has no transports; declare at least one of udp, tcp, doh, dot or doq under its transports key", profile.ID)
+		}
 		for protocol, spec := range profile.Transports {
 			if !isKnownProtocol(protocol) {
 				return fmt.Errorf("resolver %q has unsupported protocol %q", profile.ID, protocol)
 			}
+			// A field the protocol never reads is rejected like
+			// bootstrap_addresses on udp/tcp below, rather than silently
+			// ignored: `url: tls://dns.example:8853` under dot looks like
+			// it sets a port and changes nothing.
+			if spec.URL != "" && protocol != DoH {
+				return fmt.Errorf("resolver %q protocol %q cannot use url; only doh takes a url, so set port: to choose a port", profile.ID, protocol)
+			}
+			if spec.ServerName != "" && (protocol == UDP || protocol == TCP) {
+				return fmt.Errorf("resolver %q protocol %q cannot use server_name", profile.ID, protocol)
+			}
+			// The trimmed name is stored, not only checked, because the
+			// transport hands this value to the TLS handshake: a padded name
+			// would fail verification while the report showed it trimmed.
+			serverName := strings.TrimSpace(spec.ServerName)
+			if spec.ServerName != "" && serverName == "" {
+				return fmt.Errorf("resolver %q protocol %q has a blank server_name; remove it or name the TLS identity", profile.ID, protocol)
+			}
+			spec.ServerName = serverName
 			if protocol == DoH {
 				u, err := url.Parse(spec.URL)
+				// Credentials are rejected before the generic check below,
+				// which quotes the URL. Reports record endpoint_url as
+				// configured, so a password or token in the userinfo would
+				// reach every JSON, CSV and --details output.
+				if err == nil && u.User != nil {
+					return fmt.Errorf("resolver %q DoH URL must not include user credentials; reports record the URL as configured", profile.ID)
+				}
 				if err != nil || u.Scheme != "https" || u.Host == "" || u.Path == "" {
-					return fmt.Errorf("resolver %q has invalid DoH URL %q", profile.ID, spec.URL)
+					return fmt.Errorf("resolver %q has invalid DoH URL %s", profile.ID, quoteURI(spec.URL))
 				}
 				if spec.Port == 0 {
 					spec.Port = defaultPort(protocol)
@@ -316,15 +372,52 @@ func Validate(profiles []ResolverProfile) error {
 				}
 				spec.BootstrapAddresses = normalized
 			}
-			if protocol == DoT || protocol == DoQ {
-				if strings.TrimSpace(spec.ServerName) == "" {
-					return fmt.Errorf("resolver %q protocol %q requires server_name", profile.ID, protocol)
-				}
+			if (protocol == DoT || protocol == DoQ) && spec.ServerName == "" {
+				return fmt.Errorf("resolver %q protocol %q requires server_name", profile.ID, protocol)
 			}
 			profile.Transports[protocol] = spec
 		}
 	}
 	return nil
+}
+
+// validateLabelText rejects a resolver ID, name, owner or address that would
+// not print as written: one carrying a control character, a bidirectional
+// control or an invisible format character, or bytes that are not valid
+// UTF-8.
+//
+// Every report sink escapes such characters, so the configured value and the
+// printed one would differ. The target ID is also the key that joins report
+// sections and that an --assert subject is matched against, and a name or
+// owner is what an operator reads to tell resolvers apart - an invisible
+// character makes two different values look identical. Rejecting them here,
+// before any network work, keeps every configured identity printable exactly
+// as configured. The test is safetext.Escape itself, so validation and output
+// can never disagree about which characters are unsafe.
+func validateLabelText(value string) error {
+	for index, character := range value {
+		if character == utf8.RuneError {
+			if _, size := utf8.DecodeRuneInString(value[index:]); size == 1 {
+				return errors.New("is not valid UTF-8")
+			}
+		}
+		if text := string(character); safetext.Escape(text) != text {
+			return fmt.Errorf("contains the control or invisible character %U", character)
+		}
+	}
+	return nil
+}
+
+// quoteURI quotes a resolver URI for an error message. A URI with userinfo
+// can carry a password or an access token, and error text reaches terminals
+// and CI logs, so a value containing "@" is withheld rather than quoted. The
+// value is already known to be malformed wherever this is called, so its
+// userinfo cannot be located reliably enough to mask only that part.
+func quoteURI(value string) string {
+	if strings.Contains(value, "@") {
+		return `(withheld because it contains "@" and may carry credentials)`
+	}
+	return strconv.Quote(value)
 }
 
 // validateAddress rejects resolver addresses the transport layer could never
@@ -413,10 +506,15 @@ func normalizeBootstrapAddresses(addresses []string) ([]string, error) {
 		if net.ParseIP(address) == nil {
 			return nil, fmt.Errorf("entry %d %q is not an IPv4 or IPv6 literal", index+1, address)
 		}
-		if _, exists := seen[address]; exists {
+		// Compared by the same canonical key as profile addresses, so
+		// "2001:DB8::1", "2001:db8::1" and "::ffff:192.0.2.1" next to
+		// "192.0.2.1" are one candidate tried once, not a repeated attempt
+		// that spends another timeout on an address that already failed.
+		key := canonicalAddressKey(address)
+		if _, exists := seen[key]; exists {
 			continue
 		}
-		seen[address] = struct{}{}
+		seen[key] = struct{}{}
 		normalized = append(normalized, address)
 	}
 	return normalized, nil
@@ -522,11 +620,23 @@ func ParseResolverFlag(value string) (ResolverProfile, error) {
 	name = strings.TrimSpace(name)
 	rawURI = strings.TrimSpace(rawURI)
 	if !ok || name == "" || rawURI == "" {
-		return ResolverProfile{}, fmt.Errorf("resolver must use NAME=URI, got %q", value)
+		return ResolverProfile{}, fmt.Errorf("resolver must use NAME=URI, got %s", quoteURI(value))
+	}
+	// Checked here as well as in Validate so the message names the flag's
+	// NAME rather than the derived profile ID and its position in the
+	// combined resolver list.
+	if err := validateLabelText(name); err != nil {
+		return ResolverProfile{}, fmt.Errorf("resolver NAME %w", err)
 	}
 	u, err := url.Parse(rawURI)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return ResolverProfile{}, fmt.Errorf("invalid resolver URI %q", rawURI)
+		return ResolverProfile{}, fmt.Errorf("invalid resolver URI %s", quoteURI(rawURI))
+	}
+	// Userinfo is never meaningful to a resolver URI: DoH would send it as
+	// Basic authentication and record it in every report's endpoint_url, and
+	// the other schemes would drop it without a word.
+	if u.User != nil {
+		return ResolverProfile{}, errors.New("resolver URI must not include user credentials")
 	}
 	var protocol Protocol
 	switch strings.ToLower(u.Scheme) {
@@ -543,15 +653,20 @@ func ParseResolverFlag(value string) (ResolverProfile, error) {
 	default:
 		return ResolverProfile{}, fmt.Errorf("unsupported resolver URI scheme %q", u.Scheme)
 	}
-	port := 0
-	if u.Port() != "" {
-		port, err = net.LookupPort("tcp", u.Port())
+	// Only an absent port means the protocol default. An explicit ":0" used to
+	// be read as the default too, so a DoH resolver dialed 443 while its
+	// request URL and Host header still named port 0, a URL a resolver file
+	// rejects. No endpoint listens on port 0, so it is an error like an
+	// out-of-range port.
+	port := defaultPort(protocol)
+	if rawPort := u.Port(); rawPort != "" {
+		port, err = net.LookupPort("tcp", rawPort)
 		if err != nil {
 			return ResolverProfile{}, fmt.Errorf("invalid resolver URI port: %w", err)
 		}
-	}
-	if port == 0 {
-		port = defaultPort(protocol)
+		if port < 1 {
+			return ResolverProfile{}, fmt.Errorf("invalid resolver URI port %q: must be 1-65535", rawPort)
+		}
 	}
 	host := u.Hostname()
 	spec := TransportSpec{Port: port}

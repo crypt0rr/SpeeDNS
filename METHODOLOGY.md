@@ -185,6 +185,17 @@ the network would compare two different quantities. Such a target is
 `NOT COMPARABLE`, has no rank, and carries a permanent warning naming that
 reason.
 
+On Linux, an `/etc/resolv.conf` that names only loopback stubs, the usual
+systemd-resolved setup, left `--include-system` with nothing it could rank.
+Discovery then also reads `/run/systemd/resolve/resolv.conf`, read-only, and
+adds each non-loopback server listed there as its own network profile after the
+unchanged stub, with a `system-resolved-` ID that `--redact-system` covers. The
+file is a flattened view of resolved's configuration: it lists the servers of
+default-route links only, so a split-DNS or VPN link that answers just its
+routing domains is absent, and it cannot carry a DNS-over-TLS setting or a
+non-standard port, so the profile is measured over UDP and TCP on port 53. Its
+policy column says so. A missing or unreadable file adds nothing.
+
 A resolver reached over the local network but not on the measuring host -- an
 RFC 1918, CGNAT, link-local or unique-local address -- is treated differently
 and deliberately more weakly. It is still ranked, because SpeeDNS cannot tell a
@@ -390,19 +401,40 @@ escaped text as well; that includes interface names in the run provenance and
 every target ID, detail and warning that `speedns diff --format json` echoes
 from its input reports. The failure messages that `--assert` and
 `speedns diff --require` print to stderr escape the target IDs and finding
-details they quote. The status colours are the only escape sequences the table
+details they quote, and under `--redact-system` an `--assert` failure names a
+system resolver by the same `system-redacted-N@redacted/<protocol>` ID the
+report uses, so the stderr line neither contradicts the report nor prints the
+address it withholds. The status colours are the only escape sequences the table
 emits itself. CSV cells are escaped first and the formula guard runs
 afterwards on the escaped value: a cell beginning with `=`, `+`, `-`, `@`, or
 an escape sequence of either form - which is how a leading tab, carriage
 return, ESC, or bidirectional override is rendered - is prefixed with an
 apostrophe to prevent spreadsheet formula interpretation.
+
+Resolver IDs, names, owners and addresses are held to a stricter rule before
+the run starts: a profile whose ID, name, owner or address contains a control
+character, one of the bidirectional or invisible characters above, or bytes
+that are not valid UTF-8 is rejected, from `--resolver` and `--resolver-file`
+alike. Escaping alone left the configured value and the printed one different,
+and a target ID is the key that joins report sections and that an `--assert`
+subject is matched against, so a configured identity now prints exactly as
+configured everywhere. Labels that system discovery builds from the operating
+system's configuration, such as a macOS scope or interface name, are escaped
+when the profile is built instead, so an unusual DHCP-supplied domain cannot
+make `--include-system` fail. A DoH URL that carries user credentials is
+rejected for the same audit reason: reports record `endpoint_url` as
+configured, so a password or token in it would reach every JSON, CSV and
+`--details` output, and no error message quotes such a URL.
+
 For encrypted targets, these reports also expose the effective TLS server
 name, whether it was configured explicitly or derived from the endpoint,
 whether bootstrap came from explicit IP candidates, the target address, or
 the system resolver, and the selected dial address when a connection opened.
 An explicit `server_name` is the only way to opt into a different TLS identity;
 `bootstrap_addresses` only changes connection candidates and never disables
-certificate validation.
+certificate validation. The configured `server_name` is stored trimmed, so the
+name the TLS handshake authenticates is the name the report records, and a
+blank one is rejected rather than read as unset.
 
 ## Reproducibility limits
 
@@ -615,6 +647,25 @@ have external routes. Hostname-only custom endpoints remain available in
 `auto` and `both`, while explicit family selection requires literals so the
 benchmark does not include an unmeasured bootstrap lookup. Explicit `4`, `6`,
 and `both` stay exact filters, loopback included.
+
+The filters apply to `bootstrap_addresses` too. A DoH, DoT or DoQ transport
+that lists bootstrap candidates dials those and never the target address, so
+filtering the addresses alone let a row labelled with an IPv6 address measure
+an IPv4 candidate under `--family 6`. Each transport keeps only the candidates
+of the allowed families, in their configured order, with IPv4-mapped IPv6
+literals counted as IPv4. A transport left with no candidate is dropped rather
+than falling back to the target address the operator replaced, and a profile
+left with no transport is dropped like one left with no address. Bootstrap
+candidates are also de-duplicated by canonical address, so `2001:DB8::1` and
+`2001:db8::1` are one candidate tried once.
+
+A profile with several addresses still expands into one target per address,
+even when its encrypted transports dial the same bootstrap candidates. Those
+rows measure the same connection path and are ranked as separate endpoints;
+the report carries a warning naming the resolver and the transports concerned.
+The rows are kept rather than collapsed because collapsing would change target
+IDs that existing resolver files, saved reports and `--assert` subjects use.
+List one address, or remove `bootstrap_addresses`, to avoid them.
 
 Auto-detection treats the two families differently. An RFC 1918 IPv4 address
 counts as IPv4 availability because NAT makes a private v4 address an ordinary

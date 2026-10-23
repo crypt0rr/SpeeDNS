@@ -16,11 +16,19 @@ import (
 	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
 var macOSResolverHeader = regexp.MustCompile(`^\s*resolver\s+#\s*([0-9]+)\s*$`)
 var macOSNameServer = regexp.MustCompile(`^\s*nameserver\[[0-9]+\]\s*:\s*(\S+)\s*$`)
-var macOSScope = regexp.MustCompile(`^\s*(?:domain|search\s+domain\[[0-9]+\])\s*:\s*(\S+)\s*$`)
+
+// macOSScope matches only the `domain :` line of a resolver block, which makes
+// the block a supplemental resolver for that domain. A `search domain[n]` line
+// is the suffix search list, which expands short names but does not limit
+// which queries the resolver answers; DHCP puts one on the default resolver of
+// most networks, so treating it as a scope labelled the default resolver as a
+// split-DNS one.
+var macOSScope = regexp.MustCompile(`^\s*domain\s*:\s*(\S+)\s*$`)
 var macOSInterface = regexp.MustCompile(`^\s*if_index\s*:\s*([0-9]+)(?:\s+\(([^)]+)\))?\s*$`)
 
 var currentOS = runtime.GOOS
@@ -72,6 +80,25 @@ var openResolvConf = func() (io.ReadCloser, error) {
 	return os.Open(resolvConfPath)
 }
 
+// resolvedUplinkPath is where systemd-resolved publishes, in resolv.conf
+// format, the DNS servers it forwards to. When /etc/resolv.conf names only
+// its loopback stub, this file is the one read-only place that says which
+// upstream the host's lookups actually reach. It is a variable, with an
+// opener seam beside it, so tests read a fixture instead of the host file.
+var resolvedUplinkPath = "/run/systemd/resolve/resolv.conf"
+
+var openResolvedUplink = func() (io.ReadCloser, error) {
+	return os.Open(resolvedUplinkPath)
+}
+
+// resolvedUplinkPolicy says what a profile read from resolvedUplinkPath
+// cannot show. The file is a flattened view of resolved's configuration: it
+// holds only the servers of default-route links, so a split-DNS or VPN link
+// that answers only its routing domains is absent, and resolv.conf syntax has
+// no way to carry a DNS-over-TLS setting or a non-standard port. It is a table
+// column, so it stays short; the documentation spells the limits out.
+const resolvedUplinkPolicy = "unknown; split DNS, DoT and ports not shown"
+
 // scutilCommand builds the read-only macOS resolver query. It is separated
 // from runScutil so tests can assert the command name and arguments without
 // executing anything.
@@ -92,6 +119,9 @@ type resolverSource struct {
 	Block     int
 	Scope     string
 	Interface string
+	// Uplink marks a server read from systemd-resolved's uplink file rather
+	// than from the resolver configuration the host's lookups use directly.
+	Uplink bool
 }
 
 type macOSResolverBlock struct {
@@ -106,7 +136,9 @@ type macOSResolverBlock struct {
 // per-adapter resolver sets through GetAdaptersAddresses; Linux generally
 // exposes the active set through resolv.conf (including a systemd-resolved
 // stub). Each macOS block and each Windows adapter remains a separate system
-// profile, even when two of them contain the same nameserver address.
+// profile, even when two of them contain the same nameserver address. On
+// Linux, a resolv.conf that names only loopback stubs is followed by the
+// servers systemd-resolved forwards to, as extra profiles after the stub.
 func Discover(ctx context.Context) ([]catalog.ResolverProfile, error) {
 	var sources []resolverSource
 	var err error
@@ -119,6 +151,9 @@ func Discover(ctx context.Context) ([]catalog.ResolverProfile, error) {
 		var addresses []string
 		addresses, err = discoverResolvConf()
 		sources = plainSources(addresses)
+		if currentOS == "linux" {
+			sources = append(sources, resolvedUplinkSources(sources)...)
+		}
 	default:
 		return nil, &UnsupportedPlatformError{OS: currentOS}
 	}
@@ -246,6 +281,9 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 		if source.Block > 0 {
 			dedupeKey = fmt.Sprintf("%d/%s", source.Block, address)
 		}
+		if source.Uplink {
+			dedupeKey = "uplink/" + address
+		}
 		if _, exists := seen[dedupeKey]; exists {
 			continue
 		}
@@ -262,8 +300,22 @@ func profilesFromSources(sources []resolverSource) []catalog.ResolverProfile {
 			policy = "local forwarding (upstream unknown)"
 			id = "system-stub-" + sanitizeAddress(address)
 		}
+		if source.Uplink {
+			// The system- prefix keeps the profile under --redact-system, and
+			// the label says where the address came from: the stub stays the
+			// row the host's lookups use, and this one is what it forwards to.
+			name = "System DNS (systemd-resolved default route)"
+			owner = "configured locally (systemd-resolved default route)"
+			policy = resolvedUplinkPolicy
+			id = "system-resolved-" + sanitizeAddress(address)
+		}
 		if source.Block > 0 {
-			label := sourceLabel(source)
+			// The scope and interface come from the operating system - a
+			// DHCP-supplied domain, a user-renamed adapter - and
+			// catalog.Validate rejects a name or owner that would not print
+			// as written. Escaping the label keeps such a host's resolvers in
+			// the run, shown the way every report renders them anyway.
+			label := safetext.Escape(sourceLabel(source))
 			name += " (" + label + ")"
 			owner += " (" + label + ")"
 			id = fmt.Sprintf("system-resolver-%d-%s", source.Block, sanitizeAddress(address))
@@ -327,16 +379,60 @@ func discoverResolvConf() ([]string, error) {
 		return nil, fmt.Errorf("open %s: %w", resolvConfPath, err)
 	}
 	defer file.Close()
+	addresses, err := scanNameservers(file)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", resolvConfPath, err)
+	}
+	return addresses, nil
+}
+
+// scanNameservers returns the nameserver entries of a resolv.conf-format file
+// in the order listed.
+func scanNameservers(reader io.Reader) ([]string, error) {
 	var addresses []string
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) >= 2 && fields[0] == "nameserver" {
 			addresses = append(addresses, fields[1])
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read %s: %w", resolvConfPath, err)
+	return addresses, scanner.Err()
+}
+
+// resolvedUplinkSources returns the servers systemd-resolved forwards to when
+// every nameserver in sources is a loopback stub, and nothing otherwise. A
+// stub-only resolv.conf leaves --include-system with one row that is never
+// ranked, so the host's real upstream - its router or ISP resolver - was
+// never compared. Each non-loopback uplink becomes its own network profile
+// next to the unchanged stub. The file is optional: a missing or unreadable
+// one means the host is not running resolved, or not in a form this reader
+// understands, and discovery then returns exactly what resolv.conf gives.
+func resolvedUplinkSources(sources []resolverSource) []resolverSource {
+	if len(sources) == 0 {
+		return nil
 	}
-	return addresses, nil
+	for _, source := range sources {
+		if !isLocalStub(source.Address) {
+			return nil
+		}
+	}
+	file, err := openResolvedUplink()
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	addresses, err := scanNameservers(file)
+	if err != nil {
+		return nil
+	}
+	var uplinks []resolverSource
+	for _, source := range plainSources(addresses) {
+		if isLocalStub(source.Address) {
+			continue
+		}
+		source.Uplink = true
+		uplinks = append(uplinks, source)
+	}
+	return uplinks
 }

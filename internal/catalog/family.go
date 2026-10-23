@@ -79,6 +79,16 @@ func isLoopbackLiteral(address string) bool {
 // auto filter: a local stub resolver is reachable through the loopback
 // interface even when auto-detection sees external routes for one family
 // only, so filtering it out would drop a resolver that answers.
+//
+// The same rule applies to the bootstrap_addresses of every encrypted
+// transport, because a transport that has them dials those candidates and
+// never the target address. Filtering the addresses alone let a row labelled
+// with an IPv6 address measure an IPv4 candidate under --family 6. A
+// transport left with no candidate is dropped rather than falling back to
+// the target address, which the operator replaced deliberately, and a
+// profile left with no transport is dropped like one left with no address.
+// The input profiles, their address slices and their transport maps are
+// never modified.
 func FilterProfilesByFamily(profiles []ResolverProfile, family AddressFamily, available map[AddressFamily]bool) ([]ResolverProfile, error) {
 	allowed, err := allowedFamilies(family, available)
 	if err != nil {
@@ -97,17 +107,55 @@ func FilterProfilesByFamily(profiles []ResolverProfile, family AddressFamily, av
 				addresses = append(addresses, address)
 				continue
 			}
-			if allowed[addressFamily] || (family == FamilyAuto && isLoopbackLiteral(address)) {
+			if familyAllowed(address, addressFamily, family, allowed) {
 				addresses = append(addresses, address)
 			}
 		}
 		if len(addresses) == 0 {
 			continue
 		}
+		transports := filterBootstrapByFamily(profile.Transports, family, allowed)
+		if len(transports) == 0 {
+			continue
+		}
 		profile.Addresses = addresses
+		profile.Transports = transports
 		filteredProfiles = append(filteredProfiles, profile)
 	}
 	return filteredProfiles, nil
+}
+
+// familyAllowed reports whether a literal of addressFamily survives the
+// filter: its family is allowed, or it is a loopback literal under auto.
+func familyAllowed(address string, addressFamily, family AddressFamily, allowed map[AddressFamily]bool) bool {
+	return allowed[addressFamily] || (family == FamilyAuto && isLoopbackLiteral(address))
+}
+
+// filterBootstrapByFamily returns a new transport map whose bootstrap
+// candidates all pass the family filter. Validate admits only IP literals as
+// candidates, so a candidate with no family is never allowed. Candidate
+// order is kept, because it is the order the transport tries them in.
+func filterBootstrapByFamily(transports map[Protocol]TransportSpec, family AddressFamily, allowed map[AddressFamily]bool) map[Protocol]TransportSpec {
+	filtered := make(map[Protocol]TransportSpec, len(transports))
+	for protocol, spec := range transports {
+		if len(spec.BootstrapAddresses) == 0 {
+			filtered[protocol] = spec
+			continue
+		}
+		candidates := make([]string, 0, len(spec.BootstrapAddresses))
+		for _, candidate := range spec.BootstrapAddresses {
+			candidateFamily, _ := AddressFamilyForAddress(candidate)
+			if familyAllowed(candidate, candidateFamily, family, allowed) {
+				candidates = append(candidates, candidate)
+			}
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+		spec.BootstrapAddresses = candidates
+		filtered[protocol] = spec
+	}
+	return filtered
 }
 
 func allowedFamilies(family AddressFamily, available map[AddressFamily]bool) (map[AddressFamily]bool, error) {

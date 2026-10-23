@@ -1,0 +1,2 @@
+go test fuzz v1
+string("version: 1\nresolvers:\n  - id: udp\n    name: UDP\n    addresses: [192.0.2.53]\n    transports:\n      udp: {server_name: dns.example}\n")

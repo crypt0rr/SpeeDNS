@@ -194,10 +194,28 @@ func validateAssertionTargets(assertions []assertion, targets []catalog.Target, 
 	return nil
 }
 
+// assertionOptions carries the report settings an assertion failure message
+// has to agree with.
+type assertionOptions struct {
+	// redactSystem names a system target by the redacted ID the report above
+	// the message uses, so the stderr line neither contradicts the report nor
+	// prints the local address the report withholds.
+	redactSystem bool
+}
+
+// evaluateAssertions checks every assertion against the written report and
+// names targets by their recorded IDs.
 func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
+	return evaluateAssertionsWithOptions(report, assertions, assertionOptions{})
+}
+
+// evaluateAssertionsWithOptions checks every assertion against the written
+// report, naming targets the way options says the report names them.
+func evaluateAssertionsWithOptions(report benchmark.Report, assertions []assertion, options assertionOptions) error {
 	if len(assertions) == 0 {
 		return nil
 	}
+	displayIDs := redactedAssertionIDs(report, options.redactSystem)
 	reasons := make([]string, 0)
 	winners := reportWinners(report)
 	leaders := rankOneWinners(report)
@@ -214,7 +232,7 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 		// the caller named explicitly, which describes the run rather than the
 		// thing they asked about.
 		if check.subject != "" {
-			reasons = append(reasons, subjectAssertionReasons(report, check)...)
+			reasons = append(reasons, subjectAssertionReasons(report, check, displayIDs)...)
 			continue
 		}
 		if len(winners) == 0 {
@@ -249,7 +267,7 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 			}
 			actual, ok := assertionMetricValue(winner, check.metric)
 			if !ok || !assertionComparison(actual, check.operator, check.value) {
-				reasons = append(reasons, fmt.Sprintf("%s: %s winner %s has %s=%s", check.raw, protocol, winner.Target.ID(), check.metric, assertionActualText(check.metric, actual)))
+				reasons = append(reasons, fmt.Sprintf("%s: %s winner %s has %s=%s", check.raw, protocol, displayTargetID(winner.Target, displayIDs), check.metric, assertionActualText(check.metric, actual)))
 			}
 		}
 	}
@@ -262,6 +280,21 @@ func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 	// control character cannot reach the terminal through a failed gate when
 	// the report above it renders the same ID escaped.
 	return fmt.Errorf("%w: %s", ErrAssertionsFailed, safetext.Escape(strings.Join(reasons, "; ")))
+}
+
+// redactedAssertionIDs returns the redacted ID of every system target, or nil
+// when redaction is off. It is the report package's own mapping rather than a
+// copy, so the positional numbering always matches the written report.
+func redactedAssertionIDs(result benchmark.Report, redactSystem bool) map[string]string {
+	return report.RedactedTargetIDs(result, redactSystem)
+}
+
+// displayTargetID names target in a failure reason the way the report does.
+func displayTargetID(target catalog.Target, redactedIDs map[string]string) string {
+	if redacted, ok := redactedIDs[target.ID()]; ok {
+		return redacted
+	}
+	return target.ID()
 }
 
 // deadProtocols returns every protocol whose non-local endpoints all returned
@@ -320,7 +353,7 @@ func deadProtocols(report benchmark.Report) []catalog.Protocol {
 // name is validated against the selected targets before any query is sent, so
 // reaching here with no match means the resolver was selected but produced no
 // measurable result at all.
-func subjectAssertionReasons(report benchmark.Report, check assertion) []string {
+func subjectAssertionReasons(report benchmark.Report, check assertion, displayIDs map[string]string) []string {
 	reasons := make([]string, 0)
 	matched := false
 	for _, result := range report.Targets {
@@ -337,13 +370,13 @@ func subjectAssertionReasons(report benchmark.Report, check assertion) []string 
 		// a local subject and stays quiet while any peer on its protocol is
 		// alive.
 		if isLatencyMetric(check.metric) && result.Stats.Scored == 0 {
-			reasons = append(reasons, fmt.Sprintf("%s: %s has no scored latency samples", check.raw, result.Target.ID()))
+			reasons = append(reasons, fmt.Sprintf("%s: %s has no scored latency samples", check.raw, displayTargetID(result.Target, displayIDs)))
 			continue
 		}
 		actual, ok := assertionMetricValue(result, check.metric)
 		if !ok || !assertionComparison(actual, check.operator, check.value) {
 			reasons = append(reasons, fmt.Sprintf("%s: %s has %s=%s",
-				check.raw, result.Target.ID(), check.metric, assertionActualText(check.metric, actual)))
+				check.raw, displayTargetID(result.Target, displayIDs), check.metric, assertionActualText(check.metric, actual)))
 		}
 	}
 	if !matched {

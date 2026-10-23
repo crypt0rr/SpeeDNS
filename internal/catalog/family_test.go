@@ -138,3 +138,109 @@ func TestFilterProfilesByFamily(t *testing.T) {
 		t.Fatalf("empty family selection = %#v/%v", profiles, err)
 	}
 }
+
+// TestFilterProfilesByFamilyFiltersBootstrapCandidates covers #234. The filter
+// used to look at profile addresses only, while an encrypted transport with
+// bootstrap_addresses dials those candidates and never the target address. A
+// row labelled 2001:db8::53 could then measure 192.0.2.53 in a run whose
+// provenance said --family 6.
+func TestFilterProfilesByFamilyFiltersBootstrapCandidates(t *testing.T) {
+	input := `version: 1
+resolvers:
+  - id: dual
+    name: Dual
+    addresses: [192.0.2.53, "2001:db8::53"]
+    transports:
+      udp: {}
+      dot: {server_name: dns.example, bootstrap_addresses: [192.0.2.53]}
+      doh: {url: "https://dns.example/dns-query", bootstrap_addresses: [192.0.2.53, "2001:db8::1"]}
+      doq: {server_name: dns.example, bootstrap_addresses: ["2001:DB8::1", 192.0.2.1, "2001:db8::1", "::ffff:192.0.2.1"]}
+`
+	loaded, err := LoadYAML(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := loaded[0].Transports[DoQ].BootstrapAddresses
+	if strings.Join(original, ",") != "2001:DB8::1,192.0.2.1" {
+		t.Fatalf("DoQ bootstrap after canonical de-duplication = %#v", original)
+	}
+
+	// candidates returns what a target actually dials: its bootstrap
+	// candidates when it has any, otherwise its own address.
+	candidates := func(target Target) []string {
+		if len(target.Spec.BootstrapAddresses) > 0 {
+			return target.Spec.BootstrapAddresses
+		}
+		return []string{target.Address}
+	}
+	for _, test := range []struct {
+		family    AddressFamily
+		available map[AddressFamily]bool
+		forbidden AddressFamily
+		want      map[Protocol]string
+	}{
+		{family: Family6, forbidden: Family4, want: map[Protocol]string{UDP: "", DoH: "2001:db8::1", DoQ: "2001:DB8::1"}},
+		{family: Family4, forbidden: Family6, want: map[Protocol]string{UDP: "", DoT: "192.0.2.53", DoH: "192.0.2.53", DoQ: "192.0.2.1"}},
+		{family: FamilyAuto, available: map[AddressFamily]bool{Family6: true}, forbidden: Family4, want: map[Protocol]string{UDP: "", DoH: "2001:db8::1", DoQ: "2001:DB8::1"}},
+	} {
+		t.Run(string(test.family), func(t *testing.T) {
+			profiles, err := FilterProfilesByFamily(loaded, test.family, test.available)
+			if err != nil || len(profiles) != 1 {
+				t.Fatalf("FilterProfilesByFamily(%s) = %#v/%v", test.family, profiles, err)
+			}
+			if len(profiles[0].Transports) != len(test.want) {
+				t.Fatalf("--family %s transports = %#v, want %v", test.family, profiles[0].Transports, test.want)
+			}
+			for protocol, want := range test.want {
+				spec, ok := profiles[0].Transports[protocol]
+				if !ok || strings.Join(spec.BootstrapAddresses, ",") != want {
+					t.Fatalf("--family %s %s bootstrap = %#v, want %q", test.family, protocol, spec.BootstrapAddresses, want)
+				}
+			}
+			// No target dials a candidate of the other family, and no two
+			// rows of one transport share a dial plan.
+			plans := make(map[string]string)
+			for _, target := range Expand(profiles, nil) {
+				for _, candidate := range candidates(target) {
+					if family, _ := AddressFamilyForAddress(candidate); family == test.forbidden {
+						t.Fatalf("--family %s target %s dials %s", test.family, target.ID(), candidate)
+					}
+				}
+				plan := string(target.Protocol) + " " + strings.Join(candidates(target), ",")
+				if previous, shared := plans[plan]; shared {
+					t.Fatalf("--family %s targets %s and %s share the dial plan %q", test.family, previous, target.ID(), plan)
+				}
+				plans[plan] = target.ID()
+			}
+		})
+	}
+
+	// both keeps every candidate, and the input is never modified.
+	profiles, err := FilterProfilesByFamily(loaded, FamilyBoth, nil)
+	if err != nil || len(profiles) != 1 || len(profiles[0].Transports) != 4 || len(profiles[0].Transports[DoH].BootstrapAddresses) != 2 {
+		t.Fatalf("--family both = %#v/%v", profiles, err)
+	}
+	if len(loaded[0].Transports) != 4 || strings.Join(loaded[0].Transports[DoQ].BootstrapAddresses, ",") != "2001:DB8::1,192.0.2.1" ||
+		strings.Join(loaded[0].Transports[DoT].BootstrapAddresses, ",") != "192.0.2.53" || len(loaded[0].Addresses) != 2 {
+		t.Fatalf("filtering modified its input: %#v", loaded[0])
+	}
+
+	// A profile whose only transport has no candidate left is dropped, never
+	// fallen back to the target address.
+	onlyDoT := loaded[0]
+	onlyDoT.Transports = map[Protocol]TransportSpec{DoT: loaded[0].Transports[DoT]}
+	if profiles, err := FilterProfilesByFamily([]ResolverProfile{onlyDoT}, Family6, nil); err != nil || len(profiles) != 0 {
+		t.Fatalf("--family 6 over an IPv4-only bootstrap = %#v/%v", profiles, err)
+	}
+
+	// Auto keeps a loopback candidate whatever the detected families, as it
+	// does for a loopback address.
+	loopback := ResolverProfile{
+		ID: "loopback", Name: "Loopback", Addresses: []string{"::1"},
+		Transports: map[Protocol]TransportSpec{DoT: {ServerName: "localhost", BootstrapAddresses: []string{"127.0.0.1", "192.0.2.9"}}},
+	}
+	profiles, err = FilterProfilesByFamily([]ResolverProfile{loopback}, FamilyAuto, map[AddressFamily]bool{Family6: true})
+	if err != nil || len(profiles) != 1 || strings.Join(profiles[0].Transports[DoT].BootstrapAddresses, ",") != "127.0.0.1" {
+		t.Fatalf("loopback bootstrap under auto = %#v/%v", profiles, err)
+	}
+}

@@ -114,8 +114,19 @@ func loadReader(reader io.Reader) ([]string, error) {
 	return validateInputs(lines)
 }
 
+// utf8BOM is the byte order mark some Windows editors and PowerShell's
+// UTF-8 encoders write at the start of a text file.
+const utf8BOM = "\ufeff"
+
 // scanDomainLines reads a newline-delimited list, dropping blank lines and
 // comments and remembering each remaining entry's line number.
+//
+// One byte order mark is stripped from the start of the first line, where it
+// only describes the file's encoding. Left in place it turned a leading
+// comment or blank line into an entry, which failed the whole list or, under
+// --skip-invalid-domains, reported a skipped entry the file never had. A
+// U+FEFF anywhere else is part of its entry and left to that entry's own
+// validation.
 func scanDomainLines(reader io.Reader) ([]domainInput, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024), maxDomainLineSize)
@@ -123,7 +134,11 @@ func scanDomainLines(reader io.Reader) ([]domainInput, error) {
 	lineNumber := 0
 	for scanner.Scan() {
 		lineNumber++
-		line := strings.TrimSpace(scanner.Text())
+		text := scanner.Text()
+		if lineNumber == 1 {
+			text = strings.TrimPrefix(text, utf8BOM)
+		}
+		line := strings.TrimSpace(text)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}

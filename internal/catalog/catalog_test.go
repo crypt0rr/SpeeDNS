@@ -3,9 +3,14 @@ package catalog
 import (
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
 func TestDefaultResolversAreCorrectedAndProfiled(t *testing.T) {
@@ -451,5 +456,341 @@ func TestBundledCacheKeysJoinOnlyTheGooglePair(t *testing.T) {
 	want := []string{"google-8888+google-8844:host:dns.google"}
 	if !slices.Equal(shared, want) {
 		t.Fatalf("bundled profiles sharing a cache key = %q, want %q", shared, want)
+	}
+}
+
+// TestValidateRejectsUnprintableResolverText pins the resolver-ID part of
+// #252. Every report sink escapes control, bidirectional and invisible
+// characters, so a configured ID carrying one printed differently from the ID
+// an --assert subject or a consumer joining report sections would use, and a
+// name or owner carrying an invisible character looked identical to another.
+// The error names the field and the code point and never prints the
+// character itself.
+func TestValidateRejectsUnprintableResolverText(t *testing.T) {
+	// Each character sits inside the value, because Validate trims
+	// surrounding whitespace first and U+0085 is whitespace to TrimSpace.
+	unsafe := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"escape", "ev\x1b[2Kil", "contains the control or invisible character U+001B"},
+		{"delete", "ev\x7fil", "contains the control or invisible character U+007F"},
+		{"C1 next line", "ev\u0085il", "contains the control or invisible character U+0085"},
+		{"right-to-left override", "ev\U0000202Eil", "contains the control or invisible character U+202E"},
+		{"first strong isolate", "ev\U00002068il", "contains the control or invisible character U+2068"},
+		{"zero width space", "ev\U0000200Bil", "contains the control or invisible character U+200B"},
+		{"byte order mark", "ev\U0000FEFFil", "contains the control or invisible character U+FEFF"},
+		{"invalid UTF-8", "ev\xffil", "is not valid UTF-8"},
+	}
+	fields := []struct {
+		field string
+		set   func(*ResolverProfile, string)
+		want  string
+	}{
+		{"id", func(profile *ResolverProfile, value string) { profile.ID = value }, "resolver 1 id "},
+		{"name", func(profile *ResolverProfile, value string) { profile.Name = value }, `resolver "printable" name `},
+		{"owner", func(profile *ResolverProfile, value string) { profile.Owner = value }, `resolver "printable" owner `},
+		{"zoned address", func(profile *ResolverProfile, value string) { profile.Addresses = []string{"fe80::1%" + value} }, `resolver "printable" address 1 `},
+	}
+	for _, field := range fields {
+		for _, test := range unsafe {
+			t.Run(field.field+" "+test.name, func(t *testing.T) {
+				profile := minimalProfile("printable")
+				field.set(&profile, test.value)
+				err := Validate([]ResolverProfile{profile})
+				if err == nil || !strings.Contains(err.Error(), field.want+test.want) {
+					t.Fatalf("Validate(%s=%q) = %v, want an error containing %q", field.field, test.value, err, field.want+test.want)
+				}
+				if strings.Contains(err.Error(), test.value) || safetext.Escape(err.Error()) != err.Error() {
+					t.Fatalf("error for %s=%q prints the rejected character: %q", field.field, test.value, err)
+				}
+			})
+		}
+	}
+
+	// Printable Unicode stays valid, including a genuine U+FFFD and the soft
+	// hyphen, which safetext leaves as written.
+	for _, value := range []string{"Résolveur Ünïcode", "名前", "replacement \U0000FFFD", "soft\U000000ADhyphen"} {
+		profile := minimalProfile(value)
+		profile.Name, profile.Owner = value, value
+		if err := Validate([]ResolverProfile{profile}); err != nil {
+			t.Fatalf("Validate(%q) rejected printable text: %v", value, err)
+		}
+	}
+
+	// A resolver file reaches the same check through YAML escapes.
+	yamlFile := "version: 1\nresolvers:\n  - id: \"evil\\e\"\n    name: Evil\n    addresses: [192.0.2.1]\n    transports:\n      udp: {}\n"
+	if _, err := LoadYAML(strings.NewReader(yamlFile)); err == nil || !strings.Contains(err.Error(), "resolver 1 id contains the control or invisible character U+001B") {
+		t.Fatalf("LoadYAML with an escape in the id = %v", err)
+	}
+	yamlFile = "version: 1\nresolvers:\n  - id: bidi\n    name: \"a\\u202Eb\"\n    addresses: [192.0.2.1]\n    transports:\n      udp: {}\n"
+	if _, err := LoadYAML(strings.NewReader(yamlFile)); err == nil || !strings.Contains(err.Error(), `resolver "bidi" name contains the control or invisible character U+202E`) {
+		t.Fatalf("LoadYAML with a bidi override in the name = %v", err)
+	}
+
+	// The --resolver NAME is checked where it is parsed, so the message names
+	// the flag rather than a derived ID and a position in the combined list.
+	for _, test := range unsafe {
+		profile, err := ParseResolverFlag(test.value + "=udp://192.0.2.53")
+		if err == nil || !strings.Contains(err.Error(), "resolver NAME "+test.want) || !reflect.DeepEqual(profile, ResolverProfile{}) {
+			t.Fatalf("ParseResolverFlag(%q) = %#v/%v, want a NAME error containing %q", test.value, profile, err, test.want)
+		}
+	}
+	// Validate still covers a flag profile on its own, so a profile built
+	// any other way cannot bypass the rule.
+	profile, err := ParseResolverFlag("plain=udp://192.0.2.53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.Name = "plain\x1b"
+	if err := Validate([]ResolverProfile{profile}); err == nil || !strings.Contains(err.Error(), `resolver "custom-plain" name contains`) {
+		t.Fatalf("Validate of a flag profile with an unsafe name = %v", err)
+	}
+}
+
+// TestValidateRejectsProfilesWithoutTransports covers #244. A profile with no
+// transports expands into no target, so it surfaced only as the misleading
+// "no resolver supports the selected protocol(s)" or as a silent gap in JSON
+// and CSV.
+func TestValidateRejectsProfilesWithoutTransports(t *testing.T) {
+	for name, transports := range map[string]string{
+		"missing key": "",
+		"empty map":   "    transports: {}\n",
+		"null":        "    transports:\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := "version: 1\nresolvers:\n  - id: bare\n    name: Bare\n    addresses: [192.0.2.1]\n" + transports
+			profiles, err := LoadYAML(strings.NewReader(input))
+			if err == nil || profiles != nil || !strings.Contains(err.Error(), `resolver "bare" has no transports`) {
+				t.Fatalf("LoadYAML(%q) = %#v/%v, want a no-transports error", input, profiles, err)
+			}
+		})
+	}
+	// A null spec still declares the transport and takes its defaults.
+	profiles, err := LoadYAML(strings.NewReader("version: 1\nresolvers:\n  - id: null-spec\n    name: NullSpec\n    addresses: [192.0.2.1]\n    transports:\n      udp:\n"))
+	if err != nil || profiles[0].Transports[UDP].Port != 53 {
+		t.Fatalf("null udp spec = %#v/%v", profiles, err)
+	}
+}
+
+// TestValidateRejectsFieldsTheProtocolNeverReads covers #244. Strict decoding
+// rejected unknown keys but accepted known ones the protocol ignores, so
+// `url: tls://dns.example:8853` under dot looked like it set a port and
+// changed nothing. Each field gets its own error, following the existing
+// bootstrap_addresses rule for udp and tcp.
+func TestValidateRejectsFieldsTheProtocolNeverReads(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		spec string
+		want string
+	}{
+		{"url on dot", "dot: {server_name: dns.example, url: \"tls://dns.example:8853\"}", `protocol "dot" cannot use url; only doh takes a url, so set port: to choose a port`},
+		{"url on doq", "doq: {server_name: dns.example, url: \"quic://dns.example\"}", `protocol "doq" cannot use url`},
+		{"url on udp", "udp: {url: \"udp://192.0.2.1\"}", `protocol "udp" cannot use url`},
+		{"url on tcp", "tcp: {url: \" \"}", `protocol "tcp" cannot use url`},
+		{"server_name on udp", "udp: {server_name: dns.example}", `protocol "udp" cannot use server_name`},
+		{"server_name on tcp", "tcp: {server_name: dns.example}", `protocol "tcp" cannot use server_name`},
+		{"blank server_name on doh", "doh: {url: \"https://dns.example/dns-query\", server_name: \" \"}", `protocol "doh" has a blank server_name`},
+		{"blank server_name on dot", "dot: {server_name: \"   \"}", `protocol "dot" has a blank server_name`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := "version: 1\nresolvers:\n  - id: misplaced\n    name: Misplaced\n    addresses: [192.0.2.1]\n    transports:\n      " + test.spec + "\n"
+			if _, err := LoadYAML(strings.NewReader(input)); err == nil || !strings.Contains(err.Error(), `resolver "misplaced" `+test.want) {
+				t.Fatalf("LoadYAML(%s) = %v, want an error containing %q", test.spec, err, test.want)
+			}
+		})
+	}
+
+	// The documented examples still load with their values unchanged.
+	example, err := os.Open(filepath.Join("..", "..", "resolvers.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer example.Close()
+	profiles, err := LoadYAML(example)
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("resolvers.example.yaml = %#v/%v", profiles, err)
+	}
+	transports := profiles[0].Transports
+	if transports[DoT].ServerName != "dns.example" || transports[DoT].Port != 853 ||
+		transports[DoH].URL != "https://dns.example/dns-query" || transports[DoH].Port != 443 ||
+		transports[DoQ].ServerName != "dns.example" || transports[UDP].Port != 53 {
+		t.Fatalf("resolvers.example.yaml transports = %#v", transports)
+	}
+}
+
+// TestValidateStoresTrimmedServerName covers #244: the transport hands
+// server_name to the TLS handshake, so storing it untrimmed made a quoted
+// " dns.google " fail verification while the report showed "dns.google".
+func TestValidateStoresTrimmedServerName(t *testing.T) {
+	input := `version: 1
+resolvers:
+  - id: padded
+    name: Padded
+    addresses: [192.0.2.53]
+    transports:
+      dot: {server_name: " dns.google "}
+      doq: {server_name: "	dns.google	"}
+      doh: {url: "https://dns.google/dns-query", server_name: " alias.example "}
+`
+	profiles, err := LoadYAML(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for protocol, want := range map[Protocol]string{DoT: "dns.google", DoQ: "dns.google", DoH: "alias.example"} {
+		if got := profiles[0].Transports[protocol].ServerName; got != want {
+			t.Fatalf("%s server_name = %q, want %q", protocol, got, want)
+		}
+		target := Target{Resolver: profiles[0], Protocol: protocol, Address: profiles[0].Addresses[0], Spec: profiles[0].Transports[protocol]}
+		if metadata := target.EndpointMetadata(); metadata.TLSServerName != want || metadata.TLSIdentitySource != TLSIdentityConfigured {
+			t.Fatalf("%s metadata = %#v, want configured %q", protocol, metadata, want)
+		}
+	}
+}
+
+// TestEndpointMetadataClassifiesZonedLiteralsAsTargetAddresses covers #244. A
+// zoned link-local literal is dialed directly, but net.ParseIP rejects the
+// zone, so the report claimed a system-resolver lookup that never happens.
+func TestEndpointMetadataClassifiesZonedLiteralsAsTargetAddresses(t *testing.T) {
+	for _, target := range []Target{
+		{Protocol: DoT, Address: "fe80::1%eth0", Spec: TransportSpec{ServerName: "dns.example"}},
+		{Protocol: DoQ, Address: "[fe80::1%eth0]", Spec: TransportSpec{ServerName: "dns.example"}},
+		{Protocol: DoH, Spec: TransportSpec{URL: "https://[fe80::1%25eth0]/dns-query"}},
+	} {
+		if mode := target.EndpointMetadata().BootstrapMode; mode != BootstrapTarget {
+			t.Fatalf("%s %q bootstrap mode = %q, want %q", target.Protocol, target.Address+target.Spec.URL, mode, BootstrapTarget)
+		}
+	}
+}
+
+// TestDoHURLWithUserinfoIsRejectedWithoutEchoingIt covers #243. A DoH URL with
+// userinfo was accepted, sent as Basic authentication and written verbatim to
+// endpoint_url in JSON, CSV and --details. It is rejected from a resolver file
+// and from --resolver alike, and no error - including the generic malformed
+// URL errors that quote the URL - prints the credentials.
+func TestDoHURLWithUserinfoIsRejectedWithoutEchoingIt(t *testing.T) {
+	secrets := []string{"alice", "s3cret", "bob", "hunter2", "TOKEN123"}
+	assertNoSecret := func(t *testing.T, err error) {
+		t.Helper()
+		for _, secret := range secrets {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaks %q: %v", secret, err)
+			}
+		}
+	}
+
+	for _, raw := range []string{
+		"https://alice:s3cret@doh.example/dns-query",
+		"https://TOKEN123@doh.example/dns-query",
+		"https://@doh.example/dns-query",
+	} {
+		input := "version: 1\nresolvers:\n  - id: creds\n    name: Creds\n    addresses: [192.0.2.53]\n    transports:\n      doh: {url: \"" + raw + "\"}\n"
+		_, err := LoadYAML(strings.NewReader(input))
+		if err == nil || !strings.Contains(err.Error(), `resolver "creds" DoH URL must not include user credentials`) {
+			t.Fatalf("LoadYAML with %q = %v", raw, err)
+		}
+		assertNoSecret(t, err)
+
+		profile, err := ParseResolverFlag("p=" + raw)
+		if err == nil || !strings.Contains(err.Error(), "resolver URI must not include user credentials") || !reflect.DeepEqual(profile, ResolverProfile{}) {
+			t.Fatalf("ParseResolverFlag(%q) = %#v/%v", raw, profile, err)
+		}
+		assertNoSecret(t, err)
+	}
+	// Userinfo means nothing to the other schemes either; it used to be
+	// dropped without a word.
+	for _, raw := range []string{"udp://alice:s3cret@192.0.2.53", "tls://TOKEN123@dns.example", "quic://bob:hunter2@dns.example"} {
+		if _, err := ParseResolverFlag("p=" + raw); err == nil || !strings.Contains(err.Error(), "must not include user credentials") {
+			t.Fatalf("ParseResolverFlag(%q) = %v", raw, err)
+		} else {
+			assertNoSecret(t, err)
+		}
+	}
+
+	// A malformed value carrying credentials is withheld from the generic
+	// errors that otherwise quote it.
+	for _, value := range []string{"=https://alice:s3cret@doh.example/dns-query", "p=https://alice:s3cret@doh.example:bad/dns-query"} {
+		_, err := ParseResolverFlag(value)
+		if err == nil || !strings.Contains(err.Error(), `withheld because it contains "@"`) {
+			t.Fatalf("ParseResolverFlag(%q) = %v, want the value withheld", value, err)
+		}
+		assertNoSecret(t, err)
+	}
+	malformed := minimalProfile("malformed")
+	malformed.Transports = map[Protocol]TransportSpec{DoH: {URL: "https://bob:hunter2@doh.example:bad/dns-query"}}
+	err := Validate([]ResolverProfile{malformed})
+	if err == nil || !strings.Contains(err.Error(), `resolver "malformed" has invalid DoH URL (withheld`) {
+		t.Fatalf("Validate of a malformed credentialed URL = %v", err)
+	}
+	assertNoSecret(t, err)
+	// A malformed URL without credentials is still quoted, so the operator
+	// sees what was wrong.
+	malformed.Transports = map[Protocol]TransportSpec{DoH: {URL: "https://doh.example"}}
+	if err := Validate([]ResolverProfile{malformed}); err == nil || !strings.Contains(err.Error(), `invalid DoH URL "https://doh.example"`) {
+		t.Fatalf("Validate of a malformed URL = %v", err)
+	}
+}
+
+// TestParseResolverFlagRejectsExplicitPortZero covers #244. ":0" used to mean
+// the protocol default, so DoH dialed 443 while its URL and Host header kept
+// port 0 - a URL a resolver file rejects. Only an absent port means the
+// default now.
+func TestParseResolverFlagRejectsExplicitPortZero(t *testing.T) {
+	for _, value := range []string{
+		"x=https://dns.example:0/dns-query",
+		"x=udp://192.0.2.53:0",
+		"x=tcp://192.0.2.53:0",
+		"x=tls://dns.example:00",
+		"x=quic://dns.example:0",
+	} {
+		profile, err := ParseResolverFlag(value)
+		if err == nil || !strings.Contains(err.Error(), "must be 1-65535") || !reflect.DeepEqual(profile, ResolverProfile{}) {
+			t.Fatalf("ParseResolverFlag(%q) = %#v/%v, want a port error", value, profile, err)
+		}
+	}
+	for value, want := range map[string]int{
+		"x=udp://192.0.2.53":                   53,
+		"x=udp://192.0.2.53:":                  53,
+		"x=https://dns.example/dns-query":      443,
+		"x=https://dns.example:8443/dns-query": 8443,
+	} {
+		profile, err := ParseResolverFlag(value)
+		if err != nil {
+			t.Fatalf("ParseResolverFlag(%q) = %v", value, err)
+		}
+		for _, spec := range profile.Transports {
+			if spec.Port != want {
+				t.Fatalf("ParseResolverFlag(%q) port = %d, want %d", value, spec.Port, want)
+			}
+		}
+	}
+	profile, err := ParseResolverFlag("x=https://dns.example:8443/dns-query")
+	if err != nil || profile.Transports[DoH].URL != "https://dns.example:8443/dns-query" {
+		t.Fatalf("explicit DoH port URL = %#v/%v", profile, err)
+	}
+}
+
+// TestBootstrapAddressesDeduplicateCanonically covers #234: duplicates were
+// compared as raw strings, so case variants and IPv4-mapped spellings of one
+// candidate were each tried, spending another timeout on an address that had
+// already failed. The first spelling is kept, in order.
+func TestBootstrapAddressesDeduplicateCanonically(t *testing.T) {
+	input := `version: 1
+resolvers:
+  - id: dedupe
+    name: Dedupe
+    addresses: [192.0.2.53]
+    transports:
+      doq:
+        server_name: dns.example
+        bootstrap_addresses: ["2001:DB8::1", 192.0.2.1, "2001:db8::1", "::ffff:192.0.2.1", "[2001:db8:0::1]"]
+`
+	profiles, err := LoadYAML(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := profiles[0].Transports[DoQ].BootstrapAddresses; !reflect.DeepEqual(got, []string{"2001:DB8::1", "192.0.2.1"}) {
+		t.Fatalf("canonical bootstrap de-duplication = %#v", got)
 	}
 }
