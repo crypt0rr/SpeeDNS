@@ -812,16 +812,16 @@ func TestStatisticsRankingAndWarnings(t *testing.T) {
 	first := TargetResult{Target: testTarget(catalog.UDP, "fast"), Stats: Statistics{Scored: 2, ScoreMS: 1, CILowMS: 0, CIHighMS: 1}}
 	second := TargetResult{Target: testTarget(catalog.UDP, "slow"), Stats: Statistics{Scored: 2, ScoreMS: 2, CILowMS: 0.5, CIHighMS: 3}}
 	other := TargetResult{Target: testTarget(catalog.TCP, "other"), Stats: Statistics{Scored: 2, ScoreMS: 5, CILowMS: 5, CIHighMS: 5}}
-	rankings := makeRankings([]TargetResult{second, other, first})
+	rankings := makeRankings([]TargetResult{second, other, first}, DefaultTimeout)
 	if len(rankings) != 3 || rankings[0].Protocol != catalog.TCP || rankings[0].Rank != 1 || !rankings[1].Tie || !rankings[2].Tie {
 		t.Fatalf("rankings = %#v", rankings)
 	}
-	if len(makeRankings(nil)) != 0 || len(makeRankings([]TargetResult{{Target: target}})) != 0 {
+	if len(makeRankings(nil, DefaultTimeout)) != 0 || len(makeRankings([]TargetResult{{Target: target}}, DefaultTimeout)) != 0 {
 		t.Fatal("unscored results should not be ranked")
 	}
 	equalA := TargetResult{Target: testTarget(catalog.UDP, "equal-a"), Stats: Statistics{Scored: 1, ScoreMS: 5}}
 	equalB := TargetResult{Target: testTarget(catalog.UDP, "equal-b"), Stats: Statistics{Scored: 1, ScoreMS: 5}}
-	equalRankings := makeRankings([]TargetResult{equalB, equalA})
+	equalRankings := makeRankings([]TargetResult{equalB, equalA}, DefaultTimeout)
 	if len(equalRankings) != 2 || equalRankings[0].TargetID != equalA.Target.ID() || !equalRankings[0].Tie || !equalRankings[1].Tie {
 		t.Fatalf("equal-score rankings = %#v", equalRankings)
 	}
@@ -878,7 +878,7 @@ func TestBootstrapUsesCompleteOutcomesAndTargetIdentity(t *testing.T) {
 func TestIncompleteTargetsAreExcludedFromRankings(t *testing.T) {
 	target := testTarget(catalog.UDP, "partial")
 	result := TargetResult{Target: target, Incomplete: true, Stats: Statistics{Scored: 20, ScoreMS: 1}}
-	if rankings := makeRankings([]TargetResult{result}); len(rankings) != 0 {
+	if rankings := makeRankings([]TargetResult{result}, DefaultTimeout); len(rankings) != 0 {
 		t.Fatalf("incomplete target was ranked: %#v", rankings)
 	}
 	if warnings := collectWarnings([]TargetResult{result}); len(warnings) != 1 || !strings.Contains(warnings[0].String(), "excluded from ranking") {

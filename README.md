@@ -712,12 +712,21 @@ since such a row can only compare a target with itself, and count them in one
 line below the block. `--details` lists every row again, and JSON keeps every
 `paired_effects` entry in both views.
 The recommendation summary and every per-protocol comparison include a `Tie`
-column. `TIED` means the 95% score confidence interval of that target overlaps
-another ranked target, so the rank order between them is not statistically
-distinguishable; `—` means it does not. A tied recommended or provisional
-winner is also called out by a `TIED:` note below the recommendation table, so
-a rank-one result is never presented as an unqualified winner. The same flag
-is available as the CSV `tie` column and the JSON `tie` fields.
+column. `TIED` marks the protocol's rank-one tie group: the target that leads
+on score and every target whose 95% score confidence interval overlaps that
+leader's interval, so their order against the leader is not statistically
+distinguishable. When no other target overlaps the leader there is no tie, and every row,
+the leader included, reads `—`. Otherwise `—` means only that the target is
+not in that group; its
+interval can still overlap another target outside the group, or a member other
+than the leader. Members are listed first and ordered by 0.60 × median latency
+plus the scoring-failure penalty — the score without its noisy p95 term — so a
+tied resolver that lost queries does not take rank one from a tied resolver
+that lost none merely by having a slightly lower median; see
+[`METHODOLOGY.md`](METHODOLOGY.md). A tied recommended or provisional winner
+is also called out by a `TIED:` note below the recommendation table, so a
+rank-one result is never presented as an unqualified winner. The same flag is
+available as the CSV `tie` column and the JSON `tie` fields.
 
 For scripts and other tools, use JSON or CSV:
 

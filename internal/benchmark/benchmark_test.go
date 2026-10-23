@@ -172,7 +172,7 @@ func TestResolverErrorsAreNotScored(t *testing.T) {
 	}
 
 	result.Stats = stats
-	rankings := makeRankings([]TargetResult{result, {Target: target, Stats: Statistics{Scored: 0, ScoreMS: 0}}})
+	rankings := makeRankings([]TargetResult{result, {Target: target, Stats: Statistics{Scored: 0, ScoreMS: 0}}}, DefaultTimeout)
 	if len(rankings) != 1 {
 		t.Fatalf("resolver-error target should not be ranked: %#v", rankings)
 	}
@@ -449,7 +449,7 @@ func TestLocalResolverIsMeasuredButNeverRankedOrRecommended(t *testing.T) {
 		t.Fatalf("network resolver lost its recommendation: %#v", networkResult.Stats)
 	}
 
-	rankings := makeRankings([]TargetResult{stubResult, networkResult})
+	rankings := makeRankings([]TargetResult{stubResult, networkResult}, DefaultTimeout)
 	if len(rankings) != 1 || rankings[0].TargetID != network.ID() || rankings[0].Rank != 1 {
 		t.Fatalf("rankings admitted the local stub: %#v", rankings)
 	}
@@ -475,7 +475,7 @@ func TestLocalResolverIsMeasuredButNeverRankedOrRecommended(t *testing.T) {
 	if !unflagged.Stats.Recommended {
 		t.Fatalf("unflagged target lost its recommendation: %#v", unflagged.Stats)
 	}
-	if unflaggedRankings := makeRankings([]TargetResult{unflagged}); len(unflaggedRankings) != 1 {
+	if unflaggedRankings := makeRankings([]TargetResult{unflagged}, DefaultTimeout); len(unflaggedRankings) != 1 {
 		t.Fatalf("unflagged target was excluded from ranking: %#v", unflaggedRankings)
 	}
 }
