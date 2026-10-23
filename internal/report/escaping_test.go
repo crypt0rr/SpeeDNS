@@ -528,3 +528,27 @@ func TestJSONTargetReferencesMatchTheEscapedTargetID(t *testing.T) {
 		t.Fatalf("divergence[0].policy = %q, want %q", got, want)
 	}
 }
+
+// TestJSONEscapesProvenanceInterfaceNames covers the run provenance. Interface
+// names come from the operating system, which allows control characters in
+// them, so they are escaped in JSON like every other string SpeeDNS did not
+// produce itself.
+func TestJSONEscapesProvenanceInterfaceNames(t *testing.T) {
+	run := benchmark.Report{
+		StartedAt: time.Unix(10, 0), FinishedAt: time.Unix(11, 0),
+		Provenance: &benchmark.RunProvenance{
+			Version: "v0.0.0", OS: "linux", Architecture: "amd64",
+			Interfaces: []string{"eth\x1b[2J0", "wg\u202e0"},
+			Protocols:  []catalog.Protocol{catalog.UDP}, CorpusEntries: 1,
+			Timeout: time.Second, Concurrency: 1,
+		},
+	}
+	generic, _ := decodeJSONReport(t, run, false, JSONOptions{})
+	for _, value := range decodedJSONStrings(generic) {
+		assertNoRawUntrustedRune(t, "JSON", value)
+	}
+	interfaces := generic["run"].(map[string]any)["provenance"].(map[string]any)["interfaces"].([]any)
+	if interfaces[0] != `eth\x1b[2J0` || interfaces[1] != `wg\u{202e}0` {
+		t.Fatalf("interfaces = %q, want escaped names", interfaces)
+	}
+}

@@ -150,13 +150,17 @@ type jsonWarnings struct {
 	Removed []string `json:"removed"`
 }
 
-// WriteJSON renders the diff for a machine.
+// WriteJSON renders the diff for a machine. Target IDs, details, scopes and
+// warnings are read from the two report files, which a crafted report can fill
+// with control or bidirectional characters, so they are escaped exactly as the
+// table escapes them: a consumer that decodes and prints a value must not
+// receive a raw escape sequence the table would have neutralised.
 func WriteJSON(writer io.Writer, diff Diff) error {
 	document := jsonDiff{
 		SchemaVersion: 1,
 		Comparable:    diff.Comparable(),
-		Baseline:      jsonSide{Path: diff.Baseline.Path, StartedAt: stamp(diff.Baseline)},
-		Current:       jsonSide{Path: diff.Current.Path, StartedAt: stamp(diff.Current)},
+		Baseline:      jsonSide{Path: safetext.Escape(diff.Baseline.Path), StartedAt: stamp(diff.Baseline)},
+		Current:       jsonSide{Path: safetext.Escape(diff.Current.Path), StartedAt: stamp(diff.Current)},
 		Blockers:      orEmptyBlockers(diff.Blockers),
 		Findings:      orEmptyFindings(diff.Findings),
 		NotCompared:   orEmptySuppressions(diff.Suppressions),
@@ -184,36 +188,45 @@ func stamp(report Report) string {
 }
 
 func orEmptyBlockers(items []Blocker) []Blocker {
-	if items == nil {
-		return []Blocker{}
+	escaped := make([]Blocker, 0, len(items))
+	for _, item := range items {
+		item.Baseline, item.Current = safetext.Escape(item.Baseline), safetext.Escape(item.Current)
+		escaped = append(escaped, item)
 	}
-	return items
+	return escaped
 }
 
 func orEmptyFindings(items []Finding) []Finding {
-	if items == nil {
-		return []Finding{}
+	escaped := make([]Finding, 0, len(items))
+	for _, item := range items {
+		item.TargetID, item.Detail = safetext.Escape(item.TargetID), safetext.Escape(item.Detail)
+		escaped = append(escaped, item)
 	}
-	return items
+	return escaped
 }
 
 func orEmptySuppressions(items []Suppression) []Suppression {
-	if items == nil {
-		return []Suppression{}
+	escaped := make([]Suppression, 0, len(items))
+	for _, item := range items {
+		item.Scope, item.Detail = safetext.Escape(item.Scope), safetext.Escape(item.Detail)
+		escaped = append(escaped, item)
 	}
-	return items
+	return escaped
 }
 
 func orEmptyDisclosures(items []Disclosure) []Disclosure {
-	if items == nil {
-		return []Disclosure{}
+	escaped := make([]Disclosure, 0, len(items))
+	for _, item := range items {
+		item.Detail = safetext.Escape(item.Detail)
+		escaped = append(escaped, item)
 	}
-	return items
+	return escaped
 }
 
 func orEmptyStrings(items []string) []string {
-	if items == nil {
-		return []string{}
+	escaped := make([]string, 0, len(items))
+	for _, item := range items {
+		escaped = append(escaped, safetext.Escape(item))
 	}
-	return items
+	return escaped
 }

@@ -46,6 +46,8 @@ var requireConditions = map[string]func(Diff) (bool, string){
 	"target-set-identical": func(d Diff) (bool, string) {
 		for _, finding := range d.Findings {
 			if finding.Code == "PRESENCE" {
+				// A PRESENCE detail is a fixed phrase today; escaping it is
+				// defensive, so a future detail that quotes a report cannot leak.
 				return false, fmt.Sprintf("%s: %s", safetext.Escape(finding.TargetID), safetext.Escape(finding.Detail))
 			}
 		}

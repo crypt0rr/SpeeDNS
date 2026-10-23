@@ -302,11 +302,15 @@ rendered as visible `\x1b`-style sequences, so neither a certificate field nor
 a configured name can rewrite the terminal. Bidirectional controls (U+061C,
 U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) and invisible format characters
 (U+200B-U+200D, U+2060-U+2064, U+FEFF) are rendered as `\u{202e}`-style
-sequences, so they cannot reorder or hide the text around them either, and
-table column widths count format characters other than the soft hyphen as zero
+sequences, so they cannot reorder or hide the text around them either. That
+includes the zero-width joiners U+200C and U+200D, which legitimate Persian
+and Indic-script names use; they are shown escaped rather than dropped.
+Table column widths count format characters other than the soft hyphen as zero
 cells. JSON carries these values in the same escaped form as the table and
 CSV, so a consumer that decodes and prints a string, such as `jq -r`, gets the
-escaped text as well. The failure messages that `--assert` and
+escaped text as well; that includes interface names in the run provenance and
+every target ID, detail and warning that `speedns diff --format json` echoes
+from its input reports. The failure messages that `--assert` and
 `speedns diff --require` print to stderr escape the target IDs and finding
 details they quote. The status colours are the only escape sequences the table
 emits itself. CSV cells are escaped first and the formula guard runs

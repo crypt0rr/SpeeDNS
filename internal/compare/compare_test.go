@@ -605,3 +605,52 @@ func TestRequireDetailsEscapeReportText(t *testing.T) {
 		})
 	}
 }
+
+// TestWriteJSONEscapesReportText covers the machine form of a diff. Every
+// string it echoes -- paths, blocker values, target IDs, details, scopes and
+// warnings -- comes from the command line or the two report files, so a
+// crafted report must not reach a consumer that decodes and prints the JSON,
+// just as it cannot reach the escaped table.
+func TestWriteJSONEscapesReportText(t *testing.T) {
+	const hostileID = "evil\x1b[2K\u202e@1.1.1.1/udp"
+	diff := Diff{
+		Baseline:        Report{Path: "base\x1b[2J.json"},
+		Current:         Report{Path: "current\u2066.json"},
+		Blockers:        []Blocker{{Field: "run.seed", Baseline: "1\x1b[2J", Current: "2\u202e", Reason: "the query matrix differs"}},
+		Findings:        []Finding{{Code: "FAILED", TargetID: hostileID, Detail: "successes 40 -> 0\u200b"}},
+		Suppressions:    []Suppression{{Reason: "local-position", Scope: "scope\x1b", Detail: "detail\u202e"}},
+		Disclosures:     []Disclosure{{Reason: "reason", Detail: "disclosed\x1b[H"}},
+		AddedWarnings:   []string{"added\x1b[2J"},
+		RemovedWarnings: []string{"removed\u2066"},
+	}
+	var output bytes.Buffer
+	if err := WriteJSON(&output, diff); err != nil {
+		t.Fatal(err)
+	}
+	var document any
+	if err := json.Unmarshal(output.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	var walk func(value any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case string:
+			if again := safetext.Escape(typed); again != typed {
+				t.Fatalf("decoded JSON kept raw untrusted text: %q", typed)
+			}
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			for _, item := range typed {
+				walk(item)
+			}
+		}
+	}
+	walk(document)
+	findings := document.(map[string]any)["findings"].([]any)
+	if got := findings[0].(map[string]any)["target_id"]; got != `evil\x1b[2K\u{202e}@1.1.1.1/udp` {
+		t.Fatalf("target_id = %q, want the escaped form", got)
+	}
+}

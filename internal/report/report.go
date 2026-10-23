@@ -165,7 +165,12 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 	}
 	var provenance *JSONProvenance
 	if report.Provenance != nil {
-		interfaces := append([]string(nil), report.Provenance.Interfaces...)
+		// Interface names come from the operating system, which allows control
+		// characters in them, so they are escaped like every other string.
+		var interfaces []string
+		for _, name := range report.Provenance.Interfaces {
+			interfaces = append(interfaces, safetext.Escape(name))
+		}
 		if options.RedactSystem && len(interfaces) > 0 {
 			interfaces = []string{redactedValue}
 		}
