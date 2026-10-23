@@ -4,22 +4,50 @@
 
 ## Review metadata
 
-- **Date:** 2026-08-30
+- **Date:** 2026-10-23
 - **Repository:** `crypt0rr/SpeeDNS`
-- **Ref:** `main` at `b94ec77b7c25626099873843207cd8ed1fef43c7` (`v0.6.3`)
-- **Review mode:** Baseline review
-- **Scope:** Runtime benchmark scheduling and ranking, DNS transports, CLI/report output, schemas, documentation, tests, and release automation
+- **Ref:** `main` at `c2cb60a256bc18b9036b7f887b2768586007f369` (tag `v0.6.8`)
+- **Review mode:** Baseline review (clean tree, no pending diff). This is not a merge verdict.
+- **Scope:** Whole repository: DNS transports, benchmark scheduling, statistics and ranking, CLI, assertions and `diff`, report rendering and escaping, resolver catalog and domain parsing, system-resolver discovery, schemas, documentation, CI, release, and Homebrew automation. It also re-checks the four items from the 2026-08-30 report, which were fixed in `c8c4532`.
 - **Px convention:** `P0` blocker, `P1` high, `P2` medium, `P3` low
 - **P3 policy:** Report-only unless explicitly promoted; no separate P3 backlog
-- **Exclusions:** Live public-DNS testing; generated release artifacts; third-party source except to confirm parser behavior; existing Apple-signing issue #51; Dependency Dashboard #6; open dependency PR #194
+- **ID note:** IDs are local to this report. The 2026-08-30 report's `R-001`…`E-001` (issues #196–#199) were different items.
+- **Exclusions:**
+  - Live public-DNS traffic. All reproductions used local fakes on loopback or link-local addresses.
+  - GitHub-side state that cannot be checked offline: issue status, environment reviewers, rulesets, immutable releases.
+  - macOS and Windows runtime behaviour. Linux was executed; the other platforms were reviewed by reading and cross-compiled vet only.
+  - Generated or fixture content: golden reports, fuzz corpora, the `data/domains.txt` corpus body.
 
 ## Executive summary
 
-SpeeDNS has an unusually strong baseline for a young CLI: the full test suite and vet pass, the transport and benchmark packages pass under the race detector, statement coverage is 100%, machine-output contracts are schema-tested, and release-critical actions are immutably pinned. The review found no P0 blocker.
+SpeeDNS still has an unusually strong engineering baseline. Every local gate passes: gofmt, vet on Linux and Windows, unit and race tests, 100.0% statement coverage, `go mod tidy`, staticcheck, and actionlint. Machine output is schema-tested. Release actions are SHA-pinned. All four fixes from the previous report hold:
 
-The highest-impact defect is in the ranking comparator. It chooses median or score separately for each pair based on confidence-interval overlap. Because interval overlap is not transitive, the comparator can form a cycle and produce a different winner for the same result set when input order changes. That affects the product's headline recommendation and any `--assert` bound to rank one. The second P1 is a local confidentiality regression: atomically replacing an existing restrictive report does not preserve its permissions and can broaden `0600` to the process's ordinary creation mode.
+- Ranking is now permutation-invariant.
+- Existing output permissions are preserved.
+- DoH media type and the size cap are enforced exactly.
+- Preparation is split into a cold phase and a warm phase.
 
-The recommended next slice is to fix both P1 items together, with permutation/property tests for ranking and an exact-mode preservation test for existing output files. DoH response strictness and preparation-phase session aging can follow independently.
+No `P0` was found.
+
+Two `P1` items affect the outputs people act on.
+
+- **R-001:** A subject-qualified latency gate such as `mine:p95<50ms` passes when `mine` produced no scored samples. Zero-sample statistics are stored as 0 ms, so a dead monitored resolver passes CI.
+- **R-002:** The leader tie group is ordered by median alone, which drops the failure penalty. With default flags, a resolver that loses 1–2 of 200 queries can become the RECOMMENDED winner over a zero-failure leader whose score is less than half of its own. That contradicts the README statement that resolver errors cannot win latency scoring.
+
+Eleven `P2` items follow:
+
+- Regressions and contract gaps around `--output` and `diff --require` gates (R-003, R-004, R-005).
+- An endpoint-controlled terminal-escape sink (R-006).
+- Three address and bootstrap correctness defects (R-007, R-008, R-009).
+- An interrupted-run contract mismatch (R-010).
+- A release-cache trust gap (R-011).
+- Two found by the completeness pass:
+  - DoH over HTTP/2 keeps sending queries on a silently dead connection for up to the server's stream limit (R-024).
+  - Cache-miss mode can measure one resolver twice, and picks each resolver's address family by string order (R-025).
+
+The remaining items are `P3` polish and enhancement candidates.
+
+**Recommended next slice:** Make every gate fail closed when it has no evidence. That means R-001 plus the zero-compared refusal in R-005. Both are small, need no schema or policy change, and remove false passes from CI pipelines. R-002 should follow as soon as the owner picks a tie policy (see Challenge 1).
 
 **Verdict:** `NEEDS ACTION`
 
@@ -27,100 +55,1100 @@ The recommended next slice is to fix both P1 items together, with permutation/pr
 
 | ID | Priority | Type | Location | Title | Effort | Confidence | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| R-001 | P1 | Review finding | `internal/benchmark/benchmark.go:1425` | Make ranking a strict, permutation-invariant order | M | High | Open |
-| R-002 | P1 | Review finding | `cmd/speedns/main.go:1413` | Preserve permissions when replacing an existing report | S | High | Open |
-| R-003 | P2 | Review finding | `internal/transport/transport.go:664` | Enforce exact, bounded DoH response framing | S | High | Open |
-| E-001 | P2 | Enhancement | `internal/benchmark/benchmark.go:442` | Stop slow preparation from aging warm sessions | M | Medium | Proposed |
+| R-001 | P1 | Review finding | `cmd/speedns/assertions.go:303` | Subject latency assertions pass when the subject has no scored samples | S | High | Open ([#226](https://github.com/crypt0rr/SpeeDNS/issues/226)) |
+| R-002 | P1 | Review finding | `internal/benchmark/benchmark.go:1512` | Tie-group ordering drops the failure penalty, so a target with timeouts can win | M | High | Open ([#227](https://github.com/crypt0rr/SpeeDNS/issues/227)) |
+| R-003 | P2 | Review finding | `cmd/speedns/main.go:1437` | `--output /dev/stdout`, `/dev/stderr`, `/dev/fd/N` rejected since v0.6.7 | S | High | Open ([#228](https://github.com/crypt0rr/SpeeDNS/issues/228)) |
+| R-004 | P2 | Review finding | `cmd/speedns/main.go:1077` | `--output` is validated only after the whole benchmark | S | High | Open ([#229](https://github.com/crypt0rr/SpeeDNS/issues/229)) |
+| R-005 | P2 | Review finding | `cmd/speedns/diff.go:76` | `diff --require` passes with zero compared endpoints and fails on recoveries | M | High | Open ([#230](https://github.com/crypt0rr/SpeeDNS/issues/230)) |
+| R-006 | P2 | Review finding | `internal/report/report.go:1168` | Endpoint-controlled text reaches the terminal unescaped (DNSSEC section, JSON, diff stderr) | S | High | Open ([#231](https://github.com/crypt0rr/SpeeDNS/issues/231)) |
+| R-007 | P2 | Review finding | `internal/transport/transport.go:275` | Zoned link-local IPv6 UDP targets lose their zone and always fail | S | High | Open ([#232](https://github.com/crypt0rr/SpeeDNS/issues/232)) |
+| R-008 | P2 | Review finding | `internal/transport/transport.go:90` | Bootstrap failover pins reconnects to candidate 1, and DoH's first dial shares the query budget | M | High | Open ([#233](https://github.com/crypt0rr/SpeeDNS/issues/233)) |
+| R-009 | P2 | Review finding | `internal/catalog/family.go:88` | `--family` filters addresses, but encrypted transports dial `bootstrap_addresses` | M | High | Open ([#234](https://github.com/crypt0rr/SpeeDNS/issues/234)) |
+| R-010 | P2 | Review finding | `internal/benchmark/benchmark.go:333` | Interrupted runs drop never-dispatched targets; METHODOLOGY promises the full set | S | High | Open ([#235](https://github.com/crypt0rr/SpeeDNS/issues/235)) |
+| R-011 | P2 | Review finding | `.github/workflows/release.yml:118` | Signing job restores the setup-go cache written by main-branch runs | S | High | Open ([#236](https://github.com/crypt0rr/SpeeDNS/issues/236)) |
+| R-024 | P2 | Review finding | `internal/transport/transport.go:525` | DoH reuses a silently dead HTTP/2 connection; timed-out sessions leak connections | S | High | Open ([#237](https://github.com/crypt0rr/SpeeDNS/issues/237)) |
+| R-025 | P2 | Review finding | `cmd/speedns/main.go:250` | Cache-miss keeps one endpoint per profile ID, not per resolver, and picks the family by string order | M | High | Open ([#238](https://github.com/crypt0rr/SpeeDNS/issues/238)) |
+| R-012 | P3 | Review finding | `README.md:659` | Ranking and tie documentation still describes pairwise ties | S | High | Open ([#239](https://github.com/crypt0rr/SpeeDNS/issues/239)) |
+| R-013 | P3 | Review finding | `internal/benchmark/benchmark.go:538` | No cold-phase progress; DNSSEC probes run serially without progress | S | High | Open ([#240](https://github.com/crypt0rr/SpeeDNS/issues/240)) |
+| R-014 | P3 | Review finding | `internal/transport/transport.go:905` | Protocol-conformance polish (framing, DoQ stream completion, trailing bytes, error label) | M | High | Open ([#241](https://github.com/crypt0rr/SpeeDNS/issues/241)) |
+| R-015 | P3 | Review finding | `internal/transport/transport.go:151` | Hostname targets pick a family per transport; `dial_address` shows hostname, not peer | M | Medium | Open ([#242](https://github.com/crypt0rr/SpeeDNS/issues/242)) |
+| R-016 | P3 | Review finding | `internal/catalog/catalog.go:171` | Credential and redaction gaps (DoH userinfo in reports, `--assert` stderr) | S | High | Open ([#243](https://github.com/crypt0rr/SpeeDNS/issues/243)) |
+| R-017 | P3 | Review finding | `internal/catalog/catalog.go:239` | Resolver-config validation gaps (untrimmed `server_name`, `:0` port, empty or inapplicable fields) | S | High | Open ([#244](https://github.com/crypt0rr/SpeeDNS/issues/244)) |
+| R-018 | P3 | Review finding | `internal/domains/domains.go:126` | Domain-file BOM handling; macOS search domains reported as scope | S | High | Open ([#245](https://github.com/crypt0rr/SpeeDNS/issues/245)) |
+| R-019 | P3 | Review finding | `cmd/speedns/assertions.go:70` | CLI ergonomics and documentation drift | S | High | Open ([#246](https://github.com/crypt0rr/SpeeDNS/issues/246)) |
+| R-020 | P3 | Review finding | `cmd/speedns/main.go:1510` | Output replacement edge cases and unbounded `diff` input | M | High | Open ([#247](https://github.com/crypt0rr/SpeeDNS/issues/247)) |
+| R-021 | P3 | Review finding | `scripts/publish-homebrew-cask.sh:47` | Homebrew publication guards (downgrade, tag validation, prerelease runs) | S | High | Open ([#248](https://github.com/crypt0rr/SpeeDNS/issues/248)) |
+| R-022 | P3 | Review finding | `README.md:164` | Release verification instructions fail or under-pin | S | High | Open ([#249](https://github.com/crypt0rr/SpeeDNS/issues/249)) |
+| R-023 | P3 | Review finding | `.github/workflows/ci.yml:160` | CI hygiene (stale staticcheck pin, dead test assertion, no SHA-pin guard) | S | High | Open ([#250](https://github.com/crypt0rr/SpeeDNS/issues/250)) |
+| R-026 | P3 | Review finding | `CACHE_MISS.md:59` | Cache-miss guarantee wording, spurious sample warning, and "compare the runs" advice | S | High | Open ([#251](https://github.com/crypt0rr/SpeeDNS/issues/251)) |
+| R-027 | P3 | Review finding | `cmd/speedns/main.go:988` | Machine-output fidelity (seed > 2^53, truncated `timeout_ms`, ID join keys, dashboard zeros, warning attribution) | S | High | Open ([#252](https://github.com/crypt0rr/SpeeDNS/issues/252)) |
+| R-028 | P3 | Review finding | `schema/report-v1.json:15` | `schema_version: 1` spans incompatible required sets; schema conformance tests have gaps | M | High | Open ([#253](https://github.com/crypt0rr/SpeeDNS/issues/253)) |
+| R-029 | P3 | Review finding | `README.md:599` | Output-format documentation drift (CSV layout, provenance, delimiters, `answer_rate`) | S | High | Open ([#254](https://github.com/crypt0rr/SpeeDNS/issues/254)) |
+| R-030 | P3 | Review finding | `internal/benchmark/benchmark.go:667` | Unresponsive targets pace every round undocumented; misleading interrupt warning | S | High | Open ([#255](https://github.com/crypt0rr/SpeeDNS/issues/255)) |
+| E-001 | P3 | Enhancement | `.github/workflows/release.yml:18` | Isolate signing from test execution; make the reproducibility rebuild independent and offline | L | Medium | Proposed ([#256](https://github.com/crypt0rr/SpeeDNS/issues/256)) |
+| E-002 | P3 | Enhancement | `internal/systemdns/systemdns.go:324` | Discover the real upstreams behind the systemd-resolved stub | M | Medium | Proposed ([#257](https://github.com/crypt0rr/SpeeDNS/issues/257)) |
+| E-003 | P3 | Enhancement | `internal/transport/transport.go:522` | Record negotiated DoH HTTP protocol and TLS version | M | Medium | Proposed ([#258](https://github.com/crypt0rr/SpeeDNS/issues/258)) |
+| E-004 | P3 | Enhancement | `internal/benchmark/benchmark.go:327` | Disclose, and optionally counterbalance, protocol-order cache priming | M | Medium | Proposed ([#259](https://github.com/crypt0rr/SpeeDNS/issues/259)) |
+| E-005 | P3 | Enhancement | `internal/benchmark/benchmark.go:1254` | Cheaper bootstrap statistics, streamed `--raw` JSON, single domain normalisation | M | High | Proposed ([#260](https://github.com/crypt0rr/SpeeDNS/issues/260)) |
 
 ## P1 — High
 
-### [R-001] Make ranking a strict, permutation-invariant order
+### [R-001] Subject latency assertions pass when the subject has no scored samples
 
 - **Type:** Review finding
-- **Priority rationale:** Ranking and the rank-one recommendation are core product outputs, and `--assert` can act on that winner. This is not P0 because it requires a particular three-or-more-target interval topology and does not corrupt stored data or prevent execution.
-- **Location:** `internal/benchmark/benchmark.go:1425`; related documentation at `METHODOLOGY.md:168` and `METHODOLOGY.md:192`; current regression coverage at `internal/benchmark/invariants_test.go:217`
-- **Evidence:** `makeRankings` switches its comparison key pair by pair: overlapping confidence intervals compare median, while non-overlapping intervals compare score. Confidence-interval overlap is non-transitive. A plausible synthetic set produces `A < B` by median, `B < C` by median, and `C < A` by score. Sorting all six input permutations with those relations produced three different orders (`ABC`, `BCA`, and `CAB`). The existing test covers one overlapping pair and one disjoint target, but no chained-overlap cycle or permutation invariant. The methodology also contradicts itself: lines 168–177 describe median ordering for overlaps, while lines 192–195 still claim score-first ordering.
-- **Impact:** The same calculated result set can yield a different rank-one target based only on slice order. That can change the recommendation summary, JSON/CSV ranks, paired-effect reference, and the resolver selected by rank-based assertions.
-- **Recommendation:** First sort all eligible targets strictly by `(score, target ID)`. Build deterministic tie groups from that stable order using an explicit policy, then sort only the members of each group by `(median, target ID)`. A leader-anchored group—members whose interval overlaps the score-order leader—matches the tie language already documented and avoids pairwise comparator cycles. Update the methodology to state one rule consistently. Do not change the score formula in this fix.
-- **Acceptance / validation:** Add a three-target chained-overlap regression; run every permutation and require identical rankings, winner, and tie flags; add randomized/property coverage asserting antisymmetry and permutation invariance; retain the existing overlapping-pair and disjoint-score tests; run `go test -count=1 ./internal/benchmark ./internal/report ./cmd/speedns` and the full race suite.
-- **Effort:** M
-- **Confidence:** High
-- **Trade-off / challenge:** Connected-component grouping would make overlap transitive but can label two disjoint endpoints tied through a wide middle interval. Leader-anchored grouping is narrower and matches current documentation, but the owner should explicitly choose and document that statistical policy before implementation.
-
-### [R-002] Preserve permissions when replacing an existing report
-
-- **Type:** Review finding
-- **Priority rationale:** The current atomic-output path can silently broaden access to an existing file containing resolver addresses, interface inventory, endpoint diagnostics, or raw samples. This is P1 rather than P0 because exploitation requires local access and a pre-existing restrictive output path.
-- **Location:** `cmd/speedns/main.go:1413` and `cmd/speedns/main.go:1453`; incomplete mode coverage at `cmd/speedns/main_test.go:1829`
-- **Evidence:** `outputWriter` stats an existing regular destination but does not retain `info.Mode().Perm()`. On commit it always applies the mode discovered by `probeOrdinaryFileMode`, then renames the temporary file over the destination. A local reproduction created an existing `0600` report and ran a no-comparable JSON benchmark into the same path; the completed report became `0664` under the current `0002` umask. The existing mode test covers only creation of a new path.
-- **Impact:** Re-running a report can make data readable to the process's group or other local users despite the operator having deliberately restricted the file. The behavior is surprising because in-place truncation normally preserves an existing inode's mode.
-- **Recommendation:** Capture the existing regular file's permission bits before creating the temporary file and apply that exact mode to the replacement. Use the probed ordinary creation mode only when the destination did not exist. Keep atomic rename and the existing non-regular/direct-write behavior. Treat a failure to preserve an existing restrictive mode as a finalization error rather than silently broadening access.
-- **Acceptance / validation:** Add table-driven tests replacing files with `0600`, `0640`, and ordinary modes; verify a new file still respects umask; verify failed writes retain the old file and mode; verify direct non-regular destinations remain unchanged; run the CLI output and race tests on Linux and macOS.
+- **Priority rationale:** This is a fail-open CI and monitoring gate. The documented purpose of subject assertions is to catch a degraded resolver, and the defect makes a completely dead resolver pass. It is not P0 because it needs the subject-qualified form plus at least one other ranked resolver in the run. All four independent verifiers rated it P1.
+- **Location:**
+  - `cmd/speedns/assertions.go:295-313` (`subjectAssertionReasons`) and `:384-398` (`assertionMetricValue`).
+  - `cmd/speedns/assertions.go:257-281` (`deadProtocols`).
+  - `internal/benchmark/benchmark.go:1150-1159`: latency fields stay 0 when there are no samples.
+  - Contract: `METHODOLOGY.md:425-431`, `README.md:836-845`.
+- **Evidence:**
+  - `assertionMetricValue` returns `MedianMS`, `P95MS` or `ScoreMS` with `ok=true` whatever `Stats.Scored` is, and `calculateStatistics` fills those fields only when latencies exist. A subject that timed out, was refused, or returned only SERVFAIL therefore evaluates `0 < 50` and passes.
+  - `deadProtocols` fires only when every non-local endpoint of a protocol is dead, and it skips local resolvers entirely.
+  - Reproduced with unit tests and end to end with real engine output: a closed port, a black hole, and a SERVFAIL-only subject all give exit 0, while the same report labels the subject FAILED.
+- **Impact:**
+  - Who is affected: users gating CI on a specific resolver, for example the README's own `cloudflare-1111:p95<=25ms` or a local Pi-hole/unbound gate.
+  - What goes wrong: the gate passes while the resolver is down. This contradicts METHODOLOGY's promise that a subject cannot pass on the strength of another, and the #106 rule that total failure must never be quiet.
+- **Recommendation:**
+  - In `subjectAssertionReasons`, immediately after `matched = true`, add a failure reason "`<raw>: <target> has no scored latency samples`" when the metric is `median`, `p95` or `score` and `result.Stats.Scored == 0`.
+  - Apply the check to every operator and to local subjects.
+  - Leave `usable` and `success` unchanged.
+  - Do not change the shared `assertionMetricValue`: its rank-one fixtures rely on the current behaviour.
+- **Acceptance / validation:**
+  - Extend `TestSubjectQualifiedAssertions` with three subjects: a dead non-local one, a dead local one, and a SERVFAIL-only one, each with `Scored: 0` next to a ranked healthy peer. `p95<50ms`, `median<=10` and `score<100ms` must all return `ErrAssertionsFailed` (exit 4).
+  - Existing assertion tests stay green.
+  - `bash scripts/coverage.sh` stays at 100%.
 - **Effort:** S
 - **Confidence:** High
-- **Trade-off / challenge:** Exact mode preservation is safer and least surprising. If the intended policy is instead to normalize every report to a configured mode, that needs an explicit CLI contract rather than an implicit umask-dependent change.
+- **Trade-off / challenge:** The owner should confirm that a missing measurement fails a lower-bound check (`p95>=X`) too. Failing it is the consistent fail-closed reading, and today it prints a misleading `p95=0.000ms`.
+
+### [R-002] Tie-group ordering drops the failure penalty, so a target with timeouts can win
+
+- **Type:** Review finding
+- **Priority rationale:** It changes the product's headline output, the RECOMMENDED resolver, deterministically and with default flags. One or two lost UDP packets out of 200 are enough. That matches the calibration of the previous report's ranking item (P1).
+  - Dissent: three of four verifiers rated it P2. Their reasons are that the TIED note, the score and CI columns, and a failure warning are all visible, and that ordering a tie by median is documented.
+  - The owner should settle this in Challenge 1.
+- **Location:**
+  - `internal/benchmark/benchmark.go:1500-1509`: tie-group membership.
+  - `:1512-1518`: the median-only sort.
+  - `:1519`: the group placed ahead of all non-members.
+  - `:1170`: the Recommended gate, ≥20 scored and ≥99% usable.
+  - `internal/report/report.go:684-695` (`recommendedResult`).
+  - Contract: `README.md:260-261`, `METHODOLOGY.md:172-181` and `:196-203`.
+- **Evidence:**
+  - Every target whose bootstrap CI overlaps the leader's CI joins the group, and the group is then ordered only by `MedianMS`.
+  - With k ≤ 3 scoring failures in 200 queries, roughly e^-k of resamples (37%, 13.5%, 5%) contain no failures. The 2.5th percentile therefore collapses to the latency-only score and overlaps the leader.
+  - Reproduced with real `calculateStatistics` input (2 s timeout, seed 7):
+
+    | Target | Failures | Score (ms) | 95% CI (ms) | Median (ms) | Rank | Notes |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | leader | 0/200 | 12.34 | [12.22, 12.42] | 12.00 | 2 | TIED |
+    | flaky | 2/200 timeouts | 31.27 | [11.25, 61.32] | 10.86 | 1 | TIED, RECOMMENDED |
+    | third | 0/200 | 14.35 | — | — | 3 | not in the group, ranked below flaky despite a better score |
+
+  - The inversion reproduced for 50 of 50 seeds.
+  - With 3 failures, flaky still takes rank 1 but is no longer recommended, so numeric `--assert` checks run against it.
+- **Impact:**
+  - Changes the recommendation text, rank 1 in table, JSON and CSV, the paired-effect reference target, and the target that unqualified numeric `--assert` checks evaluate (`rankOneWinners`).
+  - Users are told to switch to the less reliable resolver.
+- **Recommendation:** Keep the leader-anchored structure, which is permutation-invariant, but make the ordering inside the group reliability-aware.
+  - **Smallest fix:**
+    - Order group members by `0.60×MedianMS + ScoringFailureRate×timeoutMS`, then `MedianMS`, then target ID.
+    - This is the score with only the noisy p95 term removed, and it equals median order when no member has failures, so the existing pinned tests pass unchanged.
+    - It requires passing `opts.Timeout` into `makeRankings` (`internal/benchmark/benchmark.go:345`).
+    - It must use `ScoringFailureRate`, not `FailureRate`, otherwise SERVFAIL, REFUSED and truncation would escape the penalty.
+  - **Alternative with less rank churn:**
+    - Admit a target to the leader's group only when its point score also lies inside the leader's CI.
+    - This removes the bimodal-bootstrap artefact.
+  - **Rejected:** the "contiguous prefix" idea alone does not fix the two-target case.
+- **Acceptance / validation:**
+  - Add `TestTieGroupOrderPenalizesScoringFailures`: three 200-observation results built through `calculateStatistics(…, DefaultTimeout, seed)`. The zero-failure leader must stay rank 1 and be what `recommendedResult` returns.
+  - A 50-seed sweep shows 0 inversions.
+  - `TestTieGroupsOrderByMedian` and the permutation-invariance tests still pass.
+  - Update `METHODOLOGY.md:172-181` and `:196-203`.
+- **Effort:** M
+- **Confidence:** High for the mechanism and reproduction; Medium for which policy is best.
+- **Trade-off / challenge:**
+  - One verifier measured that the reliability-aware key flips rank 1 in 22–28% of runs when two targets have *equal* true loss rates, because failure counts are noisy.
+  - Failure-aware ordering trades that stability for never recommending the less reliable target.
+  - The CI-membership alternative keeps median stability but needs its own seed sweep.
 
 ## P2 — Medium
 
-### [R-003] Enforce exact, bounded DoH response framing
+### [R-003] `--output /dev/stdout`, `/dev/stderr`, `/dev/fd/N` rejected since v0.6.7
 
 - **Type:** Review finding
-- **Priority rationale:** Official endpoints normally return compliant responses, so this does not threaten ordinary default runs. It matters for custom, compromised, or misconfigured DoH endpoints and for the tool's promise to reject protocol-invalid responses.
-- **Location:** `internal/transport/transport.go:664` and `internal/transport/transport.go:668`; response-branch coverage at `internal/transport/coverage_test.go:475`
-- **Evidence:** Content type is accepted with a substring check, so values such as `application/dns-messageevil` or a parameter containing that text pass. The body is read through `io.LimitReader(..., doHMaxResponseBodyBytes)` without reading one extra byte, so the caller cannot tell a body exactly at the cap from one that was truncated at the cap. `miekg/dns.Msg.Unpack` intentionally ignores trailing bytes, so a valid DNS message prefix followed by excessive data can still parse and be scored. Current tests reject `text/plain` but do not cover misleading media types or an oversized valid-prefix body.
-- **Impact:** SpeeDNS can count a protocol-invalid HTTP response as a valid DNS exchange, weakening diagnostics and potentially influencing latency results from custom endpoints. The memory bound itself remains effective.
-- **Recommendation:** Parse `Content-Type` with `mime.ParseMediaType` and require the media type to equal `application/dns-message` case-insensitively. Read at most `doHMaxResponseBodyBytes+1`, reject any body larger than the limit, and only then unpack. Consider lowering the limit to the maximum DNS message size, but keep that as a separate compatibility decision.
-- **Acceptance / validation:** Add tests for exact media type with legal parameters, mixed case, suffix/prefix lookalikes, malformed media types, body at the limit, body one byte over, and a valid DNS prefix plus oversized trailing data; verify the connection is safely reusable or deliberately closed after rejection.
+- **Priority rationale:** This is a regression in released tags v0.6.7 and v0.6.8. It breaks common shell idioms (`OUT=${1:-/dev/stdout}`, `--output >(jq …)`), and for `run` it discards a completed benchmark. It is not P1: the failure is loud, there are trivial workarounds (omit `--output`, `-`, `/proc/self/fd/N`), and these aliases were never documented. All four verifiers rated it P2.
+- **Location:**
+  - `cmd/speedns/main.go:1404-1424` (`isProcFDOutputPath`) and `:1436-1451`.
+  - `cmd/speedns/diff.go:94`: `diff --output` is affected too.
+  - Docs: `README.md:679-684`, `docs/speedns.1:132-136`.
+  - Tests: `cmd/speedns/main_test.go:366-383`.
+- **Evidence:**
+  - `outputWriter` Lstats the path and rejects every symlink whose literal spelling is not `/proc/self/fd/<n>`. On Linux, `/dev/stdout → /proc/self/fd/1` and `/dev/fd → /proc/self/fd`.
+  - Reproduced: HEAD exits 2 with `output path is a symlink: /dev/stdout` for `/dev/stdout`, `/dev/stderr`, `>(cat)` (`/dev/fd/63`), and `/dev/stdout` redirected to a file. A build of `1fc89cc` exits 0 for every one of them.
+  - From reading only: macOS `/dev/stdout` is also a symlink.
+- **Impact:** Scripts and CI jobs that worked with ≤ v0.6.6 now fail after the full run (see R-004), with exit 2 instead of 0, 3 or 4.
+- **Recommendation:**
+  - Recognise descriptor aliases explicitly next to `/proc/self/fd/N`: `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`, and optionally `/proc/thread-self/fd/N`.
+  - For those paths: stat through the link, reject directories, write in place, and never rename.
+  - Optionally also write in place through user symlinks whose referent is a FIFO, character device or socket.
+  - Do not simply go back to `os.Stat`. At `1fc89cc` a regular-file referent went through CreateTemp plus rename, which, as root with a writable `/dev`, would replace the `/dev/stdout` link itself (from reading).
+  - Document the supported aliases.
+- **Acceptance / validation:**
+  - A Linux table test. Each of these must write in place, exit 0 and leave the link untouched:
+    - `/dev/stdout` to a pipe;
+    - `/dev/stdout` dup2'd to a regular file;
+    - `/dev/stderr`;
+    - `/dev/fd/N` of a pipe.
+  - A symlink to a regular file and a dangling symlink must still be rejected.
+  - The macOS CI leg must stay green.
 - **Effort:** S
 - **Confidence:** High
-- **Trade-off / challenge:** A 1 MiB cap is far above DNS's framed-message limit. Tightening it to 65,535 bytes is cleaner but could expose non-compliant endpoints; the minimal fix can retain the current cap while making it enforceable.
+- **Trade-off / challenge:** Decide whether descriptor aliases are now a supported contract (then test them on macOS) or remain "best effort".
 
-### [E-001] Stop slow preparation from aging warm sessions
+### [R-004] `--output` is validated only after the whole benchmark
 
-- **Type:** Enhancement
-- **Priority rationale:** The scheduler already reduces positional bias with concurrent preparation, but the remaining barrier can still perturb the first measured exchange when one endpoint is slow or blocked. Default sample sizes limit the effect, making this P2 rather than P1.
-- **Location:** `internal/benchmark/benchmark.go:442`, `internal/benchmark/benchmark.go:521`, and `internal/benchmark/benchmark.go:667`; DoQ session lifetime at `internal/transport/transport.go:703`; acknowledged residual bias at `METHODOLOGY.md:25`
-- **Evidence:** Each worker performs all cold probes, opens the reusable session, and sends warmups before `prepareTargets` returns. Measurement does not begin until every dispatched target finishes preparation. A fast target's warm session can therefore sit behind multiple timeout-length attempts from blocked targets. Keepalives mitigate this for DoQ, and reconnect samples are excluded from warm scoring, but the wait can still force a reconnect, consume one measured query as unscored, and make connection age depend on preparation completion order. No fixture currently holds one preparation open long enough to assert the age of another target's measured session.
-- **Impact:** Mixed healthy/blocked networks—the exact environment SpeeDNS is designed to diagnose—can lose early warm samples or add reconnect noise for healthy endpoints. Small samples are most exposed because each excluded query is a larger fraction of the result.
-- **Recommendation:** Split preparation into two bounded phases: finish cold probes for all dispatched targets first, then open and warm reusable measured sessions. Start measured rounds immediately after the warm-session phase. If residual warm-open skew remains material in a deterministic fixture, add an untimed readiness refresh before measurement rather than silently scoring reconnection setup.
-- **Acceptance / validation:** Add a deterministic two-target fixture where one target's cold probes block for multiple timeout periods and the other session expires when left idle; assert the healthy target's first measured exchange does not reconnect solely because of the cold-probe barrier; retain global concurrency, one-session-per-target, query counts, progress phases, cancellation behavior, and no-fallback guarantees.
+- **Type:** Review finding
+- **Priority rationale:** The project's own rule is that invalid input exits 2 before any query is sent. A mistyped or missing `--output` directory costs a full run (about 8,650 queries in a default single-family run, estimated) and loses the results. It amplifies R-003.
+- **Location:**
+  - `cmd/speedns/main.go:1014-1018`: the engine runs.
+  - `:1077-1080`: the first time the destination is touched, which also skips `:1110-1113` (assertions).
+  - `:862-881`: the existing cheap flag checks.
+- **Evidence:** A missing directory, a symlink, a directory, or a new file in an unwritable directory is detected only inside `outputWriter`, which runs after the benchmark. Reproduced with a stubbed engine and with a live loopback UDP fake. Exit codes 0, 3, 4 and 130 are all replaced by 2.
+- **Impact:** CI jobs that write `results/run.json` before running `mkdir` waste the run and lose the measurement.
+- **Recommendation:**
+  - Extract the decision part of `outputWriter` into a `classifyOutputPath` helper that keeps today's error strings.
+  - Call it as a preflight before `runBenchmarkEngine`.
+  - Do not open FIFOs early.
+  - Do not apply a CreateTemp probe to documented in-place destinations: `/dev/null`, `/proc/self/fd/N`, or an existing writable file in an unwritable directory.
+  - Keep the post-run open as the authoritative check.
+- **Acceptance / validation:**
+  - With a call-counting seam on `runBenchmarkEngine`, each invalid destination returns exit 2 with zero engine calls and zero datagrams to a local fake.
+  - The documented in-place destinations are still accepted.
+  - The coverage gate holds.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** A preflight is advisory: the path can change before the post-run open. Keep both checks rather than trying to hold the file open across the run.
+
+### [R-005] `diff --require` passes with zero compared endpoints and fails on recoveries
+
+- **Type:** Review finding
+- **Priority rationale:** Exit status is the only signal a CI gate reads. Both defects produce the wrong exit code from a documented gating feature, but neither corrupts data.
+- **Location:**
+  - `cmd/speedns/diff.go:74-84`.
+  - `internal/compare/require.go:22-24` and `:78-89`.
+  - `internal/compare/findings.go:75-98` (suppressions, `Compared++`), `:80-86` (PRESENCE) and `:113-123` (two-way OPEN/FAILED).
+- **Evidence:**
+  - **(a) Zero compared:** if every target is suppressed (incomplete on *either* side, local, or redacted) and the target sets match, then `Compared=0`, `Findings` is empty, and every condition passes with exit 0. Reproduced: "0 endpoint(s) compared", exit 0. This violates the stated rule "a gate that could not evaluate must never report a pass" (`cmd/speedns/diff.go:74-75`, `internal/compare/require.go:62-64`).
+  - **(b) Direction:** `no-new-failed-targets` matches FAILED and OPEN findings in both directions. A dead→healthy recovery exits 4 with "successes 0 -> N", and a completely dead target that exists only in the current run produces only PRESENCE, so it is missed.
+  - **(c) Only the first failure is reported:** only the first failing condition reaches stderr (`cmd/speedns/diff.go:79-83`), while `run --assert` reports all of them.
+- **Impact:**
+  - An interrupted or all-local current run passes the gate.
+  - A baseline saved during an outage breaks CI exactly when the resolver recovers.
+- **Recommendation:**
+  - (a) Add `ErrNothingCompared` mapped to exit 3. Return it when `len(required) > 0 && diff.Compared == 0`. Do this after the condition loop, so genuine PRESENCE failures keep exit 4, and name the suppression reasons in the message.
+  - (b) Make the condition direction-aware:
+    - FAILED only when the baseline had successes and the current run has 0;
+    - OPEN only when the baseline opened and the current run has an open error;
+    - optionally, current-only targets with zero successes, excluding incomplete and local ones.
+  - (c) Join all failed results into one error.
+  - (d) Optional: record the condition outcomes in the compare JSON as an additive `conditions` array. Today neither the JSON nor the table says which gate ran. `compare-v1.json` has `additionalProperties: false`, so this is a schema edit, and it must not report `passed` on a refused diff.
+- **Acceptance / validation:** Table tests in `internal/compare` and `cmd/speedns/diff_test.go`:
+
+  | Scenario | Expected exit |
+  | --- | --- |
+  | Every current target incomplete | 3 |
+  | Every target local or redacted | 3 |
+  | Recovery (dead → healthy) | 0 |
+  | Open error cleared | 0 |
+  | Healthy → dead | 4 |
+  | Two failing conditions | 4, both named in order |
+
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** Treating a current-only dead target as "new failed" changes how the gate reads ("did a target regress" versus "is every target healthy"). Decide and document which question it answers.
+
+### [R-006] Endpoint-controlled text reaches the terminal unescaped (DNSSEC section, JSON, diff stderr)
+
+- **Type:** Review finding
+- **Priority rationale:** This breaks the explicit guarantee at `METHODOLOGY.md:285-291` that text SpeeDNS did not produce is escaped. It is P2 rather than P1 because the DNSSEC section is opt-in (`--dnssec`) and the impact is display-only: rankings, CSV and gates are unaffected.
+- **Location:**
+  - `internal/report/report.go:1168` (`"error: " + probe.Error`) and `:1206` (`assessment.Reason`).
+  - `:470-481`: `redactDNSSEC` returns the original, unescaped, when not redacting.
+  - `:140` and `:144`: JSON `tls_server_name`, `endpoint_url` and `open_error`.
+  - Sources: `internal/transport/transport.go:663` and `internal/benchmark/dnssec.go:138`.
+  - `cmd/speedns/diff.go:81` and `internal/compare/require.go:85`.
+  - `internal/safetext/safetext.go:64-66`.
+- **Evidence:**
+  - A DoH endpoint speaking HTTP/1.1 can return the reason phrase `418 \x1b[2J\x1b[Hteapot`. Go keeps the ESC, and `internal/transport/transport.go:663` stores it in the probe error, from which it reaches `Reason`.
+  - An on-path attacker presenting an untrusted certificate with ESC in a dNSName SAN reaches the same sink through the x509 error text. This needs no resolver configuration at all.
+  - Reproduced: raw `\x1b[2J` printed three times in the default (non-`--details`) table.
+  - Sibling fields (name, owner, warnings, sample errors) are escaped. The fields above come back with a raw ESC after `jq -r`, and a `--require` failure detail is printed raw to stderr.
+- **Impact:** A hostile endpoint, or an on-path attacker during a `--dnssec` run, can clear the screen or forge the DNSSEC verdict lines. JSON consumers that decode and print get raw control characters.
+- **Recommendation:**
+  - In `redactDNSSEC`, always copy the assessment and apply `safetext.Escape` to `Probes[i].Error` and `Reason` after optional redaction, so the table and JSON agree.
+  - Escape `OpenError` and the metadata strings in `toJSONWithOptions`.
+  - Escape the `runDiff` error text.
+  - P3 extension, which can ship separately:
+    - Escape the Bidi_Control set (U+061C, U+200E/F, U+202A–E, U+2066–9) and zero-width characters with a rune-aware `\u{XXXX}` form. Do not reuse `writeEscaped(byte(...))`, which truncates the rune.
+    - Count Cf runes as zero width in `textwidth`.
+    - Update the `csvCell` guard.
+- **Acceptance / validation:**
+  - Extend `hostileReport` in `internal/report/escaping_test.go` with DNSSEC probes, `Reason`, `OpenError` and `ServerName` carrying `ESC[2K\r`. The table, decoded JSON and `diff` stderr must contain no raw ESC, and escaping must stay idempotent.
+  - A fake HTTP/1.1 DoH server on 127.0.0.1 gives the same result end to end.
+- **Effort:** S (bidi extension: M)
+- **Confidence:** High
+- **Trade-off / challenge:** Choose one escaping policy for JSON (escape everywhere versus raw everywhere) and document it. The current mix is the defect.
+
+### [R-007] Zoned link-local IPv6 UDP targets lose their zone and always fail
+
+- **Type:** Review finding
+- **Priority rationale:** A working resolver is reported as 100% failed over UDP, and the blame lands on the resolver. It is P2 rather than P1 because it needs opt-in `--include-system` or a zoned custom address, and the failure is visible. All four verifiers rated it P2.
+- **Location:**
+  - `internal/transport/transport.go:275`, with `:247-260` (`resolveUDPAddress`) and `:243` (`LookupNetIP`).
+  - `internal/systemdns/systemdns.go:224-235`: zones are kept on purpose.
+  - Promise: `README.md:578`.
+- **Evidence:**
+  - `net.ParseIP("fe80::1%en0")` returns nil, so the literal goes to `LookupNetIP`, which drops the zone.
+  - The session then dials `[fe80::1]:53`, and every query fails with `connect: invalid argument` on Linux. TCP to the same zoned address works.
+  - Reproduced against a fake resolver bound to this host's real link-local address.
+  - `--resolver udp://[fe80::1%25eth0]` and YAML zoned addresses are affected too.
+- **Impact:** Users whose router announces a link-local RDNSS server (common on home networks, macOS and Windows) see their system resolver fail on UDP.
+- **Recommendation:** Replace the check with `if _, err := netip.ParseAddr(host); err != nil { … }`. This is a one-line, zone-aware literal test that is already used elsewhere in the codebase.
+- **Acceptance / validation:**
+  - `Open` on `fe80::<x>%<iface>` calls the resolver 0 times and returns `DialAddress() == "[fe80::<x>%<iface>]:p"`.
+  - A query to a link-local fake succeeds.
+  - `go test ./...` passes (verified in a scratch copy).
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None material. Hostname handling is unchanged.
+
+### [R-008] Bootstrap failover pins reconnects to candidate 1, and DoH's first dial shares the query budget
+
+- **Type:** Review finding
+- **Priority rationale:** When it triggers, a healthy endpoint fails for the rest of the run: in the end-to-end repro, usable rate fell from 0.95 to 0.30 and the score rose from 15.9 to 210.1 ms. It is P2 because it needs a custom profile with two or more `bootstrap_addresses` and a stalled first candidate. The bundled catalog has none.
+- **Location:**
+  - `internal/transport/transport.go:82-94` (`openContext`, `:90-91`) and `:107-138` (`openStream`).
+  - `:293-310`, `:397-417` and `:818-838`: reopen inside `Query`.
+  - DoH: `:515-556`, with `DialTLSContext` at `:529-538` and `Client.Timeout` at `:542`.
+  - `internal/catalog/catalog.go:308-311`: bootstrap is DoH/DoT/DoQ-only.
+- **Evidence:**
+  - A reconnect runs under the per-query context. `openContext` returns that context whenever its deadline is earlier, so a black-holed candidate 1 consumes the whole budget, and the address that worked at `Open` is never reached in time.
+  - Any fatal exchange error triggers this, including a single read timeout.
+  - DoT and DoQ were reproduced.
+  - DoH (P3 on its own): `Open` does not dial, so the first request's `Client.Timeout = T` covers both the stalled dial and the exchange. Three of three cold probes failed where DoT and DoQ succeed. Only cold metrics are affected.
+- **Impact:** For affected profiles, scores, recommendation eligibility and `--assert` results are wrong, and they do not recover.
+- **Recommendation:**
+  - Make reopen sticky: try the session's last successful address first, then the rest in configured order, and advance the start index when the budget runs out.
+  - For DoH, dial in `Open` with `plan.openStream(ctx, tlsConfig)` and hand that connection to `DialTLSContext` once. Close an untaken connection in `Close`, and record the connection only once.
+- **Acceptance / validation:**
+  - DoT and DoQ fixture with candidates [black hole, good] and a mid-session drop: queries after the drop succeed through the good candidate, and exactly one is flagged as a reconnect.
+  - DoH fixture with a stalled TLS listener plus a good server: 3/3 cold probes succeed.
+  - The fixtures must be portable to macOS (do not bind `127.0.0.2`).
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** Sticky ordering deviates from "try candidates in order" (`README.md:423`) for reconnects. Document it as "last good first".
+
+### [R-009] `--family` filters addresses, but encrypted transports dial `bootstrap_addresses`
+
+- **Type:** Review finding
+- **Priority rationale:** It breaks the filter's own "no untruthful family claim" rule (`internal/catalog/family.go:76-78`) and `README.md:423` ("not separately ranked resolvers"). It is P2 because it needs a hand-written profile with bootstrap entries, and `dial_address` exposes the real endpoint in JSON, CSV and `--details`.
+- **Location:**
+  - `internal/catalog/family.go:82-111`.
+  - `internal/transport/transport.go:59-73`: the bootstrap override in `newDialPlan`.
+  - `internal/catalog/catalog.go:404-422` (dedupe at `:415`) and `:457-481` (one target per address).
+  - `cmd/speedns/main.go:954-960` and `:1044`.
+- **Evidence:**
+  - Take a profile with addresses `[192.0.2.53, 2001:db8::53]` and DoT bootstrap `[192.0.2.53]`, run with `--family 6`. The run keeps `dual@2001:db8::53/dot`, which dials `192.0.2.53:853`, while provenance says family 6.
+  - The reverse also happens: `--family 4` keeps IPv6 bootstrap candidates.
+  - Multi-address profiles that use bootstrap expand into separately ranked rows with identical dial plans, under every family mode including `auto`.
+  - Dedupe compares raw strings, so `2001:DB8::1` and `2001:db8::1` both survive.
+- **Impact:** The default table and the RECOMMENDED summary can label an IPv4 measurement with an IPv6 address, and duplicate rows inflate the target list.
+- **Recommendation:**
+  - Filter each transport's `BootstrapAddresses` by the allowed families. Drop a transport with no candidate left and never fall back to the target address.
+  - Dedupe with `canonicalAddressKey`.
+  - Collapse, or warn about, multi-address profiles that also use bootstrap.
+  - Rejecting hostname addresses under explicit 4/6 is documented (`README.md:375-377`) and should stay.
+- **Acceptance / validation:** A catalog test with the profile above.
+  - `--family 6` yields no IPv4 candidate.
+  - `--family 4` yields no IPv6 candidate.
+  - No two ranked rows share a dial plan.
+  - Case variants are deduplicated.
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** Collapsing multi-address profiles changes target IDs for existing custom files. A warning is the compatible first step.
+
+### [R-010] Interrupted runs drop never-dispatched targets; METHODOLOGY promises the full set
+
+- **Type:** Review finding
+- **Priority rationale:** This is a written contract versus actual behaviour in the common case (Ctrl-C during the first protocol group), with knock-on effects in `diff`. It is not P1: the normative sentence matches the code, only the "In practice" paragraph is wrong, and the run is labelled interrupted.
+- **Location:**
+  - `internal/benchmark/benchmark.go:333-340`: protocol groups run sequentially.
+  - `:548-559`: dispatch stops on cancel.
+  - `:496-500`: results.
+  - `METHODOLOGY.md:270-274` (normative) versus `:276-281` (in practice).
+  - Pinned by `internal/benchmark/e2e_fixture_test.go:216-225` and `internal/benchmark/coverage_test.go:648-656`.
+- **Evidence:**
+  - A cancel during the UDP group returns empty results for every later group, and targets beyond `--concurrency` in the active group are never dispatched.
+  - Reproduced: selected=3, reported=1.
+  - With defaults on a dual-stack host, an interrupt in the first group drops 64 of 84 targets.
+  - METHODOLOGY says the interrupted report is "the full comparison set with every entry marked `INCOMPLETE`".
+- **Impact:** The report is silently short. `diff` then raises PRESENCE findings, so `--require no-removed-targets` and `target-set-identical` treat an interrupt as a change in the target set.
+- **Recommendation:**
+  - Preferred: in `runProtocolFair`, append an `Incomplete` result with no observations and the cancellation error for every selected target that was never dispatched. This fabricates no measurements, and `diff` already suppresses incomplete targets.
+  - Update `METHODOLOGY.md:270-281` and the pinned tests.
+  - Alternative: rewrite only the doc paragraph.
+- **Acceptance / validation:** A multi-protocol fair-scheduler cancel test.
+  - `len(report.Targets) == len(selected)`.
+  - Groups that finished before the cancel stay ranked.
+  - Unstarted targets are `INCOMPLETE` with no observations.
+  - `diff` against a full baseline raises no PRESENCE findings.
+- **Effort:** S (docs) / M (code)
+- **Confidence:** High
+- **Trade-off / challenge:** Completed earlier groups are correctly ranked, so "every entry INCOMPLETE" is also wrong. Fix both halves of the sentence.
+
+### [R-011] Signing job restores the setup-go cache written by main-branch runs
+
+- **Type:** Review finding
+- **Priority rationale:** It turns code execution in any read-only main-branch workflow into a signed, attested release binary, and the in-job reproducibility check cannot detect it. It needs a prior compromise (a malicious merge, or a compromised pinned action or tool), but the fix is one line. All three verifiers rated it P2.
+- **Location:**
+  - `.github/workflows/release.yml:114-118` (`cache: true` at `:118`).
+  - `:126`: `go mod verify` covers only GOMODCACHE.
+  - `:139-149`: preflight tests run cached code.
+  - `:165-187`: both GoReleaser builds.
+  - Main-branch writers: `.github/workflows/ci.yml` (including the cross-build job at `.github/workflows/ci.yml:175-179`), `.github/workflows/codeql.yml`, and the scheduled `.github/workflows/live-smoke.yml:29-33`.
+- **Evidence:**
+  - Tag and `workflow_dispatch` runs can restore caches saved on the default branch. This is GitHub platform behaviour and was not verifiable offline.
+  - GOCACHE entries are not content-verified.
+  - Both compared builds read the same restored cache, so `compare-release-artifacts.sh` passes for a poisoned entry. A verifier demonstrated this locally with a planted cache object.
+- **Impact:** Integrity of every signed archive, package, SBOM and Homebrew cask.
+- **Recommendation:**
+  - Set `cache: false` on setup-go in `release.yml`.
+  - Add a `schema/workflows_test.go` assertion that fails if caching is re-enabled in the release workflow.
+  - Structural follow-up in E-001.
+- **Acceptance / validation:**
+  - `grep -n 'cache: true' .github/workflows/release.yml` returns nothing.
+  - The new workflow test passes.
+  - A release log shows no cache restore.
+- **Effort:** S
+- **Confidence:** High for the mechanism; the cross-branch cache-scoping step is a documented platform assumption.
+- **Trade-off / challenge:** A cold build adds a few minutes to each release, which is negligible for a signing job.
+
+### [R-024] DoH reuses a silently dead HTTP/2 connection; timed-out sessions leak connections
+
+- **Type:** Review finding
+- **Priority rationale:** The same network event hits DoH up to the server's `MAX_CONCURRENT_STREAMS` times harder than TCP, DoT or DoQ. That turns a recommendation-eligible DoH target into an ineligible one, and DoH targets end up ranked partly by their server's stream limit. It is P2 rather than P1 because it needs a path that dies without FIN or RST mid-phase (Wi-Fi roam, VPN rebuild, sleep or resume, conntrack flush). Both verifiers rated it P2.
+- **Location:**
+  - `internal/transport/transport.go:525-539`: an `http.Transport` with no HTTP/2 health-check configuration.
+  - `:655-659`: the `client.Do` error is returned without invalidating the connection.
+  - `:696-699`: `Close` only calls `CloseIdleConnections`.
+  - For contrast, stream and DoQ sessions call `fatal(err)` on any exchange error (around `:386-393`).
+  - `internal/benchmark/benchmark.go:755-762`: each cold probe opens, queries and closes a session.
+- **Evidence:**
+  - **Dead connection reused:**
+    - After an exchange error, TCP, DoT and DoQ drop the connection, and the next query reconnects and is flagged as excluded from scoring.
+    - DoH keeps the pooled HTTP/2 `ClientConn`. Go's h2 client counts each cancelled stream against `MAX_CONCURRENT_STREAMS` until a PING ACK arrives (`pendingResets`), and no `ReadIdleTimeout` or `PingTimeout` is set.
+    - On a black-holed path the session therefore times out once per stream slot. Reproduced on Go 1.26 and 1.27: 100 failures at a 100-stream limit and 250 at 250, against 1 failure for TCP under the same event.
+  - **Connections leaked after `Close`:**
+    - When a session's last exchange timed out, `Close()` runs while the stream is still registered, so `CloseIdleConnections` skips the connection.
+    - The private transport is then dropped with `IdleConnTimeout=0`. In the reproduction 19–30 of 20–30 connections stayed open, each with a client read-loop goroutine, until the server or the process closed them.
+- **Impact:** Interactive users on unstable links get DoH results dominated by an artefact. Slow or overloaded DoH endpoints accumulate open connections across the later DoT and DoQ groups.
+- **Recommendation:**
+  - Set `HTTP2: &http.HTTP2Config{SendPingTimeout: f.timeout, PingTimeout: f.timeout}` on the transport. A silently dead connection then closes within about two timeouts, and the `DialTLSContext` hook flags the reconnect. Verified in a scratch copy.
+  - Additionally, record each connection returned from `DialTLSContext` under the session mutex and close them all in `Close()`.
+  - Optionally invalidate the pool on transport-level `client.Do` errors only: not on HTTP status or content-type rejections, and not when the parent context is cancelled.
+- **Acceptance / validation:**
+  - Fake h2 server that stops responding mid-session: DoH failures are about the same as TCP's (1–2), and the next query is flagged as a reconnect.
+  - After `Close()` of a session whose last query timed out, the server observes the connection closed and the goroutine count returns to baseline.
+  - The fixtures pass on the Go 1.26 toolchain used by CI.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** PING-based health checks add a little control traffic during measurement. Keep the ping interval at or above the query timeout so it cannot perturb latency samples.
+
+### [R-025] Cache-miss keeps one endpoint per profile ID, not per resolver, and picks the family by string order
+
+- **Type:** Review finding
+- **Priority rationale:** It silently breaks cache-miss mode's headline guarantee (`CACHE_MISS.md:59-71`, `METHODOLOGY.md:334-345`, `README.md:485-489`) and skews the one ranking the mode produces. The finder claimed P1. Both verifiers rated it P2, because the mode is opt-in and the Address column does show each kept endpoint.
+- **Location:**
+  - `cmd/speedns/main.go:238-258` (`cacheMissTargets`; the key is at `:250` and `:254`; the doc comment says "lowest-sorting address").
+  - `internal/catalog/catalog.go:474-479`: `Expand` sorts by target-ID string.
+  - `internal/catalog/catalog.go:192-194`: the `id@address/protocol` format.
+  - `internal/catalog/catalog.go:528-535`: one profile per `--resolver`.
+  - `cmd/speedns/main.go:1071-1075`: the dropped-endpoint warning.
+- **Evidence:**
+  - **(a) Deduplication by profile ID:** dedupe is keyed on `Resolver.ID`.
+    - Two `--resolver` flags or YAML profiles aimed at the same server are both kept and sent the same generated names. The later lookups are warm reads, yet they are scored and ranked as misses, and the "share a cache" warning never fires.
+    - The bundled `google-8888` and `google-8844` profiles (same service, same DoH URL and SNI) are both measured too.
+    - Reproduced end to end.
+  - **(b) Family chosen by string order:** the kept endpoint is the lowest-sorting `id@address/protocol` string.
+    - On a dual-stack host (`--family auto` with a global non-ULA IPv6 address, or `--family both`), Cloudflare is kept on IPv4, because `1.1.1.1` sorts before `2606:`.
+    - Google, Quad9 and DNS4EU are kept on IPv6, because `2001:`, `2620:` and `2a13:` sort before `8.`, `9.` and `86.`.
+    - The single per-protocol ranking then compares different network families for no stated reason.
+- **Impact:** Cache-miss rankings on the most common modern host configuration are biased in two independent ways, with no explicit warning.
+- **Recommendation:**
+  - (a) Key deduplication on cache identity. Use the canonical address (`canonicalAddressKey`), the DoH URL host and the DoT/DoQ `server_name`, plus an optional catalog `cache_group` for sibling profiles such as the Google pair. Name every collapsed endpoint in the existing warning.
+  - (b) Choose the kept endpoint with an explicit rule instead of ID sort order. Options: the profile's earliest declared address (IPv4 first in the bundled catalog), or one family for all profiles in the run. Also update the comment and CACHE_MISS wording.
+- **Acceptance / validation:**
+  - Two `--resolver` flags to the same host in cache-miss mode: one endpoint measured, and the warning names the other.
+  - The bundled Google pair collapses.
+  - With a dual-stack family fixture, every kept bundled endpoint is in the same family.
+  - Warm mode is byte-identical.
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** A `cache_group` field is a catalog schema addition. Inferring shared caches beyond identical endpoints is guesswork, so keep the default rule conservative and explicit.
+
+## P3 — Low (report-only parking lot)
+
+### [R-012] Ranking and tie documentation still describes pairwise ties
+
+- **Type:** Review finding
+- **Priority rationale:** Documentation only. Ranks are correct for the documented leader-anchored rule.
+- **Location:** `README.md:659-661`; `METHODOLOGY.md:172-181`; code at `internal/benchmark/benchmark.go:1500-1528`; pinned by `internal/benchmark/invariants_test.go:278-325`.
+- **Evidence:**
+  - README says `TIED` means a target's CI overlaps *another ranked target* and that `—` means it does not.
+  - METHODOLOGY says overlapping targets are ordered by median and non-overlapping ones by score.
+  - The code builds only the leader's group, so two lower targets can overlap each other and still show `—` (pinned by test).
+- **Impact:** Readers of the table, CSV and JSON misread `tie` below the leader group.
+- **Recommendation:**
+  - Reword both passages to "member of the score-order leader's tie group".
+  - Do not introduce multi-group ties: `cmd/speedns/assertions.go:349` treats any `Tie` as a `winner=` match.
+  - Bundle this with R-002's methodology update.
+- **Acceptance / validation:** `git grep -nE 'overlaps another ranked target|do not overlap are still ranked by score' README.md METHODOLOGY.md` returns nothing, and the wording matches `METHODOLOGY.md:196-203`.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None.
+
+### [R-013] No cold-phase progress; DNSSEC probes run serially without progress
+
+- **Type:** Review finding
+- **Priority rationale:** UX only. Measurements are unaffected.
+- **Location:**
+  - `internal/benchmark/benchmark.go:533-546`: cold workers emit nothing, and the comment is stale.
+  - `:611-621`: the only per-target emit.
+  - `:484-488`: serial DNSSEC loop.
+  - `internal/benchmark/dnssec.go:89-103`.
+- **Evidence:**
+  - Since `c8c4532`, the counter reads "preparing 0/N" through the whole cold barrier. With 40 black-holed endpoints at the defaults that is minutes, although the spinner keeps moving.
+  - `--dnssec` (opt-in) probes ready targets one at a time, about 2 × timeout each in the worst case, with no progress event.
+- **Impact:** Runs look stuck on networks with unreachable families.
+- **Recommendation:**
+  - Add an internal `Progress.ColdCompleted` counter. `Progress` is not serialized, so there is no schema impact. Do not reuse `TargetsCompleted`, which the renderer keeps monotonic.
+  - Run probes through a pool of `min(Concurrency, ready)` workers, keeping each target's two probes sequential.
+- **Acceptance / validation:**
+  - A blocked-cold-probe fixture emits cold progress for healthy targets before release.
+  - With 8 targets, concurrency 4 and blocking probes, the probe phase takes about 2 × timeout rather than 8 × 2 × timeout.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None.
+
+### [R-014] Protocol-conformance polish (framing, DoQ stream completion, trailing bytes, error label)
+
+- **Type:** Review finding
+- **Priority rationale:** Standards hygiene with low measured latency impact. Fails closed or affects diagnostics only.
+- **Location:**
+  - `internal/transport/transport.go:905-913`: two writes.
+  - `:802-815`: DoQ stream lifecycle.
+  - Trailing-byte paths: `:671-681` (DoH), `:888-901` (framed) and `:322-333` (UDP).
+  - `:682` and `:1003-1004`: the label.
+  - Test pinning: `internal/transport/coverage_test.go:279`.
+- **Evidence:**
+  - **Two writes:** the length prefix and the message go in two writes, against RFC 7766 §8 "SHOULD". On DoT that means two TLS records per query.
+  - **DoQ stream completion:** the client never calls `CancelRead`, so servers that send FIN in a later frame, or never, leave about 2 KB of stream state per query until the session closes.
+  - **Trailing bytes:** a valid message followed by trailing bytes is accepted on DoH, framed transports and UDP. This is the residual of the previous report's DoH-validation item; `miekg/dns` ignores trailing data.
+  - **Wrong label:** a DoH reply with a non-zero ID reports "DoQ transaction ID must be zero".
+- **Impact:** Minor protocol-validity and diagnostic accuracy.
+- **Recommendation:**
+  - Write `prefix+message` in one `Write`, and update the scripted fakes.
+  - `defer stream.CancelRead(0)` after a successful DoQ read. It is non-blocking, so measured latency is unaffected.
+  - Add a `wireLength` helper that walks the header counts with `dns.UnpackDomainName`/`UnpackRR`, and reject frames or bodies longer than the message. Re-pack length comparison is unsafe because of name compression.
+  - Make the zero-ID message transport-neutral or labelled.
+- **Acceptance / validation:**
+  - One `Write` per query (and N TLS records for N queries).
+  - DoQ late-FIN fixture: the stream map drains.
+  - A valid reply plus 1 trailing byte is rejected on every transport, while compressed and uncompressed replies are accepted.
+  - The DoH non-zero-ID error does not mention DoQ.
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** Strict trailing-byte rejection could expose buggy middleboxes. Report them as protocol errors rather than silently scoring them.
+
+### [R-015] Hostname targets pick a family per transport; `dial_address` shows hostname, not peer
+
+- **Type:** Review finding
+- **Priority rationale:** Weakens informal cross-transport reading for custom hostname endpoints only. Rankings are per protocol.
+- **Location:**
+  - `internal/transport/transport.go:151`: `quic.DialAddr`, which resolves through `ResolveUDPAddr` and prefers IPv4.
+  - `:247-260`: UDP uses the first RFC 6724 result.
+  - `:107-138`: stream transports use `net.Dialer`.
+  - `:318-320`: UDP's `DialAddress`.
+- **Evidence:**
+  - On a dual-stack host DoQ alone goes to IPv4, while UDP, TCP, DoT and DoH follow RFC 6724, usually IPv6.
+  - `dial_address` is an IP for UDP but `hostname:port` for the other transports.
+  - On an IPv6-only host, DoQ to a dual-stack name fails with "network is unreachable".
+- **Impact:** Mixed families in one report with nothing showing which was used.
+- **Recommendation:**
+  - Record the connected peer (`conn.RemoteAddr()`, QUIC `RemoteAddr()`) in a new additive field.
+  - Resolve DoQ hostnames with `LookupNetIP` order and dial the literals in turn.
+  - The documented remedy (`bootstrap_addresses`) stays valid.
+- **Acceptance / validation:**
+  - With a hosts entry for both `::1` and `127.0.0.1` and fakes on both, every transport reaches the family of LookupNetIP's first result.
+  - The report shows the peer IP for every transport.
 - **Effort:** M
 - **Confidence:** Medium
-- **Trade-off / challenge:** More phase barriers improve session-age comparability but can lengthen preparation and complicate progress semantics. The fixture should demonstrate a material sample-quality gain before adding a refresh query or another scheduler phase.
+- **Trade-off / challenge:** Changing `dial_address` semantics would be a contract change, so add a new field instead.
+
+### [R-016] Credential and redaction gaps (DoH userinfo in reports, `--assert` stderr)
+
+- **Type:** Review finding
+- **Priority rationale:** Both leaks need unusual setups: Basic-auth DoH URLs, or a ranked non-loopback system resolver plus `--redact-system` plus a failing assertion. Promote to P2 if reports are treated as routinely shareable artefacts (see Challenge 4).
+- **Location:**
+  - DoH validation and capture: `internal/catalog/catalog.go:282-286` (no `u.User` check), `:522-523` and `:171`.
+  - Report output: `internal/report/report.go:140`, `:257` and `:879`.
+  - `--assert` messages: `cmd/speedns/assertions.go:229` and `:305-306`.
+  - `cmd/speedns/main.go:1113`: the redaction flag is not passed.
+  - `internal/catalog/catalog.go:192-194`: target IDs embed the address.
+- **Evidence:**
+  - `--resolver p=https://alice:s3cret@host/dns-query` is accepted. It works (Go sends Basic auth), and the password is written verbatim to JSON, CSV and `--details` `endpoint_url`.
+  - `--redact-system` is scoped to system resolvers, so this is not a bypass of that flag.
+  - With `--redact-system`, the JSON says `system-redacted-1@redacted/udp` while the exit-4 stderr line names `system-10-20-30-40@10.20.30.40/udp`.
+- **Impact:** Credentials or local addresses in shared reports or CI logs.
+- **Recommendation:**
+  - Reject `u.User != nil` in `Validate`, without echoing the URL. If Basic-auth DoH must work, render `Redacted()` instead, but note that it still shows a username used as a token.
+  - Export a `report.DisplayTargetID` helper and use it for assertion messages when redaction is on.
+- **Acceptance / validation:**
+  - YAML and flag inputs with userinfo are rejected, and the secret appears in neither the error nor any output.
+  - The `--include-system --redact-system --assert` stderr line contains `system-redacted-N@redacted`.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** Rejecting would break any existing Basic-auth DoH users. Redacting keeps them working but leaks usernames.
+
+### [R-017] Resolver-config validation gaps (untrimmed `server_name`, `:0` port, empty or inapplicable fields)
+
+- **Type:** Review finding
+- **Priority rationale:** Misconfigurations fail closed or are inert. This is a strict-decoding consistency gap.
+- **Location:**
+  - `internal/catalog/catalog.go:318-323`: checks the trimmed value but stores the raw one.
+  - `:173-174` and `:181-182`: report the trimmed value.
+  - `:164`: `net.ParseIP` rejects zoned literals.
+  - `:510-519`: `:0` mapped to the default port.
+  - `:259-324`: no empty-transports or applicability checks.
+  - The transport uses the raw value at `internal/transport/transport.go:189`, `:212` and `:483`.
+- **Evidence:**
+  - **`server_name`:** `server_name: " dns.google "` reaches TLS with spaces while the report says `dns.google`. Verification then fails closed. A whitespace-only DoH `server_name` is accepted.
+  - **Zoned literal:** a zoned DoT literal is reported as `system_resolver` bootstrap.
+  - **`:0` port:** `https://dns.example:0/dns-query` dials 443 but keeps `Host: dns.example:0`. YAML rejects the same URL unless `port:` is set.
+  - **Empty and inapplicable fields:** a profile with no transports, `url:` on dot/doq/udp/tcp, and `server_name:` on udp/tcp are all accepted and ignored.
+- **Impact:** Audit fields that drift from the transport behaviour they describe, and confusing misconfiguration errors.
+- **Recommendation:**
+  - Trim `server_name` for every protocol and reject blank values.
+  - Use `netip.ParseAddr` in `EndpointMetadata`.
+  - Reject an explicit port `< 1` in `ParseResolverFlag`, and update the fuzz invariant.
+  - Reject empty transports and inapplicable fields, following the existing `bootstrap_addresses` rule.
+- **Acceptance / validation:**
+  - Factory TLS `ServerName` equals `metadata.TLSServerName`.
+  - `x=https://dns.example:0/dns-query` is rejected.
+  - `LoadYAML` returns a field-specific error for each case.
+  - The bundled catalog and `resolvers.example.yaml` still load.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** Stricter validation could break hand-written files that currently "work". Ship it with a clear error message.
+
+### [R-018] Domain-file BOM handling; macOS search domains reported as scope
+
+- **Type:** Review finding
+- **Priority rationale:** Loud input failure and label-only display issue.
+- **Location:** `internal/domains/domains.go:124-127`; `internal/systemdns/systemdns.go:23`, `:198-200`; `internal/systemdns/systemdns_test.go:112`.
+- **Evidence:**
+  - A UTF-8 BOM before `# comment` or a blank first line is rejected. With `--skip-invalid-domains` it becomes a spurious skipped entry.
+  - On macOS, `search domain[n]` lines set `Scope`, so the default resolver is labelled "scope: lan" on typical DHCP networks. The existing test pins this, although its message calls the block global.
+- **Impact:** Windows-edited domain lists fail. The macOS default resolver looks like a split-DNS resolver.
+- **Recommendation:**
+  - Strip one leading U+FEFF on line 1.
+  - Only `domain :` lines should set `Scope`.
+- **Acceptance / validation:**
+  - `"\xef\xbb\xbf# list\nexample.com\n"` loads as `["example.com"]` with no skipped entry.
+  - Resolver #1 with only a search domain reports `scope: global`.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None.
+
+### [R-019] CLI ergonomics and documentation drift
+
+- **Type:** Review finding
+- **Priority rationale:** Polish. Every case fails loudly or is cosmetic.
+- **Location:**
+  - `cmd/speedns/assertions.go:70`: first-colon split.
+  - `docs/speedns.1:4-18`, `:29-48` and `:264-298`.
+  - `cmd/speedns/diff.go:41` and `:48`.
+  - Status strings: `internal/report/report.go:144` versus `:635`.
+  - `README.md:740`.
+  - `cmd/speedns/main.go:537-542` (`tableColorEnabled`).
+- **Evidence:**
+  - `custom-v6@2001:db8::53/udp:p95<50ms` fails with "unsupported metric", although `README.md:847-848` promises that full target IDs are accepted. Every bundled IPv6 target is affected.
+  - The man page SYNOPSIS and COMMANDS omit `diff`, and its DIFF section omits `--output`.
+  - `run`, `version`, `resolvers` and `corpus` accept stray arguments, so `speedns run json` starts a full public benchmark.
+  - `diff --format JSON` is rejected while `run` accepts upper case.
+  - `profile_comparisons[].transports[].status` uses upper-case values while `results[].status` uses kebab case.
+  - The README calls `--timeout` "per-endpoint", while the code applies it per query and per connection.
+  - `NO_COLOR` is ignored.
+  - `speedns resolvers` sorts transports alphabetically (`doh,doq,dot,tcp,udp`), contradicting `catalog.CompareProtocols` (`internal/catalog/catalog.go:43-55`). It also overflows its fixed `%-24s` address column on 8 of 10 rows and has no header (`cmd/speedns/main.go:826-831`).
+  - `speedns corpus` never prints the decoded licence or attribution note.
+- **Impact:** Friction and surprises, including accidental network traffic from a typo.
+- **Recommendation:**
+  - Split the assertion on the last `:`.
+  - Add `Args: cobra.NoArgs` on leaf commands.
+  - Make `diff --format` case-insensitive.
+  - Complete the man page and add a test that enumerates subcommand flags.
+  - Fix the README wording.
+  - Honour a non-empty `NO_COLOR`.
+  - Treat status-string casing as a schema-versioned decision.
+- **Acceptance / validation:**
+  - The IPv6 subject parses.
+  - `speedns run json` exits 2 with no traffic.
+  - `diff --format JSON` works.
+  - The man-page test covers `diff`.
+  - `NO_COLOR=1` disables colour, while `NO_COLOR=` (empty) does not.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** Changing status casing is a contract change. Leave it unless a schema version bump is planned.
+
+### [R-020] Output replacement edge cases and unbounded `diff` input
+
+- **Type:** Review finding
+- **Priority rationale:** Uncommon triggers.
+- **Location:**
+  - `cmd/speedns/main.go:1453-1515`, including `:1460-1462` (`Perm()` only) and `:1510-1511`, where a failed rename discards the report.
+  - `internal/compare/decode.go:102-127` (`os.ReadFile` at `:105`).
+- **Evidence:**
+  - A single-file bind mount makes the rename fail with EBUSY: exit 2, report deleted. This contradicts the "written in place instead" promise at `README.md:678-681`.
+  - Hard links are broken.
+  - A non-root caller silently replaces a 0444 file.
+  - The parent directory is not fsynced after the rename.
+  - `speedns diff /dev/zero x.json` ends in a Go out-of-memory abort.
+- **Impact:** Lost reports in container setups. Crash on endless input.
+- **Recommendation:**
+  - On EBUSY, or when `nlink > 1`, copy the finished temp file into place with `O_TRUNC` instead of discarding it.
+  - Refuse to replace a file the caller cannot write.
+  - Best-effort directory `Sync` after the rename, ignoring unsupported-platform errors.
+  - Read `diff` inputs through `io.LimitReader` with a generous cap such as 256 MiB. Keep process substitution and `/dev/stdin` working; do not require regular files.
+- **Acceptance / validation:**
+  - An injected `renameOutputFile` returning EBUSY ends with the new report in place.
+  - A hard-linked destination shows new content under both names.
+  - `diff /dev/zero a.json` exits 2 with a size error.
+  - `diff <(cat a.json) a.json` still works.
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** In-place fallback gives up atomicity for those cases. Document it.
+
+### [R-021] Homebrew publication guards (downgrade, tag validation, prerelease runs)
+
+- **Type:** Review finding
+- **Priority rationale:** Every path needs maintainer write access and environment approval, and some are latent (no backport releases exist yet).
+- **Location:**
+  - `.github/workflows/homebrew.yml:3-16` and `:24-30`.
+  - `scripts/publish-homebrew-cask.sh:47-65`.
+  - `.github/workflows/release.yml:83-91`.
+  - `scripts/homebrew-cask.sh:15-18`, `:24` and `:63`.
+  - `scripts/validate-published-release.sh:10-13` and `:47-54`.
+  - `scripts/validate-homebrew-tap.sh:71`.
+- **Evidence:**
+  - **Downgrade:** publishing an older stable tag overwrites the cask without a version comparison, and backport release notes use the highest stable tag as the base (reproduced: `v0.6.1..v0.5.3`).
+  - **Tag validation:** tags are only checked for a `v` prefix before interpolation into a Ruby double-quoted string. The generator emits `version "1.0.0#{`id`}"`, and the post-publish check also passes it.
+  - **Prerelease runs:** every published prerelease requests environment approval and then fails.
+  - **Signature:** the cosign bundle is not verified before the cask is built.
+- **Impact:** A tap regression or injection is possible through maintainer error or a compromised release asset.
+- **Recommendation:**
+  - Refuse when the tag sorts below the tap version (`sort -V`) unless an explicit `allow_downgrade` input is set.
+  - Choose the previous tag as the highest stable tag lower than the current one.
+  - Validate `^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$` in all three scripts.
+  - Add a job-level `if: … !github.event.release.prerelease`.
+  - Run `cosign verify-blob` with the README identity before generating the cask.
+- **Acceptance / validation:** Fake-gh fixtures:
+  - v0.6.9 over 0.7.0 fails without the override.
+  - A crafted tag fails before any file is written.
+  - A prerelease event skips the job.
+  - A tampered `checksums.txt` fails verification.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None material.
+
+### [R-022] Release verification instructions fail or under-pin
+
+- **Type:** Review finding
+- **Priority rationale:** Documentation. It fails closed, but trains users to ignore errors.
+- **Location:** `README.md:160-169` (`:164`, `:167`); `README.md:174-176` (`:175`); `RELEASE_CHECKLIST.md:32-35`.
+- **Evidence:**
+  - Following the checklist (one archive plus `checksums.txt`) and running `sha256sum -c checksums.txt` prints FAILED for every other asset and exits 1. BusyBox has no `--ignore-missing`.
+  - `gh attestation verify … --repo` accepts any workflow or ref in the repository, whereas the cosign line pins `release.yml` on tags or `main`.
+- **Impact:** Verification friction and inconsistent policy.
+- **Recommendation:**
+  - Verify `checksums.txt` with cosign first.
+  - Then check only the downloaded asset, portably: `grep -F " <asset>" checksums.txt | sha256sum -c -`, or GNU `--ignore-missing`.
+  - Mirror the cosign identity with `--cert-identity-regex '^https://github\.com/crypt0rr/SpeeDNS/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' --deny-self-hosted-runners`. Do not document `--source-ref`, which breaks dispatch releases.
+- **Acceptance / validation:** In a directory holding one archive, `checksums.txt` and the bundle, the documented sequence exits 0 on GNU, BusyBox and macOS `shasum`, and a tampered archive fails.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None.
+
+### [R-023] CI hygiene (stale staticcheck pin, dead test assertion, no SHA-pin guard)
+
+- **Type:** Review finding
+- **Priority rationale:** Maintainability only. Nothing is exploitable today: all 37 `uses:` are SHA-pinned and every workflow declares permissions.
+- **Location:** `.github/workflows/ci.yml:160` and `:162-166`; `renovate.json:1-7`; `schema/workflows_test.go:60-72` (dead `:69-71`); `CONTRIBUTING.md:22-27`.
+- **Evidence:**
+  - `staticcheck@2025.1.1` has not changed since #125 and is invisible to Renovate. A newer release exists in the local module cache.
+  - A Renovate regex on the calendar version would never fire.
+  - `schema/workflows_test.go:69-71` is unreachable after the `t.Fatal` at `schema/workflows_test.go:66-67`, and both checks are substring matches.
+  - No test guards SHA pinning.
+  - The shellcheck glob skips `scripts/testdata/*.sh`.
+- **Impact:** Silent linter stagnation and weaker invariants.
+- **Recommendation:**
+  - Pin staticcheck by module semver (`honnef.co/go/tools/cmd/staticcheck@v0.x.y`) and add a Renovate `customManagers` regex.
+  - Delete the dead assertion and parse the YAML for the checkout step's `with:`.
+  - Add a test requiring `^[^@\s]+@[0-9a-f]{40}$` for every `uses:` plus top-level `permissions:`.
+  - Extend the shellcheck glob in CI and CONTRIBUTING.
+- **Acceptance / validation:**
+  - Renovate lists the staticcheck dependency.
+  - The new test fails when a ref is changed to `@v7`.
+  - The checkout test fails when `fetch-depth` moves into a comment.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** The maintainer's written stance favours invariant tests over schema linting. These additions fit that stance.
+
+### [R-026] Cache-miss guarantee wording, spurious sample warning, and "compare the runs" advice
+
+- **Type:** Review finding
+- **Priority rationale:** Documentation and warning text for an opt-in mode. Measurements are correct as recorded.
+- **Location:**
+  - `CACHE_MISS.md:59-65`: the heading "Every measured query is a real miss".
+  - `CACHE_MISS.md:81-85` and `README.md:489-491`: "compare the runs".
+  - `METHODOLOGY.md:342-343`.
+  - `cmd/speedns/main.go:1073`: warning text.
+  - `internal/benchmark/benchmark.go:312-317`: the engine's oversize-sample warning.
+  - `cmd/speedns/main.go:754`.
+  - `internal/compare/gate.go:70-87`: diff refuses cache-miss reports.
+- **Evidence:**
+  - **Overstated guarantee:** "every query is a genuine miss" is stronger than what the two deduplication rules ensure, which is that SpeeDNS never repeats its own question. A validating resolver doing RFC 8198 aggressive NSEC/NSEC3 synthesis can answer an unseen name from a cached covering record. The extent depends on how the signed zone serves denial, which was not verified offline.
+  - **Spurious warning:** with the default `--sample 100` and a generated corpus of at most 20, every documented example emits "requested sample of 100 domains exceeds the normalized corpus size". Only `--sample` equal to `--cache-miss-sample` is warning-free.
+  - **Contradicted advice:** the guidance says "measure one transport per invocation and compare the runs", but `speedns diff` refuses every cache-miss report (exit 3), and cross-run latency comparison is disclaimed elsewhere.
+- **Impact:** Users trust a stronger guarantee than the tool provides, see a false-alarm warning on every run, and follow advice the tool rejects.
+- **Recommendation:**
+  - Retitle the section to "No name is asked twice at one resolver" and name RFC 8198 as a limit.
+  - Clamp the engine sample to `len(domainList)` in cache-miss mode, which leaves queries and provenance byte-identical.
+  - Replace "compare the runs" with an explicit statement that cache-miss mode cannot produce a sound transport comparison.
+- **Acceptance / validation:**
+  - `git grep -n 'genuine miss\|compare the runs' CACHE_MISS.md README.md METHODOLOGY.md cmd/` returns only reworded text.
+  - `--cache-miss --cache-miss-sample 10` with the default `--sample` emits no oversize warning.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None.
+
+### [R-027] Machine-output fidelity (seed > 2^53, truncated `timeout_ms`, ID join keys, dashboard zeros, warning attribution)
+
+- **Type:** Review finding
+- **Priority rationale:** Each gap is narrow and either fails loudly or is visible in sibling fields. Together they erode the "reproducible from the report" contract.
+- **Location:**
+  - Seed: `cmd/speedns/main.go:986-989`, `internal/report/report.go:33` and `:191`, `schema/report-v1.json:89-91`.
+  - Timeout: `internal/report/report.go:180`, `internal/compare/gate.go:53-54`.
+  - IDs: `internal/report/report.go:390-402` (escaped ID) versus `:153-158`, `:542-558` and `:630-635` (raw).
+  - Dashboard: `scripts/publish-live-results.py:542-546` and `:564-567`.
+  - Warnings: `internal/benchmark/warning.go:58-66`, `internal/report/report.go:517-540`.
+- **Evidence:**
+  - **Seed:** the default seed, `time.Now().UnixNano()` (about 1.8e18), is above 2^53. JavaScript, Go `map[string]any`, jq arithmetic and jq 1.6 round it, so a rerun picks different names. `diff` decodes into `int64` and is unaffected. Note that `math/rand` reduces seeds mod 2^31-1, so the default range wastes nothing by shrinking.
+  - **Timeout:** `timeout_ms` truncates sub-millisecond timeouts. `1000500us` and `1s` both record 1000 and diff as comparable, although scoring uses the exact value.
+  - **IDs:** a resolver ID containing a control byte is escaped in `results[].target.id` and CSV but raw in `rankings`, `paired_effects`, `divergence` and `profile_comparisons`, so joins on target ID fail.
+  - **Dashboard:** the live dashboard prints a failed transport as `0.00 ms` median, p95 and score, where the CLI table shows `—`.
+  - **Warning attribution:** under `--redact-system`, JSON warnings for different system resolvers on the same protocol are identical strings.
+- **Impact:** Downstream consumers and dashboards can misreproduce runs, mis-join records or misread failures.
+- **Recommendation:**
+  - Draw the default seed from [1, 2^31-2].
+  - Reject `--timeout` values that are not whole milliseconds (schema-compatible).
+  - Reject C0/C1 control characters in resolver IDs in `catalog.Validate`.
+  - Render "—" in the publisher when `scored == 0`.
+  - Include the redacted target ID in redacted warning labels.
+- **Acceptance / validation:**
+  - Default seeds are always `< 2^31`.
+  - `--timeout 1000500us` exits 2.
+  - An ID with `\x1b` is rejected.
+  - The publisher fixture for failed DoQ shows "—".
+  - Two redacted system warnings differ.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** Rejecting sub-millisecond timeouts and control-character IDs tightens input. Ship both with clear errors.
+
+### [R-028] `schema_version: 1` spans incompatible required sets; schema conformance tests have gaps
+
+- **Type:** Review finding
+- **Priority rationale:** This is a published-contract inconsistency, and the fix is cheap. The verifiers split P2/P3: the forward break was explicitly accepted in commit `f20646e`, and the backward break was never documented. It is kept at P3; promote it if any consumer validates archived reports.
+- **Location:**
+  - `schema/report-v1.json:3` (`$id`), `:7`, `:15-17` (`schema_version` const 1), `:125-139`, `:256-280` and `:399-403`.
+  - `README.md:687-693`; `CONTRIBUTING.md:70-72`.
+  - `internal/compare/compare_test.go:397-428`; `schema/schema_test.go:272-302`.
+  - `scripts/testdata/live-results-evidence/main.go:146-166`.
+- **Evidence:**
+  - **Required-set growth:** v0.4.0 (`f20646e`) added `status`, `answers` and `answer_rate` to `required`, and v0.6.0 (`89ffa90`) added `family` and `dnssec`. `schema_version` stayed 1 and `$id` never changed.
+  - **Reproduced:**
+    - The current schema rejects v0.3.0 and v0.5.0 CLI output (missing `status`, missing `family`).
+    - Older schemas reject current output (unexpected `answer_rate`, unexpected `dnssec`).
+    - README's advice to pick validation rules from `schema_version` cannot work.
+  - **Separately:**
+    - `TestWriteJSONMatchesTheCompareSchema` only checks top-level keys and never validates against `compare-v1.json`; enum drift passed in a demonstration.
+    - `paired_effects` and `divergence` are never schema-validated.
+    - The live-results fixture feeds statistics `calculateStatistics` cannot produce (Recommended with Scored=1).
+- **Impact:** Strict validators of archived reports fail, and schema drift in compare or paired output can ship with CI green.
+- **Recommendation:**
+  - Remove the later-added fields from `required` while the encoder keeps emitting them, so v1 accepts every v1 report ever produced. Alternatively, bump the version whenever `required` grows.
+  - Document the rule next to the schema link.
+  - Validate compare JSON (all 10 finding codes and 7 suppression reasons) against `compare-v1`.
+  - Schema-validate a report with `paired_effects` and `divergence`.
+  - Generate the live fixture statistics through `calculateStatistics`.
+- **Acceptance / validation:**
+  - A test validates the golden JSON of every released v1 tag against the current schema.
+  - A deliberately renamed compare enum or `paired_effects` field fails the suite.
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** Relaxing `required` weakens what the schema promises about new reports. A version bump is stricter but forces consumer updates.
+
+### [R-029] Output-format documentation drift (CSV layout, provenance, delimiters, `answer_rate`)
+
+- **Type:** Review finding
+- **Priority rationale:** Documentation and comments only. The CSV is valid RFC 4180 and the semantics are test-pinned.
+- **Location:**
+  - `README.md:599-600` and `:695-702`.
+  - `METHODOLOGY.md:166-170`, `:283-284` and `:50-51`.
+  - `internal/report/report.go:261-263` (pipe comment) and `:323-337` (comma join).
+  - `internal/report/contract_test.go:387-391`.
+  - `internal/benchmark/benchmark.go:1144` and `:161-169`.
+- **Evidence:**
+  - **CSV layout:** README and METHODOLOGY say CSV has a "trailing `local` column" and reconnect/incomplete diagnostics "at the end". `local` is column 44 of 54 and the diagnostics are columns 33–34.
+  - **Provenance:** README says "CSV output is unchanged" by provenance and omits `family` and `dnssec`. CSV now carries `speedns_version`, `corpus_sha256` and run-identity columns.
+  - **Delimiters:** the comment says the `query_types` pipe matches `rcode_counts`, but `rcode_counts` is comma-joined and `bootstrap_addresses` uses `;`. None of the three conventions is documented.
+  - **`answer_rate`:** it is described as a share of usable responses, but it is `answers/total`, like every other rate.
+- **Impact:** Consumers who write CSV parsers from the docs misread columns.
+- **Recommendation:**
+  - Replace positional wording with column names.
+  - Add a short CSV column reference listing the three list encodings.
+  - Fix the comment.
+  - State the `answer_rate` denominator.
+  - Do not change any delimiter: the CSV contract is append-only.
+- **Acceptance / validation:** The docs name `local`, `reconnects` and `incomplete` by column, list the provenance fields including `family` and `dnssec`, and state that rates are proportions of total queries.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** None.
+
+### [R-030] Unresponsive targets pace every round undocumented; misleading interrupt warning
+
+- **Type:** Review finding
+- **Priority rationale:** Wall-clock behaviour and warning text only. No measured or ranked value is wrong.
+- **Location:**
+  - `internal/benchmark/benchmark.go:468-483` (round loop) and `:629-676` (`runQueryRound`, `wg.Wait()` at `:667`).
+  - `:732-811`: preparation never marks a silent UDP or DoH target unready; warm-up errors are discarded at `:801`.
+  - `internal/transport/transport.go:269-283` and `:515-556`: UDP and DoH `Open` do no I/O.
+  - `internal/benchmark/benchmark.go:348-350`.
+  - `cmd/speedns/main.go:1081-1082`.
+- **Evidence:**
+  - **Pacing:** a UDP or DoH target that never answers still enters measurement, and every round waits for its full `--timeout`. One dead target costs about 200 × 2 s = 400 s in a default run and about 67 minutes with `--full`, and every healthy target's pacing is stretched to match. The dead target itself is correctly reported failed and unranked.
+  - **Interrupt warning:** a Ctrl-C that arrives after the last protocol group's cancellation check still yields "benchmark interrupted before all targets completed" on a complete, ranked report. Exit 130 and assertions being skipped are the documented contract, so only the warning text is wrong.
+- **Impact:** Runs on networks with a broken family or a dead system resolver take much longer than the docs suggest, and an operator may distrust a complete report.
+- **Recommendation:**
+  - Document the worst-case bound in METHODOLOGY and in the `--timeout`/`--concurrency` help.
+  - Optionally add a deterministic cutoff, excluding a target whose cold probes and warm-ups all failed, recorded in the report.
+  - Choose the interrupt warning based on whether any target is actually incomplete.
+- **Acceptance / validation:**
+  - A fixture with one silent UDP target shows the documented bound, or the cutoff when it is implemented.
+  - A cancel after measurement completes produces an "interrupted after measurement completed" warning and keeps exit 130.
+- **Effort:** S
+- **Confidence:** High
+- **Trade-off / challenge:** A cutoff stops sampling a resolver that might recover mid-run. If added, it must be explicit and visible in the report.
+
+### [E-001] Isolate signing from test execution; make the reproducibility rebuild independent and offline
+
+- **Type:** Enhancement
+- **Priority rationale:** Defence in depth beyond R-011. Preconditions are a reviewed malicious merge or a compromised pinned tool. There is no test-only dependency in this repo, and the environment is already gated, so verifiers rated it P3.
+- **Location:**
+  - `.github/workflows/release.yml:18-23` (workflow-level `contents`/`attestations`/`id-token` write), `:33-44`, `:139-149`, `:165-207`, and `:189` (the "independent rebuild" wording).
+  - `.goreleaser.yaml:92-114` (`--enrich all` at `:100-101` and `:111-112`).
+  - `scripts/reproducible-syft.sh:22` and `:41-57`.
+  - `.github/workflows/live-smoke.yml:74-80` and `:109-121`.
+- **Evidence:**
+  - One job holds OIDC, attestation and write permissions while running `go test`, race, coverage, fixtures, and the built binaries (`artifact-smoke.sh`).
+  - Both reproducibility builds share one runner and one cache.
+  - Syft online enrichment can make the two SBOMs differ.
+  - The live-smoke publish checkout persists a repository-wide write token.
+- **Impact:** Code that runs in the job can mint signatures that pass the README's cosign identity. Reproducibility failures can be caused by network flakes rather than real drift.
+- **Recommendation:**
+  - Split the release into two jobs:
+    - `verify`: `contents: read`, `cache: false`, tests, smoke runs and the reference build.
+    - `publish`: `needs: verify`, `environment: release`, OIDC and write permissions; it only builds, signs, compares, uploads and attests.
+  - Rebuild on a fresh runner and compare `checksums.txt`.
+  - Set Syft to offline license lookup: `SYFT_GOLANG_SEARCH_LOCAL_MOD_CACHE_LICENSES=true`, remote lookup off. Verify these option names against the pinned Syft.
+  - `persist-credentials: false` on checkouts.
+- **Acceptance / validation:**
+  - No job with `id-token: write` contains `go test`, `go run`, `coverage.sh`, or execution of `dist/*`.
+  - Two offline Syft runs produce byte-identical SBOMs.
+  - A dry-run tag still signs and attests.
+- **Effort:** L
+- **Confidence:** Medium
+- **Trade-off / challenge:** More jobs mean more artifact hand-offs, and smoke tests must move to the unprivileged side or the split gains little.
+
+### [E-002] Discover the real upstreams behind the systemd-resolved stub
+
+- **Type:** Enhancement
+- **Priority rationale:** On Ubuntu and Fedora defaults, `--include-system` yields one unranked stub row. A documented workaround exists: `resolvectl status` plus `--resolver`.
+- **Location:** `internal/systemdns/systemdns.go:254-264`, `:324-342`, `:28-31` and `:71-73`; `README.md:587-589`.
+- **Evidence:** Only `/etc/resolv.conf` is read. A stub-only file yields "upstream unknown".
+- **Impact:** The system-baseline feature never compares the real ISP or router upstream on resolved hosts.
+- **Recommendation:**
+  - When every nameserver is loopback, also read `/run/systemd/resolve/resolv.conf`, read-only and through an injectable path.
+  - Add each non-loopback address as an extra `system-…` profile, keeping the stub row.
+  - Label it "default-route servers only". Split-DNS links, DoT settings and ports are not represented.
+- **Acceptance / validation:** A fixture with a stub-only `resolv.conf` plus an upstream file returns the unchanged stub profile and two upstream profiles. With no upstream file, the output is identical to today's.
+- **Effort:** M
+- **Confidence:** Medium
+- **Trade-off / challenge:** The file is a flattened view of resolved's configuration. Make sure the label does not over-promise.
+
+### [E-003] Record negotiated DoH HTTP protocol and TLS version
+
+- **Type:** Enhancement
+- **Priority rationale:** Diagnostic value. It is not a security downgrade: ALPN is authenticated.
+- **Location:** `internal/transport/transport.go:515-556` (`NextProtos` at `:522-524`) and `:457-459`; `README.md:312`; `schema/report-v1.json`.
+- **Evidence:** `README.md:312` says DoH means "RFC 8484 and HTTP/2", but HTTP/1.1 is accepted silently, and neither the protocol nor the TLS version is recorded for DoH or DoT.
+- **Impact:** HTTP/1.1-only endpoints are benchmarked and compared without disclosure.
+- **Recommendation:**
+  - Fix the README sentence now.
+  - Capture `ConnectionState().NegotiatedProtocol` and `Version` in the `DialTLSContext` hook.
+  - Expose them through an optional session interface, as an additive `omitempty` JSON field.
+- **Acceptance / validation:** httptest fixtures report `h2` with TLS 1.3, `http/1.1` when h2 is not offered, and TLS 1.2 when the server is capped there.
+- **Effort:** M
+- **Confidence:** Medium
+- **Trade-off / challenge:** Each schema addition must stay additive and covered by the schema tests.
+
+### [E-004] Disclose, and optionally counterbalance, protocol-order cache priming
+
+- **Type:** Enhancement
+- **Priority rationale:** Rankings are per protocol and unaffected. It only matters for reading `--profile-view` transport costs, mainly with uncached corpora.
+- **Location:** `internal/benchmark/benchmark.go:319-340`, `:433-435` and `:654-665`; `METHODOLOGY.md:16-17` and `:334-353`; `README.md:216-222`.
+- **Evidence:**
+  - Protocol groups always run udp→tcp→doh→dot→doq over the same names, so UDP absorbs first-lookup misses and later transports read a warmed shared cache.
+  - Dispatch order within a round is fixed by target ID. Same-operator priming only matters near the concurrency boundary.
+- **Impact:** `--profile-view` systematically understates the cost of encryption.
+- **Recommendation:**
+  - Document the bias in METHODOLOGY, README and the profile-view header now.
+  - Optionally add a seeded per-round rotation, or an interleaved opt-in mode recorded in report metadata. Default output stays byte-identical.
+- **Acceptance / validation:** A shared-cache fake fixture shows misses spread across transports in the opt-in mode, and default mode output is unchanged.
+- **Effort:** M
+- **Confidence:** Medium
+- **Trade-off / challenge:** A seeded order spreads the bias across runs but does not remove it within one run. Only counterbalancing per query does.
+
+### [E-005] Cheaper bootstrap statistics, streamed `--raw` JSON, single domain normalisation
+
+- **Type:** Enhancement
+- **Priority rationale:** Efficiency only. Results are correct and deterministic. The cost matters with `--full`, large custom corpora or `--raw`.
+- **Location:**
+  - Bootstrap: `internal/benchmark/benchmark.go:1225-1270` (`scoreFromSamples` and `bootstrapCI`) and `:1454-1470` (`bootstrapPairedCI`).
+  - `--raw` encoding: `internal/report/report.go:126-197` and `:210-214`.
+  - Normalisation: `cmd/speedns/main.go:924-929` and `internal/benchmark/benchmark.go:392-396`.
+- **Evidence:**
+  - **Bootstrap:** each target runs 1000 replicates, and each replicate allocates and sorts N samples on one goroutine after measurement. That is about 1–1.5 s of CPU for a default run, about 24 s for `--full` (84 targets), and about 2.5 minutes for a 10k-name list. It also cannot be cancelled, so a Ctrl-C waits.
+  - **`--raw` JSON:** the whole document is materialised compact and then indented, so peak RSS grows by about 3–6× the output size (+222 MB for a 37.6 MB report).
+  - **Normalisation:** a domain list is IDNA-normalised twice: about 1.3–1.6 s and about 150 MB of garbage per 1M names.
+- **Impact:** Silent pauses and memory spikes at the end of long runs.
+- **Recommendation:**
+  - Sort successes once and resample by rank counts, which reproduces the same multiset from the same RNG draws and keeps CIs bit-identical. Reuse buffers.
+  - Stream the `results` array element by element through a `bufio.Writer`, keeping the bytes identical.
+  - Carry an already-normalised list type from `domains` into the engine instead of re-normalising.
+- **Acceptance / validation:**
+  - Pinned CI vectors and golden reports are unchanged.
+  - Benchmarks show order-of-magnitude reductions in statistics CPU.
+  - `--full --raw` peak RSS growth stays within about 1× the output size.
+- **Effort:** M
+- **Confidence:** High
+- **Trade-off / challenge:** Hand-streamed JSON must stay byte-identical to `encoding/json`. Keep a golden comparison test.
 
 ## Challenge & Decisions
 
-1. Should a confidence-interval tie mean overlap with the score-order leader, or the transitive closure of all overlaps? The former avoids broad chain ties and aligns with current prose; the latter is mathematically transitive but can group endpoints whose intervals do not overlap each other.
-2. Should replacing an existing output file preserve its exact permission bits, or should SpeeDNS introduce an explicit report-mode policy? Silent normalization to the current umask is the unsafe middle ground.
-3. Is one reconnect-excluded sample acceptable at small sample sizes, or should preparation guarantee that every reusable session is freshly warmed at the measurement boundary? A deterministic fixture should decide whether E-001 earns implementation complexity.
+1. **Is a resolver with 1–2/200 scoring failures a legitimate co-winner with a zero-failure leader?** The statistics say the two are "not distinguishable", but users act on RECOMMENDED. Decide whether reliability participates in tie ordering (R-002, reliability-aware key) or in tie membership (point-score-inside-CI). Field data on how often rank 1 carries scoring failures would justify moving R-002 back to P2.
+2. **Should every gate fail closed when it has no evidence?** R-001 (zero scored samples) and R-005 (zero compared endpoints) are the same class of defect as #106. Recommendation: yes, uniformly. Use exit 4 for "measured and failed" and exit 3 for "could not evaluate", and write that rule into METHODOLOGY once.
+3. **What is the `--output` contract?** If descriptor aliases (R-003) and early validation (R-004) are supported behaviour, they need tests on Linux and macOS and a documented list. Otherwise document `-` as the only supported stdout spelling. Silently rejecting after a full run is the worst option.
+4. **Are reports shareable artefacts by default?** If yes, R-006's JSON escaping and R-016's credential and redaction gaps move up to P2. If reports are private operator output, they stay P3.
+5. **Is a compromised main-branch workflow in the release threat model?** R-011 costs one line either way. E-001's job split is only worth its complexity if the answer is yes.
 
-**Recommended next slice:** Implement R-001 and R-002 together. They are bounded, independently testable P1 fixes that protect the headline decision and local report confidentiality without changing transport behavior, output schemas, or the scoring formula.
+**Recommended next slice:** R-001 plus the zero-compared refusal half of R-005, shipped together as "gates fail closed".
+
+- It removes the only paths where SpeeDNS tells CI everything is fine when it measured nothing.
+- Both changes are small, need no schema change, need no policy decision, and are fully covered by deterministic unit tests.
+- It beats starting with R-002, which needs the Challenge 1 decision first.
+- It beats the one-line quick wins (R-007, R-011, R-003), which are independent and can land in parallel.
 
 ## Delivery sequence
 
-1. R-001: replace the pairwise mixed-key comparator with explicit deterministic grouping, add permutation/property tests, and reconcile the methodology.
-2. R-002: preserve existing output permissions and add Linux/macOS mode regression coverage.
-3. R-003: make DoH media-type and body-limit validation exact.
-4. E-001: first add the aging fixture; implement the two-phase preparation change only if the fixture proves the expected sample loss.
+1. R-001 and R-005(a) together: gates fail closed. Then R-005(b) and (c): a direction-aware condition and all failures reported.
+2. R-002 once the tie policy is chosen, with R-012's documentation rewrite in the same change.
+3. Quick, independent fixes: R-007 (one line), R-011 (one line), then R-003 plus R-004 together, since they share the output-path code.
+4. R-006, escaping the DNSSEC, JSON and diff sinks, with the bidi extension optional.
+5. Transport and measurement correctness: R-024 (two small DoH changes), R-008, R-009, and R-010 (code option).
+6. Cache-miss mode: R-025, then R-026's wording and warning fixes in the same pass.
+7. P3 parking lot and enhancements as capacity allows. E-001 depends on the answer to Challenge 5.
 
 ## Validation performed and planned
 
-- **Performed:** `go test -count=1 ./...` — Pass
-- **Performed:** `go vet ./...` — Pass
-- **Performed:** `go test -count=1 -race ./internal/benchmark ./internal/transport ./cmd/speedns` — Pass
-- **Performed:** `bash scripts/coverage.sh` — Pass, 100.0% (3883/3883 statements)
-- **Performed:** `git diff --check` on the clean baseline — Pass
-- **Performed:** Comparator cycle/permutation diagnostic — Fail as intended; six permutations produced three different ranking orders
-- **Performed:** Existing restrictive output-mode reproduction — Fail as intended; `0600` became `0664`
-- **Performed:** Read-only GitHub issue/PR inventory — Pass; no duplicate of R-001 through E-001 is open
-- **Planned:** Full unit, race, vet, coverage, schema, cross-platform build, and package smoke gates after each selected implementation slice
+- **Performed:** `gofmt -l .` — Pass (no files)
+- **Performed:** `go vet ./...` and `GOOS=windows go vet ./...` — Pass
+- **Performed:** `go test -count=1 ./...` — Pass (13 packages)
+- **Performed:** `go test -count=1 -race ./...` — Pass
+- **Performed:** `bash scripts/coverage.sh` — Pass, 100.0% (3955/3955 statements)
+- **Performed:** `go mod tidy -diff` — Pass (no diff)
+- **Performed:** `staticcheck ./...` (local install) — Pass
+- **Performed:** `actionlint` v1.7.12, built offline from the module cache — Pass, 0 issues. `shellcheck`, `zizmor` and `govulncheck` are not installed — Not run.
+- **Performed:** Re-check of the 2026-08-30 fixes:
+  - Permutation-invariant ranking — sound.
+  - Output permissions preserved — sound.
+  - DoH media type and size cap — sound; the trailing-byte residual is in R-014.
+  - Two-phase preparation — implemented; progress regression in R-013.
+- **Performed:** Five review lenses (transport, benchmark and methodology, CLI/report/compare, inputs/platform, CI/release). Every candidate was then checked by 2–4 independent adversarial verifiers covering facts, reproduction, impact and fix soundness: 129 verifier runs.
+- **Performed:** A completeness pass. Three gap-hunters covered machine-output contracts, resource bounds and platform paths, and secondary modes and data scripts. They produced 24 candidates, each checked by two verifiers (48 runs). Every candidate survived in some form. Most were narrowed, and two P2 areas were added (R-024, R-025).
+- **Performed:** All reproductions used throwaway tests in exported copies outside the repository, against loopback, link-local and in-memory fakes only. Priorities reflect the verifiers' consensus except where a dissent or split is stated (R-002, R-028).
+- **Performed:** Working tree verified clean after the review (`git status --short` empty) apart from this report.
+- **Planned:** For each implemented slice, rerun the full unit, race, vet, Windows-vet, coverage, schema, golden-fixture and cross-platform build gates, plus the specific acceptance tests listed per item.
 
 ## GitHub publication
 
-- **Status:** Published 2026-08-30
-- **Selected IDs:** R-001, R-002, R-003, E-001
+- **Status:** Published 2026-10-23
+- **Selected IDs:** All (35 items: every actionable `P0`–`P3` item, selected by the user)
+- **Disclosure note:** Issues are public. Concrete exploit payloads (terminal-escape strings in R-006, the Ruby-interpolation tag in R-021) were described rather than reproduced in the issue bodies; this report retains them.
 - **Issue URLs:**
-  - R-001: https://github.com/crypt0rr/SpeeDNS/issues/196
-  - R-002: https://github.com/crypt0rr/SpeeDNS/issues/197
-  - R-003: https://github.com/crypt0rr/SpeeDNS/issues/198
-  - E-001: https://github.com/crypt0rr/SpeeDNS/issues/199
+  - R-001: https://github.com/crypt0rr/SpeeDNS/issues/226
+  - R-002: https://github.com/crypt0rr/SpeeDNS/issues/227
+  - R-003: https://github.com/crypt0rr/SpeeDNS/issues/228
+  - R-004: https://github.com/crypt0rr/SpeeDNS/issues/229
+  - R-005: https://github.com/crypt0rr/SpeeDNS/issues/230
+  - R-006: https://github.com/crypt0rr/SpeeDNS/issues/231
+  - R-007: https://github.com/crypt0rr/SpeeDNS/issues/232
+  - R-008: https://github.com/crypt0rr/SpeeDNS/issues/233
+  - R-009: https://github.com/crypt0rr/SpeeDNS/issues/234
+  - R-010: https://github.com/crypt0rr/SpeeDNS/issues/235
+  - R-011: https://github.com/crypt0rr/SpeeDNS/issues/236
+  - R-024: https://github.com/crypt0rr/SpeeDNS/issues/237
+  - R-025: https://github.com/crypt0rr/SpeeDNS/issues/238
+  - R-012: https://github.com/crypt0rr/SpeeDNS/issues/239
+  - R-013: https://github.com/crypt0rr/SpeeDNS/issues/240
+  - R-014: https://github.com/crypt0rr/SpeeDNS/issues/241
+  - R-015: https://github.com/crypt0rr/SpeeDNS/issues/242
+  - R-016: https://github.com/crypt0rr/SpeeDNS/issues/243
+  - R-017: https://github.com/crypt0rr/SpeeDNS/issues/244
+  - R-018: https://github.com/crypt0rr/SpeeDNS/issues/245
+  - R-019: https://github.com/crypt0rr/SpeeDNS/issues/246
+  - R-020: https://github.com/crypt0rr/SpeeDNS/issues/247
+  - R-021: https://github.com/crypt0rr/SpeeDNS/issues/248
+  - R-022: https://github.com/crypt0rr/SpeeDNS/issues/249
+  - R-023: https://github.com/crypt0rr/SpeeDNS/issues/250
+  - R-026: https://github.com/crypt0rr/SpeeDNS/issues/251
+  - R-027: https://github.com/crypt0rr/SpeeDNS/issues/252
+  - R-028: https://github.com/crypt0rr/SpeeDNS/issues/253
+  - R-029: https://github.com/crypt0rr/SpeeDNS/issues/254
+  - R-030: https://github.com/crypt0rr/SpeeDNS/issues/255
+  - E-001: https://github.com/crypt0rr/SpeeDNS/issues/256
+  - E-002: https://github.com/crypt0rr/SpeeDNS/issues/257
+  - E-003: https://github.com/crypt0rr/SpeeDNS/issues/258
+  - E-004: https://github.com/crypt0rr/SpeeDNS/issues/259
+  - E-005: https://github.com/crypt0rr/SpeeDNS/issues/260
