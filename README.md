@@ -733,12 +733,34 @@ run leaves the previous file untouched, and the replacement gets the
 permissions an ordinary shell redirection would produce, narrowed by your
 umask. Destinations that cannot be replaced
 that way are written in place instead, so `--output /dev/null`, a named pipe,
-and a writable file in a directory that rejects new entries all work. On
-systems that expose them, `/proc/self/fd/N` descriptor paths are also written
-in place. Other symlink destinations, including dangling symlinks, are rejected
-before writing, leaving the link and its referent unchanged. An in-place
-destination can keep partial output after a failed run. A destination that is
-a directory is rejected.
+and a writable file in a directory that rejects new entries all work. On Unix
+systems a regular file with more than one hard link is also written in place,
+so every name shows the new report. When the final rename is refused because
+the destination is a mount point, such as a single-file bind mount in a
+container, the finished report is copied into it rather than discarded; if
+that copy fails, the temporary file holding the complete report is kept and
+named in the error. Writing in place gives up atomicity: an in-place
+destination, these two included, can keep partial output after a failed run
+or write. An existing file you cannot write is refused rather than replaced, as
+a shell redirection would refuse it, and a destination that is a directory or
+a socket is rejected.
+
+The descriptor aliases `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`,
+`/proc/self/fd/N` and `/proc/thread-self/fd/N` are written in place on systems
+that provide them, when spelled exactly like that. They include the
+`/dev/fd/N` paths that process substitution such as `--output >(jq .)` hands
+out. An alias is opened anew and truncated like any other destination, so on
+Linux `--output /dev/stdout >> run.log` overwrites `run.log` instead of
+appending to it; leave `--output` out to let the shell append. A symlink of
+your own is written through only when it points at a named pipe, a terminal or
+other character device. Any other symlink destination, including one to a
+regular file, a directory or a socket and a dangling one, is rejected before
+writing, leaving the link and its referent unchanged.
+
+`run` checks the destination before it sends the first query, so a missing
+directory, a rejected symlink or an unwritable file fails with status 2 instead
+of costing a whole benchmark. The path can still change while the benchmark
+runs, so it is checked again when the report is written.
 
 The versioned JSON contract is published as
 [`schema/report-v1.json`](schema/report-v1.json). It describes the current
@@ -792,6 +814,13 @@ of `report-v1.json`.
 
 There is no CSV form for a diff. A comparison is not a per-target row set with
 stable columns, and the report CSV's append-only contract is not forked.
+
+The two inputs do not have to be regular files: a pipe, `/dev/stdin` and
+process substitution such as `speedns diff <(gunzip -c last.json.gz) now.json`
+are read the same way. Each input is read up to 256 MiB, far more than a
+default report, so an endless stream such as `/dev/zero` fails with status 2 and a size
+error instead of exhausting memory. `--output` for a diff follows the same
+rules as for a run.
 
 The two fields a machine consumer needs first are `comparable` and `blockers`.
 When `comparable` is false the document carries no count from either report,

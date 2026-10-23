@@ -1037,6 +1037,11 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if err := validateAssertionTargets(assertions, targets); err != nil {
 		return err
 	}
+	// The destination is otherwise first touched after the benchmark, so a
+	// mistyped --output would cost a whole run and its results.
+	if err := preflightOutput(config.output); err != nil {
+		return err
+	}
 	seed := config.seed
 	if seed == 0 {
 		seed = time.Now().UnixNano()
@@ -1435,6 +1440,19 @@ var createOutputProbeFile = func(path string) (io.Closer, error) {
 	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, ordinaryFileMode)
 }
 
+// syncOutputDirectory flushes the directory entry a rename just changed. The
+// rename is atomic but not yet durable: until the directory itself reaches
+// stable storage, a crash shortly after the run can bring back the previous
+// report. Callers treat it as best effort, because some platforms cannot sync
+// a directory handle at all and the report is already complete either way.
+var syncOutputDirectory = func(directory string) error {
+	handle, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	return errors.Join(handle.Sync(), handle.Close())
+}
+
 // ordinaryFileMode is the permission set an ordinary file creation asks for
 // before the process umask narrows it. os.CreateTemp instead forces 0600, so a
 // report written with --output would stay unreadable to everyone but its owner
@@ -1493,71 +1511,211 @@ func directOutputWriter(path string, syncOnCommit bool) (io.Writer, outputFinali
 	return file, finalize, nil
 }
 
-// isProcFDOutputPath recognizes the descriptor aliases the CLI documents as
-// output destinations. These procfs entries are symlinks by design, but they
-// refer to already-open descriptors and must be written through in place.
-// Other symlink destinations are rejected so an atomic rename cannot silently
-// replace the link itself.
-func isProcFDOutputPath(path string) bool {
-	const prefix = "/proc/self/fd/"
-	if !filepath.IsAbs(path) {
+// isDescriptorOutputPath recognizes the spellings that address an already-open
+// descriptor rather than a file: /dev/stdout, /dev/stderr, /dev/fd/N,
+// /proc/self/fd/N and /proc/thread-self/fd/N. They are symlinks on Linux, and
+// /dev/stdout is one on macOS too, yet shells hand them out for redirection
+// and process substitution, so they are written through in place. Matching the
+// spelling instead of following every link keeps other symlinks rejected: an
+// atomic rename over /dev/stdout, which root may perform, would replace the
+// link itself. Only the exact clean absolute forms match.
+func isDescriptorOutputPath(path string) bool {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return false
 	}
-	cleanPath := filepath.Clean(path)
-	if cleanPath != path || !strings.HasPrefix(cleanPath, prefix) {
-		return false
+	if path == "/dev/stdout" || path == "/dev/stderr" {
+		return true
 	}
-	descriptor := strings.TrimPrefix(cleanPath, prefix)
-	if strings.ContainsRune(descriptor, filepath.Separator) {
-		return false
+	for _, prefix := range []string{"/dev/fd/", "/proc/self/fd/", "/proc/thread-self/fd/"} {
+		if descriptor, found := strings.CutPrefix(path, prefix); found {
+			value, err := strconv.ParseUint(descriptor, 10, 64)
+			return err == nil && strconv.FormatUint(value, 10) == descriptor
+		}
 	}
-	value, err := strconv.ParseUint(descriptor, 10, 64)
-	return err == nil && strconv.FormatUint(value, 10) == descriptor
+	return false
 }
 
-// outputWriter replaces a regular destination atomically: the report is
-// written to a temporary file in the destination directory and renamed over
-// the target only after a successful run. Destinations that cannot be
-// replaced that way are written in place instead. That covers non-regular
-// files such as /dev/null and named pipes, writable regular files inside
-// directories that reject new entries, and /proc/self/fd/N descriptor paths.
-func outputWriter(path string) (io.Writer, outputFinalizer, error) {
+// streamOutputModes are the referents a user symlink may name and still be
+// written through: named pipes, terminals and other character devices.
+// Writing into one delivers the bytes where the link points and cannot replace
+// the link, which is also what a shell redirection through it does. A socket
+// is deliberately absent: no supported system can open(2) one, so accepting it
+// would only move the failure to after the run.
+const streamOutputModes = fs.ModeNamedPipe | fs.ModeCharDevice
+
+// outputDestinationKind is how a report reaches the --output destination.
+type outputDestinationKind int
+
+const (
+	// outputToStdout writes to standard output.
+	outputToStdout outputDestinationKind = iota
+	// outputInPlace opens the destination itself and writes into it.
+	outputInPlace
+	// outputReplace writes a temporary file beside the destination and renames
+	// it over the destination once the report is complete.
+	outputReplace
+)
+
+// outputDestination is the decision classifyOutputPath makes about a path
+// before anything is opened or created.
+type outputDestination struct {
+	kind outputDestinationKind
+	// syncOnCommit flushes an in-place destination. It is set only for
+	// regular files, because flushing a device or a pipe is not meaningful.
+	syncOnCommit bool
+	// existing marks a replacement that takes over a regular file, whose
+	// permissions existingMode carries over to the new report.
+	existing     bool
+	existingMode fs.FileMode
+}
+
+// classifyOutputPath decides how --output will deliver a report to path,
+// without opening a pipe or device and without creating or truncating
+// anything. preflightOutput and outputWriter both rely on it, so the check made
+// before a run cannot drift from the decision made after it.
+func classifyOutputPath(path string) (outputDestination, error) {
 	if strings.TrimSpace(path) == "" || path == "-" {
-		return os.Stdout, func(bool) error { return nil }, nil
+		return outputDestination{kind: outputToStdout}, nil
+	}
+	if isDescriptorOutputPath(path) {
+		// Follow the alias to the descriptor it names. A closed descriptor
+		// fails here, before the run, instead of when the report is opened.
+		info, err := statOutputPath(path)
+		if err != nil {
+			return outputDestination{}, fmt.Errorf("inspect output path: %w", err)
+		}
+		if info.IsDir() {
+			return outputDestination{}, fmt.Errorf("output path is a directory: %s", path)
+		}
+		return outputDestination{kind: outputInPlace, syncOnCommit: info.Mode().IsRegular()}, nil
 	}
 	info, err := lstatOutputPath(path)
 	if err == nil && info.Mode()&fs.ModeSymlink != 0 {
-		if !isProcFDOutputPath(path) {
-			return nil, nil, fmt.Errorf("output path is a symlink: %s", path)
+		// A link to a regular file, a directory or nothing at all is refused,
+		// because the atomic rename would replace the link rather than the
+		// file it names.
+		referent, statErr := statOutputPath(path)
+		if statErr == nil && referent.Mode()&streamOutputModes != 0 {
+			return outputDestination{kind: outputInPlace}, nil
 		}
-		// Descriptor paths are pseudo-links used to address an already-open
-		// file, pipe or device. Preserve the existing direct-write behavior
-		// rather than trying to create a temporary entry beside a procfs link.
-		info, err = statOutputPath(path)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, nil, fmt.Errorf("inspect output path: %w", err)
-		}
-		if err == nil && info.IsDir() {
-			return nil, nil, fmt.Errorf("output path is a directory: %s", path)
-		}
-		return directOutputWriter(path, err == nil && info.Mode().IsRegular())
+		return outputDestination{}, fmt.Errorf("output path is a symlink: %s", path)
 	}
-	var existingMode fs.FileMode
-	preserveExistingMode := false
 	switch {
 	case err == nil && info.IsDir():
-		return nil, nil, fmt.Errorf("output path is a directory: %s", path)
+		return outputDestination{}, fmt.Errorf("output path is a directory: %s", path)
+	case err == nil && info.Mode()&fs.ModeSocket != 0:
+		// Opening a socket by name fails with ENXIO on Linux and EOPNOTSUPP
+		// on macOS and the BSDs, so refuse it now rather than after the run.
+		return outputDestination{}, fmt.Errorf("output path is a socket: %s", path)
 	case err == nil && !info.Mode().IsRegular():
-		return directOutputWriter(path, false)
+		return outputDestination{kind: outputInPlace}, nil
 	case err == nil:
-		existingMode = info.Mode().Perm()
-		preserveExistingMode = true
-	case err != nil && !errors.Is(err, os.ErrNotExist):
-		return nil, nil, fmt.Errorf("inspect output path: %w", err)
+		// A shell redirection refuses a file the caller may not write, while
+		// a rename would replace it regardless of its permissions.
+		if writeErr := probeOutputWritable(path); writeErr != nil {
+			return outputDestination{}, fmt.Errorf("output path is not writable: %w", writeErr)
+		}
+		if outputLinkCount(info) > 1 {
+			// A rename would detach this name from the file's other hard
+			// links, which would keep showing the previous report.
+			return outputDestination{kind: outputInPlace, syncOnCommit: true}, nil
+		}
+		return outputDestination{kind: outputReplace, existing: true, existingMode: info.Mode().Perm()}, nil
+	case !errors.Is(err, os.ErrNotExist):
+		return outputDestination{}, fmt.Errorf("inspect output path: %w", err)
 	}
-	directory := filepath.Dir(path)
-	base := filepath.Base(path)
-	file, err := createTempOutputFile(directory, "."+base+".speedns-*")
+	return outputDestination{kind: outputReplace}, nil
+}
+
+// probeOutputWritable opens an existing regular file for writing without
+// truncating it, which is the permission check a shell redirection makes. The
+// open does not block: if the path became a named pipe after it was inspected,
+// waiting for a reader would hang the preflight before the run, so the probe
+// fails instead. Windows ignores the flag.
+func probeOutputWritable(path string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+// temporaryOutputPattern names the hidden temporary file a replacement is
+// written to. It lives in the destination's own directory so the final rename
+// never has to cross a filesystem.
+func temporaryOutputPattern(path string) (directory, pattern string) {
+	return filepath.Dir(path), "." + filepath.Base(path) + ".speedns-*"
+}
+
+// preflightOutput checks --output before the benchmark sends a query, so an
+// unusable destination exits with status 2 instead of discarding a finished
+// run. It never opens a pipe or device and never truncates anything: a named
+// pipe would block until a reader appeared, and an in-place file would be
+// emptied before a run that might still fail. An existing regular file is
+// opened for writing only to check its permissions, and left as it was. The
+// one probe it adds is for a file that does not exist yet. That file is
+// created by renaming a temporary file into place, so a throwaway temporary
+// file shows whether the directory accepts one. The check is advisory, because
+// the path can change while the benchmark runs; outputWriter makes the
+// authoritative decision when it opens the destination afterwards.
+func preflightOutput(path string) error {
+	destination, err := classifyOutputPath(path)
+	if err != nil || destination.kind != outputReplace || destination.existing {
+		return err
+	}
+	directory, pattern := temporaryOutputPattern(path)
+	probe, err := createTempOutputFile(directory, pattern)
+	if err != nil {
+		return fmt.Errorf("create temporary output file: %w", err)
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	_ = removeOutputFile(name)
+	return nil
+}
+
+// copyOutputInPlace writes a finished temporary report into the destination
+// itself, for a destination no rename can replace. Like every in-place write it
+// gives up atomicity: a failure part-way can leave the destination truncated.
+func copyOutputInPlace(temporaryPath, path string) error {
+	source, err := os.Open(temporaryPath)
+	if err != nil {
+		return fmt.Errorf("reopen temporary output file: %w", err)
+	}
+	defer source.Close()
+	writer, finalize, err := directOutputWriter(path, true)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(writer, source); err != nil {
+		_ = finalize(false)
+		return fmt.Errorf("copy output file: %w", err)
+	}
+	return finalize(true)
+}
+
+// outputWriter delivers a report the way classifyOutputPath decided. A regular
+// destination is replaced atomically: the report is written to a temporary file
+// in the destination directory and renamed over the target only after a
+// successful run. Destinations that cannot be replaced that way are written in
+// place instead. That covers non-regular files such as /dev/null and named
+// pipes, descriptor aliases such as /dev/stdout and /proc/self/fd/N, symlinks
+// to a named pipe, terminal or other character device, regular files with more
+// than one hard link, writable regular files inside directories that reject
+// new entries, and mount points that refuse the final rename.
+func outputWriter(path string) (io.Writer, outputFinalizer, error) {
+	destination, err := classifyOutputPath(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch destination.kind {
+	case outputToStdout:
+		return os.Stdout, func(bool) error { return nil }, nil
+	case outputInPlace:
+		return directOutputWriter(path, destination.syncOnCommit)
+	}
+	directory, pattern := temporaryOutputPattern(path)
+	file, err := createTempOutputFile(directory, pattern)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			return directOutputWriter(path, true)
@@ -1586,8 +1744,8 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 			_ = removeOutputFile(temporaryPath)
 			return fmt.Errorf("close output file: %w", err)
 		}
-		if preserveExistingMode {
-			if err := chmodOutputFile(temporaryPath, existingMode); err != nil {
+		if destination.existing {
+			if err := chmodOutputFile(temporaryPath, destination.existingMode); err != nil {
 				_ = removeOutputFile(temporaryPath)
 				return fmt.Errorf("preserve output file mode: %w", err)
 			}
@@ -1599,10 +1757,29 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 				_ = chmodOutputFile(temporaryPath, mode)
 			}
 		}
-		if err := renameOutputFile(temporaryPath, path); err != nil {
-			_ = removeOutputFile(temporaryPath)
-			return fmt.Errorf("replace output file: %w", err)
+		renameErr := renameOutputFile(temporaryPath, path)
+		if renameErr == nil {
+			_ = syncOutputDirectory(directory)
+			return nil
 		}
+		if !errors.Is(renameErr, syscall.EBUSY) && !errors.Is(renameErr, syscall.EXDEV) {
+			_ = removeOutputFile(temporaryPath)
+			return fmt.Errorf("replace output file: %w", renameErr)
+		}
+		// The destination is a mount point, typically a single-file bind
+		// mount in a container, which no rename can replace. The report is
+		// already complete, so write it into the mounted file rather than
+		// throw the finished run away.
+		if copyErr := copyOutputInPlace(temporaryPath, path); copyErr != nil {
+			// The copy may have truncated the destination already, which
+			// leaves the temporary file as the only complete report. Keep it
+			// and name it, so a finished run can still be recovered.
+			if _, statErr := os.Stat(temporaryPath); statErr == nil {
+				return fmt.Errorf("replace output file: %v; write in place: %w; the complete report is kept at %s", renameErr, copyErr, temporaryPath)
+			}
+			return fmt.Errorf("replace output file: %v; write in place: %w", renameErr, copyErr)
+		}
+		_ = removeOutputFile(temporaryPath)
 		return nil
 	}
 	return file, finalize, nil

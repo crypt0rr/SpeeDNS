@@ -12,9 +12,11 @@
 package compare
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -105,12 +107,25 @@ type DNSSEC struct {
 	Verdict string `json:"verdict"`
 }
 
+// maxReportBytes caps how much of one diff input is read. A default report
+// stays far below it; only --raw samples over a large custom --domains corpus
+// can approach it, because their size grows with the corpus. The cap exists so
+// an endless stream such as /dev/zero ends in a usage error instead of
+// exhausting memory. It is a variable only so tests can exercise the cap
+// without a stream of this size.
+var maxReportBytes int64 = 256 << 20
+
+// reportReadChunk is how much of an input is read into one buffer.
+const reportReadChunk = 1 << 20
+
 // Load reads a published report. It decodes only the fields this package uses,
 // so a report carrying keys it does not know about is read without complaint.
+// The path need not be a regular file: a pipe, /dev/stdin and a shell's
+// process substitution are read the same way, up to maxReportBytes.
 func Load(path string) (Report, error) {
-	content, err := os.ReadFile(path)
+	content, err := readReportInput(path)
 	if err != nil {
-		return Report{}, fmt.Errorf("read %s: %w", path, err)
+		return Report{}, err
 	}
 	var loaded Report
 	if err := json.Unmarshal(content, &loaded); err != nil {
@@ -130,6 +145,58 @@ func Load(path string) (Report, error) {
 		return Report{}, fmt.Errorf("%s has no run.provenance; it cannot be checked for comparability", path)
 	}
 	return loaded, nil
+}
+
+// readReportInput returns the whole input at path, refusing one larger than
+// maxReportBytes. A regular file states its size, so one past the cap is
+// refused before any of it is read, and one within it is read into a single
+// buffer of that size, as os.ReadFile would. Anything else is read in fixed
+// chunks that are joined only once the input has ended within the cap.
+// Regrowing a single buffer instead would keep every outgrown copy alive until
+// the next garbage collection, so an endless stream would cost several times
+// the cap before it was refused; chunks cost the cap and no more.
+func readReportInput(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	defer file.Close()
+	limit := fmt.Sprintf("the %d MiB limit for a report", maxReportBytes>>20)
+	chunkSize := int64(reportReadChunk)
+	if info, err := file.Stat(); err == nil && info.Mode().IsRegular() {
+		if info.Size() > maxReportBytes {
+			return nil, fmt.Errorf("%s is %d bytes, larger than %s", path, info.Size(), limit)
+		}
+		// One byte more than the file holds lets the first read reach its
+		// end, so a file that did not grow after Stat fills one buffer and is
+		// never copied to be joined. The floor keeps a file that reports no
+		// size, as procfs files do, from being read a byte at a time.
+		chunkSize = max(chunkSize, info.Size()+1)
+	}
+	// One byte past the cap tells an input of exactly the cap from a larger
+	// one without reading the rest of an endless stream.
+	input := io.LimitReader(file, maxReportBytes+1)
+	var chunks [][]byte
+	var total int64
+	for {
+		chunk := make([]byte, chunkSize)
+		n, err := io.ReadFull(input, chunk)
+		chunks = append(chunks, chunk[:n])
+		total += int64(n)
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+	}
+	if total > maxReportBytes {
+		return nil, fmt.Errorf("%s is larger than %s", path, limit)
+	}
+	if len(chunks) == 1 {
+		return chunks[0], nil
+	}
+	return bytes.Join(chunks, nil), nil
 }
 
 // resultByID indexes a report's results by target ID.

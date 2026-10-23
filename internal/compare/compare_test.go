@@ -542,6 +542,66 @@ func TestLoadRejectsUnusableInput(t *testing.T) {
 	if _, err := Load(filepath.Join(dir, "absent.json")); err == nil {
 		t.Fatal("a missing file must be an error")
 	}
+	// A directory opens on every supported platform but cannot be read.
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "read "+dir) {
+		t.Fatalf("Load(directory) = %v, want a read error", err)
+	}
+}
+
+// TestLoadCapsTheInputSize pins the boundary of the size cap: an input of
+// exactly maxReportBytes is still a report, one byte more is refused with an
+// error that names the limit. A regular file is refused by its size before it
+// is read, which the stated byte count in the error shows: a refusal made
+// while reading cannot know it. TestLoadStopsReadingAnEndlessStream covers
+// inputs without a size. The cap is lowered so the test needs no 256 MiB
+// fixture.
+func TestLoadCapsTheInputSize(t *testing.T) {
+	oldLimit := maxReportBytes
+	t.Cleanup(func() { maxReportBytes = oldLimit })
+	maxReportBytes = 1 << 20
+
+	document, err := os.ReadFile(writeReportFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// JSON permits trailing whitespace, so padding changes the size and
+	// nothing else.
+	padded := func(size int64) string {
+		path := filepath.Join(t.TempDir(), "padded.json")
+		content := append(append([]byte(nil), document...), bytes.Repeat([]byte(" "), int(size)-len(document))...)
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	if _, err := Load(padded(maxReportBytes)); err != nil {
+		t.Fatalf("an input of exactly the cap must load: %v", err)
+	}
+	oversized := padded(maxReportBytes + 1)
+	_, err = Load(oversized)
+	if err == nil || !strings.Contains(err.Error(), oversized) || !strings.Contains(err.Error(), "1 MiB limit") ||
+		!strings.Contains(err.Error(), "is 1048577 bytes") {
+		t.Fatalf("an input past the cap = %v, want an error naming the path, its size and the limit", err)
+	}
+}
+
+// TestReadReportInputReadsARegularFileIntoOneBuffer pins that the cap did not
+// double the memory a large report costs. A regular file states its size, so
+// it is read into one buffer of that size, as os.ReadFile would, instead of
+// into chunks that are then copied into a second buffer to be joined.
+func TestReadReportInputReadsARegularFileIntoOneBuffer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.json")
+	want := bytes.Repeat([]byte(" "), 3*reportReadChunk+7)
+	if err := os.WriteFile(path, want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	content, err := readReportInput(path)
+	if err != nil || !bytes.Equal(content, want) {
+		t.Fatalf("readReportInput = %d bytes/%v, want %d bytes", len(content), err, len(want))
+	}
+	if cap(content) != len(want)+1 {
+		t.Fatalf("a %d-byte file was read into a %d-byte buffer, want one buffer of its size plus one", len(want), cap(content))
+	}
 }
 
 // TestRequireDetailsEscapeReportText covers the gate's failure message. It is

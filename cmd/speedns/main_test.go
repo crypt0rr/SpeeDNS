@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -325,8 +326,10 @@ func TestOutputWriterRejectsSymlinkDestinations(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		hasReferent bool
+		isDirectory bool
 	}{
 		{name: "to existing file", hasReferent: true},
+		{name: "to directory", isDirectory: true},
 		{name: "dangling"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -336,6 +339,11 @@ func TestOutputWriterRejectsSymlinkDestinations(t *testing.T) {
 			const original = "keep this referent"
 			if tc.hasReferent {
 				if err := os.WriteFile(referent, []byte(original), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.isDirectory {
+				if err := os.Mkdir(referent, 0o700); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -356,43 +364,73 @@ func TestOutputWriterRejectsSymlinkDestinations(t *testing.T) {
 			if target, err := os.Readlink(link); err != nil || target != filepath.Base(referent) {
 				t.Fatalf("output symlink target = %q/%v", target, err)
 			}
-			if tc.hasReferent {
+			switch {
+			case tc.hasReferent:
 				content, err := os.ReadFile(referent)
 				if err != nil || string(content) != original {
 					t.Fatalf("symlink referent = %q/%v", content, err)
 				}
-			} else if _, err := os.Stat(referent); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("dangling symlink referent unexpectedly exists: %v", err)
+			case tc.isDirectory:
+				if entries, err := os.ReadDir(referent); err != nil || len(entries) != 0 {
+					t.Fatalf("symlinked directory gained entries: %v/%v", entries, err)
+				}
+			default:
+				if _, err := os.Stat(referent); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("dangling symlink referent unexpectedly exists: %v", err)
+				}
+			}
+			// The preflight applies the same rule before a run starts.
+			if err := preflightOutput(link); err == nil || !strings.Contains(err.Error(), "output path is a symlink") {
+				t.Fatalf("symlink destination preflight error = %v", err)
 			}
 		})
 	}
 }
 
-func TestIsProcFDOutputPathRequiresCanonicalAbsolutePath(t *testing.T) {
-	for _, path := range []string{
-		"proc/self/fd/1",
-		"/tmp/output.json",
-		"/proc/self/fd/./1",
-		"/proc/self/fd/1/2",
-		"/proc/self/fd/+1",
-		"/proc/self/fd/01",
-		"/proc/self/fd/not-a-number",
+// TestIsDescriptorOutputPathAcceptsOnlyCanonicalAliases pins the spellings
+// that are written through in place without following the link. Anything
+// else that happens to be a symlink stays rejected, so the matcher must not
+// accept near misses such as relative, unclean or padded forms.
+func TestIsDescriptorOutputPathAcceptsOnlyCanonicalAliases(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{path: "/dev/stdout", want: true},
+		{path: "/dev/stderr", want: true},
+		{path: "/dev/fd/0", want: true},
+		{path: "/dev/fd/63", want: true},
+		{path: "/proc/self/fd/1", want: true},
+		{path: "/proc/thread-self/fd/2", want: true},
+		{path: "/dev/stdin"},
+		{path: "/dev/stdout/"},
+		{path: "/dev/./stdout"},
+		{path: "dev/stdout"},
+		{path: "/dev/fd"},
+		{path: "/dev/fd/"},
+		{path: "/dev/fd/-1"},
+		{path: "/dev/fd/1x"},
+		{path: "/proc/1/fd/1"},
+		{path: "/proc/thread-self/fd/01"},
+		{path: "proc/self/fd/1"},
+		{path: "/tmp/output.json"},
+		{path: "/proc/self/fd/./1"},
+		{path: "/proc/self/fd/1/2"},
+		{path: "/proc/self/fd/+1"},
+		{path: "/proc/self/fd/01"},
+		{path: "/proc/self/fd/not-a-number"},
 	} {
-		if isProcFDOutputPath(filepath.FromSlash(path)) {
-			t.Errorf("isProcFDOutputPath(%q) = true, want false", path)
+		// The aliases are POSIX paths, so on a platform with another
+		// separator nothing may match, including the canonical spellings.
+		want := tc.want && filepath.Separator == '/'
+		if got := isDescriptorOutputPath(filepath.FromSlash(tc.path)); got != want {
+			t.Errorf("isDescriptorOutputPath(%q) = %v, want %v", tc.path, got, want)
 		}
-	}
-	if filepath.Separator == '/' && !isProcFDOutputPath(filepath.FromSlash("/proc/self/fd/1")) {
-		t.Fatal("canonical absolute proc fd path was not recognized")
 	}
 }
 
 func TestRunBenchmarkRejectsSymlinkOutput(t *testing.T) {
-	oldEngine := runBenchmarkEngine
-	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
-	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
-		return fakeCLIReport(), nil
-	}
+	engineCalls := countEngineCalls(t)
 
 	directory := t.TempDir()
 	referent := filepath.Join(directory, "referent.json")
@@ -413,6 +451,9 @@ func TestRunBenchmarkRejectsSymlinkOutput(t *testing.T) {
 	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "output path is a symlink") {
 		t.Fatalf("run output symlink error = %v", err)
 	}
+	if *engineCalls != 0 {
+		t.Fatalf("a refused symlink destination still ran the benchmark %d time(s)", *engineCalls)
+	}
 	linkInfo, err := os.Lstat(link)
 	if err != nil || linkInfo.Mode()&fs.ModeSymlink == 0 {
 		t.Fatalf("run changed output symlink: %v/%v", linkInfo, err)
@@ -423,6 +464,48 @@ func TestRunBenchmarkRejectsSymlinkOutput(t *testing.T) {
 	content, err := os.ReadFile(referent)
 	if err != nil || string(content) != original {
 		t.Fatalf("run symlink referent = %q/%v", content, err)
+	}
+}
+
+// TestOutputRefusesSocketsBeforeTheRun pins that a socket is never accepted
+// as a destination. Opening one by name fails on every supported system
+// (ENXIO on Linux, EOPNOTSUPP on macOS and the BSDs), so accepting it, through
+// a symlink or directly, would let the whole benchmark run and then replace
+// its exit status with 2 when the report could not be opened. Synthetic stat
+// results cover both spellings on every platform.
+func TestOutputRefusesSocketsBeforeTheRun(t *testing.T) {
+	oldStat, oldLstat := statOutputPath, lstatOutputPath
+	t.Cleanup(func() { statOutputPath, lstatOutputPath = oldStat, oldLstat })
+	socket := fakeOutputPathInfo{mode: fs.ModeSocket | 0o755}
+	for _, tc := range []struct {
+		name  string
+		lstat fakeOutputPathInfo
+		wants string
+	}{
+		{name: "symlink to a socket", lstat: fakeOutputPathInfo{mode: fs.ModeSymlink | 0o777}, wants: "output path is a symlink"},
+		{name: "socket", lstat: socket, wants: "output path is a socket"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engineCalls := countEngineCalls(t)
+			lstatOutputPath = func(string) (os.FileInfo, error) { return tc.lstat, nil }
+			statOutputPath = func(string) (os.FileInfo, error) { return socket, nil }
+			path := filepath.Join(t.TempDir(), "report.json")
+			if _, _, err := outputWriter(path); err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("writer error = %v, want %q", err, tc.wants)
+			}
+			if err := preflightOutput(path); err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("preflight error = %v, want %q", err, tc.wants)
+			}
+			config := cliConfigForTest(t)
+			config.output = path
+			err := runBenchmark(context.Background(), config)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) || exitCodeForError(err) != 2 {
+				t.Fatalf("run error = %v (exit %d), want %q with status 2", err, exitCodeForError(err), tc.wants)
+			}
+			if *engineCalls != 0 {
+				t.Fatalf("the benchmark ran %d time(s) for a socket destination", *engineCalls)
+			}
+		})
 	}
 }
 
@@ -1355,10 +1438,12 @@ func TestRunBenchmarkFormatsAndRuntimeErrors(t *testing.T) {
 			t.Fatalf("format %s output = %q/%v", format, content, err)
 		}
 	}
+	// The preflight refuses this before the run; the post-run refusal is
+	// pinned by TestRunBenchmarkReportsADestinationThatBreaksDuringTheRun.
 	config := cliConfigForTest(t)
 	config.output = t.TempDir()
-	if err := runBenchmark(context.Background(), config); err == nil {
-		t.Fatal("expected output writer error")
+	if err := runBenchmark(context.Background(), config); err == nil || !strings.Contains(err.Error(), "output path is a directory") {
+		t.Fatalf("directory destination error = %v", err)
 	}
 
 	writeJSONReport = func(io.Writer, benchmark.Report, bool, report.JSONOptions) error {
@@ -1510,43 +1595,62 @@ func TestOutputWriterErrorPaths(t *testing.T) {
 		t.Fatalf("create output error = %v", err)
 	}
 
-	// Proc descriptor paths are symlinks too, but they retain direct-write
-	// behavior. Use a synthetic Lstat result so this branch is covered on
-	// systems with POSIX path syntax even when /proc itself is unavailable.
+	// Descriptor aliases are symlinks too, but they are written in place.
+	// Synthetic Stat results cover this branch on every system with POSIX
+	// path syntax, including those without Linux procfs. Lstat must not be
+	// consulted at all: on macOS /dev/fd/N is not a link, and a closed
+	// descriptor has no entry to inspect.
 	if filepath.Separator == '/' {
 		lstatOutputPath = func(string) (os.FileInfo, error) {
-			return fakeOutputPathInfo{mode: fs.ModeSymlink}, nil
+			return nil, errors.New("lstat must not inspect a descriptor alias")
 		}
-		statOutputPath = func(string) (os.FileInfo, error) { return nil, errors.New("stat failed") }
-		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "stat failed") {
-			t.Fatalf("proc descriptor inspection error = %v", err)
-		}
-		statOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
-		openOutputFile = func(string) (outputFileHandle, error) { return nil, errors.New("open failed") }
-		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "open failed") {
-			t.Fatalf("dangling proc descriptor open error = %v", err)
+		for _, alias := range []string{"/proc/self/fd/1", "/dev/stdout", "/dev/fd/3"} {
+			statOutputPath = func(string) (os.FileInfo, error) { return nil, errors.New("stat failed") }
+			if _, _, err := outputWriter(alias); err == nil || !strings.Contains(err.Error(), "stat failed") {
+				t.Fatalf("%s inspection error = %v", alias, err)
+			}
+			// A closed descriptor cannot be opened either, so it is refused
+			// before anything is written instead of after the run.
+			statOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+			if _, _, err := outputWriter(alias); !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), "inspect output path") {
+				t.Fatalf("%s closed descriptor error = %v", alias, err)
+			}
+			statOutputPath = func(string) (os.FileInfo, error) {
+				return fakeOutputPathInfo{mode: fs.ModeDir, isDir: true}, nil
+			}
+			if _, _, err := outputWriter(alias); err == nil || !strings.Contains(err.Error(), "output path is a directory") {
+				t.Fatalf("%s directory error = %v", alias, err)
+			}
 		}
 
-		// The successful descriptor inspection path must remain covered on
-		// POSIX systems that do not provide Linux procfs in the test runner.
 		statOutputPath = func(string) (os.FileInfo, error) {
 			return fakeOutputPathInfo{mode: 0o600}, nil
 		}
-		procFile := &fakeOutputFile{name: "proc-descriptor"}
-		openOutputFile = func(string) (outputFileHandle, error) { return procFile, nil }
-		writer, finalize, err := outputWriter("/proc/self/fd/1")
-		if err != nil || writer != procFile {
-			t.Fatalf("regular proc descriptor writer = %#v/%v", writer, err)
-		}
-		if err := finalize(true); err != nil {
-			t.Fatalf("regular proc descriptor finalize error = %v", err)
+		openOutputFile = func(string) (outputFileHandle, error) { return nil, errors.New("open failed") }
+		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "open failed") {
+			t.Fatalf("proc descriptor open error = %v", err)
 		}
 
-		statOutputPath = func(string) (os.FileInfo, error) {
-			return fakeOutputPathInfo{mode: fs.ModeDir, isDir: true}, nil
-		}
-		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "output path is a directory") {
-			t.Fatalf("directory proc descriptor error = %v", err)
+		// A regular referent is flushed on commit; a pipe or terminal is not.
+		for _, tc := range []struct {
+			mode     fs.FileMode
+			wantSync bool
+		}{
+			{mode: 0o600, wantSync: true},
+			{mode: fs.ModeNamedPipe | 0o600},
+		} {
+			statOutputPath = func(string) (os.FileInfo, error) {
+				return fakeOutputPathInfo{mode: tc.mode}, nil
+			}
+			procFile := &fakeOutputFile{name: "proc-descriptor", syncErr: errors.New("sync called")}
+			openOutputFile = func(string) (outputFileHandle, error) { return procFile, nil }
+			writer, finalize, err := outputWriter("/proc/self/fd/1")
+			if err != nil || writer != procFile {
+				t.Fatalf("proc descriptor writer for %v = %#v/%v", tc.mode, writer, err)
+			}
+			if err := finalize(true); (err != nil) != tc.wantSync {
+				t.Fatalf("proc descriptor finalize for %v = %v, want sync %v", tc.mode, err, tc.wantSync)
+			}
 		}
 	}
 	lstatOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
@@ -1783,6 +1887,425 @@ func TestOutputWriterFallsBackWhenTemporaryFilesAreRejected(t *testing.T) {
 	// written in place.
 	if _, _, err := outputWriter(t.TempDir()); err == nil || !strings.Contains(err.Error(), "is a directory") {
 		t.Fatalf("directory destination error = %v", err)
+	}
+}
+
+// countEngineCalls replaces the benchmark engine with a stub that returns the
+// fake report and counts how often the CLI asked it to measure.
+func countEngineCalls(t *testing.T) *int {
+	t.Helper()
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	calls := new(int)
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		*calls++
+		return fakeCLIReport(), nil
+	}
+	return calls
+}
+
+// failingWriteOutputFile is a destination whose writes fail. It deliberately
+// has no ReadFrom method, so io.Copy has to reach Write.
+type failingWriteOutputFile struct{}
+
+func (failingWriteOutputFile) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+func (failingWriteOutputFile) Sync() error               { return nil }
+func (failingWriteOutputFile) Close() error              { return nil }
+func (failingWriteOutputFile) Name() string              { return "failing-write" }
+
+// TestRunBenchmarkRejectsAnUnusableOutputBeforeMeasuring pins #229: the
+// destination used to be inspected only after the benchmark, so a mistyped
+// --output cost a whole run and replaced its exit status with 2. Every
+// destination outputWriter would refuse must now fail before the engine runs,
+// without creating anything at the destination.
+func TestRunBenchmarkRejectsAnUnusableOutputBeforeMeasuring(t *testing.T) {
+	engineCalls := countEngineCalls(t)
+	directory := t.TempDir()
+	regular := filepath.Join(directory, "regular.json")
+	if err := os.WriteFile(regular, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	type unusable struct {
+		name, output, wants string
+	}
+	cases := []unusable{
+		{name: "missing parent directory", output: filepath.Join(directory, "missing", "run.json"), wants: "create temporary output file"},
+		{name: "parent is a file", output: filepath.Join(regular, "run.json"), wants: "not a directory"},
+		{name: "directory", output: directory, wants: "output path is a directory"},
+	}
+	for _, link := range []struct{ name, referent string }{
+		{name: "symlink to a file", referent: "regular.json"},
+		{name: "symlink to a directory", referent: "."},
+		{name: "dangling symlink", referent: "absent.json"},
+	} {
+		path := filepath.Join(directory, strings.ReplaceAll(link.name, " ", "-"))
+		if err := os.Symlink(link.referent, path); err != nil {
+			t.Logf("skipping %s: %v", link.name, err)
+			continue
+		}
+		cases = append(cases, unusable{name: link.name, output: path, wants: "output path is a symlink"})
+	}
+	// Permission checks do not bind root, and directory modes do not bind
+	// anyone on Windows, so these cases run only where they can fail.
+	if os.Geteuid() != 0 && runtime.GOOS != "windows" {
+		readOnly := filepath.Join(directory, "read-only.json")
+		if err := os.WriteFile(readOnly, []byte("keep"), 0o444); err != nil {
+			t.Fatal(err)
+		}
+		locked := filepath.Join(directory, "locked")
+		if err := os.Mkdir(locked, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		cases = append(cases,
+			unusable{name: "read-only file", output: readOnly, wants: "output path is not writable"},
+			unusable{name: "new file in a read-only directory", output: filepath.Join(locked, "run.json"), wants: "create temporary output file"},
+		)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := os.ReadDir(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := cliConfigForTest(t)
+			config.output = tc.output
+			err = runBenchmark(context.Background(), config)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("run error = %v, want %q", err, tc.wants)
+			}
+			if code := exitCodeForError(err); code != 2 {
+				t.Fatalf("exit code = %d, want 2", code)
+			}
+			if *engineCalls != 0 {
+				t.Fatalf("the benchmark ran %d time(s) for an unusable destination", *engineCalls)
+			}
+			after, err := os.ReadDir(directory)
+			if err != nil || len(after) != len(before) {
+				t.Fatalf("the preflight left entries behind: %v -> %v (%v)", before, after, err)
+			}
+		})
+	}
+	if content, err := os.ReadFile(regular); err != nil || string(content) != "keep" {
+		t.Fatalf("a refused destination changed a file = %q/%v", content, err)
+	}
+}
+
+// TestRunBenchmarkPreflightAcceptsInPlaceDestinations pins the other half of
+// #229: the documented destinations that are written in place must still be
+// accepted before the run, because the preflight never opens or truncates
+// them and never asks their directory for a temporary file.
+func TestRunBenchmarkPreflightAcceptsInPlaceDestinations(t *testing.T) {
+	for _, path := range []string{"", " ", "-", os.DevNull} {
+		if err := preflightOutput(path); err != nil {
+			t.Fatalf("preflightOutput(%q) = %v", path, err)
+		}
+	}
+
+	engineCalls := countEngineCalls(t)
+	config := cliConfigForTest(t)
+	config.output = os.DevNull
+	if err := runBenchmark(context.Background(), config); err != nil || *engineCalls != 1 {
+		t.Fatalf("run to %s = %v after %d engine call(s)", os.DevNull, err, *engineCalls)
+	}
+
+	// An existing writable file in a directory that rejects new entries is
+	// written in place, so the preflight must not probe that directory. A
+	// failing temporary-file seam makes the check independent of the user.
+	oldCreate := createTempOutputFile
+	t.Cleanup(func() { createTempOutputFile = oldCreate })
+	createTempOutputFile = func(string, string) (outputFileHandle, error) {
+		return nil, fmt.Errorf("open .report.speedns-1: %w", os.ErrPermission)
+	}
+	existing := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(existing, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config = cliConfigForTest(t)
+	config.output = existing
+	if err := runBenchmark(context.Background(), config); err != nil || *engineCalls != 2 {
+		t.Fatalf("run to an existing file in a locked directory = %v after %d engine call(s)", err, *engineCalls)
+	}
+	if content, err := os.ReadFile(existing); err != nil || !strings.Contains(string(content), "\"results\"") {
+		t.Fatalf("in-place report = %q/%v", content, err)
+	}
+}
+
+// TestPreflightOutputRemovesItsProbe pins that probing a new destination
+// leaves nothing behind: the directory holds no report and no temporary file
+// until the run has finished.
+func TestPreflightOutputRemovesItsProbe(t *testing.T) {
+	directory := t.TempDir()
+	if err := preflightOutput(filepath.Join(directory, "report.json")); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(directory); err != nil || len(entries) != 0 {
+		t.Fatalf("the preflight probe was left behind: %v/%v", entries, err)
+	}
+}
+
+// TestRunBenchmarkReportsADestinationThatBreaksDuringTheRun keeps the post-run
+// check authoritative. The preflight is advisory, so a destination that turns
+// unusable while the benchmark runs must still be refused when the report is
+// written.
+func TestRunBenchmarkReportsADestinationThatBreaksDuringTheRun(t *testing.T) {
+	config := cliConfigForTest(t)
+	config.output = filepath.Join(t.TempDir(), "report.json")
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	calls := 0
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		calls++
+		if err := os.Mkdir(config.output, 0o700); err != nil {
+			t.Error(err)
+		}
+		return fakeCLIReport(), nil
+	}
+	err := runBenchmark(context.Background(), config)
+	if err == nil || !strings.Contains(err.Error(), "output path is a directory") || calls != 1 {
+		t.Fatalf("run error = %v after %d engine call(s), want the post-run directory error", err, calls)
+	}
+}
+
+// TestOutputWriterRefusesAFileTheCallerCannotWrite matches a shell
+// redirection, which fails on a read-only file for an ordinary user. Renaming
+// over the file would instead replace it regardless of the permissions that
+// say it must not change.
+func TestOutputWriterRefusesAFileTheCallerCannotWrite(t *testing.T) {
+	// A synthetic regular file that cannot be opened covers the refusal for
+	// every user, root included.
+	oldLstat := lstatOutputPath
+	t.Cleanup(func() { lstatOutputPath = oldLstat })
+	lstatOutputPath = func(string) (os.FileInfo, error) { return fakeOutputPathInfo{mode: 0o644}, nil }
+	missing := filepath.Join(t.TempDir(), "vanished.json")
+	if _, _, err := outputWriter(missing); err == nil || !strings.Contains(err.Error(), "output path is not writable") {
+		t.Fatalf("unopenable regular file error = %v", err)
+	}
+	lstatOutputPath = oldLstat
+
+	if os.Geteuid() == 0 {
+		t.Skip("root may write a read-only file, as a shell redirection run by root may")
+	}
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, []byte("keep"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	for name, check := range map[string]func() error{
+		"writer":    func() error { _, _, err := outputWriter(path); return err },
+		"preflight": func() error { return preflightOutput(path) },
+	} {
+		if err := check(); err == nil || !strings.Contains(err.Error(), "output path is not writable") {
+			t.Fatalf("%s error for a read-only file = %v", name, err)
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0o444 {
+		t.Fatalf("read-only file changed mode: %v/%v", info, err)
+	}
+	if content, err := os.ReadFile(path); err != nil || string(content) != "keep" {
+		t.Fatalf("read-only file changed = %q/%v", content, err)
+	}
+}
+
+// TestOutputLinkCountTreatsSyntheticInfoAsOneLink keeps a FileInfo that did
+// not come from the operating system on the ordinary replacement path.
+func TestOutputLinkCountTreatsSyntheticInfoAsOneLink(t *testing.T) {
+	if got := outputLinkCount(fakeOutputPathInfo{mode: 0o644}); got != 1 {
+		t.Fatalf("outputLinkCount(synthetic) = %d, want 1", got)
+	}
+}
+
+// TestOutputWriterWritesInPlaceWhenTheRenameHitsAMountPoint pins the
+// documented promise that a destination which cannot be replaced atomically is
+// written in place. A single-file bind mount, common in containers, refuses
+// the rename with EBUSY (EXDEV on some filesystems), and the finished report
+// used to be deleted along with the temporary file.
+func TestOutputWriterWritesInPlaceWhenTheRenameHitsAMountPoint(t *testing.T) {
+	oldRename := renameOutputFile
+	t.Cleanup(func() { renameOutputFile = oldRename })
+	for _, errno := range []syscall.Errno{syscall.EBUSY, syscall.EXDEV} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			directory := t.TempDir()
+			path := filepath.Join(directory, "report.json")
+			if err := os.WriteFile(path, []byte("a previous report longer than the new one"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			renames := 0
+			renameOutputFile = func(oldPath, newPath string) error {
+				renames++
+				return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: errno}
+			}
+			writer, finalize, err := outputWriter(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(writer, "new report"); err != nil {
+				t.Fatal(err)
+			}
+			if err := finalize(true); err != nil {
+				t.Fatalf("finalize after %v = %v", errno, err)
+			}
+			if content, err := os.ReadFile(path); err != nil || string(content) != "new report" {
+				t.Fatalf("destination after %v = %q/%v", errno, content, err)
+			}
+			after, err := os.Stat(path)
+			if err != nil || !os.SameFile(before, after) || after.Mode() != before.Mode() || renames != 1 {
+				t.Fatalf("destination was not written in place: %v -> %v (%v, %d rename(s))", before, after, err, renames)
+			}
+			if entries, err := os.ReadDir(directory); err != nil || len(entries) != 1 {
+				t.Fatalf("the temporary file was left behind: %v/%v", entries, err)
+			}
+		})
+	}
+}
+
+// TestOutputWriterReportsAFailedInPlaceFallback covers every way the in-place
+// copy after a refused rename can fail. Each failure is reported with the
+// rename error that caused the fallback. The copy may already have truncated
+// the destination, so the temporary file, then the only complete report, is
+// kept and named in the error instead of being deleted with the finished run.
+func TestOutputWriterReportsAFailedInPlaceFallback(t *testing.T) {
+	oldRename, oldOpen := renameOutputFile, openOutputFile
+	t.Cleanup(func() { renameOutputFile, openOutputFile = oldRename, oldOpen })
+	busy := func(oldPath, newPath string) error {
+		return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: syscall.EBUSY}
+	}
+	for _, tc := range []struct {
+		name   string
+		rename func(string, string) error
+		open   func(string) (outputFileHandle, error)
+		wants  string
+	}{
+		{
+			name: "temporary file vanished",
+			rename: func(oldPath, newPath string) error {
+				_ = os.Remove(oldPath)
+				return busy(oldPath, newPath)
+			},
+			open:  oldOpen,
+			wants: "reopen temporary output file",
+		},
+		{
+			name:  "destination cannot be opened",
+			open:  func(string) (outputFileHandle, error) { return nil, errors.New("open failed") },
+			wants: "open output file: open failed",
+		},
+		{
+			name:  "copy fails",
+			open:  func(string) (outputFileHandle, error) { return failingWriteOutputFile{}, nil },
+			wants: "copy output file: write failed",
+		},
+		{
+			name: "flush fails",
+			open: func(string) (outputFileHandle, error) {
+				return &fakeOutputFile{syncErr: errors.New("sync failed")}, nil
+			},
+			wants: "flush output file: sync failed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			renameOutputFile = busy
+			if tc.rename != nil {
+				renameOutputFile = tc.rename
+			}
+			openOutputFile = oldOpen
+			directory := t.TempDir()
+			writer, finalize, err := outputWriter(filepath.Join(directory, "report.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(writer, "finished report"); err != nil {
+				t.Fatal(err)
+			}
+			openOutputFile = tc.open
+			err = finalize(true)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) ||
+				!strings.Contains(err.Error(), "replace output file: rename") {
+				t.Fatalf("fallback error = %v, want %q after the rename error", err, tc.wants)
+			}
+			entries, readErr := os.ReadDir(directory)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if tc.rename != nil {
+				// Nothing is left to keep once the temporary file is gone,
+				// so the error must not point at it.
+				if len(entries) != 0 || strings.Contains(err.Error(), "kept at") {
+					t.Fatalf("a vanished temporary file was reported as kept: %v (%v)", err, entries)
+				}
+				return
+			}
+			if len(entries) != 1 {
+				t.Fatalf("the finished report was not kept: %v", entries)
+			}
+			kept := filepath.Join(directory, entries[0].Name())
+			if !strings.HasSuffix(err.Error(), "the complete report is kept at "+kept) {
+				t.Fatalf("fallback error = %v, want it to name %s", err, kept)
+			}
+			if content, err := os.ReadFile(kept); err != nil || string(content) != "finished report" {
+				t.Fatalf("kept report = %q/%v", content, err)
+			}
+		})
+	}
+}
+
+// TestOutputWriterSyncsTheDirectoryAfterARename pins that a replacement is
+// made durable, not only atomic, and that a platform which cannot sync a
+// directory still gets its report. Nothing is synced when no rename happened.
+func TestOutputWriterSyncsTheDirectoryAfterARename(t *testing.T) {
+	oldSync, oldRename := syncOutputDirectory, renameOutputFile
+	t.Cleanup(func() { syncOutputDirectory, renameOutputFile = oldSync, oldRename })
+	var synced []string
+	syncOutputDirectory = func(directory string) error {
+		synced = append(synced, directory)
+		return errors.New("directory sync unsupported")
+	}
+	directory := t.TempDir()
+	path := filepath.Join(directory, "report.json")
+	commit := func(commit bool) error {
+		t.Helper()
+		writer, finalize, err := outputWriter(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(writer, "report"); err != nil {
+			t.Fatal(err)
+		}
+		return finalize(commit)
+	}
+	if err := commit(true); err != nil {
+		t.Fatalf("a failed directory sync must not fail the run: %v", err)
+	}
+	if len(synced) != 1 || synced[0] != directory {
+		t.Fatalf("synced directories = %q, want [%q]", synced, directory)
+	}
+	if content, err := os.ReadFile(path); err != nil || string(content) != "report" {
+		t.Fatalf("report = %q/%v", content, err)
+	}
+
+	if err := commit(false); err != nil {
+		t.Fatal(err)
+	}
+	renameOutputFile = func(string, string) error { return errors.New("rename failed") }
+	if err := commit(true); err == nil {
+		t.Fatal("expected the rename error")
+	}
+	renameOutputFile = func(oldPath, newPath string) error {
+		return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: syscall.EBUSY}
+	}
+	if err := commit(true); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 1 {
+		t.Fatalf("a run without a rename synced %q", synced[1:])
+	}
+
+	if err := oldSync(filepath.Join(directory, "missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("syncing a missing directory = %v", err)
 	}
 }
 
