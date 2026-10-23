@@ -7,8 +7,19 @@ usage() {
 
 release_tag="${1:-}"
 repository="${2:-${GITHUB_REPOSITORY:-crypt0rr/SpeeDNS}}"
-if [[ -z "${release_tag}" || "${release_tag}" != v* ]]; then
+if [[ -z "${release_tag}" ]]; then
 	usage
+	exit 2
+fi
+# The same strict shape scripts/homebrew-cask.sh enforces (see the reasons
+# there), checked here so the Homebrew workflow stops before it fetches
+# anything for a crafted tag.
+valid_release_tag() {
+	local LC_ALL=C
+	[[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+}
+if ! valid_release_tag "${release_tag}"; then
+	echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: ${release_tag}" >&2
 	exit 2
 fi
 if ! command -v gh >/dev/null 2>&1; then

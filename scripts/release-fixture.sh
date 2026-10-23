@@ -135,6 +135,66 @@ if PATH="${validate_bin}:${PATH}" \
 	exit 1
 fi
 
+# Crafted tags. homebrew-cask.sh prints the version into a Ruby double-quoted
+# string, so each tag gets a checksums.txt that matches it exactly: the tag
+# check is then the only thing left to refuse it, and it must do so before
+# anything is written. The published-release check sees a release that exists
+# and is stable, so it too can only refuse on the tag. Both run under a UTF-8
+# locale, where bracket ranges follow collation order and [A-Za-z] would also
+# match the é below unless the check pins the C locale. (Where en_US.UTF-8 is
+# not installed, bash stays in C and that one case passes trivially.)
+printf '%s\n' published >"${fake_state}"
+# shellcheck disable=SC2016 # The backticks are the payload, not a command.
+crafted_tags=('v1.0.0#{`id`}' 'v1.0.0";system("id");"' 'v1.0.0;id' 'v1.0.0-rc.1#{1}' 'v1.0' 'v1.0.0-é')
+crafted_index=0
+for crafted_tag in "${crafted_tags[@]}"; do
+	crafted_dir="${fixture_dir}/crafted-${crafted_index}"
+	crafted_index=$((crafted_index + 1))
+	mkdir -p "${crafted_dir}"
+	for platform in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+		printf '%064d  SpeeDNS_%s_%s.tar.gz\n' 0 "${crafted_tag#v}" "${platform}"
+	done >"${crafted_dir}/checksums.txt"
+	if LC_ALL=en_US.UTF-8 bash "${root_dir}/scripts/homebrew-cask.sh" "${crafted_tag}" "${crafted_dir}" \
+		"${crafted_dir}/out/speedns.rb"; then
+		echo "homebrew-cask.sh accepted crafted tag ${crafted_tag}" >&2
+		exit 1
+	fi
+	if [[ -e "${crafted_dir}/out" ]]; then
+		echo "homebrew-cask.sh wrote output before refusing crafted tag ${crafted_tag}" >&2
+		exit 1
+	fi
+	if PATH="${validate_bin}:${PATH}" \
+		GH_TOKEN=fixture-token \
+		FAKE_RELEASE_STATE="${fake_state}" \
+		LC_ALL=en_US.UTF-8 \
+		bash "${root_dir}/scripts/validate-published-release.sh" "${crafted_tag}" "example/repository"; then
+		echo "validate-published-release.sh accepted crafted tag ${crafted_tag}" >&2
+		exit 1
+	fi
+done
+
+# Release-notes base. A stable release is measured from the highest stable tag
+# BELOW it, so a backport cut after a newer release (v0.5.3 after v0.6.1) does
+# not inherit the newer release as its base. v0.10.0 checks that the order is
+# by version rather than by text, and the non-release tags must be ignored.
+tag_list="$(printf '%s\n' v0.1.0-rc.1 v0.1.0 v0.5.1 v0.5.2 v0.6.0 v0.6.1 v0.7.0-rc.1 v0.10.0 v1.0 latest)"
+for case_spec in 'v0.5.3 v0.5.2' 'v0.6.2 v0.6.1' 'v0.6.1 v0.6.0' 'v0.7.0 v0.6.1' 'v0.11.0 v0.10.0' 'v0.1.0 none'; do
+	read -r release expected <<<"${case_spec}"
+	if [[ "${expected}" == none ]]; then
+		expected=""
+	fi
+	actual="$(printf '%s\n' "${tag_list}" | bash "${root_dir}/scripts/previous-stable-tag.sh" "${release}")"
+	if [[ "${actual}" != "${expected}" ]]; then
+		echo "previous stable tag for ${release} is '${actual}', expected '${expected}'" >&2
+		exit 1
+	fi
+done
+# Prereleases keep GoReleaser's default range, and sort -V cannot rank them.
+if printf '%s\n' "${tag_list}" | bash "${root_dir}/scripts/previous-stable-tag.sh" v0.7.0-rc.2; then
+	echo "previous-stable-tag.sh accepted a prerelease tag" >&2
+	exit 1
+fi
+
 bash "${root_dir}/scripts/release-assets.sh" verify "${fixture_dir}/first" \
 	"${fixture_dir}/first/release-assets.txt"
 bash "${root_dir}/scripts/homebrew-cask.sh" "v${version}" "${fixture_dir}/first" \

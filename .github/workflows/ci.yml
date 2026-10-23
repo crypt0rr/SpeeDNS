@@ -156,14 +156,21 @@ jobs:
       # not, such as an ineffective break inside a select and a value that is
       # assigned and never read - both of which were present in this tree and
       # are fixed in the same change that adds this gate.
+      #
+      # Pinned by module version, not by staticcheck's release name: v0.6.1 is
+      # the module version of release 2025.1.1. Renovate's go datasource knows
+      # only module versions, so the custom manager in renovate.json can find
+      # and bump this pin; a calendar version would never match an update.
       - name: Run staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
 
+      # scripts/testdata holds the fake CLIs the release fixtures put on PATH;
+      # they run in CI like any other script, so they are linted like one.
       - name: Run shellcheck
         shell: bash
         run: |
           set -euo pipefail
-          shellcheck --severity=style scripts/*.sh
+          shellcheck --severity=style scripts/*.sh scripts/testdata/*.sh
 
   cross-build:
     name: Cross-build release targets

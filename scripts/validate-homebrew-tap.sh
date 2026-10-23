@@ -12,8 +12,15 @@ if [[ -z "${release_tag}" ]]; then
 	usage
 	exit 2
 fi
-if [[ "${release_tag}" != v* ]]; then
-	echo "release tag must start with v: ${release_tag}" >&2
+# Strict, like scripts/homebrew-cask.sh (see the reasons there): the exact-line
+# version match below would otherwise accept an injected version line as
+# readily as a real one.
+valid_release_tag() {
+	local LC_ALL=C
+	[[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+}
+if ! valid_release_tag "${release_tag}"; then
+	echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: ${release_tag}" >&2
 	exit 2
 fi
 : "${GH_TOKEN:?GH_TOKEN is required}"

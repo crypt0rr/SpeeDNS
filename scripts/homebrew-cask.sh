@@ -12,8 +12,19 @@ if [[ -z "${release_tag}" || -z "${dist_dir}" || -z "${output}" ]]; then
 	usage
 	exit 2
 fi
-if [[ "${release_tag}" != v* ]]; then
-	echo "release tag must start with v: ${release_tag}" >&2
+# The version lands inside a Ruby double-quoted string in the cask, where #{...}
+# is interpolation, and Homebrew evaluates the cask on every user's machine. A
+# `v` prefix check let 'v1.0.0#{`id`}' through verbatim. Accept only the shape
+# a release tag can have, before the version is derived or any file written.
+#
+# The match runs in the C locale because bracket ranges follow the locale's
+# collation order: under en_US.UTF-8, [A-Za-z] also matches letters such as é.
+valid_release_tag() {
+	local LC_ALL=C
+	[[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+}
+if ! valid_release_tag "${release_tag}"; then
+	echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: ${release_tag}" >&2
 	exit 2
 fi
 if [[ ! -f "${dist_dir}/checksums.txt" ]]; then

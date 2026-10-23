@@ -3,5 +3,18 @@
   "extends": [
     "config:recommended",
     "helpers:pinGitHubActionDigests"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Go tools a workflow runs by module version, such as go run honnef.co/go/tools/cmd/staticcheck@v0.6.1. The dependency is the module before /cmd/, which is what the go datasource looks up.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "go run (?<depName>[^@\\s]+?)/cmd/[^@\\s]+@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "go"
+    }
   ]
 }

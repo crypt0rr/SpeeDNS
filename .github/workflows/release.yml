@@ -78,17 +78,10 @@ jobs:
             echo "prerelease ${RELEASE_TAG}: keeping GoReleaser's default range"
             exit 0
           fi
-          # Pure case matching rather than `grep -v -- '-'`, whose argument
-          # handling differs between grep implementations.
-          previous=""
-          while read -r candidate; do
-            case "${candidate}" in
-              *-*) continue ;;
-              "${RELEASE_TAG}") continue ;;
-            esac
-            previous="${candidate}"
-            break
-          done < <(git tag --list 'v*' --sort=-version:refname)
+          # The previous stable tag is the highest one BELOW this release, not
+          # the highest overall: a backport such as v0.5.3 cut after v0.6.1
+          # must be measured from v0.5.2. scripts/release-fixture.sh covers it.
+          previous="$(git tag --list 'v*' | bash scripts/previous-stable-tag.sh "${RELEASE_TAG}")"
           if [[ -z "${previous}" ]]; then
             echo "no earlier stable tag: keeping GoReleaser's default range"
             exit 0
@@ -111,11 +104,18 @@ jobs:
         shell: bash
         run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
+      # No cache, deliberately. A tag or dispatch run can restore the setup-go
+      # cache that main-branch CI, CodeQL and the scheduled live smoke save, and
+      # nothing here checks what it restores: `go mod verify` covers the module
+      # cache only, and GOCACHE entries are trusted as written. Both GoReleaser
+      # builds would read the same restored GOCACHE, so the reproducibility
+      # comparison cannot catch a planted entry either, and this is the job that
+      # signs and attests. A cold build costs a few minutes per release.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
       - name: Verify module metadata
         shell: bash
