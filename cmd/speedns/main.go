@@ -1075,6 +1075,9 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	corpusZone := ""
 	corpusNonce := ""
 	var domainList []string
+	// normalizedDomains stays empty for the generated cache-miss corpus: it
+	// holds at most 20 names, so the engine's own validation costs nothing.
+	var normalizedDomains domains.Normalized
 	var skippedDomains []string
 	if config.cacheMiss {
 		if strings.TrimSpace(config.domainFile) != "" {
@@ -1102,6 +1105,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			return loadErr
 		}
 		domainList = corpus.Names
+		normalizedDomains = corpus.Normalized()
 		skippedDomains = corpus.Skipped
 	}
 	selection, err := loadProfilesFunc(ctx, config)
@@ -1212,7 +1216,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	runContext, stop := interruptContext(ctx)
 	defer stop()
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
-		Domains: domainList, QueryTypes: queryTypes, Sample: engineSample, Full: config.full,
+		Domains: domainList, NormalizedDomains: normalizedDomains, QueryTypes: queryTypes, Sample: engineSample, Full: config.full,
 		Seed: seed, Timeout: config.timeout, Concurrency: effectiveConcurrency, Protocols: selected,
 		OnProgress: onProgress, DNSSEC: config.dnssec, CacheMiss: config.cacheMiss,
 	})
@@ -1323,6 +1327,10 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 // and telling the operator that targets did not complete made them distrust
 // it. The exit status stays 130 and assertions stay unevaluated either way:
 // the operator still asked the run to stop.
+//
+// The engine lists every selected target, an unmeasured one as incomplete, so
+// a target missing from the report would mean that contract broke; it is still
+// read as incomplete rather than trusted as complete.
 func interruptWarning(targets []catalog.Target, result benchmark.Report) string {
 	const incomplete = "benchmark interrupted before all targets completed"
 	reported := make(map[string]bool, len(result.Targets))

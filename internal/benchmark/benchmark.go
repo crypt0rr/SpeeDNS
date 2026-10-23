@@ -60,6 +60,17 @@ type Options struct {
 	Concurrency int
 	Protocols   []catalog.Protocol
 	OnProgress  func(Progress)
+	// NormalizedDomains is the corpus as the domains package already
+	// normalized it. Run validates and normalizes Domains itself, so a caller
+	// may pass names exactly as a user wrote them; a caller that loaded the
+	// corpus through the domains package passes this instead, or as well, so
+	// Run does not normalize every name a second time. When it holds names,
+	// Run samples from it and ignores Domains. Only the domains package can
+	// build a non-empty one, so every name in it was validated when it was
+	// built. Its Names share the loaded list rather than copying it, so that
+	// guarantee also needs the caller not to modify them, as the domains
+	// package requires; Run itself only shuffles a copy.
+	NormalizedDomains domains.Normalized
 	// CacheMiss reports that Domains holds generated reserved-zone names whose
 	// point is that no resolver has seen them. It changes how queries are
 	// built: a name is asked exactly one question rather than one per entry in
@@ -311,7 +322,9 @@ func (r Report) ResultFor(id string) (TargetResult, bool) {
 
 // Run executes one protocol group at a time. All targets in a group receive
 // the same shuffled query sequence. The production scheduler interleaves
-// measured rounds while bounding the number of in-flight exchanges.
+// measured rounds while bounding the number of in-flight exchanges. The report
+// lists every selected target, including after an interrupt: a target that was
+// not measured to completion is incomplete, never absent.
 func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, error) {
 	if err := validateOptions(opts); err != nil {
 		return Report{}, err
@@ -353,7 +366,18 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 	})
 
 	for _, protocol := range protocols {
-		groupResults := runProtocol(ctx, byProtocol[protocol], queries, opts)
+		var groupResults []TargetResult
+		if err := ctx.Err(); err != nil {
+			// A group the interrupt arrived before is never started: no
+			// session opens and no progress is reported for it. Its targets
+			// are still part of the selected comparison set, so the report
+			// lists each of them as incomplete rather than dropping the group,
+			// which made an interrupted report look like a change in the
+			// target set to speedns diff.
+			groupResults = unmeasuredResults(byProtocol[protocol], err)
+		} else {
+			groupResults = runProtocol(ctx, byProtocol[protocol], queries, opts)
+		}
 		report.Divergence = append(report.Divergence, markDivergence(groupResults)...)
 		for i := range groupResults {
 			groupResults[i].Stats = calculateStatistics(groupResults[i], opts.Timeout, opts.Seed)
@@ -377,7 +401,7 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 }
 
 func validateOptions(opts Options) error {
-	if len(opts.Domains) == 0 {
+	if len(opts.Domains) == 0 && len(opts.NormalizedDomains.Names()) == 0 {
 		return errors.New("domain corpus is empty")
 	}
 	if len(opts.QueryTypes) == 0 {
@@ -412,10 +436,15 @@ func distinctQueryNames(queries []Query) int {
 }
 
 func buildQueries(opts Options) ([]Query, error) {
-	names, err := domains.Normalize(opts.Domains)
-	if err != nil {
-		return nil, fmt.Errorf("domain corpus has no valid names: %w", err)
+	names := opts.NormalizedDomains.Names()
+	if len(names) == 0 {
+		normalized, err := domains.Normalize(opts.Domains)
+		if err != nil {
+			return nil, fmt.Errorf("domain corpus has no valid names: %w", err)
+		}
+		names = normalized
 	}
+	// The copy is shuffled, never the caller's list.
 	source := append([]string(nil), names...)
 	rng := rand.New(rand.NewSource(opts.Seed))
 	rng.Shuffle(len(source), func(i, j int) { source[i], source[j] = source[j], source[i] })
@@ -530,8 +559,17 @@ func runProtocolFair(ctx context.Context, targets []catalog.Target, queries []Qu
 		}
 	}
 
-	results := make([]TargetResult, 0, len(runners))
-	for _, runner := range runners {
+	// Every target the group was given is reported, in target-ID order.
+	// Dispatch stops only on cancellation, so a target that never reached a
+	// preparation worker -- with fewer workers than targets, the later ones
+	// wait for earlier cold probes to finish -- is listed as incomplete with
+	// the cancellation diagnostic and no observations, never dropped.
+	results := make([]TargetResult, 0, len(orderedTargets))
+	for index, runner := range prepared {
+		if !dispatched[index] || runner == nil {
+			results = append(results, unmeasuredResult(orderedTargets[index], ctx.Err()))
+			continue
+		}
 		runner.close()
 		results = append(results, runner.result)
 	}
@@ -930,6 +968,26 @@ func markIncomplete(result *TargetResult, err error) {
 	}
 }
 
+// unmeasuredResult represents a selected target that an interrupt kept from
+// ever reaching a worker. It carries the cancellation as its diagnostic and no
+// observations: nothing was measured, and cancellation never synthesizes a
+// sample. Listing it keeps an interrupted report's target set equal to the
+// selected one, so incompleteness is visible per target instead of as a
+// shorter report.
+func unmeasuredResult(target catalog.Target, err error) TargetResult {
+	result := TargetResult{Target: target}
+	markIncomplete(&result, err)
+	return result
+}
+
+func unmeasuredResults(targets []catalog.Target, err error) []TargetResult {
+	results := make([]TargetResult, 0, len(targets))
+	for _, target := range targets {
+		results = append(results, unmeasuredResult(target, err))
+	}
+	return results
+}
+
 func sessionDialAddress(session transport.Session) string {
 	type dialAddressSession interface {
 		DialAddress() string
@@ -1246,14 +1304,86 @@ func percentile(sorted []float64, p float64) float64 {
 	if len(sorted) == 1 {
 		return sorted[0]
 	}
-	position := p * float64(len(sorted)-1)
-	lower := int(math.Floor(position))
-	upper := int(math.Ceil(position))
+	lower, upper, weight := percentilePosition(len(sorted), p)
 	if lower == upper {
 		return sorted[lower]
 	}
-	weight := position - float64(lower)
-	return sorted[lower] + (sorted[upper]-sorted[lower])*weight
+	return interpolate(sorted[lower], sorted[upper], weight)
+}
+
+// percentilePosition locates percentile p among n >= 1 sorted values: the
+// indexes of the two values it interpolates between, equal when p lands on one
+// exactly, and the weight of the upper value. percentile and countedPercentile
+// both go through it and through interpolate, so a bootstrap replicate taken
+// from rank counts performs the very floating-point operations a sorted
+// resample would and rounds identically.
+//
+// The explicit float64 conversions here, in interpolate and in compositeScore
+// round every product before it is used. Go may otherwise
+// fuse a multiply and an add or subtract into one FMA instruction on arm64,
+// and whether it does depends on inlining and constant folding, so the same
+// statistic could differ in its last bit between call sites, between builds
+// and between amd64 and Apple silicon. Rounded products are what amd64 builds
+// have always computed, so results are unchanged there and now identical on
+// arm64 too.
+func percentilePosition(n int, p float64) (int, int, float64) {
+	position := float64(p * float64(n-1))
+	lower := int(math.Floor(position))
+	return lower, int(math.Ceil(position)), position - float64(lower)
+}
+
+func interpolate(lower, upper, weight float64) float64 {
+	return lower + float64((upper-lower)*weight)
+}
+
+// countedPercentile is percentile over the sorted multiset that holds
+// sorted[rank] counts[rank] times, total values in all.
+func countedPercentile(sorted []float64, counts []int, total int, p float64) float64 {
+	if total == 0 {
+		return 0
+	}
+	lower, upper, weight := percentilePosition(total, p)
+	lowerValue, upperValue := countedValues(sorted, counts, lower, upper)
+	if lower == upper {
+		return lowerValue
+	}
+	return interpolate(lowerValue, upperValue, weight)
+}
+
+// countedValues returns the values at positions lower <= upper of that sorted
+// multiset, walking the counts once.
+func countedValues(sorted []float64, counts []int, lower, upper int) (float64, float64) {
+	rank, seen := 0, counts[0]
+	for lower >= seen {
+		rank++
+		seen += counts[rank]
+	}
+	lowerValue := sorted[rank]
+	for upper >= seen {
+		rank++
+		seen += counts[rank]
+	}
+	return lowerValue, sorted[rank]
+}
+
+// rankValues returns values in ascending order, with NaN first exactly as
+// sort.Float64s orders them, and the position each value occupies there.
+// Values that compare equal are interchangeable: a latency or a difference of
+// two latencies is never negative zero, so equal values carry equal bits and
+// which of them is placed first cannot change a percentile.
+func rankValues(values []float64) ([]float64, []int) {
+	order := make([]int, len(values))
+	for index := range order {
+		order[index] = index
+	}
+	sort.Slice(order, func(i, j int) bool { return sort.Float64Slice(values).Less(order[i], order[j]) })
+	sorted := make([]float64, len(values))
+	ranks := make([]int, len(values))
+	for rank, index := range order {
+		sorted[rank] = values[index]
+		ranks[index] = rank
+	}
+	return sorted, ranks
 }
 
 func mad(sorted []float64, median float64) float64 {
@@ -1266,7 +1396,13 @@ func mad(sorted []float64, median float64) float64 {
 }
 
 func scoreFromLatencies(latencies []float64, failureRate, timeoutMS float64) float64 {
-	return 0.60*percentile(latencies, 0.50) + 0.40*percentile(latencies, 0.95) + failureRate*timeoutMS
+	return compositeScore(percentile(latencies, 0.50), percentile(latencies, 0.95), failureRate, timeoutMS)
+}
+
+// compositeScore is the documented score formula, written once so the point
+// estimate and every bootstrap replicate round it the same way.
+func compositeScore(median, p95, failureRate, timeoutMS float64) float64 {
+	return float64(0.60*median) + float64(0.40*p95) + float64(failureRate*timeoutMS)
 }
 
 func scoreFromSamples(samples []scoreSample, timeoutMS float64) float64 {
@@ -1298,19 +1434,61 @@ func bootstrapSeed(seed int64, targetID string) int64 {
 	return seed ^ int64(hasher.Sum64())
 }
 
+// bootstrapCI is the 95% percentile bootstrap of the composite score.
+//
+// A replicate draws len(samples) samples with replacement, and its score
+// depends only on how often each sample was drawn: the failure rate on the
+// failures drawn, the median and p95 on the drawn latencies in sorted order.
+// So the successful latencies are sorted once, each replicate counts how often
+// every rank is drawn, and its percentiles are read off the cumulative counts.
+// That is the multiset a sorted resample holds, built from the same draws of
+// the same seeded generator, so every interval is bit-identical to sorting
+// each resample. Sorting each resample instead allocated and sorted N values
+// for every one of the 1,000 replicates of every target, which held up a
+// --full run or a large corpus for seconds after its last measured round.
 func bootstrapCI(samples []scoreSample, timeout time.Duration, seed int64) (float64, float64) {
 	if len(samples) < 2 {
 		score := scoreFromSamples(samples, durationMS(timeout))
 		return score, score
 	}
-	rng := rand.New(rand.NewSource(seed))
-	scores := make([]float64, BootstrapIterations)
-	resample := make([]scoreSample, len(samples))
-	for iteration := range scores {
-		for index := range resample {
-			resample[index] = samples[rng.Intn(len(samples))]
+	timeoutMS := durationMS(timeout)
+	latencies := make([]float64, 0, len(samples))
+	for _, sample := range samples {
+		if sample.success {
+			latencies = append(latencies, sample.latencyMS)
 		}
-		scores[iteration] = scoreFromSamples(resample, durationMS(timeout))
+	}
+	sorted, latencyRanks := rankValues(latencies)
+	// ranks[i] is sample i's position among the sorted latencies, or -1 for a
+	// scoring failure, which has no latency to count.
+	ranks := make([]int, len(samples))
+	successes := 0
+	for index, sample := range samples {
+		ranks[index] = -1
+		if sample.success {
+			ranks[index] = latencyRanks[successes]
+			successes++
+		}
+	}
+	rng := rand.New(rand.NewSource(seed))
+	counts := make([]int, len(sorted))
+	scores := make([]float64, BootstrapIterations)
+	for iteration := range scores {
+		clear(counts)
+		drawn := 0
+		for range samples {
+			if rank := ranks[rng.Intn(len(samples))]; rank >= 0 {
+				counts[rank]++
+				drawn++
+			}
+		}
+		// A replicate that draws only failures has no latency term and scores
+		// exactly the timeout penalty, as scoreFromSamples documents.
+		failureRate := float64(len(samples)-drawn) / float64(len(samples))
+		scores[iteration] = compositeScore(
+			countedPercentile(sorted, counts, drawn, 0.50), countedPercentile(sorted, counts, drawn, 0.95),
+			failureRate, timeoutMS,
+		)
 	}
 	sort.Float64s(scores)
 	return percentile(scores, 0.025), percentile(scores, 0.975)
@@ -1498,19 +1676,23 @@ func pairedBootstrapSeed(seed int64, protocol catalog.Protocol, referenceID, tar
 	return seed ^ int64(hasher.Sum64())
 }
 
+// bootstrapPairedCI is the 95% percentile bootstrap of the median paired
+// delta. Like bootstrapCI it reads each replicate's median off rank counts
+// rather than sorting the resample, with the same draws and the same result.
 func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 	if len(deltas) == 0 {
 		return 0, 0
 	}
+	sorted, ranks := rankValues(deltas)
 	rng := rand.New(rand.NewSource(seed))
+	counts := make([]int, len(sorted))
 	scores := make([]float64, BootstrapIterations)
-	resample := make([]float64, len(deltas))
 	for iteration := range scores {
-		for index := range resample {
-			resample[index] = deltas[rng.Intn(len(deltas))]
+		clear(counts)
+		for range deltas {
+			counts[ranks[rng.Intn(len(deltas))]]++
 		}
-		sort.Float64s(resample)
-		scores[iteration] = percentile(resample, 0.5)
+		scores[iteration] = countedPercentile(sorted, counts, len(deltas), 0.5)
 	}
 	sort.Float64s(scores)
 	return percentile(scores, 0.025), percentile(scores, 0.975)
@@ -1637,7 +1819,13 @@ func collectWarnings(results []TargetResult) []Warning {
 		if result.Incomplete {
 			warnings = append(warnings, TargetWarning(result.Target, "was incomplete and excluded from ranking"))
 		}
-		if result.OpenError != "" {
+		// An incomplete target's OpenError is the cancellation markIncomplete
+		// recorded, not a session that failed: an interrupt lists every target
+		// that never reached a worker, and none of them tried to open one. The
+		// warning above already reports it, and the cancellation stays in the
+		// result's diagnostic, so only a real open failure is called one here,
+		// which is the rule the table's summary applies too.
+		if result.OpenError != "" && !result.Incomplete {
 			warnings = append(warnings, TargetWarning(result.Target, fmt.Sprintf("could not open a session: %s", safetext.Escape(result.OpenError))))
 		}
 		if result.Stats.Failures > 0 {

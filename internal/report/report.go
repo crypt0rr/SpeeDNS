@@ -1,6 +1,8 @@
 package report
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -16,6 +18,13 @@ import (
 	"github.com/crypt0rr/SpeeDNS/internal/textwidth"
 )
 
+// JSONReport is the published JSON document. WriteJSONWithOptions writes its
+// top-level members one by one so it can stream results, so a member added
+// here must be added there as well, in the same position and with the same
+// omission rule. TestJSONReportMembersMatchTheStreamer pins this member list,
+// tags included, and fails until both are updated together; the equivalence
+// tests against the encoder only catch a missing member that their reports
+// happen to fill.
 type JSONReport struct {
 	SchemaVersion      int                          `json:"schema_version"`
 	Run                JSONRun                      `json:"run"`
@@ -123,37 +132,39 @@ var newCSVWriter = func(writer io.Writer) csvWriter {
 	return csv.NewWriter(writer)
 }
 
-func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) JSONReport {
-	results := make([]JSONResult, 0, len(report.Targets))
-	redactedIDs := redactedTargetIDs(report, options.RedactSystem)
-	for _, result := range report.Targets {
-		metadata := jsonEndpointMetadata(result.Target)
-		view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
-		dialAddress := result.DialAddress
-		if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
-			dialAddress = redactedValue
-		}
-		jsonResult := JSONResult{
-			Target: JSONTarget{
-				ID: view.ID, Name: view.Name, Owner: view.Owner, Policy: view.Policy,
-				Address: view.Address, Protocol: result.Target.Protocol, Local: result.Target.Resolver.Local,
-				EndpointURL: metadata.EndpointURL, TLSServerName: metadata.TLSServerName,
-				TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
-				BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: safetext.Escape(dialAddress),
-			},
-			// The session error quotes endpoint-chosen text, such as the
-			// certificate names in an x509 mismatch, so it is escaped like
-			// the target metadata beside it; the CSV open_error column
-			// renders the same value.
-			Stats: result.Stats, Status: statusValue(result), OpenError: safetext.Escape(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), Incomplete: result.Incomplete,
-			DNSSEC: redactDNSSEC(result, options.RedactSystem, redactedIDs[result.Target.ID()]),
-		}
-		if raw {
-			jsonResult.Observations = redactObservations(result, options.RedactSystem, redactedIDs[result.Target.ID()])
-			jsonResult.Cold = redactColdObservations(result, options.RedactSystem, redactedIDs[result.Target.ID()])
-		}
-		results = append(results, jsonResult)
+// jsonResultFor builds one element of the results array.
+func jsonResultFor(result benchmark.TargetResult, raw bool, options JSONOptions, redactedIDs map[string]string) JSONResult {
+	metadata := jsonEndpointMetadata(result.Target)
+	view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
+	dialAddress := result.DialAddress
+	if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
+		dialAddress = redactedValue
 	}
+	jsonResult := JSONResult{
+		Target: JSONTarget{
+			ID: view.ID, Name: view.Name, Owner: view.Owner, Policy: view.Policy,
+			Address: view.Address, Protocol: result.Target.Protocol, Local: result.Target.Resolver.Local,
+			EndpointURL: metadata.EndpointURL, TLSServerName: metadata.TLSServerName,
+			TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
+			BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: safetext.Escape(dialAddress),
+		},
+		// The session error quotes endpoint-chosen text, such as the
+		// certificate names in an x509 mismatch, so it is escaped like the
+		// target metadata beside it; the CSV open_error column renders the
+		// same value.
+		Stats: result.Stats, Status: statusValue(result), OpenError: safetext.Escape(redactResultText(result, result.OpenError, options.RedactSystem, redactedIDs[result.Target.ID()])), Incomplete: result.Incomplete,
+		DNSSEC: redactDNSSEC(result, options.RedactSystem, redactedIDs[result.Target.ID()]),
+	}
+	if raw {
+		jsonResult.Observations = redactObservations(result, options.RedactSystem, redactedIDs[result.Target.ID()])
+		jsonResult.Cold = redactColdObservations(result, options.RedactSystem, redactedIDs[result.Target.ID()])
+	}
+	return jsonResult
+}
+
+// jsonEnvelope builds every member of the JSON document except results, which
+// WriteJSONWithOptions streams one element at a time; Results stays nil.
+func jsonEnvelope(report benchmark.Report, options JSONOptions, redactedIDs map[string]string) JSONReport {
 	rankings := append(make([]benchmark.Ranking, 0, len(report.Rankings)), report.Rankings...)
 	for index := range rankings {
 		rankings[index].TargetID = jsonTargetID(rankings[index].TargetID, redactedIDs)
@@ -198,7 +209,7 @@ func toJSONWithOptions(report benchmark.Report, raw bool, options JSONOptions) J
 			Seed: report.Seed, CorpusMode: report.CorpusMode, CorpusZone: report.CorpusZone, CorpusNonce: report.CorpusNonce,
 			SampleSize: report.SampleSize, Queries: report.Queries, QueryTypes: report.QueryTypes, Provenance: provenance,
 		},
-		Results: results, Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), ProfileComparisons: profileComparisons,
+		Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), ProfileComparisons: profileComparisons,
 		Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
 	}
 }
@@ -214,10 +225,119 @@ func WriteJSON(writer io.Writer, report benchmark.Report, raw bool) error {
 	return WriteJSONWithOptions(writer, report, raw, JSONOptions{})
 }
 
+// WriteJSONWithOptions writes the report as one JSON document, byte for byte
+// what a json.Encoder indenting by two spaces writes for the JSONReport value:
+// the same member order and omissions, HTML escaping, number formatting and
+// final newline.
+//
+// The results array is streamed one element at a time through a buffered
+// writer instead of being encoded with the rest of the document. With --raw it
+// carries every observation, and encoding the document as one value held it in
+// memory several times over -- the JSONResult copies, the encoder's compact
+// buffer and the indented copy of that -- so a large run peaked at several
+// times its output size just to write it. Streaming holds one result at a
+// time. Every other member is small and is still encoded whole by
+// encoding/json. A failure mid-document can leave a partial document behind;
+// the CLI writes a regular file through a temporary file it discards on error.
 func WriteJSONWithOptions(writer io.Writer, report benchmark.Report, raw bool, options JSONOptions) error {
-	encoder := json.NewEncoder(writer)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(toJSONWithOptions(report, raw, options))
+	redactedIDs := redactedTargetIDs(report, options.RedactSystem)
+	document := jsonEnvelope(report, options, redactedIDs)
+	stream := newJSONStream(writer)
+	stream.literal("{\n" + jsonMemberPrefix + `"schema_version": `)
+	stream.value(document.SchemaVersion, jsonMemberPrefix)
+	stream.member("run", document.Run)
+	stream.literal(",\n" + jsonMemberPrefix + `"results": [`)
+	for index, result := range report.Targets {
+		if stream.err != nil {
+			break
+		}
+		if index > 0 {
+			stream.literal(",")
+		}
+		stream.literal("\n" + jsonElementPrefix)
+		stream.value(jsonResultFor(result, raw, options, redactedIDs), jsonElementPrefix)
+	}
+	if len(report.Targets) > 0 {
+		stream.literal("\n" + jsonMemberPrefix)
+	}
+	stream.literal("]")
+	stream.member("rankings", document.Rankings)
+	if len(document.PairedEffects) > 0 {
+		stream.member("paired_effects", document.PairedEffects)
+	}
+	if len(document.ProfileComparisons) > 0 {
+		stream.member("profile_comparisons", document.ProfileComparisons)
+	}
+	if len(document.Divergence) > 0 {
+		stream.member("divergence", document.Divergence)
+	}
+	if len(document.Warnings) > 0 {
+		stream.member("warnings", document.Warnings)
+	}
+	stream.literal("\n}\n")
+	return stream.close()
+}
+
+const (
+	// jsonIndent is the report's indentation unit. A top-level member's line
+	// begins with one unit and an element of the results array with two.
+	jsonIndent        = "  "
+	jsonMemberPrefix  = jsonIndent
+	jsonElementPrefix = jsonIndent + jsonIndent
+	// jsonStreamBufferSize batches the streamed document into large writes.
+	jsonStreamBufferSize = 64 << 10
+)
+
+// jsonStream writes a JSON document piece by piece. It keeps the first error
+// and turns every later write into a no-op, so the writer above can be a plain
+// sequence of calls with one check at the end.
+type jsonStream struct {
+	out     *bufio.Writer
+	scratch bytes.Buffer
+	encoder *json.Encoder
+	err     error
+}
+
+func newJSONStream(writer io.Writer) *jsonStream {
+	stream := &jsonStream{out: bufio.NewWriterSize(writer, jsonStreamBufferSize)}
+	stream.encoder = json.NewEncoder(&stream.scratch)
+	return stream
+}
+
+func (s *jsonStream) literal(text string) {
+	if s.err == nil {
+		_, s.err = s.out.WriteString(text)
+	}
+}
+
+// member writes a top-level member after the first one. Member names are
+// fixed ASCII identifiers, which JSON quotes without escaping.
+func (s *jsonStream) member(name string, value any) {
+	s.literal(",\n" + jsonMemberPrefix + `"` + name + `": `)
+	s.value(value, jsonMemberPrefix)
+}
+
+// value writes v as the json.Encoder writes it at a depth whose lines begin
+// with prefix. One encoder and its buffers are reused for every value, so a
+// value costs its own encoding and nothing in proportion to the document.
+// Encode ends every value with a newline; the document places its own.
+func (s *jsonStream) value(v any, prefix string) {
+	if s.err != nil {
+		return
+	}
+	s.scratch.Reset()
+	s.encoder.SetIndent(prefix, jsonIndent)
+	if s.err = s.encoder.Encode(v); s.err != nil {
+		return
+	}
+	_, s.err = s.out.Write(bytes.TrimSuffix(s.scratch.Bytes(), []byte("\n")))
+}
+
+func (s *jsonStream) close() error {
+	if s.err != nil {
+		return s.err
+	}
+	return s.out.Flush()
 }
 
 func WriteCSV(writer io.Writer, report benchmark.Report) error {
@@ -1349,8 +1469,17 @@ func profileViewRows(report benchmark.Report, options TableOptions) [][]string {
 	return rows
 }
 
+// profileViewOrderNote travels with the view because the bias it names is
+// specific to reading transports side by side: protocol groups run in a fixed
+// order over the same names, so a later transport can read answers an earlier
+// one primed in the resolver's shared cache. Rankings compare one protocol and
+// are not shifted by it, which is why the note is here and not on them.
+const profileViewOrderNote = "  Transports run in the fixed order udp, tcp, doh, dot, doq over the same names, so a\n" +
+	"  later transport can read answers an earlier one left in the resolver's shared cache;\n" +
+	"  encrypted transport costs here can read lower than they are.\n"
+
 func writeProfileView(writer io.Writer, report benchmark.Report, options TableOptions) error {
-	if _, err := io.WriteString(writer, "\nProfile-level transport view (same resolver/address; score 95% CI)\n"); err != nil {
+	if _, err := io.WriteString(writer, "\nProfile-level transport view (same resolver/address; score 95% CI)\n"+profileViewOrderNote); err != nil {
 		return err
 	}
 	rows := profileViewRows(report, options)

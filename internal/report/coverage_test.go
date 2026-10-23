@@ -1046,8 +1046,17 @@ func TestProfileViewShowsTransportCostsConfidenceAndCorpusMetadata(t *testing.T)
 	if err := writeProfileView(contentFailWriter{needle: "Profile"}, run, options); err == nil {
 		t.Fatal("profile view table writer failure was not returned")
 	}
-	if err := writeProfileView(&bytes.Buffer{}, benchmark.Report{}, TableOptions{}); err != nil {
+	var empty bytes.Buffer
+	if err := writeProfileView(&empty, benchmark.Report{}, TableOptions{}); err != nil {
 		t.Fatalf("empty profile view = %v", err)
+	}
+	// The view compares transports measured one group after another over the
+	// same names, so its heading carries the cache-priming caveat even when
+	// it has no rows; the per-protocol tables never needed it.
+	heading := "\nProfile-level transport view (same resolver/address; score 95% CI)\n" +
+		"  Transports run in the fixed order udp, tcp, doh, dot, doq over the same names, so a\n"
+	if !strings.HasPrefix(empty.String(), heading) || !strings.Contains(empty.String(), "encrypted transport costs here can read lower") {
+		t.Fatalf("profile view heading = %q, want the protocol-order caveat", empty.String())
 	}
 	if err := WriteTableWithOptions(contentFailWriter{needle: "Profile-level transport view"}, run, options); err == nil {
 		t.Fatal("top-level profile view writer failure was not returned")

@@ -242,7 +242,10 @@ Include per-query observations in JSON output.
 .TP
 .B --profile-view
 Show same-resolver transport comparisons with score confidence intervals.
-Requires table or JSON output.
+Requires table or JSON output. Transports are measured in the fixed order
+udp, tcp, doh, dot, doq over the same names, so a later transport can read
+answers an earlier one left in the resolver's shared cache and the view can
+understate the cost of encryption.
 .TP
 .B --redact-system
 Redact local system resolver addresses and labels in reports. A failed

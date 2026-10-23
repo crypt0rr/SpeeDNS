@@ -29,6 +29,29 @@ go test -count=1 ./internal/report -run TestGoldenReports -update
 Always review `git diff internal/report/testdata/golden/` before committing a
 regenerated fixture. Never regenerate to make a failing test pass.
 
+The JSON writer streams the `results` array one element at a time instead of
+encoding the report as one value, and must stay byte-identical to that single
+encoding. Besides the golden JSON, `TestStreamedJSONMatchesTheEncoderOnFixtures`
+and `TestStreamedJSONMatchesTheEncoderOnRandomReports` compare every streamed
+byte with what one `json.Encoder` writes for the whole document, over the
+fixture reports, hundreds of random reports and a multi-megabyte `--raw`
+report. `TestJSONReportMembersMatchTheStreamer` pins the document's top-level
+members, so one added to `JSONReport` fails until the streamer writes it too.
+The confidence-interval bootstraps read each replicate's percentiles
+from rank counts instead of sorting the resample; the previous implementation
+is kept in `internal/benchmark/bootstrap_equivalence_test.go`, and
+`TestRankCountBootstrapMatchesSortedResampling` requires bit-identical
+intervals from both over random sample vectors and seeds, next to the pinned
+interval in `scoring_test.go`.
+
+Go benchmarks compare those two paths with the ones they replaced, and query
+construction from an already-normalized corpus with normalizing it again. They
+are offline, assert nothing about timing, and run only when asked:
+
+```sh
+go test -run '^$' -bench . -benchmem ./internal/benchmark ./internal/report
+```
+
 `TestDeterministicResolverFixtureCoversBenchmarkOutcomes` uses in-memory
 resolver sessions to exercise the full benchmark scheduler and statistics
 path. Its targets cover:

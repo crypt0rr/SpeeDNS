@@ -242,7 +242,11 @@ Compare two saved runs and see what changed about the resolvers themselves:
 Show a profile-level transport view for the same resolver/address. This is
 useful when comparing the cost of enabling encrypted transports; it includes
 the existing score confidence interval and does not replace per-protocol
-rankings:
+rankings. Transports are measured in the fixed order udp, tcp, doh, dot, doq
+over the same names, so a later transport can read answers an earlier one left
+in the resolver's shared cache, and the view can understate the cost of
+encryption — most with names the resolvers had not cached
+([details](METHODOLOGY.md#cache-miss-mode-and-profile-view)):
 
 ```sh
 ./speedns --profile-view --protocol udp,tcp,doh,dot,doq --sample 25 --type A
@@ -1010,9 +1014,16 @@ that compared no endpoint, and `4` for a failed `--require` condition; see
 [Comparing two runs](#comparing-two-runs).
 
 An interrupted run reports `interrupted` on standard error and still writes the
-report it has. Its warning says whether some selected target was left
-incomplete or missing, or whether the interrupt arrived after measurement had
-completed, in which case the results are complete. Either way the status is
+report it has, which lists every selected target. Protocol groups that finished
+before the interrupt keep their results and rankings. Every other target that
+had not already failed is `INCOMPLETE` and unranked, carrying only the
+observations it completed — none for a target that never started, which
+includes every target of a group the interrupt arrived before — so
+`speedns diff` declines those targets rather than reporting them as removed. A
+target whose session had already failed to open before the interrupt keeps its
+`FAILED` result and its error. The warning says whether some selected target was
+left incomplete or missing, or whether the interrupt arrived after measurement
+had completed, in which case the results are complete. Either way the status is
 `130` and assertions are not evaluated. A second interrupt exits immediately.
 
 ### Assertions for automation

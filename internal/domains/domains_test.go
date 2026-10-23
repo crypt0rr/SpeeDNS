@@ -314,3 +314,47 @@ func TestLoadStripsALeadingByteOrderMark(t *testing.T) {
 		t.Fatal("a byte order mark after the first line must stay part of its entry")
 	}
 }
+
+// TestLoadTolerantCarriesItsNamesAsNormalized pins the proof the benchmark
+// engine relies on to skip a second normalization pass: every successful load
+// -- the embedded corpus, a strict file, and a file loaded with invalid
+// entries skipped -- hands back exactly its names as a Normalized list, and a
+// failed load hands back none, so a failure can never pass for a corpus.
+func TestLoadTolerantCarriesItsNamesAsNormalized(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "domains.txt")
+	if err := os.WriteFile(path, []byte("Example.COM.\nexample.com\nbücher.example\n_dmarc.example.org\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mixed := filepath.Join(t.TempDir(), "mixed.txt")
+	if err := os.WriteFile(mixed, []byte("example.com\nexa mple.com\nexample.org\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		path string
+		skip bool
+	}{{"embedded", "", false}, {"strict file", path, false}, {"skipping file", mixed, true}} {
+		result, err := LoadTolerant(tc.path, tc.skip)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		names := result.Normalized().Names()
+		if len(names) == 0 || fmt.Sprint(names) != fmt.Sprint(result.Names) {
+			t.Fatalf("%s: normalized list %q, want the loaded names %q", tc.name, names, result.Names)
+		}
+		again, err := Normalize(names)
+		if err != nil || fmt.Sprint(again) != fmt.Sprint(names) {
+			t.Fatalf("%s: normalizing the list again changed it: %q/%v", tc.name, again, err)
+		}
+	}
+	bad := filepath.Join(t.TempDir(), "bad.txt")
+	if err := os.WriteFile(bad, []byte("bad..name\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := LoadTolerant(bad, false); err == nil || len(result.Normalized().Names()) != 0 {
+		t.Fatalf("failed load = %q/%v, want an error and no normalized names", result.Normalized().Names(), err)
+	}
+	if names := (Normalized{}).Names(); names != nil {
+		t.Fatalf("zero Normalized holds %q", names)
+	}
+}
