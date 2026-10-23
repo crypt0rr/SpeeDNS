@@ -385,6 +385,16 @@ func IsSystemTarget(target catalog.Target) bool {
 	return isSystemTarget(target)
 }
 
+// RedactedTargetIDs maps the ID of every system target in report to the
+// positional system-redacted-N@redacted/<protocol> ID that the table, JSON and
+// CSV reports print for it under --redact-system. It returns nil when redact
+// is false. Text printed next to a redacted report, such as an --assert
+// failure on stderr, uses it so the two name each target the same way and
+// the address the report withholds is not printed beside it.
+func RedactedTargetIDs(report benchmark.Report, redact bool) map[string]string {
+	return redactedTargetIDs(report, redact)
+}
+
 func redactedTargetIDs(report benchmark.Report, redact bool) map[string]string {
 	if !redact {
 		return nil
@@ -402,11 +412,11 @@ func redactedTargetIDs(report benchmark.Report, redact bool) map[string]string {
 }
 
 // targetViewFor builds the presentation values for one target. Every field is
-// escaped here because catalog.Validate only trims the surrounding whitespace
-// of resolver names, owners, policies, scopes and interfaces, so --resolver,
-// --resolver-file and the system resolver configuration can all place control
-// characters in them. Escaping at the view keeps every consumer - table, CSV
-// and JSON - on the same rendered value.
+// escaped here because catalog.Validate rejects control and invisible
+// characters only in resolver IDs, names, owners and addresses: it just trims
+// policies, scopes and interfaces, so --resolver-file and the system resolver
+// configuration can still place such characters in them. Escaping at the view
+// keeps every consumer - table, CSV and JSON - on the same rendered value.
 func targetViewFor(target catalog.Target, redact bool, redactedID string) targetView {
 	view := targetView{
 		ID: safetext.Escape(target.ID()), Name: safetext.Escape(target.DisplayName()), Owner: safetext.Escape(target.Resolver.Owner),

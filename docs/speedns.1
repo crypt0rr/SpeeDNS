@@ -54,9 +54,25 @@ transport no selected resolver declares is skipped rather than failed.
 .TP
 .B --resolver NAME=URI
 Add a custom resolver endpoint. Repeat the option for multiple endpoints.
+NAME must be printable text without control, bidirectional or invisible
+format characters. An explicit URI port must be 1-65535; omit it for the
+protocol default. A URI with user credentials is rejected, because reports
+record a DoH endpoint URL as configured.
 .TP
 .B --resolver-file PATH
-Load strict, versioned resolver profiles from YAML.
+Load strict, versioned resolver profiles from YAML. Every profile needs at
+least one transport;
+.I url
+applies only to doh,
+.I server_name
+is rejected on udp and tcp and must not be blank, and a DoH
+.I url
+must not include user credentials. Resolver ids, names, owners and addresses
+must not contain control, bidirectional or invisible format characters or
+invalid UTF-8. A profile with several addresses whose encrypted transports
+dial
+.I bootstrap_addresses
+measures the same candidates once per address, and the report warns about it.
 .TP
 .B --no-defaults
 Do not include the bundled public resolver catalog. Use with
@@ -69,12 +85,18 @@ to benchmark only your own endpoints.
 Select the resolver address family. The default
 .B auto
 uses the local up-interface address inventory without performing DNS lookups or
-connection probes.
+connection probes. The filter also applies to the
+.I bootstrap_addresses
+of encrypted transports; a transport left with no candidate is dropped rather
+than falling back to the target address. When that leaves no selected protocol
+to measure, the error names
+.BR --family .
 .TP
 .B --domains PATH
-Read one domain per line from a custom list. Blank lines and comments are
-ignored. Underscored service labels such as _dmarc.example.com are accepted;
-the underscore is only allowed as the first character of a label.
+Read one domain per line from a custom list. Blank lines, comments and a
+leading UTF-8 byte order mark are ignored. Underscored service labels such as
+_dmarc.example.com are accepted; the underscore is only allowed as the first
+character of a label.
 .TP
 .B --sample N
 Sample N domains from the selected corpus. Defaults to 100.
@@ -223,7 +245,9 @@ Show same-resolver transport comparisons with score confidence intervals.
 Requires table or JSON output.
 .TP
 .B --redact-system
-Redact local system resolver addresses and labels in reports.
+Redact local system resolver addresses and labels in reports. A failed
+.B --assert
+names a system resolver by the same redacted target id the report uses.
 .TP
 .B --assert EXPRESSION
 Assert a winner metric or profile condition, and exit
@@ -269,7 +293,12 @@ A transport that no selected resolver supports is not required, and a resolver
 on the local host does not make its protocol required.
 .TP
 .B --include-system
-Include resolvers discovered from the operating system configuration.
+Include resolvers discovered from the operating system configuration. On
+Linux, when every nameserver in /etc/resolv.conf is a loopback stub, the
+non-loopback servers in /run/systemd/resolve/resolv.conf are added as extra
+profiles beside the stub. That file lists systemd-resolved's default-route
+servers only; split-DNS links, DNS-over-TLS settings and non-standard ports are
+not represented.
 .TP
 .B --no-color
 Disable ANSI styling in table output.
@@ -440,6 +469,17 @@ second interrupt exits immediately.
 .I /etc/resolv.conf
 System resolver configuration on Linux, and the fallback on macOS.
 .TP
+.I /run/systemd/resolve/resolv.conf
+Read on Linux by
+.B --include-system
+only when every nameserver in
+.I /etc/resolv.conf
+is a loopback stub. Each non-loopback server it lists is added as a
+.I system-resolved-
+profile beside the stub. The file holds systemd-resolved's default-route
+servers only, so split-DNS links, DNS-over-TLS settings and non-standard ports
+are not represented. A missing or unreadable file is ignored.
+.TP
 .I scutil --dns
 Queried on macOS for scoped resolver configuration before the
 .I /etc/resolv.conf
@@ -457,4 +497,5 @@ speedns --protocol doq --sample 25 2>speedns-progress.log
 speedns completion bash > speedns.bash
 .EE
 .SH SEE ALSO
-.BR resolv.conf (5)
+.BR resolv.conf (5),
+.BR systemd-resolved (8)

@@ -1149,6 +1149,13 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	onNetworkResolvers := classifyLocalResolvers(profiles, ownAddresses)
 
 	targets := catalog.Expand(profiles, selected)
+	// When the profiles did support a selected protocol before the family
+	// filter, the filter is what removed it, often by dropping an encrypted
+	// transport whose bootstrap candidates are all in the other family. The
+	// generic message below would send the operator to --protocol instead.
+	if len(targets) == 0 && len(catalog.Expand(selection.all(), selected)) > 0 {
+		return fmt.Errorf("no resolver supports the selected protocol(s) under --family %s, which also drops a doh, dot or doq transport whose bootstrap_addresses are all outside that family", family)
+	}
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
 	}
@@ -1267,6 +1274,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 			len(cacheMissDropped), cacheMissDroppedNames(cacheMissDropped, config.redactSystem))))
 	}
 	result.Warnings = append(result.Warnings, familyWarnings...)
+	result.Warnings = append(result.Warnings, sharedBootstrapWarnings(targets)...)
 	writer, finalizeOutput, err := outputWriterFunc(config.output)
 	if err != nil {
 		return err
@@ -1303,7 +1311,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if runErr != nil {
 		return runErr
 	}
-	return evaluateAssertions(result, assertions)
+	return evaluateAssertionsWithOptions(result, assertions, assertionOptions{redactSystem: config.redactSystem})
 }
 
 // interruptWarning describes an interrupted run from the evidence in its
@@ -1420,6 +1428,51 @@ func autoFamilyWarnings(family catalog.AddressFamily, available map[catalog.Addr
 		return nil
 	}
 	return []benchmark.Warning{benchmark.RunWarning(fmt.Sprintf("--family auto detected %s on local interfaces and dropped %d bundled resolver address(es) from other families", describeFamilies(available), dropped))}
+}
+
+// sharedBootstrapWarnings reports resolvers measured more than once over an
+// encrypted transport that dials bootstrap_addresses. Such a transport never
+// dials the target address, yet the catalog expands one target per profile
+// address, so those rows measure the same connection candidates and are
+// ranked as if they were separate endpoints. The rows are kept rather than
+// collapsed, because collapsing would change target IDs that existing
+// resolver files, saved reports and --assert subjects already use; the
+// warning says why they match. It reads the final target list, so a family
+// filter that left one address, or cache-miss mode keeping one endpoint per
+// resolver, raises nothing.
+func sharedBootstrapWarnings(targets []catalog.Target) []benchmark.Warning {
+	type endpoint struct {
+		resolver string
+		protocol catalog.Protocol
+	}
+	rows := make(map[endpoint]int)
+	for _, target := range targets {
+		if len(target.Spec.BootstrapAddresses) > 0 {
+			rows[endpoint{target.Resolver.ID, target.Protocol}]++
+		}
+	}
+	// Targets are sorted by protocol, then ID, so walking them again yields
+	// every resolver's protocols in the documented order.
+	var resolvers []string
+	shared := make(map[string][]string)
+	for _, target := range targets {
+		key := endpoint{target.Resolver.ID, target.Protocol}
+		if rows[key] < 2 {
+			continue
+		}
+		rows[key] = 0
+		if _, seen := shared[key.resolver]; !seen {
+			resolvers = append(resolvers, key.resolver)
+		}
+		shared[key.resolver] = append(shared[key.resolver], key.protocol.String())
+	}
+	warnings := make([]benchmark.Warning, 0, len(resolvers))
+	for _, resolver := range resolvers {
+		warnings = append(warnings, benchmark.RunWarning(fmt.Sprintf(
+			"resolver %q is measured once per address over %s, but those transports dial bootstrap_addresses, so its rows measure the same connection candidates; list one address or remove bootstrap_addresses to avoid duplicate rows",
+			resolver, strings.Join(shared[resolver], ", "))))
+	}
+	return warnings
 }
 
 func countProfileAddresses(profiles []catalog.ResolverProfile) int {

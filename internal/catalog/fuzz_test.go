@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
 // fuzzSchemeProtocols restates the accepted resolver URI schemes and their
@@ -49,9 +51,15 @@ func FuzzParseResolverFlagInvariants(f *testing.F) {
 		if !ok || name == "" || rawURI == "" {
 			t.Fatalf("accepted %q which is not NAME=URI", input)
 		}
+		if safetext.Escape(name) != name {
+			t.Fatalf("accepted resolver NAME %q that does not print as written", name)
+		}
 		u, parseErr := url.Parse(rawURI)
 		if parseErr != nil || u.Scheme == "" || u.Host == "" {
 			t.Fatalf("accepted unparsable resolver URI %q: %v", rawURI, parseErr)
+		}
+		if u.User != nil {
+			t.Fatalf("accepted resolver URI %q with user credentials", rawURI)
 		}
 		scheme, known := fuzzSchemeProtocols[strings.ToLower(u.Scheme)]
 		if !known {
@@ -76,15 +84,15 @@ func FuzzParseResolverFlagInvariants(f *testing.F) {
 			t.Fatalf("profile transports = %#v, want protocol %q", profile.Transports, scheme.protocol)
 		}
 
+		// Only an absent port means the default; an explicit one, including
+		// ":0", must be a port an endpoint can listen on.
 		wantPort := scheme.defaultPort
 		if rawPort := u.Port(); rawPort != "" {
 			number, convErr := strconv.Atoi(rawPort)
-			if convErr != nil || number < 0 || number > 65535 {
+			if convErr != nil || number < 1 || number > 65535 {
 				t.Fatalf("accepted out-of-range port %q", rawPort)
 			}
-			if number != 0 {
-				wantPort = number
-			}
+			wantPort = number
 		}
 		if spec.Port != wantPort {
 			t.Fatalf("transport port = %d, want %d for %q", spec.Port, wantPort, rawURI)
@@ -143,6 +151,15 @@ func FuzzLoadYAMLInvariants(f *testing.F) {
 			if strings.TrimSpace(profile.ID) != profile.ID {
 				t.Fatalf("accepted untrimmed profile id %q", profile.ID)
 			}
+			// Identities print exactly as configured in every report sink.
+			for _, value := range append([]string{profile.ID, profile.Name, profile.Owner}, profile.Addresses...) {
+				if safetext.Escape(value) != value {
+					t.Fatalf("accepted resolver %q text %q that does not print as written", profile.ID, value)
+				}
+			}
+			if len(profile.Transports) == 0 {
+				t.Fatalf("accepted resolver %q without transports", profile.ID)
+			}
 			if _, duplicate := seen[profile.ID]; duplicate {
 				t.Fatalf("accepted duplicate resolver id %q", profile.ID)
 			}
@@ -162,19 +179,29 @@ func FuzzLoadYAMLInvariants(f *testing.F) {
 				if spec.Port < 1 || spec.Port > 65535 {
 					t.Fatalf("accepted resolver %q protocol %q port %d", profile.ID, protocol, spec.Port)
 				}
+				// The stored name is the one the TLS handshake uses.
+				if strings.TrimSpace(spec.ServerName) != spec.ServerName {
+					t.Fatalf("accepted resolver %q protocol %q with untrimmed server name %q", profile.ID, protocol, spec.ServerName)
+				}
+				if protocol != DoH && spec.URL != "" {
+					t.Fatalf("accepted resolver %q protocol %q with a url it never reads", profile.ID, protocol)
+				}
 				switch protocol {
 				case DoH:
 					u, parseErr := url.Parse(spec.URL)
 					if parseErr != nil || u.Scheme != "https" || u.Host == "" || u.Path == "" {
 						t.Fatalf("accepted resolver %q with DoH URL %q", profile.ID, spec.URL)
 					}
+					if u.User != nil {
+						t.Fatalf("accepted resolver %q with credentials in its DoH URL", profile.ID)
+					}
 				case DoT, DoQ:
-					if strings.TrimSpace(spec.ServerName) == "" {
+					if spec.ServerName == "" {
 						t.Fatalf("accepted resolver %q protocol %q without a server name", profile.ID, protocol)
 					}
 				default:
-					if len(spec.BootstrapAddresses) != 0 {
-						t.Fatalf("accepted resolver %q protocol %q with bootstrap addresses", profile.ID, protocol)
+					if len(spec.BootstrapAddresses) != 0 || spec.ServerName != "" {
+						t.Fatalf("accepted resolver %q protocol %q with TLS settings it never reads", profile.ID, protocol)
 					}
 				}
 			}

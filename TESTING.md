@@ -54,8 +54,12 @@ Malformed wire data is handed to `validateResponse` instead of being skipped.
 `FuzzParseResolverFlagInvariants` asserts that an accepted `NAME=URI` flag
 yields exactly one transport for the URI scheme, with the right default port
 and with TLS or HTTP settings only where the scheme needs them, so no resolver
-can silently gain a second transport. `FuzzLoadYAMLInvariants` asserts that
-every accepted resolver file revalidates unchanged. The seed corpora in
+can silently gain a second transport; an accepted explicit port is 1-65535,
+and an accepted URI carries no user credentials and a printable NAME.
+`FuzzLoadYAMLInvariants` asserts that every accepted resolver file revalidates
+unchanged, declares at least one transport per profile, carries `url` and
+`server_name` only on protocols that read them, stores `server_name` trimmed,
+and has printable ids, names, owners and addresses. The seed corpora in
 `internal/catalog/testdata/fuzz/` pin the interesting accept and reject paths.
 
 Transport recovery runs against local fixtures bound to `127.0.0.1` only,

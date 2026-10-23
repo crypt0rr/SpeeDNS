@@ -275,3 +275,42 @@ func TestLoadTolerantCapsSkippedDescriptions(t *testing.T) {
 		t.Fatalf("missing the overflow summary: %#v", result.Skipped)
 	}
 }
+
+// TestLoadStripsALeadingByteOrderMark covers #245. Windows editors and
+// PowerShell's UTF-8 encoders start a file with EF BB BF, which turned a
+// leading comment or blank line into an entry: the list failed by default,
+// and --skip-invalid-domains reported a skipped entry the file never had. Only
+// the mark at the very start of the file is encoding metadata; anywhere else
+// it stays part of its entry.
+func TestLoadStripsALeadingByteOrderMark(t *testing.T) {
+	const bom = "\xef\xbb\xbf"
+	for name, contents := range map[string]string{
+		"comment":      bom + "# list\nexample.com\n",
+		"bare hash":    bom + "#\nexample.com\n",
+		"blank line":   bom + "\nexample.com\n",
+		"CRLF comment": bom + "# list\r\nexample.com\r\n",
+		"domain":       bom + "example.com\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := loadReader(strings.NewReader(contents))
+			if err != nil || len(got) != 1 || got[0] != "example.com" {
+				t.Fatalf("loadReader(%q) = %#v/%v, want [example.com]", contents, got, err)
+			}
+			path := filepath.Join(t.TempDir(), "bom.txt")
+			if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			result, err := LoadTolerant(path, true)
+			if err != nil || len(result.Skipped) != 0 || len(result.Names) != 1 || result.Names[0] != "example.com" {
+				t.Fatalf("LoadTolerant(%q) = %#v/%v, want example.com and nothing skipped", contents, result, err)
+			}
+			if CorpusDigest(result.Names) != CorpusDigest([]string{"example.com"}) {
+				t.Fatal("a byte order mark changed the corpus digest")
+			}
+		})
+	}
+
+	if _, err := loadReader(strings.NewReader("example.com\n" + bom + "# not the first line\n")); err == nil {
+		t.Fatal("a byte order mark after the first line must stay part of its entry")
+	}
+}

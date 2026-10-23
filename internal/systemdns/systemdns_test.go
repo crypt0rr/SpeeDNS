@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -22,6 +23,7 @@ type testReadCloser struct {
 }
 
 var originalOpenResolvConf = openResolvConf
+var originalOpenResolvedUplink = openResolvedUplink
 var originalRunScutil = runScutil
 
 func (r *testReadCloser) Close() error {
@@ -109,7 +111,9 @@ resolver #4
 	if profiles[0].ID != "system-resolver-1-192-0-2-1" || profiles[2].ID != "system-resolver-2-192-0-2-1" {
 		t.Fatalf("resolver block IDs = %#v", profiles)
 	}
-	if profiles[0].Scope != "example.test" || profiles[0].Interface != "en0" || !strings.Contains(profiles[0].Name, "scope: example.test") || !strings.Contains(profiles[0].Owner, "interface: en0") {
+	// Resolver #1 carries only search domains, which expand short names but
+	// do not limit which queries it answers, so it is the global resolver.
+	if profiles[0].Scope != "global" || profiles[0].Interface != "en0" || profiles[0].Name != "System DNS (scope: global; interface: en0)" || !strings.Contains(profiles[0].Owner, "interface: en0") {
 		t.Fatalf("global resolver metadata = %#v", profiles[0])
 	}
 	if profiles[2].Scope != "corp.test" || profiles[2].Interface != "utun3" {
@@ -120,6 +124,70 @@ resolver #4
 	}
 	if profiles[4].Scope != "global" || !strings.Contains(profiles[4].Name, "scope: global") {
 		t.Fatalf("global scope metadata = %#v", profiles[4])
+	}
+}
+
+// TestDiscoverMacOSScopesComeFromDomainLinesOnly covers #245 with the shape a
+// DHCP network produces: the default resolver gets a search domain such as
+// "lan", and a VPN adds a supplemental resolver for its own domain. Only the
+// `domain :` line makes a resolver scoped; labelling the default resolver
+// "scope: lan" made it look like the split-DNS resolver beside it.
+func TestDiscoverMacOSScopesComeFromDomainLinesOnly(t *testing.T) {
+	oldOS, oldRun := currentOS, runScutil
+	t.Cleanup(func() { currentOS, runScutil = oldOS, oldRun })
+	currentOS = "darwin"
+	runScutil = func(context.Context) ([]byte, error) {
+		return []byte(`DNS configuration
+
+resolver #1
+  search domain[0] : lan
+  nameserver[0] : 192.168.1.1
+  if_index : 6 (en0)
+  flags    : Request A records
+  reach    : 0x00020002 (Reachable,Directly Reachable Address)
+
+resolver #2
+  domain   : corp.example.com
+  search domain[0] : corp.example.com
+  search domain[1] : eng.corp.example.com
+  nameserver[0] : 10.8.0.1
+  if_index : 21 (utun3)
+`), nil
+	}
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 2 {
+		t.Fatalf("macOS Discover profiles = %#v/%v", profiles, err)
+	}
+	if profiles[0].ID != "system-resolver-1-192-168-1-1" || profiles[0].Scope != "global" || profiles[0].Name != "System DNS (scope: global; interface: en0)" {
+		t.Fatalf("default resolver with only a search domain = %#v", profiles[0])
+	}
+	if profiles[1].ID != "system-resolver-2-10-8-0-1" || profiles[1].Scope != "corp.example.com" || profiles[1].Name != "System DNS (scope: corp.example.com; interface: utun3)" {
+		t.Fatalf("supplemental resolver = %#v", profiles[1])
+	}
+}
+
+// TestDiscoveredLabelsPassCatalogValidation keeps an unusual label from
+// failing --include-system. A scope is a DHCP- or VPN-supplied domain and an
+// interface label can be a user-renamed adapter, and catalog.Validate rejects
+// a name or owner that would not print as written, so the label is escaped
+// the way every report renders it.
+func TestDiscoveredLabelsPassCatalogValidation(t *testing.T) {
+	oldOS, oldRun := currentOS, runScutil
+	t.Cleanup(func() { currentOS, runScutil = oldOS, oldRun })
+	currentOS = "darwin"
+	runScutil = func(context.Context) ([]byte, error) {
+		return []byte("resolver #1\n  domain : evil\U0000202Etset.example\n  nameserver[0] : 192.0.2.1\n  if_index : 7 (en\x1b[2K0)\n"), nil
+	}
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 1 {
+		t.Fatalf("Discover = %#v/%v", profiles, err)
+	}
+	want := `System DNS (scope: evil\u{202e}tset.example; interface: en\x1b[2K0)`
+	if profiles[0].Name != want {
+		t.Fatalf("escaped name = %q, want %q", profiles[0].Name, want)
+	}
+	if err := catalog.Validate(profiles); err != nil {
+		t.Fatalf("a discovered profile failed validation: %v", err)
 	}
 }
 
@@ -270,6 +338,13 @@ func TestSystemSourceHelpers(t *testing.T) {
 	}
 	if got, ok := normalizeAddress("::ffff:192.0.2.1"); !ok || got != "192.0.2.1" {
 		t.Fatalf("normalized IPv4-mapped IPv6 = %q/%v", got, ok)
+	}
+	// netip takes any zone text; one catalog.Validate would reject is not
+	// an address discovery can offer.
+	for _, zoned := range []string{"fe80::1%en\x1b0", "fe80::1%en\u202e0", "fe80::1%en\u200b0", "fe80::1%en\xff"} {
+		if got, ok := normalizeAddress(zoned); ok || got != "" {
+			t.Fatalf("zone with an unprintable character %q = %q/%v", zoned, got, ok)
+		}
 	}
 	if isLocalStub("fe80::1%en0") {
 		t.Fatal("link-local nameserver must not be labeled a local stub")
@@ -527,5 +602,177 @@ func TestPlatformWindowsAdaptersIsBuildGated(t *testing.T) {
 	adapters, err := platformWindowsAdapters()
 	if adapters != nil || err == nil || !strings.Contains(err.Error(), "not built for Windows") {
 		t.Fatalf("placeholder reader = %#v/%v", adapters, err)
+	}
+}
+
+// withResolvConfFixtures points discovery at a resolv.conf and a
+// systemd-resolved uplink file held in memory. A nil uplink makes the uplink
+// file missing, the state of a host that is not running systemd-resolved.
+func withResolvConfFixtures(t *testing.T, resolvConf string, uplink *string) *int {
+	t.Helper()
+	oldOS, oldOpen, oldUplink := currentOS, openResolvConf, openResolvedUplink
+	t.Cleanup(func() { currentOS, openResolvConf, openResolvedUplink = oldOS, oldOpen, oldUplink })
+	currentOS = "linux"
+	openResolvConf = func() (io.ReadCloser, error) {
+		return &testReadCloser{Reader: strings.NewReader(resolvConf)}, nil
+	}
+	opened := new(int)
+	openResolvedUplink = func() (io.ReadCloser, error) {
+		*opened++
+		if uplink == nil {
+			return nil, fs.ErrNotExist
+		}
+		return &testReadCloser{Reader: strings.NewReader(*uplink)}, nil
+	}
+	return opened
+}
+
+// TestDiscoverAddsSystemdResolvedUplinks covers #257. On Ubuntu and Fedora,
+// /etc/resolv.conf names only the systemd-resolved stub, which is measured but
+// never ranked, so --include-system never compared the host's real upstream.
+// The servers resolved forwards to are added as network profiles after the
+// unchanged stub, labelled for what the file can and cannot show.
+func TestDiscoverAddsSystemdResolvedUplinks(t *testing.T) {
+	const stubOnly = "# This is /run/systemd/resolve/stub-resolv.conf\nnameserver 127.0.0.53\noptions edns0 trust-ad\nsearch lan\n"
+	stubProfiles := func(t *testing.T) []catalog.ResolverProfile {
+		t.Helper()
+		withResolvConfFixtures(t, stubOnly, nil)
+		profiles, err := Discover(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return profiles
+	}
+	baseline := stubProfiles(t)
+	if len(baseline) != 1 || baseline[0].ID != "system-stub-127-0-0-53" || !baseline[0].Local {
+		t.Fatalf("stub-only discovery without an uplink file = %#v", baseline)
+	}
+
+	uplink := "# This is /run/systemd/resolve/resolv.conf\nnameserver 192.0.2.1\nnameserver 2001:db8::1\nnameserver 192.0.2.1\nnameserver 127.0.0.1\nnameserver not-an-ip\nsearch lan\n"
+	opened := withResolvConfFixtures(t, stubOnly, &uplink)
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 3 || *opened != 1 {
+		t.Fatalf("stub plus uplink discovery = %#v/%v (uplink opened %d times)", profiles, err, *opened)
+	}
+	if !reflect.DeepEqual(profiles[0], baseline[0]) {
+		t.Fatalf("the stub profile changed: %#v, want %#v", profiles[0], baseline[0])
+	}
+	for index, want := range []struct{ id, address string }{
+		{"system-resolved-192-0-2-1", "192.0.2.1"},
+		{"system-resolved-2001-db8--1", "2001:db8::1"},
+	} {
+		profile := profiles[index+1]
+		if profile.ID != want.id || profile.Local || len(profile.Addresses) != 1 || profile.Addresses[0] != want.address {
+			t.Fatalf("uplink profile %d = %#v, want %s at %s", index, profile, want.id, want.address)
+		}
+		if profile.Name != "System DNS (systemd-resolved default route)" || profile.Policy != resolvedUplinkPolicy ||
+			!strings.Contains(profile.Policy, "split DNS, DoT and ports not shown") {
+			t.Fatalf("uplink profile %d labels = %#v", index, profile)
+		}
+		if profile.Transports[catalog.UDP].Port != 53 || profile.Transports[catalog.TCP].Port != 53 || len(profile.Transports) != 2 {
+			t.Fatalf("uplink profile %d transports = %#v", index, profile.Transports)
+		}
+	}
+	if err := catalog.Validate(profiles); err != nil {
+		t.Fatalf("uplink profiles fail validation: %v", err)
+	}
+
+	// A host whose resolv.conf names a real resolver already measures it, so
+	// the uplink file is not read at all.
+	opened = withResolvConfFixtures(t, "nameserver 127.0.0.53\nnameserver 192.0.2.9\n", &uplink)
+	if profiles, err := Discover(context.Background()); err != nil || len(profiles) != 2 || *opened != 0 {
+		t.Fatalf("mixed resolv.conf = %#v/%v (uplink opened %d times)", profiles, err, *opened)
+	}
+
+	// An unreadable or empty uplink file leaves discovery exactly as before.
+	uplinkFailures := map[string]func() (io.ReadCloser, error){
+		"read error": func() (io.ReadCloser, error) { return &testReadCloser{Reader: errorReader{}}, nil },
+		"open error": func() (io.ReadCloser, error) { return nil, errors.New("permission denied") },
+		"no servers": func() (io.ReadCloser, error) {
+			return &testReadCloser{Reader: strings.NewReader("nameserver 127.0.0.1\n")}, nil
+		},
+	}
+	for name, open := range uplinkFailures {
+		withResolvConfFixtures(t, stubOnly, nil)
+		openResolvedUplink = open
+		if profiles, err := Discover(context.Background()); err != nil || !reflect.DeepEqual(profiles, baseline) {
+			t.Fatalf("%s: discovery = %#v/%v, want the stub alone", name, profiles, err)
+		}
+	}
+
+	// Only Linux runs systemd-resolved; another resolv.conf platform, and the
+	// macOS fallback, never read its file.
+	for _, platform := range []string{"freebsd", "darwin"} {
+		opened = withResolvConfFixtures(t, stubOnly, &uplink)
+		currentOS = platform
+		oldRun := runScutil
+		runScutil = func(context.Context) ([]byte, error) { return nil, errors.New("no scutil") }
+		profiles, err := Discover(context.Background())
+		runScutil = oldRun
+		if err != nil || len(profiles) != 1 || *opened != 0 {
+			t.Fatalf("%s discovery = %#v/%v (uplink opened %d times)", platform, profiles, err, *opened)
+		}
+	}
+}
+
+// TestDiscoverSkipsNameserversValidateWouldReject keeps one odd line of OS
+// configuration from failing --include-system. A zone is free text to netip,
+// and an address carrying a control or invisible character fails
+// catalog.Validate, which used to end the whole run with status 2.
+func TestDiscoverSkipsNameserversValidateWouldReject(t *testing.T) {
+	withResolvConfFixtures(t, "nameserver fe80::1%en\x1b0\nnameserver fe80::2%en\u202e0\nnameserver fe80::3%en0\n", nil)
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 1 || profiles[0].Addresses[0] != "fe80::3%en0" {
+		t.Fatalf("Discover = %#v/%v, want only the printable zoned nameserver", profiles, err)
+	}
+	if err := catalog.Validate(profiles); err != nil {
+		t.Fatalf("discovered profiles fail validation: %v", err)
+	}
+}
+
+// TestResolvedUplinkIgnoresEntriesThatAreNotAddresses pins that the "only
+// loopback stubs" test reads the nameservers discovery keeps. A stray
+// "nameserver not-an-ip" beside the stub is dropped like everywhere else, so
+// it does not hide the uplink servers; an uplink entry that is not an address,
+// or whose zone Validate would reject, is skipped the same way.
+func TestResolvedUplinkIgnoresEntriesThatAreNotAddresses(t *testing.T) {
+	uplink := "nameserver not-an-ip\nnameserver fe80::1%en\x1b0\nnameserver 192.0.2.1\n"
+	opened := withResolvConfFixtures(t, "nameserver 127.0.0.53\nnameserver not-an-ip\n", &uplink)
+	profiles, err := Discover(context.Background())
+	if err != nil || *opened != 1 || len(profiles) != 2 {
+		t.Fatalf("Discover = %#v/%v (uplink opened %d times)", profiles, err, *opened)
+	}
+	if profiles[0].ID != "system-stub-127-0-0-53" || profiles[1].ID != "system-resolved-192-0-2-1" {
+		t.Fatalf("profile IDs = %s, %s", profiles[0].ID, profiles[1].ID)
+	}
+	// A resolv.conf with no address at all is a discovery error, not a stub
+	// configuration, so the uplink file is not consulted.
+	opened = withResolvConfFixtures(t, "nameserver not-an-ip\n", &uplink)
+	if _, err := Discover(context.Background()); err == nil || *opened != 0 {
+		t.Fatalf("no usable nameserver = %v (uplink opened %d times)", err, *opened)
+	}
+}
+
+// TestOpenResolvedUplinkReadsTheConfiguredPath exercises the real opener
+// against a fixture, the way the resolv.conf opener is tested.
+func TestOpenResolvedUplinkReadsTheConfiguredPath(t *testing.T) {
+	oldPath := resolvedUplinkPath
+	t.Cleanup(func() { resolvedUplinkPath = oldPath })
+	resolvedUplinkPath = filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(resolvedUplinkPath, []byte("nameserver 192.0.2.77\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := originalOpenResolvedUplink()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	addresses, err := scanNameservers(reader)
+	if err != nil || len(addresses) != 1 || addresses[0] != "192.0.2.77" {
+		t.Fatalf("uplink fixture = %#v/%v", addresses, err)
+	}
+	resolvedUplinkPath = filepath.Join(t.TempDir(), "absent.conf")
+	if _, err := originalOpenResolvedUplink(); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing uplink file error = %v", err)
 	}
 }

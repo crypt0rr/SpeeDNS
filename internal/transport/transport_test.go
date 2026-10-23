@@ -210,6 +210,47 @@ func TestDoTOffersTheALPNToken(t *testing.T) {
 	}
 }
 
+// TestFactoryTLSNameMatchesReportedMetadata pins #244 at the point it
+// mattered: a quoted " dns.google " in a resolver file was handed to the TLS
+// handshake padded, failing verification, while the report's tls_server_name
+// showed it trimmed. Every encrypted factory must now authenticate exactly the
+// name the report records.
+func TestFactoryTLSNameMatchesReportedMetadata(t *testing.T) {
+	profiles, err := catalog.LoadYAML(strings.NewReader(`version: 1
+resolvers:
+  - id: padded
+    name: Padded
+    addresses: [192.0.2.53]
+    transports:
+      dot: {server_name: " dns.google "}
+      doq: {server_name: " dns.google "}
+      doh: {url: "https://dns.google/dns-query", server_name: " dns.google "}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range catalog.Expand(profiles, nil) {
+		factory, err := NewFactory(target, time.Second)
+		if err != nil {
+			t.Fatalf("NewFactory(%s): %v", target.Protocol, err)
+		}
+		var serverName string
+		switch typed := factory.(type) {
+		case *streamFactory:
+			serverName = typed.tlsConfig.ServerName
+		case *doqFactory:
+			serverName = typed.tlsConfig.ServerName
+		case *doHFactory:
+			serverName = typed.serverName
+		default:
+			t.Fatalf("%s factory type = %T", target.Protocol, factory)
+		}
+		if want := target.EndpointMetadata().TLSServerName; serverName != want || serverName != "dns.google" {
+			t.Fatalf("%s TLS ServerName = %q, metadata tls_server_name = %q", target.Protocol, serverName, want)
+		}
+	}
+}
+
 // TestUDPFactoryResolvesHostnameOnce covers the bootstrap lookup moving out of
 // the measured exchange. dns.Client.ExchangeContext dials whatever address it
 // is handed, so a hostname endpoint previously went through the system
