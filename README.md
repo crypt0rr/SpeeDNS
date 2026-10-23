@@ -157,27 +157,53 @@ migrating imports. New source references and release metadata use the canonical
 
 ### Verify a downloaded release
 
-From the release assets directory, verify the checksums and the keyless
-Sigstore signature on the checksum file:
+Download the asset you want together with `checksums.txt` and
+`checksums.txt.sigstore.json` into one directory. First verify the keyless
+Sigstore signature on the checksum file, so that its contents can be trusted:
 
 ```sh
-sha256sum -c checksums.txt
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
   --certificate-identity-regexp '^https://github\.com/crypt0rr/SpeeDNS/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-Release archives also carry a GitHub artifact attestation. With the GitHub CLI,
-verify an archive against this repository:
+Then check the asset against its own line in `checksums.txt`. That file lists
+every release asset, so `sha256sum -c checksums.txt` on its own reports each
+one you did not download as missing and exits non-zero. Select the line by its
+exact file name; a `grep` for the name would also match the line for the
+asset's `.sbom.json`:
 
 ```sh
-gh attestation verify SpeeDNS_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS
+asset=SpeeDNS_VERSION_OS_ARCH.tar.gz
+# Linux, with GNU coreutils or BusyBox
+awk -v asset="$asset" '$2 == asset' checksums.txt | sha256sum -c -
+# macOS
+awk -v asset="$asset" '$2 == asset' checksums.txt | shasum -a 256 -c -
 ```
 
-Replace the archive name with the exact asset you downloaded. The release
-workflow uses the protected `release` environment; maintainers must store
-`HOMEBREW_TAP_TOKEN` there and configure required reviewers before publishing.
+Both print `<asset>: OK` and exit 0 only when the file matches; they fail when
+it differs, and when the name matches no line. With GNU coreutils,
+`sha256sum --ignore-missing -c checksums.txt` instead checks every listed
+asset that is present in the directory. BusyBox has no `--ignore-missing`.
+
+Release archives also carry a GitHub artifact attestation. With the GitHub CLI,
+verify an archive against the same signer identity as the cosign check:
+
+```sh
+gh attestation verify SpeeDNS_VERSION_OS_ARCH.tar.gz --repo crypt0rr/SpeeDNS \
+  --cert-identity-regex '^https://github\.com/crypt0rr/SpeeDNS/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
+  --deny-self-hosted-runners
+```
+
+With `--repo` alone, an attestation signed by any workflow in the repository,
+on any ref, would pass. The identity limits it to the release workflow on a
+`v*` tag or on `main`, which is where a manually dispatched release signs from.
+
+Replace `SpeeDNS_VERSION_OS_ARCH.tar.gz` with the exact asset you downloaded.
+The release workflow uses the protected `release` environment; maintainers must
+store `HOMEBREW_TAP_TOKEN` there and configure required reviewers before
+publishing.
 
 ## Quick start
 

@@ -21,7 +21,7 @@ failed a pull request that passed the list above:
 
 ```sh
 staticcheck ./...
-shellcheck --severity=style scripts/*.sh
+shellcheck --severity=style scripts/*.sh scripts/testdata/*.sh
 go mod tidy && git diff --exit-code -- go.mod go.sum
 GOOS=windows go vet ./...
 ```

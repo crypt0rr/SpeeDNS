@@ -18,6 +18,16 @@ if [[ "${path}" != "${canonical_path}" ]]; then
 	echo "Homebrew cask publication path must be ${canonical_path}, got ${path}" >&2
 	exit 2
 fi
+# The version derived from the tag is compared with the tap's below, so it gets
+# the same strict shape scripts/homebrew-cask.sh enforces (see the reasons there).
+valid_release_tag() {
+	local LC_ALL=C
+	[[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+}
+if ! valid_release_tag "${release_tag}"; then
+	echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: ${release_tag}" >&2
+	exit 2
+fi
 if [[ ! -f "${cask_file}" ]]; then
 	echo "cask file does not exist: ${cask_file}" >&2
 	exit 1
@@ -44,9 +54,55 @@ if [[ -n "${case_variant_paths}" ]]; then
 	echo "remove the legacy path before publishing ${canonical_path}" >&2
 	exit 1
 fi
+# Read the sha and the content in one request, so the version checked below
+# belongs to exactly the blob the PUT replaces: the PUT carries this sha, and
+# GitHub rejects it if the cask changed in between. A failed read counts as no
+# cask yet (first publication). That cannot slip a downgrade past the check:
+# without a sha the PUT can only create the file, and GitHub refuses it when
+# one already exists.
 current_sha=""
-if current_sha="$(GH_TOKEN="${HOMEBREW_TAP_TOKEN}" gh api "repos/${repository}/contents/${path}?ref=${tap_branch}" --jq .sha 2>/dev/null)"; then
-	:
+current_version=""
+current_found=false
+if current_blob="$(GH_TOKEN="${HOMEBREW_TAP_TOKEN}" gh api "repos/${repository}/contents/${path}?ref=${tap_branch}" --jq '.sha, .content' 2>/dev/null)"; then
+	current_found=true
+	current_sha="$(printf '%s\n' "${current_blob}" | sed -n 1p)"
+	current_cask="$(printf '%s\n' "${current_blob}" | sed 1d | tr -d '\n' | base64 --decode)"
+	# awk reads to the end rather than exiting at the first match: under
+	# pipefail, an early exit could fail printf with SIGPIPE on a large cask.
+	current_version="$(printf '%s\n' "${current_cask}" |
+		awk -F'"' '!found && /^[[:space:]]*version "[^"]*"[[:space:]]*$/ { print $2; found = 1 }')"
+fi
+
+# Homebrew upgrades whenever the tap's version differs from the installed one,
+# so publishing an older release here would move every `brew upgrade` user
+# backwards. Refuse unless the maintainer asked for it explicitly. sort -V is
+# a sound order because both sides are stable versions: the tap only ever
+# holds one, and validate-published-release.sh refuses prereleases. (It would
+# rank 1.0.0 below 1.0.0-rc.1.)
+new_version="${release_tag#v}"
+downgrade_allowed() {
+	[[ "${ALLOW_DOWNGRADE:-0}" == 1 ]]
+}
+if [[ "${current_found}" != true ]]; then
+	echo "no readable ${path} in ${repository}; publishing ${new_version} as the first cask"
+elif [[ -z "${current_version}" ]]; then
+	if ! downgrade_allowed; then
+		echo "${repository}/${path} declares no version, so a downgrade cannot be ruled out;" \
+			"refusing to replace it without ALLOW_DOWNGRADE=1" >&2
+		exit 1
+	fi
+	echo "ALLOW_DOWNGRADE=1: replacing ${path}, which declares no version, with ${new_version}" >&2
+else
+	lowest_version="$(printf '%s\n' "${current_version}" "${new_version}" | sort -V | sed -n 1p)"
+	if [[ "${new_version}" != "${current_version}" && "${lowest_version}" == "${new_version}" ]]; then
+		if ! downgrade_allowed; then
+			echo "refusing to downgrade ${repository}/${path} from ${current_version} to ${new_version};" \
+				"set ALLOW_DOWNGRADE=1 (the allow_downgrade workflow input) to publish an older release" >&2
+			exit 1
+		fi
+		echo "ALLOW_DOWNGRADE=1: downgrading ${path} from ${current_version} to ${new_version}" >&2
+	fi
+	echo "${repository}/${path} holds ${current_version}; publishing ${new_version}"
 fi
 
 content="$(base64 <"${cask_file}" | tr -d '\n')"

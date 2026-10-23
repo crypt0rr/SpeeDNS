@@ -7,12 +7,29 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing published v* tag
+        description: Existing published stable vMAJOR.MINOR.PATCH tag
         required: true
         type: string
+      allow_downgrade:
+        description: Publish even if the tap already holds a newer version
+        required: false
+        default: false
+        type: boolean
 
+# One group for every run that can write the tap, not one per tag: the tap
+# holds a single cask, so two runs for different releases must not interleave
+# their read and write of it. GitHub keeps at most one run pending per group
+# and cancels the older pending run when a newer one arrives. If the cancelled
+# run was for the highest version, dispatch that tag again.
+#
+# Prerelease events get a group of their own. Concurrency applies to the whole
+# run before the publish job's if: skips it, so in the shared group a
+# prerelease published while a stable run waits would cancel that stable run
+# and then do nothing, leaving its cask unpublished. A dispatch carries no
+# release payload and always joins the shared group;
+# validate-published-release.sh refuses a prerelease tag there.
 concurrency:
-  group: homebrew-${{ inputs.tag || github.event.release.tag_name }}
+  group: ${{ (github.event_name == 'release' && github.event.release.prerelease) && format('homebrew-prerelease-{0}', github.run_id) || 'homebrew-tap' }}
   cancel-in-progress: false
 
 permissions:
@@ -24,6 +41,12 @@ env:
 jobs:
   publish:
     name: Publish Homebrew cask
+    # Skip prereleases before the job asks the protected environment for
+    # approval: the tap serves only stable releases, so such a run could only
+    # wait for a reviewer and then fail. validate-published-release.sh still
+    # refuses a prerelease, for dispatches and as a backstop. The event-name
+    # clause admits dispatches, which carry no release payload.
+    if: ${{ github.event_name != 'release' || !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     environment:
       name: release
@@ -50,6 +73,9 @@ jobs:
             exit 1
           fi
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
       - name: Download published checksums
         shell: bash
         env:
@@ -61,8 +87,23 @@ jobs:
           gh release download "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
             --pattern checksums.txt \
+            --pattern checksums.txt.sigstore.json \
             --dir "${release_dir}" \
             --clobber
+
+      # Every sha256 in the cask comes from checksums.txt, and release assets
+      # can be replaced after the release job signed them. Check the release
+      # workflow's signature, with the identity README.md tells users to
+      # require, before any of it reaches the tap.
+      - name: Verify checksums signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="${RUNNER_TEMP}/speedns-release"
+          cosign verify-blob "${release_dir}/checksums.txt" \
+            --bundle "${release_dir}/checksums.txt.sigstore.json" \
+            --certificate-identity-regexp '^https://github\.com/crypt0rr/SpeeDNS/\.github/workflows/release\.yml@refs/(tags/v[^/]+|heads/main)$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
       - name: Generate cask from published checksums
         shell: bash
@@ -77,6 +118,9 @@ jobs:
         shell: bash
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Passed through the environment, never interpolated into the script.
+          # A release event has no inputs, so it is always 0 there.
+          ALLOW_DOWNGRADE: ${{ inputs.allow_downgrade && '1' || '0' }}
         run: bash scripts/publish-homebrew-cask.sh "${RUNNER_TEMP}/speedns.rb" "${RELEASE_TAG}"
 
       - name: Validate published Homebrew tap
@@ -92,6 +136,7 @@ jobs:
           name: speedns-homebrew-cask
           path: |
             ${{ runner.temp }}/speedns-release/checksums.txt
+            ${{ runner.temp }}/speedns-release/checksums.txt.sigstore.json
             ${{ runner.temp }}/speedns.rb
           if-no-files-found: ignore
           retention-days: 14

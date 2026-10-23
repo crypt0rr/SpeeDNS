@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing v* tag to release
+        description: Existing vMAJOR.MINOR.PATCH[-PRERELEASE] tag to release
         required: true
         type: string
 
@@ -47,13 +47,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "${RELEASE_TAG}" in
-            v[0-9]*) ;;
-            *)
-              echo "release ref must be a v* tag, got ${RELEASE_TAG}" >&2
-              exit 1
-              ;;
-          esac
+          # The shape every release script requires (scripts/homebrew-cask.sh
+          # explains why), checked here as well so a malformed tag fails before
+          # either GoReleaser build rather than after both. The C locale keeps
+          # [0-9] to the ASCII digits. schema/workflows_test.go keeps this
+          # copy identical to the scripts' copies.
+          valid_release_tag() {
+            local LC_ALL=C
+            [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          }
+          if ! valid_release_tag "${RELEASE_TAG}"; then
+            echo "release ref must be a vMAJOR.MINOR.PATCH[-PRERELEASE] tag, got ${RELEASE_TAG}" >&2
+            exit 1
+          fi
           # Membership, not identity: several tags can point at one commit (a
           # stable tag on the same commit as its final prerelease), and
           # `git describe --exact-match` returns only one of them, chosen by
@@ -78,17 +84,21 @@ jobs:
             echo "prerelease ${RELEASE_TAG}: keeping GoReleaser's default range"
             exit 0
           fi
-          # Pure case matching rather than `grep -v -- '-'`, whose argument
-          # handling differs between grep implementations.
-          previous=""
-          while read -r candidate; do
-            case "${candidate}" in
-              *-*) continue ;;
-              "${RELEASE_TAG}") continue ;;
-            esac
-            previous="${candidate}"
-            break
-          done < <(git tag --list 'v*' --sort=-version:refname)
+          # The previous stable tag is the highest one BELOW this release, not
+          # the highest overall: a backport such as v0.5.3 cut after v0.6.1
+          # must be measured from v0.5.2. scripts/release-fixture.sh covers it.
+          #
+          # The script comes from the checked-out tag, like every script this
+          # job runs, while a dispatch runs this file from the branch it was
+          # started on. Dispatched from main, a tag whose tree predates the
+          # script (any tag up to v0.6.8, or one cut from a maintenance branch
+          # that has not cherry-picked it) would stop here with a bare exit 127.
+          if [[ ! -f scripts/previous-stable-tag.sh ]]; then
+            echo "${RELEASE_TAG} has no scripts/previous-stable-tag.sh, which this workflow needs to choose the release notes range." >&2
+            echo "Cherry-pick the script and this step onto the branch before tagging; see \"Backport releases\" in RELEASE_CHECKLIST.md." >&2
+            exit 1
+          fi
+          previous="$(git tag --list 'v*' | bash scripts/previous-stable-tag.sh "${RELEASE_TAG}")"
           if [[ -z "${previous}" ]]; then
             echo "no earlier stable tag: keeping GoReleaser's default range"
             exit 0
@@ -111,11 +121,18 @@ jobs:
         shell: bash
         run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
+      # No cache, deliberately. A tag or dispatch run can restore the setup-go
+      # cache that main-branch CI, CodeQL and the scheduled live smoke save, and
+      # nothing here checks what it restores: `go mod verify` covers the module
+      # cache only, and GOCACHE entries are trusted as written. Both GoReleaser
+      # builds would read the same restored GOCACHE, so the reproducibility
+      # comparison cannot catch a planted entry either, and this is the job that
+      # signs and attests. A cold build costs a few minutes per release.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
       - name: Verify module metadata
         shell: bash
