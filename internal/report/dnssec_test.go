@@ -2,13 +2,13 @@ package report
 
 import (
 	"bytes"
-	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/schematest"
 	"github.com/crypt0rr/SpeeDNS/schema"
 )
 
@@ -114,17 +114,7 @@ func TestDNSSECAppearsInJSONAndCSV(t *testing.T) {
 			t.Fatalf("JSON missing %q:\n%s", expected, jsonOutput.String())
 		}
 	}
-	var schemaDocument map[string]any
-	if err := json.Unmarshal(schema.ReportV1(), &schemaDocument); err != nil {
-		t.Fatal(err)
-	}
-	var instance any
-	decoder := json.NewDecoder(bytes.NewReader(jsonOutput.Bytes()))
-	decoder.UseNumber()
-	if err := decoder.Decode(&instance); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateJSONSchema(schemaDocument, instance, schemaDocument, "$"); err != nil {
+	if err := schematest.Validate(schema.ReportV1(), jsonOutput.Bytes()); err != nil {
 		t.Fatalf("DNSSEC JSON does not match schema: %v\n%s", err, jsonOutput.String())
 	}
 

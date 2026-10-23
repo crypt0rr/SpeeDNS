@@ -3,7 +3,11 @@
 This document describes the ranking rules used by the current SpeeDNS
 benchmark. A run records its random seed and corpus size so that the query
 matrix can be reproduced, subject to the normal variability of the network and
-the recursive resolvers being measured.
+the recursive resolvers being measured. A run without `--seed` draws its seed
+from 1 to 2^31-2. The generator reduces every seed modulo 2^31-1, so that
+range already holds every distinct query order, and a seed that small reads
+back exactly in a JSON consumer that parses numbers as doubles; the nanosecond
+clock reading the default used to be did not.
 
 ## Query matrix and execution
 
@@ -104,7 +108,14 @@ retried. A DoT or DoQ reconnect runs inside one query's deadline, so it first
 tries the bootstrap candidate the session last connected to and then the
 others in configured order; when a reconnect runs out of time, the next one
 starts at the following candidate, so a candidate that stopped answering
-cannot consume every later query's budget.
+cannot consume every later query's budget. A DoQ reconnect treats the addresses
+a hostname endpoint resolves to the same way: it dials the address the session
+last reached first and the others in the resolver's order, and once a
+reconnect runs out of time, the next one starts at the address that follows,
+in the resolver's order, the one that reconnect started at, so successive
+reconnects reach every address. Otherwise every reconnect would start at the
+resolver's first address, and where that address silently drops packets, each
+would spend its whole deadline there.
 
 Cold probes use three separate sessions. Their timer includes session opening,
 the first DNS exchange, and response validation, but stops before session
@@ -126,6 +137,11 @@ score_ms = 0.60 × median_ms
          + 0.40 × p95_ms
          + scoring_failure_rate × timeout_ms
 ```
+
+`timeout_ms` is the run's `--timeout`, recorded in `run.provenance`. A timeout
+must be a whole number of milliseconds, so that field is the exact value the
+score charged and the value `speedns diff` compares; a timeout such as
+`1000500us` is rejected as a usage error rather than recorded as `1000`.
 
 For each name/type, SpeeDNS builds separate comparison groups for each
 normalized declared resolver policy. This prevents an unfiltered resolver from
@@ -449,6 +465,22 @@ For encrypted targets, these reports also expose the effective TLS server
 name, whether it was configured explicitly or derived from the endpoint,
 whether bootstrap came from explicit IP candidates, the target address, or
 the system resolver, and the selected dial address when a connection opened.
+The dial address is the configured candidate, so for a hostname endpoint it
+is the hostname. JSON and CSV therefore also record, for every transport, the
+remote address the session's last connection reached, which shows the address
+family it used, and for DoT, DoH and DoQ the negotiated TLS version. For DoH
+they record the HTTP version too: SpeeDNS offers `h2` first through ALPN and
+accepts `http/1.1`, and an endpoint that negotiates HTTP/1.1, or no ALPN
+protocol at all, is measured over HTTP/1.1, reported as `http/1.1`. A hostname
+endpoint is resolved through the system resolver for every transport, and each
+starts with the first address returned; DoQ used to let its QUIC library
+resolve the name, which preferred IPv4 whatever that order was. The transports
+fall back from that address differently. TCP, DoT and DoH connect through Go's
+dialer, which shares one timeout among the addresses and starts the other
+address family 300 ms after the first if that has not connected. DoQ dials the
+addresses one after another, each with a full timeout, so where the first
+address silently drops packets a DoQ session opens only after one timeout, and
+every DoQ cold probe, which opens its own session, includes that wait.
 An explicit `server_name` is the only way to opt into a different TLS identity;
 `bootstrap_addresses` only changes connection candidates and never disables
 certificate validation. The configured `server_name` is stored trimmed, so the
@@ -784,7 +816,13 @@ findings, so a pass would describe nothing, and the gate exits 3 with a count
 of the targets each reason excluded. A condition that fails on such a pair
 still exits 4, because a target missing from one run is a real finding that
 needs no pairing. Every condition that does not hold is reported, in the order
-given, rather than only the first.
+given, rather than only the first. `diff --format json` records the same
+verdicts in an optional `conditions` array, so the archived diff says which
+gate ran: each condition is `passed` or `failed`, except that every condition
+of a refused pair, and one that held on a pair that compared no endpoint, is
+`not-evaluated`. A condition that failed on a comparable pair stays `failed`
+even when no endpoint was compared, and only a `passed` condition has
+`passed: true`.
 
 `no-new-failed-targets` asks whether the current run introduced a failed
 target. The findings it reads are two-way, because a recovery is a behaviour

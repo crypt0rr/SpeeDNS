@@ -83,10 +83,12 @@ func TestStreamSessionReconnectsAfterFatalErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			first := tc.first()
 			second := newScriptedStreamConn()
+			second.remote = "192.0.2.2:53"
 			opens := 0
 			session := &streamSession{
-				conn:    first,
-				timeout: time.Second,
+				conn:       first,
+				timeout:    time.Second,
+				connection: streamConnectionInfo(first),
 				reopen: func(context.Context) (net.Conn, string, error) {
 					opens++
 					return second, "reconnected:853", nil
@@ -124,6 +126,12 @@ func TestStreamSessionReconnectsAfterFatalErrors(t *testing.T) {
 			}
 			if got := session.DialAddress(); got != "reconnected:853" {
 				t.Fatalf("reconnected dial address = %q", got)
+			}
+			// The session began with the first connection's description, as
+			// Open leaves it, so only a reconnect that replaced it reports
+			// the peer the session now talks to.
+			if got, want := session.Connection(), (ConnectionInfo{RemoteAddress: "192.0.2.2:53"}); got != want {
+				t.Fatalf("connection after the reconnect = %#v, want %#v", got, want)
 			}
 			if err := session.Close(); err != nil {
 				t.Fatal(err)
@@ -567,6 +575,13 @@ func TestDoTReconnectMovesOnWhenTheLastGoodCandidateGoesSilent(t *testing.T) {
 	}
 	if address := session.(*streamSession).DialAddress(); address != second.Addr().String() {
 		t.Fatalf("DoT reconnected to %q, want %q", address, second.Addr().String())
+	}
+	// Open reached the first candidate, so a description that did not follow
+	// the reconnect would still name it: remote_address is the last
+	// connection the session made.
+	want := ConnectionInfo{RemoteAddress: second.Addr().String(), TLSVersion: "TLS 1.3"}
+	if got := connectionOf(t, session); got != want {
+		t.Fatalf("DoT connection after failing over = %#v, want %#v", got, want)
 	}
 	if firstDials, secondDials := firstAccepts.Load(), secondAccepts.Load(); firstDials != 2 || secondDials != 1 {
 		t.Fatalf("candidate dials = %d/%d, want 2/1", firstDials, secondDials)

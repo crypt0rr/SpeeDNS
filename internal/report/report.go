@@ -111,6 +111,12 @@ type JSONTarget struct {
 	BootstrapMode      string           `json:"bootstrap_mode"`
 	BootstrapAddresses []string         `json:"bootstrap_addresses,omitempty"`
 	DialAddress        string           `json:"dial_address,omitempty"`
+	// RemoteAddress, TLSVersion and HTTPProtocol describe the connection the
+	// session actually made, where dial_address names the configured
+	// candidate it dialled; see transport.ConnectionInfo.
+	RemoteAddress string `json:"remote_address,omitempty"`
+	TLSVersion    string `json:"tls_version,omitempty"`
+	HTTPProtocol  string `json:"http_protocol,omitempty"`
 }
 
 type JSONOptions struct {
@@ -136,10 +142,7 @@ var newCSVWriter = func(writer io.Writer) csvWriter {
 func jsonResultFor(result benchmark.TargetResult, raw bool, options JSONOptions, redactedIDs map[string]string) JSONResult {
 	metadata := jsonEndpointMetadata(result.Target)
 	view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
-	dialAddress := result.DialAddress
-	if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
-		dialAddress = redactedValue
-	}
+	dialAddress, remoteAddress := connectionAddresses(result, options.RedactSystem)
 	jsonResult := JSONResult{
 		Target: JSONTarget{
 			ID: view.ID, Name: view.Name, Owner: view.Owner, Policy: view.Policy,
@@ -147,6 +150,12 @@ func jsonResultFor(result benchmark.TargetResult, raw bool, options JSONOptions,
 			EndpointURL: metadata.EndpointURL, TLSServerName: metadata.TLSServerName,
 			TLSIdentitySource: metadata.TLSIdentitySource, BootstrapMode: metadata.BootstrapMode,
 			BootstrapAddresses: metadata.BootstrapAddresses, DialAddress: safetext.Escape(dialAddress),
+			// crypto/tls names the version itself and accepts only an ALPN
+			// protocol the client offered, but the two are escaped like every
+			// other endpoint string, so no sink depends on where a value came
+			// from.
+			RemoteAddress: safetext.Escape(remoteAddress), TLSVersion: safetext.Escape(result.Connection.TLSVersion),
+			HTTPProtocol: safetext.Escape(result.Connection.HTTPProtocol),
 		},
 		// The session error quotes endpoint-chosen text, such as the
 		// certificate names in an x509 mismatch, so it is escaped like the
@@ -212,6 +221,22 @@ func jsonEnvelope(report benchmark.Report, options JSONOptions, redactedIDs map[
 		Rankings: rankings, PairedEffects: pairedEffectsForJSON(report, redactedIDs), ProfileComparisons: profileComparisons,
 		Divergence: divergenceForJSON(report, redactedIDs), Warnings: warnings,
 	}
+}
+
+// connectionAddresses returns the dial and remote address a report shows for
+// one result. A system resolver's address is local configuration, so under
+// --redact-system both are replaced like the target address beside them.
+func connectionAddresses(result benchmark.TargetResult, redactSystem bool) (string, string) {
+	dialAddress, remoteAddress := result.DialAddress, result.Connection.RemoteAddress
+	if redactSystem && isSystemTarget(result.Target) {
+		if dialAddress != "" {
+			dialAddress = redactedValue
+		}
+		if remoteAddress != "" {
+			remoteAddress = redactedValue
+		}
+	}
+	return dialAddress, remoteAddress
 }
 
 func durationMilliseconds(started, finished time.Time) float64 {
@@ -379,6 +404,10 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 		// and unattributable. It was also the only format not reproducible
 		// from its own contents.
 		"started_at", "seed", "sample_size", "query_types", "speedns_version", "corpus_sha256",
+		// Appended for v0.7.0: the connection each target actually made.
+		// dial_address is the configured candidate, often a hostname, so it
+		// does not say which address family or protocol versions were used.
+		"remote_address", "tls_version", "http_protocol",
 	}); err != nil {
 		return err
 	}
@@ -388,10 +417,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 		stats := result.Stats
 		metadata := result.Target.EndpointMetadata()
 		view := targetViewFor(result.Target, options.RedactSystem, redactedIDs[result.Target.ID()])
-		dialAddress := result.DialAddress
-		if options.RedactSystem && isSystemTarget(result.Target) && dialAddress != "" {
-			dialAddress = redactedValue
-		}
+		dialAddress, remoteAddress := connectionAddresses(result, options.RedactSystem)
 		row := []string{
 			csvCell(view.ID), csvCell(view.Name), csvCell(view.Owner), csvCell(view.Policy),
 			csvCell(view.Address), csvCell(result.Target.Protocol.String()), strconv.Itoa(rank), strconv.FormatBool(stats.Recommended),
@@ -413,6 +439,7 @@ func WriteCSVWithOptions(writer io.Writer, report benchmark.Report, options CSVO
 			csvCell(strings.ReplaceAll(queryTypes(report.QueryTypes), ",", "|")),
 			csvCell(csvProvenanceField(report, func(p *benchmark.RunProvenance) string { return p.Version })),
 			csvCell(csvProvenanceField(report, func(p *benchmark.RunProvenance) string { return p.CorpusSHA256 })),
+			csvCell(remoteAddress), csvCell(result.Connection.TLSVersion), csvCell(result.Connection.HTTPProtocol),
 		}
 		if err := writerCSV.Write(row); err != nil {
 			return err
@@ -611,6 +638,7 @@ func redactResultText(result benchmark.TargetResult, value string, redact bool, 
 		result.Target.DisplayName(), redactedSystemName,
 		result.Target.Resolver.Owner, redactedSystemOwner,
 		result.DialAddress, redactedValue,
+		result.Connection.RemoteAddress, redactedValue,
 		result.Target.Address, redactedValue,
 	}
 	replacements := make([]string, 0, len(sources)*2)
@@ -735,8 +763,7 @@ func renderWarning(report benchmark.Report, warning benchmark.Warning, redactSys
 	redactedID := redactedIDs[warning.Target.ID()]
 	redacted := warning
 	redacted.Message = redactResultText(warningTargetResult(report, *warning.Target), warning.Message, true, redactedID)
-	view := targetViewFor(*warning.Target, true, redactedID)
-	return redacted.RenderWith(view.Name, view.Address)
+	return redacted.RenderWith(warningEndpoint(*warning.Target, true, redactedID))
 }
 
 func renderWarnings(report benchmark.Report, redactSystem bool, redactedIDs map[string]string) []string {
@@ -1608,9 +1635,25 @@ func comparisonHeaders(details bool) []string {
 	return append(headers, "Tie", "Status")
 }
 
-func targetWarningLabelWithOptions(result benchmark.TargetResult, redactSystem bool) string {
-	view := targetViewFor(result.Target, redactSystem, redactedValue)
-	return fmt.Sprintf("%s %s/%s", view.Name, view.Address, result.Target.Protocol)
+func targetWarningLabelWithOptions(result benchmark.TargetResult, redactSystem bool, redactedID string) string {
+	name, address := warningEndpoint(result.Target, redactSystem, redactedID)
+	return fmt.Sprintf("%s %s/%s", name, address, result.Target.Protocol)
+}
+
+// warningEndpoint returns the name and address a warning label shows for a
+// target. Under --redact-system a system target's address is the address part
+// of its redacted ID, so the label reads "System DNS (redacted)
+// system-redacted-1@redacted/udp", the ID results[].target.id carries. With
+// the generic address alone every system resolver on one protocol rendered
+// the same label, so their warnings could neither be told apart nor joined
+// with their results. A warning whose target produced no result has no
+// redacted ID and keeps the generic address.
+func warningEndpoint(target catalog.Target, redactSystem bool, redactedID string) (string, string) {
+	view := targetViewFor(target, redactSystem, redactedID)
+	if redactSystem && isSystemTarget(target) && redactedID != "" {
+		return view.Name, strings.TrimSuffix(redactedID, "/"+target.Protocol.String())
+	}
+	return view.Name, view.Address
 }
 
 func compactWarnings(report benchmark.Report) []string {
@@ -1619,6 +1662,7 @@ func compactWarnings(report benchmark.Report) []string {
 
 func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []string {
 	warnings := make([]string, 0)
+	redactedIDs := redactedTargetIDs(report, redactSystem)
 	handled := make(map[string]bool)
 	// Endpoints that already contributed a line, so a targeted warning does
 	// not add a second one for the same endpoint.
@@ -1707,10 +1751,9 @@ func compactWarningsWithOptions(report benchmark.Report, redactSystem bool) []st
 		}
 		if len(parts) > 0 {
 			rebuilt[result.Target.ID()] = true
-			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabelWithOptions(result, redactSystem), strings.Join(parts, "; ")))
+			warnings = append(warnings, fmt.Sprintf("%s: %s", targetWarningLabelWithOptions(result, redactSystem, redactedIDs[result.Target.ID()]), strings.Join(parts, "; ")))
 		}
 	}
-	redactedIDs := redactedTargetIDs(report, redactSystem)
 	for _, warning := range report.Warnings {
 		// Run-level warnings are carried through verbatim.
 		if !warning.Targeted() {

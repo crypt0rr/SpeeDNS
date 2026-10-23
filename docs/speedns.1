@@ -143,7 +143,9 @@ measure every generated name.
 Use the complete selected domain list.
 .TP
 .B --seed N
-Use a specific seed so the selected query order can be reproduced.
+Use a specific seed so the selected query order can be reproduced. Without it,
+or with 0, the run draws a seed from 1 to 2^31-2 and records it in the report;
+that range holds every distinct query order the generator can produce.
 .TP
 .B --type A,AAAA
 Select DNS record types, defaulting to A,AAAA. Zone-transfer types
@@ -151,7 +153,9 @@ Select DNS record types, defaulting to A,AAAA. Zone-transfer types
 pseudo-record are rejected.
 .TP
 .B --timeout DURATION
-Set the per-query and connection timeout, for example 2s. Every measured round
+Set the per-query and connection timeout, for example 2s or 750ms. It must be a
+whole number of milliseconds, because the report records it that way. Every
+measured round
 waits for its slowest dispatched target, so a target that never answers costs
 the whole protocol group up to one timeout per measured query. Per protocol,
 unresponsive targets add roughly queries per target \(mu
@@ -248,9 +252,11 @@ answers an earlier one left in the resolver's shared cache and the view can
 understate the cost of encryption.
 .TP
 .B --redact-system
-Redact local system resolver addresses and labels in reports. A failed
+Redact local system resolver addresses and labels in reports. Each system
+resolver keeps a redacted ID such as system-redacted-1@redacted/udp; its
+warnings and a failed
 .B --assert
-names a system resolver by the same redacted target id the report uses.
+name it by that ID.
 .TP
 .B --assert EXPRESSION
 Assert a winner metric or profile condition, and exit
@@ -324,6 +330,12 @@ write progress only to standard error: terminals receive one updating line,
 while redirected standard error receives deterministic preparation,
 measurement, and completion lines. JSON and CSV runs are silent on standard
 error.
+.PP
+Within one schema version, fields a release adds are optional, so the
+published schema accepts every report of that version. Per target, JSON and
+CSV record the configured dial address, the remote address the connection
+reached, the negotiated TLS version, and for DoH whether the connection speaks
+h2 or http/1.1; DoH offers h2 first and accepts http/1.1.
 .PP
 Preparation covers connection setup, cold probes, and warm-up queries, and
 runs with the same bounded concurrency as measurement. Every target finishes
@@ -439,6 +451,14 @@ When no endpoint was compared, because every target was interrupted, local,
 redacted, or present in only one run, and no condition failed, the exit status
 is 3 and the message counts the targets each reason excluded: a gate that read
 nothing does not pass. A refusal outranks every condition.
+.IP
+With
+.BR "--format json" ,
+the diff records each condition in a conditions array with its outcome:
+passed or failed, except that every condition of refused runs, and one that
+held when no endpoint was compared, is not-evaluated. A condition that failed
+when no endpoint was compared stays failed. Only a passed condition reports
+passed as true.
 .SH EXIT STATUS
 .TP
 .B 0

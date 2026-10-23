@@ -71,6 +71,10 @@ assert record["run"]["seed"] == 42
 assert record["failures"] == []
 assert len(record["transports"]) == 5
 assert len(record["summary"]) == 5
+# One scored sample per transport, as the live smoke's --sample 1 run
+# produces, is ranked but never recommendation-eligible.
+assert all(item["status"] == "provisional" for item in record["summary"]), record["summary"]
+assert all(item["status"] == "ineligible" for item in record["transports"]), record["transports"]
 PY
 
 python3 - "${evidence_dir}" <<'PY'
@@ -126,6 +130,11 @@ import sys
 
 report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert report["rankings"] == [], report["rankings"]
+# A transport that opened records the connection it made, as a real run does,
+# so the publisher is fed the target fields the encoder now writes.
+target = report["results"][0]["target"]
+for key in ("dial_address", "remote_address", "tls_version"):
+    assert target.get(key), f"evidence target has no {key}: {target}"
 stats = report["results"][0]["stats"]
 for key in ("cold_median_ms", "ci_low_ms", "ci_high_ms", "tie"):
     assert key in stats, f"encoder dropped stats.{key} for a failed transport"
@@ -147,6 +156,47 @@ assert record["failures"] == ["doq: no comparable ranking"]
 assert record["summary"][-1]["status"] == "failed"
 assert record["summary"][-1]["winner"] is None
 assert record["transports"][-1]["status"] == "failed"
+PY
+# The failed transport measured no latency. Its median, p95 and score cells
+# must read as unmeasured, as the CLI table prints them, rather than as the
+# 0.00 ms the encoder writes; its success rate is measured and stays numeric.
+python3 - "${temporary_dir}/no-comparable-results/index.html" <<'PY'
+import html.parser
+import pathlib
+import sys
+
+
+class Rows(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self.cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: object) -> None:
+        if tag == "tr":
+            self.rows.append([])
+        elif tag == "td":
+            self.cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "td" and self.cell is not None:
+            self.rows[-1].append("".join(self.cell))
+            self.cell = None
+
+    def handle_data(self, data: str) -> None:
+        if self.cell is not None:
+            self.cell.append(data)
+
+
+parser = Rows()
+parser.feed(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+summary = {row[0]: row for row in parser.rows if len(row) == 9}
+# protocol, status, owner, address, policy, median, p95, success, score
+assert summary["doq"][5:] == ["—", "—", "0.00", "—"], summary["doq"]
+for protocol in ("udp", "tcp", "doh", "dot"):
+    median, p95, success, score = summary[protocol][5:]
+    assert median.endswith(" ms") and p95.endswith(" ms") and score.endswith(" ms"), summary[protocol]
+    assert success == "1.00", summary[protocol]
 PY
 
 generate_evidence "${temporary_dir}/all-failed-evidence" udp,tcp,doh,dot,doq

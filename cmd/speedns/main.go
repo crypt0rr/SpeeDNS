@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
@@ -85,6 +86,19 @@ var progressWriterFunc = func() io.Writer { return os.Stderr }
 var warningWriterFunc = func() io.Writer { return os.Stderr }
 
 var newCacheMissNonceFunc = domains.NewCacheMissNonce
+
+// maxDefaultSeed is the largest seed a run picks for itself. The benchmark's
+// math/rand sources reduce every seed modulo 2^31-1, and a residue of 0 is
+// remapped, so [1, 2^31-2] already reaches every distinct query order and a
+// wider draw adds nothing. It keeps the recorded seed far below 2^53, too: the
+// nanosecond clock the default used to be is about 1.8e18, which JavaScript,
+// jq arithmetic and any decoder that reads numbers as doubles round, so a seed
+// taken from a JSON report could rerun a different sample.
+const maxDefaultSeed = 1<<31 - 2
+
+// newSeedFunc draws the seed for a run that did not pin one, uniformly from
+// [1, maxDefaultSeed]. Zero is excluded because --seed 0 means "choose one".
+var newSeedFunc = func() int64 { return rand.Int64N(maxDefaultSeed) + 1 }
 
 var listProvenanceInterfacesFunc = net.Interfaces
 var listNetworkInterfacesFunc = net.Interfaces
@@ -931,7 +945,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.BoolVar(&config.full, "full", false, "test the complete embedded or custom domain list")
 	flags.Int64Var(&config.seed, "seed", 0, "random seed (0 chooses and prints a new seed)")
 	flags.StringVar(&config.queryTypes, "type", "A,AAAA", "comma-separated DNS record types; zone-transfer, meta and pseudo-record types are rejected")
-	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout; every measured round waits for its slowest target, up to this long")
+	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout in whole milliseconds; every measured round waits for its slowest target, up to this long")
 	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum concurrent target preparations, measured exchanges and DNSSEC probes per protocol; each group of up to this many silent targets adds about one timeout per round")
 	flags.BoolVar(&config.includeSystem, "include-system", false, "include the configured system resolver as a baseline")
 	flags.StringVar(&config.format, "format", "table", "output format: table, json, or csv")
@@ -1048,6 +1062,14 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	// the value. --sample one line above already does this.
 	if config.timeout <= 0 {
 		return fmt.Errorf("--timeout must be greater than zero, got %s", config.timeout)
+	}
+	// Provenance records the timeout as whole milliseconds, and diff compares
+	// that field to decide whether two runs are comparable, while scoring
+	// charges the exact value. A fractional millisecond was therefore lost
+	// from the report: 1000500us and 1s both recorded 1000 and diffed as
+	// comparable. Rejecting it keeps timeout_ms an exact record.
+	if config.timeout%time.Millisecond != 0 {
+		return fmt.Errorf("--timeout must be a whole number of milliseconds, got %s", config.timeout)
 	}
 	if config.concurrency <= 0 {
 		return fmt.Errorf("--concurrency must be greater than zero, got %d", config.concurrency)
@@ -1177,7 +1199,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	seed := config.seed
 	if seed == 0 {
-		seed = time.Now().UnixNano()
+		seed = newSeedFunc()
 	}
 	effectiveConcurrency := config.concurrency
 	concurrencyCapped := false

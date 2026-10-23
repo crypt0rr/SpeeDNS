@@ -138,6 +138,9 @@ type jsonDiff struct {
 	Disclosures   []Disclosure  `json:"disclosures"`
 	Warnings      jsonWarnings  `json:"warnings"`
 	Compared      int           `json:"compared"`
+	// Conditions is present only when --require was given, so a diff
+	// without a gate is unchanged.
+	Conditions []Condition `json:"conditions,omitempty"`
 }
 
 type jsonSide struct {
@@ -150,12 +153,14 @@ type jsonWarnings struct {
 	Removed []string `json:"removed"`
 }
 
-// WriteJSON renders the diff for a machine. Target IDs, details, scopes and
-// warnings are read from the two report files, which a crafted report can fill
-// with control or bidirectional characters, so they are escaped exactly as the
-// table escapes them: a consumer that decodes and prints a value must not
-// receive a raw escape sequence the table would have neutralised.
-func WriteJSON(writer io.Writer, diff Diff) error {
+// WriteJSON renders the diff for a machine, with the --require verdicts from
+// Conditions when a gate ran; nil leaves them out. Target IDs, details,
+// scopes and warnings are read from the two report files, which a crafted
+// report can fill with control or bidirectional characters, so they are
+// escaped exactly as the table escapes them: a consumer that decodes and
+// prints a value must not receive a raw escape sequence the table would have
+// neutralised.
+func WriteJSON(writer io.Writer, diff Diff, conditions []Condition) error {
 	document := jsonDiff{
 		SchemaVersion: 1,
 		Comparable:    diff.Comparable(),
@@ -167,6 +172,7 @@ func WriteJSON(writer io.Writer, diff Diff) error {
 		Disclosures:   orEmptyDisclosures(diff.Disclosures),
 		Warnings:      jsonWarnings{Added: orEmptyStrings(diff.AddedWarnings), Removed: orEmptyStrings(diff.RemovedWarnings)},
 		Compared:      diff.Compared,
+		Conditions:    escapedConditions(conditions),
 	}
 	encoder := json.NewEncoder(writer)
 	encoder.SetIndent("", "  ")
@@ -216,6 +222,19 @@ func orEmptySuppressions(items []Suppression) []Suppression {
 
 func orEmptyDisclosures(items []Disclosure) []Disclosure {
 	escaped := make([]Disclosure, 0, len(items))
+	for _, item := range items {
+		item.Detail = safetext.Escape(item.Detail)
+		escaped = append(escaped, item)
+	}
+	return escaped
+}
+
+// escapedConditions escapes condition details, which quote target IDs and
+// finding details from the reports. Require already builds them from escaped
+// text and escaping is idempotent, so this only keeps the guarantee local. No
+// conditions encode as an empty slice, which omitempty leaves out.
+func escapedConditions(items []Condition) []Condition {
+	escaped := make([]Condition, 0, len(items))
 	for _, item := range items {
 		item.Detail = safetext.Escape(item.Detail)
 		escaped = append(escaped, item)

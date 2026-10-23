@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode"
@@ -16,6 +17,8 @@ import (
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/compare"
+	"github.com/crypt0rr/SpeeDNS/internal/schematest"
+	"github.com/crypt0rr/SpeeDNS/schema"
 	"github.com/miekg/dns"
 )
 
@@ -577,5 +580,92 @@ func TestInterruptedRunDiffsAsTheSameTargetSet(t *testing.T) {
 	}
 	if len(loaded.Results) != 2 {
 		t.Fatalf("interrupted report lists %d targets, want both selected targets: %#v", len(loaded.Results), loaded.Results)
+	}
+}
+
+// TestDiffJSONRecordsTheGate pins R-005(d): with --require, the compare JSON
+// carries each condition's verdict -- the same one the exit status is read
+// from -- so an archived diff says which gate ran and how it ended. A gate
+// that could not evaluate records not-evaluated and never passed, and a diff
+// without --require has no conditions at all.
+func TestDiffJSONRecordsTheGate(t *testing.T) {
+	reportWith := func(name string, results ...any) string {
+		return writeDiffFixture(t, name, func(d map[string]any) { d["results"] = results })
+	}
+	type condition struct {
+		Name    string `json:"name"`
+		Passed  bool   `json:"passed"`
+		Outcome string `json:"outcome"`
+		Detail  string `json:"detail"`
+	}
+	for _, testCase := range []struct {
+		name              string
+		baseline, current string
+		required          []string
+		exit              int
+		want              []condition
+	}{
+		{
+			name:     "two failures and a pass, in flag order",
+			baseline: reportWith("baseline.json", diffTarget("a@1.1.1.1/udp"), diffTarget("b@9.9.9.9/udp")),
+			current:  reportWith("current.json", diffTarget("a@1.1.1.1/udp", deadDiffTarget)),
+			required: []string{"no-removed-targets", "no-dnssec-regression", "no-new-failed-targets"},
+			exit:     4,
+			want: []condition{
+				{Name: "no-removed-targets", Outcome: "failed", Detail: "b@9.9.9.9/udp is absent from the current run"},
+				{Name: "no-dnssec-regression", Passed: true, Outcome: "passed", Detail: "no target stopped validating"},
+				{Name: "no-new-failed-targets", Outcome: "failed", Detail: "a@1.1.1.1/udp: successes 40 -> 0"},
+			},
+		},
+		{
+			name:     "nothing compared",
+			baseline: reportWith("baseline.json", diffTarget("a@1.1.1.1/udp")),
+			current:  reportWith("current.json", diffTarget("a@1.1.1.1/udp", incompleteDiffTarget)),
+			required: []string{"no-behaviour-change"},
+			exit:     3,
+			want: []condition{
+				{Name: "no-behaviour-change", Outcome: "not-evaluated", Detail: "not evaluated: no endpoint was compared (1 incomplete-target)"},
+			},
+		},
+		{
+			name:     "refused",
+			baseline: reportWith("baseline.json", diffTarget("a@1.1.1.1/udp")),
+			current: writeDiffFixture(t, "refused.json", func(d map[string]any) {
+				d["run"].(map[string]any)["seed"] = 99
+			}),
+			required: []string{"target-set-identical"},
+			exit:     3,
+			want: []condition{
+				{Name: "target-set-identical", Outcome: "not-evaluated", Detail: "not evaluated: the runs are not comparable"},
+			},
+		},
+		{
+			name:     "no gate",
+			baseline: reportWith("baseline.json", diffTarget("a@1.1.1.1/udp")),
+			current:  reportWith("current.json", diffTarget("a@1.1.1.1/udp", deadDiffTarget)),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := runDiff(&out, testCase.baseline, testCase.current, "json", "", testCase.required)
+			if got := exitCodeForError(err); got != testCase.exit {
+				t.Fatalf("exit = %d, want %d (error %v)", got, testCase.exit, err)
+			}
+			if err := schematest.Validate(schema.CompareV1(), out.Bytes()); err != nil {
+				t.Fatalf("diff JSON does not match compare-v1: %v\n%s", err, out.String())
+			}
+			var document struct {
+				Conditions []condition `json:"conditions"`
+			}
+			if err := json.Unmarshal(out.Bytes(), &document); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(document.Conditions, testCase.want) {
+				t.Fatalf("conditions = %#v\nwant %#v", document.Conditions, testCase.want)
+			}
+			if testCase.want == nil && strings.Contains(out.String(), `"conditions"`) {
+				t.Fatalf("a diff without --require must not carry conditions:\n%s", out.String())
+			}
+		})
 	}
 }

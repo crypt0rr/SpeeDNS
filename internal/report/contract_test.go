@@ -118,9 +118,10 @@ func TestCSVHeaderIsAppendOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The published prefix as of v0.3.0. New columns append after it; this
-	// list must only ever grow at the end.
+	// Every published column, in release order. New columns append after
+	// them; this list must only ever grow at the end.
 	published := []string{
+		// v0.3.0
 		"target_id", "name", "owner", "policy", "address", "protocol", "rank", "recommended", "tie",
 		"total", "successes", "failures", "usable_responses", "resolver_failures", "scored", "divergent",
 		"truncated", "success_rate", "usable_rate", "resolver_failure_rate", "scoring_failure_rate",
@@ -129,6 +130,11 @@ func TestCSVHeaderIsAppendOnly(t *testing.T) {
 		"endpoint_url", "tls_server_name", "tls_identity_source", "bootstrap_mode",
 		"bootstrap_addresses", "dial_address", "corpus_mode", "corpus_zone", "corpus_nonce",
 		"local", "dnssec_verdict",
+		// v0.4.0
+		"answers", "answer_rate", "status",
+		"started_at", "seed", "sample_size", "query_types", "speedns_version", "corpus_sha256",
+		// v0.7.0
+		"remote_address", "tls_version", "http_protocol",
 	}
 	if len(rows[0]) < len(published) {
 		t.Fatalf("CSV header shrank to %d columns, want at least the %d published ones", len(rows[0]), len(published))

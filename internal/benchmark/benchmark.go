@@ -211,6 +211,10 @@ type TargetResult struct {
 	Incomplete   bool              `json:"incomplete,omitempty"`
 	DNSSEC       *DNSSECAssessment `json:"dnssec,omitempty"`
 	DialAddress  string            `json:"-"`
+	// Connection describes the warm session's last connection: the peer it
+	// reached and the TLS and HTTP versions it negotiated. Like DialAddress
+	// it is read from the session, so it is empty when none opened.
+	Connection transport.ConnectionInfo `json:"-"`
 }
 
 type Ranking struct {
@@ -891,6 +895,7 @@ func (runner *targetRunner) prepareWarm(ctx context.Context) bool {
 		}
 	}
 	runner.result.DialAddress = sessionDialAddress(runner.session)
+	runner.result.Connection = sessionConnection(runner.session)
 	runner.ready = true
 	return true
 }
@@ -957,6 +962,7 @@ func (runner *targetRunner) close() {
 	runner.closed = true
 	if runner.session != nil {
 		runner.result.DialAddress = sessionDialAddress(runner.session)
+		runner.result.Connection = sessionConnection(runner.session)
 		_ = runner.session.Close()
 	}
 }
@@ -996,6 +1002,16 @@ func sessionDialAddress(session transport.Session) string {
 		return session.DialAddress()
 	}
 	return ""
+}
+
+func sessionConnection(session transport.Session) transport.ConnectionInfo {
+	type connectionSession interface {
+		Connection() transport.ConnectionInfo
+	}
+	if session, ok := session.(connectionSession); ok {
+		return session.Connection()
+	}
+	return transport.ConnectionInfo{}
 }
 
 func sessionQueryReconnected(session transport.Session) bool {
@@ -1184,6 +1200,15 @@ func queryKey(name string, qtype uint16) string {
 type scoreSample struct {
 	latencyMS float64
 	success   bool
+}
+
+// CalculateStatistics derives a target's Statistics from its observations
+// exactly as Run does. It exists for fixtures outside this package, such as
+// the live-results evidence generator: hand-written statistics drifted into
+// combinations the engine cannot produce -- a recommended target with one
+// scored sample -- and a downstream test that accepts those proves nothing.
+func CalculateStatistics(result TargetResult, timeout time.Duration, seed int64) Statistics {
+	return calculateStatistics(result, timeout, seed)
 }
 
 func calculateStatistics(result TargetResult, timeout time.Duration, seed int64) Statistics {
