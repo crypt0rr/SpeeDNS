@@ -8,6 +8,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"strconv"
 	"testing"
 )
@@ -384,10 +385,32 @@ func TestCSVCarriesRunIdentity(t *testing.T) {
 			t.Fatalf("CSV %s = %q, want %q", field, got, want)
 		}
 	}
-	// The delimiter matters: a comma inside query_types would shift every
-	// column after it for a naive reader.
-	if strings.Contains(rows[1][column["query_types"]], ",") {
-		t.Fatal("query_types must not contain a comma")
+	// Each list cell keeps its own documented encoding: rcode_counts joins
+	// CODE:count pairs with a comma, query_types joins mnemonics with a pipe
+	// and bootstrap_addresses joins addresses with a semicolon. No delimiter
+	// is what keeps the columns aligned -- the writer quotes a cell holding a
+	// comma, and csv.Reader has already rejected any row that is not the
+	// header's width -- but a consumer splitting a cell relies on them, and
+	// the CSV contract only ever appends, so all three are pinned.
+	if got := rows[1][column["rcode_counts"]]; got != "NOERROR:88,SERVFAIL:3" {
+		t.Fatalf("CSV rcode_counts = %q, want comma-joined CODE:count pairs", got)
+	}
+	if got := rows[1][column["query_types"]]; got != "A|AAAA" {
+		t.Fatalf("CSV query_types = %q, want pipe-joined mnemonics", got)
+	}
+	encrypted := contractFixture()
+	encrypted.Targets[0].Target.Protocol = catalog.DoT
+	encrypted.Targets[0].Target.Spec.BootstrapAddresses = []string{"192.0.2.10", "2001:db8::10"}
+	var encryptedBuffer bytes.Buffer
+	if err := WriteCSV(&encryptedBuffer, encrypted); err != nil {
+		t.Fatal(err)
+	}
+	encryptedRows, err := csv.NewReader(&encryptedBuffer).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := encryptedRows[1][column["bootstrap_addresses"]]; got != "192.0.2.10;2001:db8::10" {
+		t.Fatalf("CSV bootstrap_addresses = %q, want semicolon-joined addresses", got)
 	}
 
 	// A report without provenance is valid and must still produce parseable

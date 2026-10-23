@@ -92,7 +92,11 @@ be combined with --domains or --full. Each resolver is measured exactly once
 and each generated name is asked exactly one question, because a resolver holds
 one cache across its transports and addresses and caches a negative answer for
 the whole name. Dropped endpoints are named in a report warning. A cache-miss
-run therefore does not compare transports.
+run therefore cannot produce a sound transport comparison, and speedns diff
+refuses cache-miss reports by design. The rules keep any name from being asked
+twice at one resolver; they do not prove the resolver recursed, because a
+validating resolver using RFC 8198 aggressive NSEC/NSEC3 synthesis can answer
+an unseen name from a cached denial proof.
 .TP
 .B --cache-miss-sample N
 Generate N unique reserved-zone names, at most 20 and 20 by default, for
@@ -100,7 +104,8 @@ Generate N unique reserved-zone names, at most 20 and 20 by default, for
 count. The
 generated names are still a corpus that --sample draws from: when --sample is
 smaller than N, only that many names are measured and the report warns about
-the truncation. Set --sample to N or higher to measure every generated name.
+the truncation. Set --sample to N or higher, as the default of 100 is, to
+measure every generated name.
 .TP
 .B --full
 Use the complete selected domain list.
@@ -114,11 +119,19 @@ Select DNS record types, defaulting to A,AAAA. Zone-transfer types
 pseudo-record are rejected.
 .TP
 .B --timeout DURATION
-Set the per-query and connection timeout, for example 2s.
+Set the per-query and connection timeout, for example 2s. Every measured round
+waits for its slowest dispatched target, so a target that never answers costs
+the whole protocol group up to one timeout per measured query. Per protocol,
+unresponsive targets add roughly queries per target \(mu
+ceil(unresponsive / concurrency) \(mu timeout: one silent target in a default
+run adds about 200 \(mu 2s. There is no cutoff; --family, a smaller resolver
+selection, or a lower --timeout shortens such a run.
 .TP
 .B --concurrency N
-Set the maximum number of targets prepared at once, and of measured exchanges
-in flight, per transport. Defaults to 4.
+Set the maximum number of targets prepared at once, of measured exchanges in
+flight, and of targets receiving --dnssec probes, per transport. Defaults to 4.
+Unresponsive targets beyond this limit stretch every measured round by another
+timeout.
 .TP
 .B --format table|json|csv
 Choose human-readable, JSON, or CSV output. Defaults to table.
@@ -205,8 +218,10 @@ Opt in to DNSSEC probing. Every query of the run carries the EDNS(0) DO bit
 and each prepared target answers two additional pinned probe queries after its
 measured rounds: a correctly signed control name that must resolve and a
 deliberately mis-signed name that a validating resolver must refuse with
-SERVFAIL. The report gains a per-target verdict of validating, not-validating,
-or inconclusive, together with the raw AD and CD flags. The probe describes
+SERVFAIL. Up to --concurrency targets are probed at once, each with its two
+probes in sequence. The report gains a per-target verdict of validating,
+not-validating, or inconclusive, together with the raw AD and CD flags. The
+probe describes
 those two names at that moment and is not a DNSSEC audit. Without this option
 SpeeDNS sends its unchanged default queries and contacts no probe names.
 .SH OUTPUT
@@ -218,15 +233,24 @@ measurement, and completion lines. JSON and CSV runs are silent on standard
 error.
 .PP
 Preparation covers connection setup, cold probes, and warm-up queries, and
-runs with the same bounded concurrency as measurement.
-Measurement counts completed DNS exchanges, including failures. Progress does
-not show an ETA or resolver addresses and does not change report contents.
+runs with the same bounded concurrency as measurement. Every target finishes
+its cold probes before any warm session opens, so until the first target is
+fully prepared the line also counts targets whose cold probes have finished,
+as in
+.BR "preparing 0/10 (cold probes 7/10)" .
+Measurement counts completed DNS exchanges, including failures. A --dnssec run
+adds a
+.B dnssec probes
+phase after measurement that counts targets whose two probes have finished.
+Progress does not show an ETA or resolver addresses and does not change report
+contents.
 .PP
 Redirected progress reports each phase when it starts, again after roughly
 every 25 percent of the work in that phase, and once more with its final
-counters before the next phase or the completion line. That bounds the log at
-five lines per phase and protocol. A phase whose total is small or zero still
-reports its final counters.
+counters before the next phase or the completion line; cold probes and warm
+sessions each count as half of preparation. That bounds the log at five lines
+per phase and protocol. A phase whose total is small or zero still reports its
+final counters.
 .PP
 Transport-library diagnostics use the same standard-error channel. Interactive
 progress clears and restores its status line around such diagnostics. If all
@@ -342,8 +366,10 @@ status is returned.
 .B 130
 The run was interrupted. SpeeDNS reports
 .B interrupted
-on standard error and writes the partial report; a second interrupt exits
-immediately.
+on standard error and writes the report it has, with a warning that says
+whether some target was left incomplete or the interrupt arrived after
+measurement had completed. Assertions are not evaluated. A second interrupt
+exits immediately.
 .SH FILES
 .TP
 .I /etc/resolv.conf

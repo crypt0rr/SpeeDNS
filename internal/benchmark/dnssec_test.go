@@ -3,7 +3,10 @@ package benchmark
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -256,5 +259,183 @@ func TestAssessDNSSECIsConservative(t *testing.T) {
 				t.Fatalf("probes = %+v, want both raw outcomes", assessment.Probes)
 			}
 		})
+	}
+}
+
+// isDNSSECProbeName reports whether a query is one of the two pinned probes.
+func isDNSSECProbeName(name string) bool {
+	return name == DNSSECProbeSignedName || name == DNSSECProbeBogusName
+}
+
+// TestDNSSECProbesShareTheBoundedPool pins the post-measurement probe phase
+// to the --concurrency pool. The probes used to run one target at a time, so
+// eight ready targets whose probes each wait out a timeout cost 8 × 2 ×
+// timeout of extra wall-clock time instead of about 2 × timeout.
+//
+// Timing would make that a flaky assertion, so the fixture proves the
+// concurrency structurally: every probe holds its worker until four probes
+// are in flight at the same moment, which a serial loop can never reach. The
+// guard releases everything and fails the test rather than letting it hang.
+func TestDNSSECProbesShareTheBoundedPool(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+
+	const concurrency = 4
+	var inFlight, peak atomic.Int32
+	allIn := make(chan struct{})
+	var allInOnce sync.Once
+	var mu sync.Mutex
+	probes := make(map[string][]string)
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+		warm := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+			if !isDNSSECProbeName(name) {
+				return dnssecReply(name, qtype, dns.RcodeSuccess, 1, true), nil
+			}
+			mu.Lock()
+			probes[target.ID()] = append(probes[target.ID()], name)
+			mu.Unlock()
+			current := inFlight.Add(1)
+			for {
+				seen := peak.Load()
+				if current <= seen || peak.CompareAndSwap(seen, current) {
+					break
+				}
+			}
+			if current == concurrency {
+				allInOnce.Do(func() { close(allIn) })
+			}
+			select {
+			case <-allIn:
+			case <-time.After(10 * time.Second):
+				t.Error("DNSSEC probes never had more than one target in flight")
+				allInOnce.Do(func() { close(allIn) })
+			}
+			inFlight.Add(-1)
+			if name == DNSSECProbeBogusName {
+				return dnssecReply(name, qtype, dns.RcodeServerFailure, 0, false), nil
+			}
+			return dnssecReply(name, qtype, dns.RcodeSuccess, 1, true), nil
+		}}
+		return dnssecFactory(warm), nil
+	}
+
+	targets := make([]catalog.Target, 0, 8)
+	for index := 8; index >= 1; index-- {
+		targets = append(targets, testTarget(catalog.UDP, fmt.Sprintf("probe-%d", index)))
+	}
+	var events []Progress
+	report, err := Run(context.Background(), targets, Options{
+		Domains: []string{"measured.example"}, QueryTypes: []uint16{dns.TypeA}, Sample: 1, Seed: 3,
+		Timeout: time.Second, Concurrency: concurrency, DNSSEC: true,
+		OnProgress: func(progress Progress) {
+			mu.Lock()
+			defer mu.Unlock()
+			events = append(events, progress)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := peak.Load(); got != concurrency {
+		t.Fatalf("peak probes in flight = %d, want exactly the %d-worker pool", got, concurrency)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for index, result := range report.Targets {
+		id := result.Target.ID()
+		if index > 0 && report.Targets[index-1].Target.ID() >= id {
+			t.Fatalf("results left target-ID order: %s after %s", id, report.Targets[index-1].Target.ID())
+		}
+		if got := probes[id]; len(got) != 2 || got[0] != DNSSECProbeSignedName || got[1] != DNSSECProbeBogusName {
+			t.Fatalf("%s probes = %v, want signed then bogus on its own session", id, got)
+		}
+		if result.DNSSEC == nil || result.DNSSEC.Verdict != DNSSECValidating {
+			t.Fatalf("%s assessment = %+v, want %q", id, result.DNSSEC, DNSSECValidating)
+		}
+		for _, observation := range result.Observations {
+			if isDNSSECProbeName(observation.Name) {
+				t.Fatalf("probe query %q entered %s's measured samples", observation.Name, id)
+			}
+		}
+	}
+
+	// The phase is visible: it opens with 0/8 after the last measured round,
+	// counts every probed target, and is closed by the completion event.
+	lastMeasuring, firstDNSSEC, maxProbed := -1, -1, 0
+	for index, event := range events {
+		switch event.Phase {
+		case ProgressMeasuring:
+			lastMeasuring = index
+		case ProgressDNSSEC:
+			if firstDNSSEC < 0 {
+				firstDNSSEC = index
+			}
+			if event.DNSSECTotal != len(targets) || event.DNSSECCompleted > event.DNSSECTotal {
+				t.Fatalf("DNSSEC progress event = %#v", event)
+			}
+			maxProbed = max(maxProbed, event.DNSSECCompleted)
+		}
+	}
+	if firstDNSSEC < lastMeasuring || events[firstDNSSEC].DNSSECCompleted != 0 {
+		t.Fatalf("the DNSSEC phase must open at 0 after the last measured round: %#v", events)
+	}
+	if maxProbed != len(targets) || events[len(events)-1].Phase != ProgressComplete {
+		t.Fatalf("DNSSEC progress reached %d/%d before completion: %#v", maxProbed, len(targets), events)
+	}
+}
+
+// TestDNSSECProbesStartNothingAfterCancellation covers the pool's cancel
+// path. One worker takes the first target, whose signed probe is where the
+// interrupt lands; the targets still queued behind it must never reach their
+// sessions, and the phase must count only the target that was probed.
+func TestDNSSECProbesStartNothingAfterCancellation(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	probes := make(map[string]int)
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+		warm := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
+			if isDNSSECProbeName(name) {
+				mu.Lock()
+				probes[target.Address]++
+				mu.Unlock()
+				if target.Address == "1" && name == DNSSECProbeSignedName {
+					cancel()
+				}
+			}
+			return dnssecReply(name, qtype, dns.RcodeSuccess, 1, true), nil
+		}}
+		return dnssecFactory(warm), nil
+	}
+
+	var maxProbed int
+	results := runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "1"), testTarget(catalog.UDP, "2"), testTarget(catalog.UDP, "3")},
+		[]Query{{Name: "a.example", QType: dns.TypeA}}, Options{
+			QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1, DNSSEC: true,
+			OnProgress: func(progress Progress) {
+				if progress.Phase == ProgressDNSSEC {
+					maxProbed = max(maxProbed, progress.DNSSECCompleted)
+				}
+			},
+		})
+	if probes["1"] == 0 || probes["2"] != 0 || probes["3"] != 0 {
+		t.Fatalf("probes after cancellation = %v, want only the target in flight", probes)
+	}
+	if maxProbed != 1 {
+		t.Fatalf("DNSSEC progress counted %d probed targets, want 1", maxProbed)
+	}
+	for _, result := range results {
+		if !result.Incomplete {
+			t.Fatalf("%s was not marked incomplete after the interrupt", result.Target.ID())
+		}
+		if result.Target.Address != "1" && result.DNSSEC != nil {
+			t.Fatalf("%s gained an assessment without being probed: %+v", result.Target.ID(), result.DNSSEC)
+		}
 	}
 }

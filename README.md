@@ -353,7 +353,11 @@ NODATA is usable and is scored, which is correct, but it means `Usable 100%`
 spans everything from a working resolver down to one answering every query with
 an empty answer section. On the default `A,AAAA` corpus a real resolver returns
 a record only around 45% of the time, so a low answer rate is normal and is
-disclosed rather than penalised.
+disclosed rather than penalised. Like the success, failure, usable and
+resolver-failure rates, `answer_rate` is divided by all measured queries
+(`total`), so failed, unusable and NXDOMAIN queries lower it too; divide
+`answers` by `usable_responses` for the share of usable responses that carried
+a record.
 
 Every table shows `Score 95% CI`, the deterministic bootstrap interval behind
 the score, beside the score itself. At the default sample that interval is often
@@ -503,19 +507,26 @@ This generates 1–20 unique labels below the IANA-reserved `example.com` zone,
 caps measured concurrency at two, and records a random nonce in the report.
 It cannot be combined with `--domains` or `--full`. The generated names are a
 corpus that `--sample` still draws from, so keep `--sample` at least as large
-as `--cache-miss-sample`; a smaller `--sample` measures only that many
-generated names and the report warns that the corpus was truncated. Cache-miss results are
-kept in their own run and ranking population; they are never mixed with the
-normal embedded warm-cache corpus.
+as `--cache-miss-sample`, which the default of 100 already is; a smaller
+`--sample` measures only that many generated names and the report warns that
+the corpus was truncated. Cache-miss results are kept in their own run and
+ranking population; they are never mixed with the normal embedded warm-cache
+corpus.
 
 Because a resolver holds one cache across every transport and address it
 offers, cache-miss mode measures each resolver exactly once and asks each
 generated name exactly one question — otherwise the second measurement of a
 name is a warm read of the answer the first one cached. It names the endpoints
-it dropped in a warning. The deliberate consequence is that a cache-miss run
-does not compare transports: measure one transport per invocation and compare
-the runs. Read [`CACHE_MISS.md`](CACHE_MISS.md) before
-using the mode, especially for ownership, traffic, and abuse limits.
+it dropped in a warning. The deliberate consequence is that cache-miss mode
+cannot produce a sound transport comparison, within one run or across runs:
+separate runs used different names under different network conditions, and
+`speedns diff` refuses every cache-miss report by design. For transport cost,
+use `--profile-view` on an ordinary run. The two rules keep any name from
+being asked twice at one resolver, but they do not prove the resolver
+recursed: a validating resolver using RFC 8198 aggressive NSEC/NSEC3 synthesis
+can answer an unseen name from a cached denial proof. Read
+[`CACHE_MISS.md`](CACHE_MISS.md) before using the mode, especially for
+ownership, traffic, and abuse limits.
 
 ### What a default run sends
 
@@ -638,8 +649,8 @@ upstream resolution it forwards to and is not comparable with a resolver
 reached over the network; without this rule a warm local cache would win every
 comparison it entered. Its row keeps the measured latency, shows no rank and
 the status `NOT COMPARABLE`, and the report carries a warning naming the
-reason. JSON marks the target with `"local": true` and CSV adds a trailing
-`local` column.
+reason. JSON marks the target with `"local": true` and CSV sets its `local`
+column to `true`.
 
 When sharing a report that includes the system resolver, add
 `--redact-system`. It keeps the measurements and rankings but replaces local
@@ -665,9 +676,11 @@ prepared target answers two extra queries after all of its measured rounds:
 
 Each target then receives a verdict of `validating`, `not-validating`, or
 `inconclusive`, shown in a separate table section and emitted as a `dnssec`
-object in JSON and a `dnssec_verdict` column in CSV. The raw response codes and
-the AD (authentic data) and CD (checking disabled) flags are reported next to
-the verdict so the conclusion can be checked.
+object in JSON and a `dnssec_verdict` column in CSV. Up to `--concurrency`
+targets are probed at once, each with its two probes in sequence on its own
+session. The raw response codes and the AD (authentic data) and CD (checking
+disabled) flags are reported next to the verdict so the conclusion can be
+checked.
 
 ```sh
 ./speedns --dnssec --protocol udp,dot
@@ -737,11 +750,36 @@ version rather than assuming that table or CSV output has the same shape.
 CLI-generated JSON reports also include `run.provenance`. It records the
 SpeeDNS build version, commit, build date, operating system, architecture,
 active interface names, selected protocols, effective timeout and concurrency,
-elapsed duration, and the SHA-256 digest plus entry count of the exact
-normalized domain sequence used by the run. This makes custom-domain and
-cache-miss results auditable without downloading anything at runtime. The
-`--redact-system` option replaces interface names with `redacted` along with
-other local resolver details; CSV output is unchanged.
+the requested address `family` and `dnssec` setting, elapsed duration, and the
+SHA-256 digest plus entry count of the exact normalized domain sequence used by
+the run. This makes custom-domain and cache-miss results auditable without
+downloading anything at runtime. The `--redact-system` option replaces
+interface names with `redacted` along with other local resolver details. CSV
+carries only two provenance fields, `speedns_version` and `corpus_sha256`,
+beside the run-identity columns described below; it has no interface names,
+so redaction leaves those two columns as they are.
+
+### CSV columns
+
+CSV has one row per target, and its header names every column. Read it with an
+RFC 4180 parser and select columns by name. The contract only ever appends:
+existing columns keep their names and order, and a release may add new ones
+after the last. Every row repeats the run identity in `started_at` (RFC 3339
+UTC, whole seconds), `seed`, `sample_size`, `query_types`, `speedns_version`
+and `corpus_sha256`, so rows appended from several runs stay attributable.
+Three columns hold lists, each with its own fixed delimiter:
+
+- `rcode_counts` — `CODE:count` pairs sorted by code name and joined with a
+  comma, for example `NOERROR:88,SERVFAIL:3`; a cell holding more than one pair
+  is quoted;
+- `bootstrap_addresses` — dial candidates joined with a semicolon;
+- `query_types` — record-type mnemonics joined with a pipe, for example
+  `A|AAAA`.
+
+`success_rate`, `usable_rate`, `resolver_failure_rate` and `answer_rate` are
+proportions of `total`, the measured queries of that target;
+`scoring_failure_rate` is a proportion of the observations eligible for
+scoring, as [METHODOLOGY.md](METHODOLOGY.md) describes.
 
 ### Diff output
 
@@ -779,8 +817,8 @@ Useful flags include:
 --cache-miss-sample N  number of unique cache-miss names (default and maximum 20)
 --seed N            reproduce a domain order
 --type A,AAAA       record types to query (zone-transfer, meta and pseudo-record types are rejected)
---timeout 2s        per-endpoint timeout
---concurrency 4    maximum concurrent target preparations and measured DNS exchanges per protocol
+--timeout 2s        per-query and connection timeout; every measured round waits for its slowest target
+--concurrency 4    maximum concurrent target preparations, measured DNS exchanges and DNSSEC probes per protocol
 --format table|json|csv
 --output PATH       write output to a file, /dev/null, or a pipe
 --no-color          disable terminal colors
@@ -800,15 +838,24 @@ testing | udp done | tcp done | doh queued | dot queued | doq preparing 2/10 | e
 ```
 
 Preparation covers connection setup, cold probes, and warm-ups, and runs with
-the same bounded concurrency as measurement. Measuring
-shows completed DNS exchanges, including failed exchanges; no ETA or resolver
-addresses are shown. When standard error is not a terminal, SpeeDNS prints
-deterministic milestone lines instead: each phase is reported when it starts,
-again roughly every 25 percent of its own work, and once more with its final
-counters, followed by the protocol-completion line:
+the same bounded concurrency as measurement. Every target finishes its cold
+probes before any warm session opens, and that barrier can last several
+timeouts when an endpoint is unreachable, so until the first target is fully
+prepared the line also counts targets whose cold probes have finished, for
+example `doq preparing 0/10 (cold probes 7/10)`. Measuring shows completed DNS
+exchanges, including failed exchanges. A `--dnssec` run adds a `dnssec probes`
+phase after measurement that counts targets whose two probes have finished. No
+ETA or resolver addresses are shown. When standard error is not a terminal,
+SpeeDNS prints deterministic milestone lines instead: each phase is reported
+when it starts, again roughly every 25 percent of its own work, and once more
+with its final counters, followed by the protocol-completion line. Cold probes
+and warm sessions each count as half of preparation:
 
 ```text
 progress doq: preparing 0/10 targets
+progress doq: preparing 0/10 targets (cold probes 5/10)
+progress doq: preparing 0/10 targets (cold probes 10/10)
+progress doq: preparing 5/10 targets
 progress doq: preparing 10/10 targets
 progress doq: measuring 0/1000 exchanges
 progress doq: measuring 250/1000 exchanges
@@ -854,7 +901,10 @@ that compared no endpoint, and `4` for a failed `--require` condition; see
 [Comparing two runs](#comparing-two-runs).
 
 An interrupted run reports `interrupted` on standard error and still writes the
-partial report. A second interrupt exits immediately.
+report it has. Its warning says whether some selected target was left
+incomplete or missing, or whether the interrupt arrived after measurement had
+completed, in which case the results are complete. Either way the status is
+`130` and assertions are not evaluated. A second interrupt exits immediately.
 
 ### Assertions for automation
 
@@ -928,6 +978,7 @@ and status `130` for interruption take precedence.
 
 - If a network blocks traditional DNS, UDP and TCP may show `FAILED` while encrypted transports still work. SpeeDNS reports these failures instead of retrying through another protocol.
 - If no resolver is marked recommended, increase `--sample` or use `--full`. A short run may only qualify for a provisional winner.
+- If a run takes far longer than its size suggests, an endpoint is probably not answering. Every measured round waits for its slowest target, so each protocol group grows by roughly `queries_per_target × ceil(unresponsive / concurrency) × timeout` — about 400 seconds for one silent target in a default run. Restrict `--family`, leave the endpoint out, or lower `--timeout`; see [METHODOLOGY.md](METHODOLOGY.md#query-matrix-and-execution).
 - If a resolver receives DNS messages but returns `SERVFAIL`, `REFUSED`, or another resolver error, it can have a high transport success rate but a low usable-response rate and will not be recommended.
 - Compare resolvers with similar policies when answer behavior matters. Protective, ad-blocking, and unfiltered services may intentionally return different response classes.
 - Use `--details` to inspect connection errors, response counters, and RCODEs for a failing endpoint.

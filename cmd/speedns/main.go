@@ -174,6 +174,9 @@ type progressState struct {
 	targetsTotal       int
 	exchangesCompleted int
 	exchangesTotal     int
+	coldCompleted      int
+	dnssecCompleted    int
+	dnssecTotal        int
 }
 
 // Write keeps diagnostics emitted by dependencies from corrupting an active
@@ -230,11 +233,16 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 // endpoints it dropped.
 //
 // A resolver holds one cache, shared across every transport it offers and every
-// address it answers on. So the first measurement of a generated name at a
-// resolver is a genuine miss and every later measurement of that name at that
-// resolver is a warm read, no matter which transport or address reaches it.
-// Measuring a resolver once is what makes "cache miss" true of every query
-// rather than only of whichever group happened to run first.
+// address it answers on. So once a generated name has been measured at a
+// resolver, every later measurement of that name at that resolver is a warm
+// read, no matter which transport or address reaches it. Measuring a resolver
+// once is what keeps any name from being asked twice at one resolver, for
+// every query rather than only for whichever group happened to run first.
+//
+// That rules out reading back an answer SpeeDNS itself caused to be cached;
+// it does not prove the resolver recursed. A validating resolver doing RFC
+// 8198 aggressive NSEC/NSEC3 synthesis can answer an unseen name from a denial
+// proof cached for another one, which CACHE_MISS.md names as a limit.
 //
 // catalog.Expand returns targets in documented protocol order, then by target
 // ID, so the endpoint kept for a profile is its earliest declared transport at
@@ -346,6 +354,15 @@ func (p *progressRenderer) Update(update benchmark.Progress) {
 	if update.ExchangesCompleted > state.exchangesCompleted {
 		state.exchangesCompleted = update.ExchangesCompleted
 	}
+	if update.ColdCompleted > state.coldCompleted {
+		state.coldCompleted = update.ColdCompleted
+	}
+	if update.DNSSECCompleted > state.dnssecCompleted {
+		state.dnssecCompleted = update.DNSSECCompleted
+	}
+	if update.DNSSECTotal > state.dnssecTotal {
+		state.dnssecTotal = update.DNSSECTotal
+	}
 	phaseAccepted := progressPhaseRank(update.Phase) >= progressPhaseRank(state.phase)
 	if phaseAccepted {
 		state.phase = update.Phase
@@ -363,8 +380,10 @@ func progressPhaseRank(phase benchmark.ProgressPhase) int {
 		return 1
 	case benchmark.ProgressMeasuring:
 		return 2
-	case benchmark.ProgressComplete:
+	case benchmark.ProgressDNSSEC:
 		return 3
+	case benchmark.ProgressComplete:
+		return 4
 	default:
 		return 0
 	}
@@ -381,6 +400,7 @@ const progressMilestoneSteps = 4
 var progressPhaseSequence = []benchmark.ProgressPhase{
 	benchmark.ProgressPreparing,
 	benchmark.ProgressMeasuring,
+	benchmark.ProgressDNSSEC,
 	benchmark.ProgressComplete,
 }
 
@@ -399,12 +419,37 @@ func progressMilestone(completed, total int) int {
 }
 
 // progressPhaseUnits reports the counters a phase advances: measurement counts
-// DNS exchanges, every other phase counts targets.
+// DNS exchanges, the DNSSEC phase counts probed targets, and every other phase
+// counts targets.
+//
+// Preparation is two barriers, every target's cold probes and then every
+// target's warm session, so it counts both halves. The cold half can last
+// several timeouts per unreachable endpoint, and counting only prepared
+// targets left a redirected log silent for all of it. A target cannot finish
+// preparing before its cold probes have, so the larger of the two counters
+// stands in for the cold half when no cold count was reported at all; that
+// keeps the milestones of such a stream exactly what they were.
 func progressPhaseUnits(phase benchmark.ProgressPhase, state progressState) (int, int) {
-	if phase == benchmark.ProgressMeasuring {
+	switch phase {
+	case benchmark.ProgressMeasuring:
 		return state.exchangesCompleted, state.exchangesTotal
+	case benchmark.ProgressDNSSEC:
+		return state.dnssecCompleted, state.dnssecTotal
+	case benchmark.ProgressPreparing:
+		return max(state.coldCompleted, state.targetsCompleted) + state.targetsCompleted, 2 * state.targetsTotal
+	default:
+		return state.targetsCompleted, state.targetsTotal
 	}
-	return state.targetsCompleted, state.targetsTotal
+}
+
+// coldProgressText shows cold-probe progress while the cold barrier is the
+// only preparation work that can advance: once any target has finished
+// preparing, every cold probe has finished and the prepared count says more.
+func coldProgressText(state progressState) string {
+	if state.targetsCompleted > 0 || state.coldCompleted == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (cold probes %d/%d)", state.coldCompleted, state.targetsTotal)
 }
 
 func (p *progressRenderer) renderUpdateLocked(update benchmark.Progress, now time.Time) {
@@ -432,16 +477,19 @@ func (p *progressRenderer) renderUpdateLocked(update benchmark.Progress, now tim
 // is seen and again whenever it crosses a milestone. Lines carry counters
 // only: no ETA and no resolver addresses.
 func (p *progressRenderer) emitPhaseLocked(protocol catalog.Protocol, phase benchmark.ProgressPhase) {
-	completed, total := progressPhaseUnits(phase, p.states[protocol])
+	state := p.states[protocol]
+	completed, total := progressPhaseUnits(phase, state)
 	milestone := progressMilestone(completed, total)
 	if reached, started := p.phaseMilestones[protocol][phase]; started && milestone <= reached {
 		return
 	}
 	switch phase {
 	case benchmark.ProgressPreparing:
-		_, _ = fmt.Fprintf(p.writer, "progress %s: preparing %d/%d targets\n", protocol, completed, total)
+		_, _ = fmt.Fprintf(p.writer, "progress %s: preparing %d/%d targets%s\n", protocol, state.targetsCompleted, state.targetsTotal, coldProgressText(state))
 	case benchmark.ProgressMeasuring:
 		_, _ = fmt.Fprintf(p.writer, "progress %s: measuring %d/%d exchanges\n", protocol, completed, total)
+	case benchmark.ProgressDNSSEC:
+		_, _ = fmt.Fprintf(p.writer, "progress %s: dnssec probes %d/%d targets\n", protocol, completed, total)
 	case benchmark.ProgressComplete:
 		_, _ = fmt.Fprintf(p.writer, "tested %s %d/%d targets\n", protocol, completed, total)
 	default:
@@ -485,9 +533,11 @@ func (p *progressRenderer) progressLineLocked(now time.Time) string {
 		}
 		switch state.phase {
 		case benchmark.ProgressPreparing:
-			parts = append(parts, fmt.Sprintf("%s preparing %d/%d", protocol, state.targetsCompleted, state.targetsTotal))
+			parts = append(parts, fmt.Sprintf("%s preparing %d/%d%s", protocol, state.targetsCompleted, state.targetsTotal, coldProgressText(state)))
 		case benchmark.ProgressMeasuring:
 			parts = append(parts, fmt.Sprintf("%s measuring %d/%d", protocol, state.exchangesCompleted, state.exchangesTotal))
+		case benchmark.ProgressDNSSEC:
+			parts = append(parts, fmt.Sprintf("%s dnssec probes %d/%d", protocol, state.dnssecCompleted, state.dnssecTotal))
 		case benchmark.ProgressComplete:
 			parts = append(parts, fmt.Sprintf("%s done", protocol))
 		default:
@@ -756,8 +806,8 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.BoolVar(&config.full, "full", false, "test the complete embedded or custom domain list")
 	flags.Int64Var(&config.seed, "seed", 0, "random seed (0 chooses and prints a new seed)")
 	flags.StringVar(&config.queryTypes, "type", "A,AAAA", "comma-separated DNS record types; zone-transfer, meta and pseudo-record types are rejected")
-	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout")
-	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum concurrent target preparations and measured DNS exchanges per protocol")
+	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout; every measured round waits for its slowest target, up to this long")
+	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum concurrent target preparations, measured DNS exchanges and DNSSEC probes per protocol; each round waits about ceil(unresponsive/concurrency) timeouts for unresponsive targets")
 	flags.BoolVar(&config.includeSystem, "include-system", false, "include the configured system resolver as a baseline")
 	flags.StringVar(&config.format, "format", "table", "output format: table, json, or csv")
 	flags.StringVar(&config.output, "output", "", "write output to a file instead of stdout")
@@ -1010,10 +1060,22 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		restoreLogOutput = func() { log.SetOutput(previousLogWriter) }
 	}
 	defer restoreLogOutput()
+	// The engine warns when --sample asks for more names than the corpus
+	// holds, which is right for a domain file but fired on every documented
+	// cache-miss run: the generated corpus holds at most 20 names and the
+	// default --sample is 100, a combination the docs recommend. Clamping
+	// changes nothing that is measured or recorded -- the engine already
+	// measures min(sample, corpus) names, and sample_size counts the names it
+	// measured -- and the CLI's own truncation warning below still reads the
+	// requested value.
+	engineSample := config.sample
+	if config.cacheMiss {
+		engineSample = min(config.sample, len(domainList))
+	}
 	runContext, stop := interruptContext(ctx)
 	defer stop()
 	result, runErr := runBenchmarkEngine(runContext, targets, benchmark.Options{
-		Domains: domainList, QueryTypes: queryTypes, Sample: config.sample, Full: config.full,
+		Domains: domainList, QueryTypes: queryTypes, Sample: engineSample, Full: config.full,
 		Seed: seed, Timeout: config.timeout, Concurrency: effectiveConcurrency, Protocols: selected,
 		OnProgress: onProgress, DNSSEC: config.dnssec, CacheMiss: config.cacheMiss,
 	})
@@ -1071,7 +1133,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	}
 	if len(cacheMissDropped) > 0 {
 		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
-			"cache-miss mode measures each resolver once so every query is a genuine miss; it dropped %d endpoint(s) that share a cache with one already selected: %s",
+			"cache-miss mode measures each resolver once so no name is asked twice at one resolver; it dropped %d endpoint(s) that share a cache with one already selected: %s",
 			len(cacheMissDropped), strings.Join(cacheMissDropped, ", "))))
 	}
 	result.Warnings = append(result.Warnings, familyWarnings...)
@@ -1080,7 +1142,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		return err
 	}
 	if runErr != nil && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
-		result.Warnings = append(result.Warnings, benchmark.RunWarning("benchmark interrupted before all targets completed"))
+		result.Warnings = append(result.Warnings, benchmark.RunWarning(interruptWarning(targets, result)))
 	}
 	var reportErr error
 	switch strings.ToLower(config.format) {
@@ -1112,6 +1174,32 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		return runErr
 	}
 	return evaluateAssertions(result, assertions)
+}
+
+// interruptWarning describes an interrupted run from the evidence in its
+// report rather than from the interrupt alone.
+//
+// The engine returns the cancellation whenever the run context was cancelled,
+// including after the last protocol group's final check, while statistics and
+// rankings were still being computed. Such a report is complete and ranked,
+// and telling the operator that targets did not complete made them distrust
+// it. The exit status stays 130 and assertions stay unevaluated either way:
+// the operator still asked the run to stop.
+func interruptWarning(targets []catalog.Target, result benchmark.Report) string {
+	const incomplete = "benchmark interrupted before all targets completed"
+	reported := make(map[string]bool, len(result.Targets))
+	for _, target := range result.Targets {
+		if target.Incomplete {
+			return incomplete
+		}
+		reported[target.Target.ID()] = true
+	}
+	for _, target := range targets {
+		if !reported[target.ID()] {
+			return incomplete
+		}
+	}
+	return "interrupt received after measurement completed; results are complete"
 }
 
 // profileSelection keeps the bundled catalog separate from resolvers the

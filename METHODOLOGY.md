@@ -28,13 +28,30 @@ flight, and a single target is always prepared by one worker so its session is
 never used concurrently. Preparing targets one after another would have made a
 target's cold probes start systematically later, and left its warm session
 idle for longer, the further down the ordered catalog it sat; bounded parallel
-preparation shrinks that positional bias by the concurrency factor. Results
-preparation has a barrier between the cold probes and the reusable measured
+preparation shrinks that positional bias by the concurrency factor.
+Preparation has a barrier between the cold probes and the reusable measured
 sessions: all dispatched targets finish cold preparation before any target's
 warm session is opened. This prevents a blocked target's cold-probe timeout
 from aging a healthy target's connection before measurement. Results and
 rankings stay in target-identity order regardless of which preparation
 finished first. There is no transport fallback.
+
+Every measured round waits for its slowest dispatched target, so a target
+that never answers costs wall-clock time for the whole protocol group, not
+only failed samples of its own. Opening a UDP or DoH session sends nothing, so
+a silent UDP or DoH endpoint still enters measurement, as does a TCP, DoT, or
+DoQ endpoint that completes its connection and then never answers; each of its
+measured queries waits out the full `--timeout`. Per protocol, unresponsive
+targets therefore add roughly `queries_per_target × ceil(unresponsive /
+concurrency) × timeout` to the run, and every healthy target in the group is
+paced at that slower rate. One silent UDP target in a default run costs about
+200 × 2 s, close to seven minutes, and about 67 minutes with `--full`. Its
+cold probes and warm-ups add a few more timeouts during preparation, and a
+`--dnssec` run up to two more for its probes. There is deliberately no
+cutoff: a resolver that stops answering is measured and reported as failed
+rather than silently dropped mid-run. On a network where one address family
+or resolver is black-holed, `--family`, a smaller resolver selection, or a
+lower `--timeout` shortens the run.
 
 Three excluded warm-up queries are sent before the measured phase. Encrypted
 and stream transports reuse their connections during measured queries. UDP
@@ -48,12 +65,16 @@ operators receives roughly 38% of the total. `CACHE_MISS.md` states the
 separate reserved-zone budget for `--cache-miss`, which is 200 queries.
 
 Each target also records how many of its usable responses carried an actual
-record rather than NODATA, published as `answers` and `answer_rate`. NODATA is
-usable and is scored, so without this a resolver answering every query with an
-empty answer section is indistinguishable from a working one on the success and
-usable columns. It is disclosed and never penalised: on the default `A,AAAA`
-corpus a real resolver returns a record only about 45% of the time, so an
-absolute threshold would produce false accusations.
+record rather than NODATA, published as `answers` and `answer_rate`. Like
+`success_rate`, `failure_rate`, `usable_rate` and `resolver_failure_rate`,
+`answer_rate` is divided by all measured queries (`total`), not by usable
+responses, so failed, unusable and NXDOMAIN queries lower it too;
+`answers / usable_responses` is the share of usable responses that carried a
+record. NODATA is usable and is scored, so without this a resolver answering
+every query with an empty answer section is indistinguishable from a working
+one on the success and usable columns. It is disclosed and never penalised: on
+the default `A,AAAA` corpus a real resolver returns a record only about 45% of
+the time, so an absolute threshold would produce false accusations.
 
 ## What is measured
 
@@ -174,9 +195,9 @@ without the address.
 
 The local-host classification comes from the address inventory, not from the
 resolver file format, so it cannot be asserted by a catalog. JSON reports it
-in the additive `local` field on the target and CSV in a trailing `local`
-column, so a consumer can tell a missing rank caused by non-comparability
-apart from one caused by a failure.
+in the additive `local` field on the target and CSV in its `local` column, so
+a consumer can tell a missing rank caused by non-comparability apart from one
+caused by a failure.
 
 Targets whose 95% score confidence intervals overlap are ordered among
 themselves by median latency rather than by score. The score is 60% median and
@@ -289,8 +310,17 @@ begins for any of them to be missing. An interrupted report is therefore the
 full comparison set with every entry marked `INCOMPLETE`, not a shortened
 list.
 
+An interrupt can also land after the last measured round, while statistics and
+rankings are still being computed. That report is complete and ranked, and its
+warning says so -- `interrupt received after measurement completed; results are
+complete` -- instead of `benchmark interrupted before all targets completed`,
+which a report carries only when some selected target is incomplete or missing.
+Either way the run exits with status 130 and assertions are not evaluated,
+because the operator asked it to stop.
+
 JSON contains the structured result and optional raw observations. CSV keeps
-the aggregate schema and adds reconnect/incomplete diagnostics at the end.
+the aggregate schema and carries these diagnostics in its `reconnects` and
+`incomplete` columns.
 Text that SpeeDNS did not produce itself is escaped before it reaches a
 terminal, a CSV cell, or a JSON string. Session errors and DNSSEC probe errors
 quote strings chosen by the endpoint, such as the certificate names in an
@@ -363,10 +393,16 @@ address, and naming the dropped endpoints in a warning — and asks each
 generated name exactly one question, rotating the selected query types across
 the corpus rather than pairing them per name. A resolver caches an NXDOMAIN for
 the name rather than for the query type, so asking one name for both `A` and
-`AAAA` measured a miss and then a cache hit. Both rules together are what make
-every measured cache-miss query a genuine miss; the cost is that a cache-miss
+`AAAA` measured a miss and then a cache hit. Both rules together mean that no
+generated name is asked twice at one resolver, so no measured query reads back
+an answer SpeeDNS itself caused to be cached. That is not proof the resolver
+recursed: a validating resolver using RFC 8198 aggressive NSEC/NSEC3 synthesis
+can answer an unseen name from a denial proof cached for another one, which
+`CACHE_MISS.md` names as a limit. The cost of the rules is that a cache-miss
 run cannot compare transports, because doing so requires measuring one name
-twice at one resolver.
+twice at one resolver. Separate runs cannot stand in for that either -- each
+generates fresh names, and cross-run latency is dominated by path and time of
+day -- so `speedns diff` refuses every cache-miss report.
 
 `--profile-view` groups the measured target rows by resolver profile and
 address, then lists each available selected transport side by side in a
@@ -382,7 +418,9 @@ per-protocol score.
 carries the EDNS(0) DO bit, and each prepared target answers two extra queries
 after all of its measured rounds have finished. The CD (checking disabled) bit
 is never set, because the point of the probe is to observe validation rather
-than to suppress it.
+than to suppress it. Up to `--concurrency` targets are probed at once; a
+target's two probes run one after the other on its own measured session, and
+no target begins probing after an interrupt.
 
 The two probe names are pinned constants in `internal/benchmark/dnssec.go`:
 

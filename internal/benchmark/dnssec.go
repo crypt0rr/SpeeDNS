@@ -2,6 +2,8 @@ package benchmark
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/transport"
@@ -83,18 +85,57 @@ type DNSSECAssessment struct {
 	Probes  []DNSSECProbe `json:"probes,omitempty"`
 }
 
+// probeDNSSECTargets probes every ready runner through at most concurrency
+// workers and calls probed with the running count after each target.
+//
+// The probes used to run one target at a time. Each probe can take a full
+// timeout, and every target that answered its warm-ups is probed -- including
+// one whose warm-ups all timed out -- so a phase that ignored the pool cost up
+// to ready × 2 × timeout of wall-clock time with nothing on the progress line.
+// Each runner is still taken by exactly one worker and its two probes stay
+// sequential on its own session, because a session is never used
+// concurrently. Every outcome lands in that runner's own result, so the
+// report keeps target-ID order no matter which probe finishes first.
+func probeDNSSECTargets(ctx context.Context, runners []*targetRunner, concurrency int, probed func(int)) {
+	// Queue every runner up front: a worker that finds the run cancelled gets
+	// false from probeDNSSEC, so no target begins probing after an interrupt
+	// and the dispatcher never has to race a cancellation against a send.
+	jobs := make(chan *targetRunner, len(runners))
+	for _, runner := range runners {
+		jobs <- runner
+	}
+	close(jobs)
+	var completed atomic.Int32
+	var wg sync.WaitGroup
+	workers := max(1, min(concurrency, len(runners)))
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for runner := range jobs {
+				if runner.probeDNSSEC(ctx) {
+					probed(int(completed.Add(1)))
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // probeDNSSEC runs the pinned probes on the already warmed session, after all
 // measured rounds for the target, so it can never influence latency samples.
-// The probe names are never added to the measured query matrix.
-func (runner *targetRunner) probeDNSSEC(ctx context.Context) {
+// The probe names are never added to the measured query matrix. It reports
+// whether the probes ran.
+func (runner *targetRunner) probeDNSSEC(ctx context.Context) bool {
 	if !runner.opts.DNSSEC || !runner.ready || runner.session == nil || ctx.Err() != nil {
-		return
+		return false
 	}
 	names := runner.opts.DNSSECProbe.withDefaults()
 	signed := runner.dnssecProbe(ctx, DNSSECRoleSigned, names.Signed)
 	bogus := runner.dnssecProbe(ctx, DNSSECRoleBogus, names.Bogus)
 	assessment := assessDNSSEC(signed, bogus)
 	runner.result.DNSSEC = &assessment
+	return true
 }
 
 func (runner *targetRunner) dnssecProbe(ctx context.Context, role, name string) DNSSECProbe {

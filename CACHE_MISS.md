@@ -41,8 +41,10 @@ speedns --cache-miss --cache-miss-sample 10 --no-defaults \
 `--cache-miss` cannot be combined with `--domains` or `--full`.
 `--cache-miss-sample` sizes this bounded generated corpus, and `--sample`
 still selects how many of those names are measured. Keep `--sample` at least
-as large as `--cache-miss-sample`; a smaller `--sample` measures only that
-many generated names, and the report warns that the corpus was truncated.
+as large as `--cache-miss-sample`, which the default of 100 already is: a
+larger `--sample` simply measures every generated name. A smaller `--sample`
+measures only that many generated names, and the report warns that the corpus
+was truncated.
 Because each name is asked one question, the corpus size is also the scored
 sample count, and the default of 20 is the minimum the paired confidence
 intervals need. The report labels the corpus mode, zone, and
@@ -56,12 +58,12 @@ local interception, aggressive negative caching, and authoritative behavior
 can all affect the result. A cache-miss run is therefore a diagnostic view of
 one controlled query population, not a claim about every uncached domain.
 
-## Every measured query is a real miss
+## No name is asked twice at one resolver
 
 A resolver holds one cache, shared across every transport it offers and every
-address it answers on. So the first lookup of a generated name at a resolver is
-a genuine miss, and every later lookup of that name at that resolver is a warm
-read however it is reached. Two consequences follow, and cache-miss mode now
+address it answers on. So once a generated name has been looked up at a
+resolver, every later lookup of that name at that resolver is a warm read
+however it is reached. Two consequences follow, and cache-miss mode now
 enforces both rather than reporting them.
 
 **Each resolver is measured once.** Cache-miss mode keeps one endpoint per
@@ -78,11 +80,26 @@ each name exactly one question, rotating the selected types across the corpus,
 so a multi-type selection is still represented without any name being asked
 twice.
 
-The deliberate consequence is that **a cache-miss run does not compare
-transports.** Comparing two transports requires measuring the same name twice
-at the same resolver, which is exactly what makes the second measurement warm.
-Measure one transport per invocation and compare the runs, accepting that they
-used different names.
+Together the two rules mean that no measured query reads back an answer that
+SpeeDNS itself caused a resolver to cache. They do not prove that the resolver
+had to recurse. A validating resolver that uses RFC 8198 aggressive
+NSEC/NSEC3 synthesis can answer a generated name it has never seen from a
+denial proof cached for another name in the zone, so later names in a run may
+be answered from cache. Whether that happens depends on how `example.com`
+signs its denials, which SpeeDNS neither controls nor detects; a warm-up that
+asks `example.com` for a record type the apex lacks can cache such a proof
+before the first measured query.
+
+The deliberate consequence of the two rules is that **a cache-miss run does
+not compare transports.** Comparing two transports requires measuring the same
+name twice at the same resolver, which is exactly what makes the second
+measurement warm. Separate runs cannot stand in for that: every run generates
+fresh names, and the latency difference between two runs is dominated by the
+network path and the time of day, which no report records. Cache-miss mode
+therefore cannot produce a sound transport comparison, and `speedns diff`
+refuses every cache-miss report by design, including against another
+cache-miss run. Reading two single-transport cache-miss reports side by side
+is an anecdote, not a comparison.
 
 For the same reason `--profile-view` is a warm-cache tool: in cache-miss mode a
 resolver contributes a single transport, so the view has nothing to compare.
