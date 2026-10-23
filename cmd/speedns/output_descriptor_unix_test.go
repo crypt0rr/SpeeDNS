@@ -20,6 +20,18 @@ import (
 // descriptors, not Linux procfs, so they run on macOS as well; on macOS
 // /dev/fd/N is not even a symlink.
 
+// inheritDescriptor makes a descriptor the test opened look like one a shell
+// hands down, by clearing its close-on-exec flag. os.Pipe, os.Open and
+// os.OpenFile make close-on-exec descriptors, which openOutputDescriptor
+// refuses as the process's own. No test in this package starts a child
+// process, so the cleared flag cannot leak a descriptor into one.
+func inheritDescriptor(t *testing.T, descriptor uintptr) {
+	t.Helper()
+	if _, err := unix.FcntlInt(descriptor, unix.F_SETFD, 0); err != nil {
+		t.Fatalf("clear close-on-exec on descriptor %d: %v", descriptor, err)
+	}
+}
+
 // drainPipe reads a pipe or socket to its end in the background, so a writer
 // never blocks on a full buffer.
 func drainPipe(reader *os.File) <-chan string {
@@ -35,22 +47,32 @@ func drainPipe(reader *os.File) <-chan string {
 	return received
 }
 
-// writeReportTo delivers report to an --output path the way a run does: the
-// preflight first, then the writer and a commit.
-func writeReportTo(t *testing.T, path, report string) {
-	t.Helper()
+// deliverReport delivers report to an --output path the way a run does: the
+// preflight first, then the writer and a commit. It returns its failure rather
+// than failing the test, so a caller that has pointed standard output
+// elsewhere can restore it before anything is reported.
+func deliverReport(path, report string) error {
 	if err := preflightOutput(path); err != nil {
-		t.Fatalf("preflight for %s: %v", path, err)
+		return fmt.Errorf("preflight for %s: %w", path, err)
 	}
 	writer, finalize, err := outputWriter(path)
 	if err != nil {
-		t.Fatalf("writer for %s: %v", path, err)
+		return fmt.Errorf("writer for %s: %w", path, err)
 	}
 	if _, err := io.WriteString(writer, report); err != nil {
-		t.Fatal(err)
+		return errors.Join(fmt.Errorf("write to %s: %w", path, err), finalize(false))
 	}
 	if err := finalize(true); err != nil {
-		t.Fatalf("finalize for %s: %v", path, err)
+		return fmt.Errorf("finalize for %s: %w", path, err)
+	}
+	return nil
+}
+
+// writeReportTo is deliverReport for a test that can fail straight away.
+func writeReportTo(t *testing.T, path, report string) {
+	t.Helper()
+	if err := deliverReport(path, report); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -65,6 +87,7 @@ func TestOutputWriterWritesThroughDevFDOfAPipe(t *testing.T) {
 	}
 	defer reader.Close()
 	defer pipeWriter.Close()
+	inheritDescriptor(t, pipeWriter.Fd())
 	received := drainPipe(reader)
 
 	writeReportTo(t, fmt.Sprintf("/dev/fd/%d", pipeWriter.Fd()), "piped report")
@@ -106,6 +129,7 @@ func TestOutputWriterWritesAtTheDescriptorsOffset(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer file.Close()
+			inheritDescriptor(t, file.Fd())
 			before, err := os.Stat(name)
 			if err != nil {
 				t.Fatal(err)
@@ -145,6 +169,9 @@ func TestOutputWriterWritesToASocketDescriptor(t *testing.T) {
 	peer := os.NewFile(uintptr(pair[1]), "peer")
 	defer local.Close()
 	defer peer.Close()
+	// A socket pair is not close-on-exec, but clearing the flag keeps the
+	// test from depending on that.
+	inheritDescriptor(t, uintptr(pair[0]))
 	received := drainPipe(peer)
 
 	writeReportTo(t, fmt.Sprintf("/dev/fd/%d", pair[0]), "socket report")
@@ -166,6 +193,7 @@ func TestOutputRefusesADirectoryDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer handle.Close()
+	inheritDescriptor(t, handle.Fd())
 	path := fmt.Sprintf("/dev/fd/%d", handle.Fd())
 	if err := preflightOutput(path); err == nil || !strings.Contains(err.Error(), "output path is a directory") {
 		t.Fatalf("directory descriptor preflight = %v", err)
@@ -200,6 +228,8 @@ func TestRunBenchmarkRefusesADescriptorNotOpenForWriting(t *testing.T) {
 	}
 	defer reader.Close()
 	defer pipeWriter.Close()
+	inheritDescriptor(t, file.Fd())
+	inheritDescriptor(t, reader.Fd())
 
 	for _, tc := range []struct {
 		name       string
@@ -291,6 +321,7 @@ func TestRunBenchmarkAppendsThroughADescriptorAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
+	inheritDescriptor(t, file.Fd())
 	config := cliConfigForTest(t)
 	config.output = fmt.Sprintf("/dev/fd/%d", file.Fd())
 	if err := runBenchmark(context.Background(), config); err != nil || *engineCalls != 1 {
@@ -299,5 +330,87 @@ func TestRunBenchmarkAppendsThroughADescriptorAlias(t *testing.T) {
 	content, err := os.ReadFile(name)
 	if err != nil || !strings.HasPrefix(string(content), "previous run\n{") || !strings.Contains(string(content), "\"results\"") {
 		t.Fatalf("run.log = %q/%v, want the report after the previous run", content, err)
+	}
+}
+
+// TestRunBenchmarkRefusesADescriptorTheProcessOpenedItself pins that an alias
+// of a descriptor SpeeDNS did not inherit counts as closed. When the preflight
+// runs, the Go runtime already holds descriptors of its own at the lowest free
+// numbers, typically 3 and 4, and dup, fstat and F_GETFL all accept them. So
+// `--output /dev/fd/3` with the `3>` redirection forgotten ran the whole
+// benchmark and then wrote the report into the network poller. Every
+// descriptor the process opens itself is close-on-exec, which an inherited one
+// cannot be; a file from os.OpenFile stands in for the runtime's own here. It
+// must be refused before the first query with EBADF and status 2, like a
+// closed descriptor, and neither the file nor its descriptor may be touched.
+func TestRunBenchmarkRefusesADescriptorTheProcessOpenedItself(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(name, []byte("previous report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFD, 0); err != nil || flags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("os.OpenFile made descriptor %d without close-on-exec: %#x/%v", file.Fd(), flags, err)
+	}
+	path := fmt.Sprintf("/dev/fd/%d", file.Fd())
+	wants := "inspect output path: dup " + path + ": " + syscall.EBADF.Error()
+	engineCalls := countEngineCalls(t)
+	if err := preflightOutput(path); !errors.Is(err, syscall.EBADF) || err.Error() != wants {
+		t.Fatalf("preflight = %v, want %q", err, wants)
+	}
+	if _, _, err := outputWriter(path); !errors.Is(err, syscall.EBADF) || err.Error() != wants {
+		t.Fatalf("writer = %v, want %q", err, wants)
+	}
+	config := cliConfigForTest(t)
+	config.output = path
+	err = runBenchmark(context.Background(), config)
+	if !errors.Is(err, syscall.EBADF) || err.Error() != wants || exitCodeForError(err) != 2 || *engineCalls != 0 {
+		t.Fatalf("run = %v (exit %d) after %d engine call(s), want %q with status 2 and no run",
+			err, exitCodeForError(err), *engineCalls, wants)
+	}
+	if content, err := os.ReadFile(name); err != nil || string(content) != "previous report" {
+		t.Fatalf("the file behind the descriptor = %q/%v", content, err)
+	}
+	if flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFD, 0); err != nil || flags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("the descriptor was closed or changed behind its owner: %#x/%v", flags, err)
+	}
+
+	// The same descriptor, once it looks inherited, takes the report.
+	inheritDescriptor(t, file.Fd())
+	writeReportTo(t, path, "new report")
+	if content, err := os.ReadFile(name); err != nil || string(content) != "previous reportnew report" {
+		t.Fatalf("the inherited descriptor's file = %q/%v", content, err)
+	}
+}
+
+// TestRunBenchmarkReportsABrokenPipeOnADescriptorAlias pins the one way an
+// alias differs from plain standard output. When the reader of a pipe has
+// gone, as with `speedns --output /dev/stdout | true`, the write fails with
+// EPIPE and the run exits with status 2 and the error. A write to descriptor 1
+// or 2 itself would instead end the process with SIGPIPE, but the report goes
+// to a duplicate, which never has either number.
+func TestRunBenchmarkReportsABrokenPipeOnADescriptorAlias(t *testing.T) {
+	reader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipeWriter.Close()
+	inheritDescriptor(t, pipeWriter.Fd())
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/dev/fd/%d", pipeWriter.Fd())
+	engineCalls := countEngineCalls(t)
+	config := cliConfigForTest(t)
+	config.output = path
+	err = runBenchmark(context.Background(), config)
+	if !errors.Is(err, syscall.EPIPE) || !strings.Contains(err.Error(), "write "+path+": ") ||
+		exitCodeForError(err) != 2 || *engineCalls != 1 {
+		t.Fatalf("run = %v (exit %d) after %d engine call(s), want EPIPE on %s with status 2",
+			err, exitCodeForError(err), *engineCalls, path)
 	}
 }

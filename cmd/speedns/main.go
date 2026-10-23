@@ -1561,12 +1561,14 @@ func descriptorForOutputPath(path string) (int, bool) {
 }
 
 // openDescriptorOutput opens the descriptor an alias names and checks that a
-// report can be written to it. The descriptor must be open for writing and
-// must not be a directory. Anything else, a regular file, a pipe, a terminal or
-// a socket, takes the report as standard output would. The result also says
-// whether the descriptor is a regular file, the only kind worth flushing.
-// preflightOutput makes the same check before the run, so a closed or
-// read-only descriptor or a directory fails before the first query.
+// report can be written to it. The descriptor must be one the process
+// inherited, must be open for writing and must not be a directory; one the
+// process opened itself counts as closed, and openOutputDescriptor explains
+// why. Anything else, a regular file, a pipe, a terminal or a socket, takes the
+// report as standard output would. The result also says whether the descriptor
+// is a regular file, the only kind worth flushing. preflightOutput makes the
+// same check before the run, so a closed or read-only descriptor or a
+// directory fails before the first query.
 func openDescriptorOutput(path string, descriptor int) (outputDescriptorHandle, bool, error) {
 	file, writable, err := openOutputDescriptor(descriptor, path)
 	if err != nil {

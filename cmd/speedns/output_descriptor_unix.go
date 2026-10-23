@@ -22,6 +22,21 @@ import (
 // The result also says whether the descriptor is open for writing, which
 // fstat cannot tell: openDescriptorOutput refuses one that is not.
 //
+// Only a descriptor the process inherited counts as open. By the time the
+// preflight runs, the Go runtime holds descriptors of its own, such as the
+// network poller's epoll and eventfd descriptors on Linux or its kqueue on
+// macOS. They take the lowest free numbers, typically 3 and 4 when the caller
+// opened nothing more, and dup, fstat and F_GETFL all accept them, so
+// `--output /dev/fd/3` with the `3>` redirection forgotten ran the whole
+// benchmark and then wrote the report into the poller. Every descriptor the
+// runtime and package os open is close-on-exec, and an inherited one cannot
+// be, because exec would have closed it. A close-on-exec descriptor is
+// therefore refused with EBADF, exactly as if it were closed. The /dev/null
+// descriptors the runtime opens in place of a closed 0, 1 or 2 are not
+// close-on-exec, so those are still written to, as standard output would be.
+// A descriptor that really is closed fails F_GETFD too, and is left to dup to
+// report.
+//
 // The handle owns only the duplicate, and closing it leaves the inherited
 // descriptor open. Closing descriptor 1 or 2 would break every later write to
 // standard output or standard error; the process exit closes them anyway.
@@ -29,6 +44,9 @@ import (
 // because the garbage collector closes such a file once it is unreachable,
 // possibly after its number has been reused by another file.
 var openOutputDescriptor = func(descriptor int, path string) (outputDescriptorHandle, bool, error) {
+	if flags, err := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0); err == nil && flags&unix.FD_CLOEXEC != 0 {
+		return nil, false, &os.PathError{Op: "dup", Path: path, Err: syscall.EBADF}
+	}
 	// The fork lock keeps a concurrent fork from inheriting the duplicate
 	// before it is marked close-on-exec.
 	syscall.ForkLock.RLock()

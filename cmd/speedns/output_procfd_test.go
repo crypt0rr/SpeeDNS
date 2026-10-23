@@ -5,10 +5,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -16,34 +18,41 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// redirectDescriptor points descriptor fd at target and returns a function
-// that restores the original early. The test cleanup restores it as well, so
-// a failing test never leaves the runner writing into a test pipe. Dup3 is
-// used because linux/arm64 has no dup2 system call.
-func redirectDescriptor(t *testing.T, fd int, target *os.File) func() {
+// withDescriptorRedirected runs body with descriptor fd pointed at target and
+// puts the original back before it returns, also if body panics. body reports
+// a failure by returning it instead of failing the test: while descriptor 1
+// or 2 points at a test pipe, a diagnostic that go test -v streams straight
+// away would go into the pipe and be lost. The redirected descriptor is not
+// close-on-exec, so it looks inherited, as descriptor 1 under a shell
+// redirection does. Dup3 is used because linux/arm64 has no dup2 system call.
+func withDescriptorRedirected(t *testing.T, fd int, target *os.File, body func() error) error {
 	t.Helper()
 	saved, err := syscall.Dup(fd)
 	if err != nil {
 		t.Fatalf("save descriptor %d: %v", fd, err)
 	}
-	restored := false
-	restore := func() {
-		if restored {
-			return
-		}
-		restored = true
-		if err := syscall.Dup3(saved, fd, 0); err != nil {
-			t.Errorf("restore descriptor %d: %v", fd, err)
-		}
-		if err := syscall.Close(saved); err != nil {
-			t.Errorf("close saved descriptor %d: %v", fd, err)
-		}
-	}
-	t.Cleanup(restore)
 	if err := syscall.Dup3(int(target.Fd()), fd, 0); err != nil {
+		_ = syscall.Close(saved)
 		t.Fatalf("redirect descriptor %d: %v", fd, err)
 	}
-	return restore
+	defer func() {
+		if err := errors.Join(syscall.Dup3(saved, fd, 0), syscall.Close(saved)); err != nil {
+			t.Errorf("restore descriptor %d: %v", fd, err)
+		}
+	}()
+	return body()
+}
+
+// deliverReportThroughLink is deliverReport for a descriptor alias that is a
+// symlink into /proc, which must still be the same link afterwards.
+func deliverReportThroughLink(path, report string) error {
+	if err := procFDLinkError(path); err != nil {
+		return err
+	}
+	if err := deliverReport(path, report); err != nil {
+		return err
+	}
+	return procFDLinkError(path)
 }
 
 func TestOutputWriterWritesProcFD1PipeInPlace(t *testing.T) {
@@ -53,23 +62,13 @@ func TestOutputWriterWritesProcFD1PipeInPlace(t *testing.T) {
 	}
 	defer reader.Close()
 	defer pipeWriter.Close()
-	restoreStdout := redirectDescriptor(t, 1, pipeWriter)
 
-	const path = "/proc/self/fd/1"
-	assertProcFDLink(t, path)
-	writer, finalize, err := outputWriter(path)
+	err = withDescriptorRedirected(t, 1, pipeWriter, func() error {
+		return deliverReportThroughLink("/proc/self/fd/1", "report through stdout pipe")
+	})
 	if err != nil {
-		t.Fatalf("proc fd writer: %v", err)
-	}
-	if _, err := io.WriteString(writer, "report through stdout pipe"); err != nil {
 		t.Fatal(err)
 	}
-	if err := finalize(true); err != nil {
-		t.Fatalf("proc fd finalize: %v", err)
-	}
-	assertProcFDLink(t, path)
-
-	restoreStdout()
 	if err := pipeWriter.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -152,28 +151,18 @@ func TestOutputWriterWritesDescriptorAliasesInPlace(t *testing.T) {
 				target = pipeWriter
 				received = drainPipe(reader)
 			}
-			restore := func() {}
-			if tc.fd >= 0 {
-				restore = redirectDescriptor(t, tc.fd, target)
-			}
-
 			path := tc.alias(target)
-			assertProcFDLink(t, path)
-			if err := preflightOutput(path); err != nil {
-				t.Fatalf("preflight for %s: %v", path, err)
+			deliver := func() error { return deliverReportThroughLink(path, "new report") }
+			var err error
+			if tc.fd >= 0 {
+				err = withDescriptorRedirected(t, tc.fd, target, deliver)
+			} else {
+				inheritDescriptor(t, target.Fd())
+				err = deliver()
 			}
-			writer, finalize, err := outputWriter(path)
 			if err != nil {
-				t.Fatalf("writer for %s: %v", path, err)
-			}
-			if _, err := io.WriteString(writer, "new report"); err != nil {
 				t.Fatal(err)
 			}
-			if err := finalize(true); err != nil {
-				t.Fatalf("finalize for %s: %v", path, err)
-			}
-			assertProcFDLink(t, path)
-			restore()
 
 			if tc.file != 0 {
 				if content, err := os.ReadFile(target.Name()); err != nil || string(content) != tc.want {
@@ -216,9 +205,7 @@ func TestCommandsWriteThroughDevStdout(t *testing.T) {
 			defer reader.Close()
 			defer pipeWriter.Close()
 			received := drainPipe(reader)
-			restoreStdout := redirectDescriptor(t, 1, pipeWriter)
-			commandErr := command()
-			restoreStdout()
+			commandErr := withDescriptorRedirected(t, 1, pipeWriter, command)
 			if err := pipeWriter.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -246,6 +233,7 @@ func TestOutputWriterWritesRegularProcFDInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer target.Close()
+	inheritDescriptor(t, target.Fd())
 	if _, err := io.WriteString(target, "old report, "); err != nil {
 		t.Fatal(err)
 	}
@@ -276,6 +264,7 @@ func TestOutputWriterRejectsDirectoryProcFD(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer target.Close()
+	inheritDescriptor(t, target.Fd())
 
 	for _, path := range []string{
 		fmt.Sprintf("/proc/self/fd/%d", target.Fd()),
@@ -305,6 +294,7 @@ func TestOutputRefusesAnOPathDescriptor(t *testing.T) {
 		t.Skipf("opening an O_PATH descriptor is unavailable: %v", err)
 	}
 	defer syscall.Close(descriptor)
+	inheritDescriptor(t, uintptr(descriptor))
 
 	path := fmt.Sprintf("/proc/self/fd/%d", descriptor)
 	assertProcFDLink(t, path)
@@ -320,10 +310,79 @@ func TestOutputRefusesAnOPathDescriptor(t *testing.T) {
 	}
 }
 
-func assertProcFDLink(t *testing.T, path string) {
-	t.Helper()
+// TestOutputRefusesTheRuntimesPollerDescriptors is the failure behind the
+// close-on-exec check, on the descriptors that caused it. The Go runtime's
+// network poller holds an epoll descriptor and an eventfd, both open and
+// writable, typically at 3 and 4 when the caller opened nothing more. So
+// `--output /dev/fd/3` with the `3>` redirection forgotten ran the whole
+// benchmark and then wrote the report into the poller. Each of them must count
+// as closed, before the run and after it.
+func TestOutputRefusesTheRuntimesPollerDescriptors(t *testing.T) {
+	// A pipe end is registered with the poller, so the poller's descriptors
+	// exist by now even when this test runs alone.
+	reader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer pipeWriter.Close()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("listing /proc/self/fd is unavailable: %v", err)
+	}
+	engineCalls := countEngineCalls(t)
+	refused := 0
+	for _, entry := range entries {
+		link, err := os.Readlink("/proc/self/fd/" + entry.Name())
+		if err != nil || (link != "anon_inode:[eventpoll]" && link != "anon_inode:[eventfd]") {
+			continue
+		}
+		descriptor, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A poller descriptor a careless parent leaked into the test would
+		// be inherited, and so the caller's to name; only the runtime's own
+		// are close-on-exec.
+		if flags, err := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0); err != nil || flags&unix.FD_CLOEXEC == 0 {
+			continue
+		}
+		path := "/dev/fd/" + entry.Name()
+		wants := "inspect output path: dup " + path + ": " + syscall.EBADF.Error()
+		if err := preflightOutput(path); !errors.Is(err, syscall.EBADF) || err.Error() != wants {
+			t.Fatalf("preflight for %s (%s) = %v, want %q", path, link, err, wants)
+		}
+		if _, _, err := outputWriter(path); !errors.Is(err, syscall.EBADF) || err.Error() != wants {
+			t.Fatalf("writer for %s (%s) = %v, want %q", path, link, err, wants)
+		}
+		config := cliConfigForTest(t)
+		config.output = path
+		if err := runBenchmark(context.Background(), config); err == nil || err.Error() != wants || exitCodeForError(err) != 2 {
+			t.Fatalf("run to %s (%s) = %v (exit %d), want %q with status 2", path, link, err, exitCodeForError(err), wants)
+		}
+		refused++
+	}
+	if *engineCalls != 0 {
+		t.Fatalf("the benchmark ran %d time(s) for a poller descriptor", *engineCalls)
+	}
+	if refused == 0 {
+		t.Skip("no poller descriptor of the runtime's own was found")
+	}
+}
+
+// procFDLinkError reports whether path is a symlink, as every descriptor alias
+// on Linux is, without failing the test.
+func procFDLinkError(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("proc fd link %q = %v/%v", path, info, err)
+		return fmt.Errorf("proc fd link %q = %v/%v", path, info, err)
+	}
+	return nil
+}
+
+func assertProcFDLink(t *testing.T, path string) {
+	t.Helper()
+	if err := procFDLinkError(path); err != nil {
+		t.Fatal(err)
 	}
 }
