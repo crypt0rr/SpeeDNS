@@ -1156,7 +1156,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if config.cacheMiss {
 		targets, cacheMissDropped = cacheMissTargets(selection.all(), targets)
 	}
-	if err := validateAssertionTargets(assertions, targets, cacheMissDropped); err != nil {
+	if err := validateAssertionTargets(assertions, targets, cacheMissDropped, config.redactSystem); err != nil {
 		return err
 	}
 	// The destination is otherwise first touched after the benchmark, so a

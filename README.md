@@ -534,7 +534,9 @@ a TLS name (a DoH URL host or a `server_name`) count as one, so two
 `--resolver` flags aimed at one server, or the two bundled Google profiles, are
 measured once. The endpoint kept is the earliest declared profile's first
 transport at its earliest declared address, which on a dual-stack run is IPv4
-for every bundled resolver.
+for every bundled resolver. Profiles count in load order: the bundled catalog,
+then `--resolver-file` entries, then `--resolver` flags in the order given, then
+discovered system resolvers.
 
 ### What a default run sends
 

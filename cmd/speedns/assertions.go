@@ -11,6 +11,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/report"
 	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
@@ -153,7 +154,7 @@ func parseLatencyMilliseconds(value string) (float64, error) {
 // --cache-miss run, say -- sent the user looking for a mistake they had not
 // made. The error names the endpoint measured instead, which the assertion
 // can name.
-func validateAssertionTargets(assertions []assertion, targets []catalog.Target, dropped []cacheMissDrop) error {
+func validateAssertionTargets(assertions []assertion, targets []catalog.Target, dropped []cacheMissDrop, redactSystem bool) error {
 	for _, check := range assertions {
 		// A named resolver is checked before any query is sent, so a typo is
 		// invalid input rather than a gate that runs the whole benchmark and
@@ -179,6 +180,12 @@ func validateAssertionTargets(assertions []assertion, targets []catalog.Target, 
 		}
 		for _, drop := range dropped {
 			if targetMatchesID(drop.target, wanted) {
+				// The kept endpoint may be a discovered system resolver, whose ID
+				// carries its address; --redact-system keeps that out of stderr
+				// exactly as it keeps it out of the report.
+				if redactSystem && report.IsSystemTarget(drop.instead) {
+					return fmt.Errorf("invalid --assert %q: %q shares a cache with a redacted system endpoint, which --cache-miss measures instead; name another resolver or drop --cache-miss", check.raw, wanted)
+				}
 				return fmt.Errorf("invalid --assert %q: %q shares a cache with %q, which --cache-miss measures instead; name that endpoint or drop --cache-miss", check.raw, wanted, drop.instead.ID())
 			}
 		}

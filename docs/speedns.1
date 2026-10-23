@@ -94,7 +94,11 @@ one cache across its transports and addresses and caches a negative answer for
 the whole name. Profiles that share an address, including one --family leaves
 out, or a TLS name (a DoH URL host or a server_name) count as one resolver,
 measured over the earliest declared profile's first transport at its earliest
-declared address. Dropped endpoints are named in a report warning; under
+declared address, with profiles in load order: the bundled catalog, then
+.B --resolver-file
+entries, then
+.B --resolver
+flags in the order given, then discovered system resolvers. Dropped endpoints are named in a report warning; under
 --redact-system a dropped system resolver endpoint is counted instead. A
 cache-miss run therefore cannot produce a sound transport comparison, and
 speedns diff refuses cache-miss reports by design. An --assert that names only

@@ -99,7 +99,9 @@ measured for that resolver instead, which the assertion can name.
 
 The endpoint kept for a resolver is chosen by an explicit rule: the earliest
 declared profile, its first transport in the documented order (UDP, TCP, DoH,
-DoT, DoQ), at its earliest declared address. Every bundled profile declares
+DoT, DoQ), at its earliest declared address. Profiles count in load order:
+the bundled catalog, then `--resolver-file` entries, then `--resolver` flags in
+the order given, then discovered system resolvers. Every bundled profile declares
 its IPv4 address first, so a dual-stack run measures every bundled resolver
 over IPv4. The kept endpoint used to be the one whose target ID sorted first,
 which measured Cloudflare over IPv4 and the other bundled resolvers over IPv6
