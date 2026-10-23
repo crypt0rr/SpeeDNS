@@ -407,7 +407,9 @@ or `6` requires IP literals so SpeeDNS does not perform an unmeasured bootstrap
 lookup to guess a family. The family filter applies to `bootstrap_addresses`
 as well: under `--family 6` a DoH, DoT or DoQ transport keeps only its IPv6
 candidates (IPv4-mapped literals count as IPv4), and a transport left with no
-candidate is dropped instead of falling back to the target address.
+candidate is dropped instead of falling back to the target address. When that
+leaves no selected protocol to measure, the error names `--family` rather than
+only the protocol selection.
 
 The bundled addresses are sourced from [Google Public DNS](https://developers.google.com/speed/public-dns/docs/using), [Cloudflare](https://developers.cloudflare.com/1.1.1.1/infrastructure/network-operators/), [Quad9](https://quad9.net/service/service-addresses-and-features/), and [DNS4EU](https://joindns4.eu/for-public).
 
@@ -680,8 +682,8 @@ ultimate upstream is not known to SpeeDNS. Scoped macOS entries are kept
 separate when the same address appears in more than one resolver block, since
 the scope and interface can change which DNS server answers.
 
-On Linux, when every nameserver in `/etc/resolv.conf` is a loopback stub — the
-usual systemd-resolved setup on Ubuntu and Fedora — SpeeDNS also reads
+On Linux, when every nameserver in `/etc/resolv.conf` is a loopback stub, as in
+the usual systemd-resolved setup on Ubuntu and Fedora, SpeeDNS also reads
 `/run/systemd/resolve/resolv.conf` and adds each non-loopback server listed
 there as an extra profile next to the unchanged stub, named
 `System DNS (systemd-resolved default route)` with a `system-resolved-` ID, so

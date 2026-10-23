@@ -204,25 +204,29 @@ type assertionOptions struct {
 }
 
 // evaluateAssertions checks every assertion against the written report and
-// names targets by their recorded IDs.
+// names targets by their recorded IDs, as a report written without
+// --redact-system does. runBenchmark passes its options explicitly; this form
+// is kept for the many callers that judge an unredacted report.
 func evaluateAssertions(report benchmark.Report, assertions []assertion) error {
 	return evaluateAssertionsWithOptions(report, assertions, assertionOptions{})
 }
 
 // evaluateAssertionsWithOptions checks every assertion against the written
 // report, naming targets the way options says the report names them.
-func evaluateAssertionsWithOptions(report benchmark.Report, assertions []assertion, options assertionOptions) error {
+func evaluateAssertionsWithOptions(result benchmark.Report, assertions []assertion, options assertionOptions) error {
 	if len(assertions) == 0 {
 		return nil
 	}
-	displayIDs := redactedAssertionIDs(report, options.redactSystem)
+	// The report package's own mapping rather than a copy, so the positional
+	// numbering always matches the written report.
+	displayIDs := report.RedactedTargetIDs(result, options.redactSystem)
 	reasons := make([]string, 0)
-	winners := reportWinners(report)
-	leaders := rankOneWinners(report)
+	winners := reportWinners(result)
+	leaders := rankOneWinners(result)
 	// A transport that failed outright must not be a quieter result than one
 	// that merely degraded. Reported before the individual checks so the
 	// structural failure leads the message.
-	for _, protocol := range deadProtocols(report) {
+	for _, protocol := range deadProtocols(result) {
 		reasons = append(reasons, fmt.Sprintf("no %s endpoint returned a usable DNS response", protocol))
 	}
 	for _, check := range assertions {
@@ -232,7 +236,7 @@ func evaluateAssertionsWithOptions(report benchmark.Report, assertions []asserti
 		// the caller named explicitly, which describes the run rather than the
 		// thing they asked about.
 		if check.subject != "" {
-			reasons = append(reasons, subjectAssertionReasons(report, check, displayIDs)...)
+			reasons = append(reasons, subjectAssertionReasons(result, check, displayIDs)...)
 			continue
 		}
 		if len(winners) == 0 {
@@ -280,13 +284,6 @@ func evaluateAssertionsWithOptions(report benchmark.Report, assertions []asserti
 	// control character cannot reach the terminal through a failed gate when
 	// the report above it renders the same ID escaped.
 	return fmt.Errorf("%w: %s", ErrAssertionsFailed, safetext.Escape(strings.Join(reasons, "; ")))
-}
-
-// redactedAssertionIDs returns the redacted ID of every system target, or nil
-// when redaction is off. It is the report package's own mapping rather than a
-// copy, so the positional numbering always matches the written report.
-func redactedAssertionIDs(result benchmark.Report, redactSystem bool) map[string]string {
-	return report.RedactedTargetIDs(result, redactSystem)
 }
 
 // displayTargetID names target in a failure reason the way the report does.

@@ -88,7 +88,9 @@ uses the local up-interface address inventory without performing DNS lookups or
 connection probes. The filter also applies to the
 .I bootstrap_addresses
 of encrypted transports; a transport left with no candidate is dropped rather
-than falling back to the target address.
+than falling back to the target address. When that leaves no selected protocol
+to measure, the error names
+.BR --family .
 .TP
 .B --domains PATH
 Read one domain per line from a custom list. Blank lines, comments and a
@@ -467,6 +469,17 @@ second interrupt exits immediately.
 .I /etc/resolv.conf
 System resolver configuration on Linux, and the fallback on macOS.
 .TP
+.I /run/systemd/resolve/resolv.conf
+Read on Linux by
+.B --include-system
+only when every nameserver in
+.I /etc/resolv.conf
+is a loopback stub. Each non-loopback server it lists is added as a
+.I system-resolved-
+profile beside the stub. The file holds systemd-resolved's default-route
+servers only, so split-DNS links, DNS-over-TLS settings and non-standard ports
+are not represented. A missing or unreadable file is ignored.
+.TP
 .I scutil --dns
 Queried on macOS for scoped resolver configuration before the
 .I /etc/resolv.conf
@@ -484,4 +497,5 @@ speedns --protocol doq --sample 25 2>speedns-progress.log
 speedns completion bash > speedns.bash
 .EE
 .SH SEE ALSO
-.BR resolv.conf (5)
+.BR resolv.conf (5),
+.BR systemd-resolved (8)

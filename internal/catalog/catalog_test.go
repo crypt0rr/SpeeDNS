@@ -693,7 +693,7 @@ func TestDoHURLWithUserinfoIsRejectedWithoutEchoingIt(t *testing.T) {
 		assertNoSecret(t, err)
 
 		profile, err := ParseResolverFlag("p=" + raw)
-		if err == nil || !strings.Contains(err.Error(), "resolver URI must not include user credentials") || !reflect.DeepEqual(profile, ResolverProfile{}) {
+		if err == nil || !strings.Contains(err.Error(), `resolver "p" URI must not include user credentials`) || !reflect.DeepEqual(profile, ResolverProfile{}) {
 			t.Fatalf("ParseResolverFlag(%q) = %#v/%v", raw, profile, err)
 		}
 		assertNoSecret(t, err)
@@ -745,9 +745,14 @@ func TestParseResolverFlagRejectsExplicitPortZero(t *testing.T) {
 		"x=quic://dns.example:0",
 	} {
 		profile, err := ParseResolverFlag(value)
-		if err == nil || !strings.Contains(err.Error(), "must be 1-65535") || !reflect.DeepEqual(profile, ResolverProfile{}) {
+		if err == nil || !strings.Contains(err.Error(), `resolver "x" has an invalid URI port`) || !strings.Contains(err.Error(), "must be 1-65535") || !reflect.DeepEqual(profile, ResolverProfile{}) {
 			t.Fatalf("ParseResolverFlag(%q) = %#v/%v, want a port error", value, profile, err)
 		}
+	}
+	// An out-of-range port names the resolver too, so the rejected one of
+	// several --resolver flags is identifiable.
+	if _, err := ParseResolverFlag("upstream=udp://192.0.2.53:99999"); err == nil || !strings.Contains(err.Error(), `resolver "upstream" has an invalid URI port`) {
+		t.Fatalf("out-of-range port = %v", err)
 	}
 	for value, want := range map[string]int{
 		"x=udp://192.0.2.53":                   53,

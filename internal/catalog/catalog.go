@@ -634,9 +634,11 @@ func ParseResolverFlag(value string) (ResolverProfile, error) {
 	}
 	// Userinfo is never meaningful to a resolver URI: DoH would send it as
 	// Basic authentication and record it in every report's endpoint_url, and
-	// the other schemes would drop it without a word.
+	// the other schemes would drop it without a word. NAME has passed the
+	// printable check above, so it is quoted to say which of several
+	// --resolver flags was rejected; the URI is not.
 	if u.User != nil {
-		return ResolverProfile{}, errors.New("resolver URI must not include user credentials")
+		return ResolverProfile{}, fmt.Errorf("resolver %q URI must not include user credentials", name)
 	}
 	var protocol Protocol
 	switch strings.ToLower(u.Scheme) {
@@ -662,10 +664,10 @@ func ParseResolverFlag(value string) (ResolverProfile, error) {
 	if rawPort := u.Port(); rawPort != "" {
 		port, err = net.LookupPort("tcp", rawPort)
 		if err != nil {
-			return ResolverProfile{}, fmt.Errorf("invalid resolver URI port: %w", err)
+			return ResolverProfile{}, fmt.Errorf("resolver %q has an invalid URI port: %w", name, err)
 		}
 		if port < 1 {
-			return ResolverProfile{}, fmt.Errorf("invalid resolver URI port %q: must be 1-65535", rawPort)
+			return ResolverProfile{}, fmt.Errorf("resolver %q has an invalid URI port %q: must be 1-65535", name, rawPort)
 		}
 	}
 	host := u.Hostname()

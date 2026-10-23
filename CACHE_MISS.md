@@ -127,6 +127,17 @@ names in a run may be answered from cache. Whether that happens depends on how
 warm-up that asks `example.com` for a record type the apex lacks can cache
 such a proof before the first measured query.
 
+A resolver that forwards to another is not an independent cache either. On
+Linux, `--include-system` can add both the systemd-resolved stub
+(`system-stub-`) and the default-route servers it forwards to
+(`system-resolved-`). SpeeDNS measures them as separate resolvers, but every
+name the stub is asked is forwarded to one of those servers, so the stub's
+query can warm the cache that a ranked `system-resolved-` row then reads, or
+arrive while that row's own query is in flight. The stub is local and never
+ranked, so the warm reads it causes are on the network row. For a cache-miss
+measurement of the host's upstream, name it with `--resolver` instead of
+`--include-system`.
+
 The deliberate consequence of the two rules is that **a cache-miss run does
 not compare transports.** Comparing two transports requires measuring the same
 name twice at the same resolver, which is exactly what makes the second

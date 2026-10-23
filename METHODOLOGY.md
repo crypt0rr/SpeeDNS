@@ -393,7 +393,9 @@ U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) and invisible format characters
 (U+200B-U+200D, U+2060-U+2064, U+FEFF) are rendered as `\u{202e}`-style
 sequences, so they cannot reorder or hide the text around them either. That
 includes the zero-width joiners U+200C and U+200D, which legitimate Persian
-and Indic-script names use; they are shown escaped rather than dropped.
+and Indic-script names use; they are shown escaped rather than dropped. A
+resolver ID, name, owner or address is the exception: one that contains them
+is rejected before the run, as described below.
 Table column widths count format characters other than the soft hyphen as zero
 cells. JSON carries these values in the same escaped form as the table and
 CSV, so a consumer that decodes and prints a string, such as `jq -r`, gets the
@@ -421,10 +423,12 @@ subject is matched against, so a configured identity now prints exactly as
 configured everywhere. Labels that system discovery builds from the operating
 system's configuration, such as a macOS scope or interface name, are escaped
 when the profile is built instead, so an unusual DHCP-supplied domain cannot
-make `--include-system` fail. A DoH URL that carries user credentials is
-rejected for the same audit reason: reports record `endpoint_url` as
-configured, so a password or token in it would reach every JSON, CSV and
-`--details` output, and no error message quotes such a URL.
+make `--include-system` fail. A discovered nameserver whose IPv6 zone carries
+such a character is skipped, like any other entry that is not an address. A
+DoH URL that carries user credentials is rejected for the same audit reason:
+reports record `endpoint_url` as configured, so a password or token in it
+would reach every JSON, CSV and `--details` output, and no error message
+quotes such a URL.
 
 For encrypted targets, these reports also expose the effective TLS server
 name, whether it was configured explicitly or derived from the endpoint,
@@ -655,9 +659,11 @@ an IPv4 candidate under `--family 6`. Each transport keeps only the candidates
 of the allowed families, in their configured order, with IPv4-mapped IPv6
 literals counted as IPv4. A transport left with no candidate is dropped rather
 than falling back to the target address the operator replaced, and a profile
-left with no transport is dropped like one left with no address. Bootstrap
-candidates are also de-duplicated by canonical address, so `2001:DB8::1` and
-`2001:db8::1` are one candidate tried once.
+left with no transport is dropped like one left with no address. When the
+filter leaves no target on any selected protocol, the run stops with status 2
+and an error that names `--family`, not only the protocol selection.
+Bootstrap candidates are also de-duplicated by canonical address, so
+`2001:DB8::1` and `2001:db8::1` are one candidate tried once.
 
 A profile with several addresses still expands into one target per address,
 even when its encrypted transports dial the same bootstrap candidates. Those

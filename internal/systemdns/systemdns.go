@@ -260,10 +260,19 @@ func plainSources(addresses []string) []resolverSource {
 // parsing is required because a link-local IPv6 nameserver carries a zone
 // ("fe80::1%en0") that net.ParseIP rejects; dropping it would hide the only
 // resolver on a host whose router advertises a link-local address.
+//
+// netip accepts any text as a zone, while catalog.Validate rejects an address
+// with a control or invisible character, because the address is part of the
+// target ID. Such a nameserver is skipped here, like any other entry that is
+// not an address, so one odd line of OS configuration cannot fail the whole
+// --include-system run.
 func normalizeAddress(address string) (string, bool) {
 	address = strings.TrimSpace(address)
 	parsed, err := netip.ParseAddr(address)
 	if err != nil {
+		return "", false
+	}
+	if zone := parsed.Zone(); safetext.Escape(zone) != zone {
 		return "", false
 	}
 	return parsed.Unmap().String(), true

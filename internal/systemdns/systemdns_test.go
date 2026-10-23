@@ -339,6 +339,13 @@ func TestSystemSourceHelpers(t *testing.T) {
 	if got, ok := normalizeAddress("::ffff:192.0.2.1"); !ok || got != "192.0.2.1" {
 		t.Fatalf("normalized IPv4-mapped IPv6 = %q/%v", got, ok)
 	}
+	// netip takes any zone text; one catalog.Validate would reject is not
+	// an address discovery can offer.
+	for _, zoned := range []string{"fe80::1%en\x1b0", "fe80::1%en\u202e0", "fe80::1%en\u200b0", "fe80::1%en\xff"} {
+		if got, ok := normalizeAddress(zoned); ok || got != "" {
+			t.Fatalf("zone with an unprintable character %q = %q/%v", zoned, got, ok)
+		}
+	}
 	if isLocalStub("fe80::1%en0") {
 		t.Fatal("link-local nameserver must not be labeled a local stub")
 	}
@@ -705,6 +712,44 @@ func TestDiscoverAddsSystemdResolvedUplinks(t *testing.T) {
 		if err != nil || len(profiles) != 1 || *opened != 0 {
 			t.Fatalf("%s discovery = %#v/%v (uplink opened %d times)", platform, profiles, err, *opened)
 		}
+	}
+}
+
+// TestDiscoverSkipsNameserversValidateWouldReject keeps one odd line of OS
+// configuration from failing --include-system. A zone is free text to netip,
+// and an address carrying a control or invisible character fails
+// catalog.Validate, which used to end the whole run with status 2.
+func TestDiscoverSkipsNameserversValidateWouldReject(t *testing.T) {
+	withResolvConfFixtures(t, "nameserver fe80::1%en\x1b0\nnameserver fe80::2%en\u202e0\nnameserver fe80::3%en0\n", nil)
+	profiles, err := Discover(context.Background())
+	if err != nil || len(profiles) != 1 || profiles[0].Addresses[0] != "fe80::3%en0" {
+		t.Fatalf("Discover = %#v/%v, want only the printable zoned nameserver", profiles, err)
+	}
+	if err := catalog.Validate(profiles); err != nil {
+		t.Fatalf("discovered profiles fail validation: %v", err)
+	}
+}
+
+// TestResolvedUplinkIgnoresEntriesThatAreNotAddresses pins that the "only
+// loopback stubs" test reads the nameservers discovery keeps. A stray
+// "nameserver not-an-ip" beside the stub is dropped like everywhere else, so
+// it does not hide the uplink servers; an uplink entry that is not an address,
+// or whose zone Validate would reject, is skipped the same way.
+func TestResolvedUplinkIgnoresEntriesThatAreNotAddresses(t *testing.T) {
+	uplink := "nameserver not-an-ip\nnameserver fe80::1%en\x1b0\nnameserver 192.0.2.1\n"
+	opened := withResolvConfFixtures(t, "nameserver 127.0.0.53\nnameserver not-an-ip\n", &uplink)
+	profiles, err := Discover(context.Background())
+	if err != nil || *opened != 1 || len(profiles) != 2 {
+		t.Fatalf("Discover = %#v/%v (uplink opened %d times)", profiles, err, *opened)
+	}
+	if profiles[0].ID != "system-stub-127-0-0-53" || profiles[1].ID != "system-resolved-192-0-2-1" {
+		t.Fatalf("profile IDs = %s, %s", profiles[0].ID, profiles[1].ID)
+	}
+	// A resolv.conf with no address at all is a discovery error, not a stub
+	// configuration, so the uplink file is not consulted.
+	opened = withResolvConfFixtures(t, "nameserver not-an-ip\n", &uplink)
+	if _, err := Discover(context.Background()); err == nil || *opened != 0 {
+		t.Fatalf("no usable nameserver = %v (uplink opened %d times)", err, *opened)
 	}
 }
 

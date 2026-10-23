@@ -272,3 +272,48 @@ func TestSharedBootstrapWarningsReportEachResolverOnce(t *testing.T) {
 		t.Fatalf("no targets = %#v", got)
 	}
 }
+
+// TestFamilyFilterNamesItselfWhenItEmptiesAProtocol keeps the error honest
+// when --family, not --protocol, is why nothing is left to measure. A DoT
+// transport whose bootstrap candidates are all IPv4 is dropped under
+// --family 6; with only DoT selected the run used to fail with the generic
+// "no resolver supports the selected protocol(s)", which named neither the
+// flag nor the field responsible.
+func TestFamilyFilterNamesItselfWhenItEmptiesAProtocol(t *testing.T) {
+	oldEngine, oldOwn := runBenchmarkEngine, hostOwnAddressesFunc
+	t.Cleanup(func() { runBenchmarkEngine, hostOwnAddressesFunc = oldEngine, oldOwn })
+	hostOwnAddressesFunc = func() (map[string]bool, error) { return map[string]bool{}, nil }
+	runBenchmarkEngine = func(context.Context, []catalog.Target, benchmark.Options) (benchmark.Report, error) {
+		t.Error("the engine must not run when nothing is selected")
+		return benchmark.Report{}, nil
+	}
+	resolverFile := filepath.Join(t.TempDir(), "resolvers.yaml")
+	contents := `version: 1
+resolvers:
+  - id: pinned
+    name: Pinned
+    addresses: ["2001:db8::53"]
+    transports:
+      udp: {}
+      dot: {server_name: dns.example, bootstrap_addresses: [192.0.2.53]}
+`
+	if err := os.WriteFile(resolverFile, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(protocols string) error {
+		return runBenchmark(context.Background(), &cliConfig{
+			protocols: protocols, noDefaults: true, resolverFile: resolverFile, domainFile: cliDomainFile(t),
+			sample: 1, seed: 1, queryTypes: "A", timeout: time.Second, concurrency: 1, format: "json", family: "6",
+		})
+	}
+	err := run("dot")
+	want := "no resolver supports the selected protocol(s) under --family 6, which also drops a doh, dot or doq transport whose bootstrap_addresses are all outside that family"
+	if err == nil || exitCodeForError(err) != 2 || err.Error() != want {
+		t.Fatalf("--family 6 --protocol dot = %v, want %q", err, want)
+	}
+	// A protocol no profile declares at all is still the plain selection
+	// error: the family filter removed nothing that could have answered.
+	if err := run("doq"); err == nil || exitCodeForError(err) != 2 || err.Error() != "no resolver supports the selected protocol(s)" {
+		t.Fatalf("--protocol doq = %v, want the generic selection error", err)
+	}
+}

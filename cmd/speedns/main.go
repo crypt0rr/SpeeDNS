@@ -1149,6 +1149,13 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	onNetworkResolvers := classifyLocalResolvers(profiles, ownAddresses)
 
 	targets := catalog.Expand(profiles, selected)
+	// When the profiles did support a selected protocol before the family
+	// filter, the filter is what removed it, often by dropping an encrypted
+	// transport whose bootstrap candidates are all in the other family. The
+	// generic message below would send the operator to --protocol instead.
+	if len(targets) == 0 && len(catalog.Expand(selection.all(), selected)) > 0 {
+		return fmt.Errorf("no resolver supports the selected protocol(s) under --family %s, which also drops a doh, dot or doq transport whose bootstrap_addresses are all outside that family", family)
+	}
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
 	}
