@@ -1425,6 +1425,14 @@ type outputFileHandle interface {
 	Name() string
 }
 
+// outputDescriptorHandle is an open descriptor a report is written to. Stat
+// describes what the descriptor refers to, as fstat(2) does, without resolving
+// any path.
+type outputDescriptorHandle interface {
+	outputFileHandle
+	Stat() (fs.FileInfo, error)
+}
+
 var statOutputPath = os.Stat
 var lstatOutputPath = os.Lstat
 var createTempOutputFile = func(directory, pattern string) (outputFileHandle, error) {
@@ -1459,6 +1467,10 @@ var syncOutputDirectory = func(directory string) error {
 // while the same bytes redirected by a shell would not.
 const ordinaryFileMode fs.FileMode = 0o666
 
+// temporaryOutputMode is the owner-only mode os.CreateTemp gives the temporary
+// report before any other mode is applied to it.
+const temporaryOutputMode fs.FileMode = 0o600
+
 // outputProbeSuffix names the umask probe next to the temporary report file.
 const outputProbeSuffix = ".mode"
 
@@ -1490,7 +1502,13 @@ func directOutputWriter(path string, syncOnCommit bool) (io.Writer, outputFinali
 	if err != nil {
 		return nil, nil, fmt.Errorf("open output file: %w", err)
 	}
-	finalize := func(commit bool) error {
+	return file, finalizeDirectOutput(file, syncOnCommit), nil
+}
+
+// finalizeDirectOutput ends an in-place write: on commit it flushes the handle
+// if syncOnCommit asks for it, and either way it closes the handle.
+func finalizeDirectOutput(file outputFileHandle, syncOnCommit bool) outputFinalizer {
+	return func(commit bool) error {
 		if !commit {
 			if err := file.Close(); err != nil {
 				return fmt.Errorf("discard output file: %w", err)
@@ -1508,31 +1526,62 @@ func directOutputWriter(path string, syncOnCommit bool) (io.Writer, outputFinali
 		}
 		return nil
 	}
-	return file, finalize, nil
 }
 
-// isDescriptorOutputPath recognizes the spellings that address an already-open
-// descriptor rather than a file: /dev/stdout, /dev/stderr, /dev/fd/N,
-// /proc/self/fd/N and /proc/thread-self/fd/N. They are symlinks on Linux, and
-// /dev/stdout is one on macOS too, yet shells hand them out for redirection
-// and process substitution, so they are written through in place. Matching the
-// spelling instead of following every link keeps other symlinks rejected: an
-// atomic rename over /dev/stdout, which root may perform, would replace the
-// link itself. Only the exact clean absolute forms match.
-func isDescriptorOutputPath(path string) bool {
+// descriptorForOutputPath maps the spellings that address an already-open
+// descriptor rather than a file to that descriptor: /dev/stdout is 1,
+// /dev/stderr is 2, and /dev/fd/N, /proc/self/fd/N and /proc/thread-self/fd/N
+// are N. Shells hand these out for redirection and process substitution, so
+// the report is written to the descriptor the process already holds, exactly
+// as a report on standard output is, instead of reopening the path;
+// openOutputDescriptor explains why. Matching the spelling instead of
+// following every link keeps other symlinks rejected: an atomic rename over
+// /dev/stdout, which root may perform, would replace the link itself. Only the
+// exact clean absolute forms match, and none does on Windows, where they are
+// not absolute paths. N is limited to 31 bits: a descriptor is a C int, so a
+// larger number cannot be open, and passing it on could wrap around to name
+// another descriptor.
+func descriptorForOutputPath(path string) (int, bool) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return false
+		return 0, false
 	}
-	if path == "/dev/stdout" || path == "/dev/stderr" {
-		return true
+	switch path {
+	case "/dev/stdout":
+		return 1, true
+	case "/dev/stderr":
+		return 2, true
 	}
 	for _, prefix := range []string{"/dev/fd/", "/proc/self/fd/", "/proc/thread-self/fd/"} {
-		if descriptor, found := strings.CutPrefix(path, prefix); found {
-			value, err := strconv.ParseUint(descriptor, 10, 64)
-			return err == nil && strconv.FormatUint(value, 10) == descriptor
+		if number, found := strings.CutPrefix(path, prefix); found {
+			value, err := strconv.ParseUint(number, 10, 31)
+			return int(value), err == nil && strconv.FormatUint(value, 10) == number
 		}
 	}
-	return false
+	return 0, false
+}
+
+// openDescriptorOutput opens the descriptor an alias names and checks that a
+// report can be written to it. The descriptor must be open and must not be a
+// directory. Anything else, a regular file, a pipe, a terminal or a socket,
+// takes the report as standard output would. The result also says whether the
+// descriptor is a regular file, the only kind worth flushing. preflightOutput
+// makes the same check before the run, so a closed descriptor or a directory
+// fails before the first query.
+func openDescriptorOutput(path string, descriptor int) (outputDescriptorHandle, bool, error) {
+	file, err := openOutputDescriptor(descriptor, path)
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect output path: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, false, fmt.Errorf("inspect output path: %w", err)
+	}
+	if info.IsDir() {
+		_ = file.Close()
+		return nil, false, fmt.Errorf("output path is a directory: %s", path)
+	}
+	return file, info.Mode().IsRegular(), nil
 }
 
 // streamOutputModes are the referents a user symlink may name and still be
@@ -1554,6 +1603,9 @@ const (
 	// outputReplace writes a temporary file beside the destination and renames
 	// it over the destination once the report is complete.
 	outputReplace
+	// outputToDescriptor writes to the open descriptor a descriptor alias
+	// names, without opening the alias by path.
+	outputToDescriptor
 )
 
 // outputDestination is the decision classifyOutputPath makes about a path
@@ -1567,27 +1619,22 @@ type outputDestination struct {
 	// permissions existingMode carries over to the new report.
 	existing     bool
 	existingMode fs.FileMode
+	// descriptor is the descriptor an outputToDescriptor destination names.
+	descriptor int
 }
 
 // classifyOutputPath decides how --output will deliver a report to path,
 // without opening a pipe or device and without creating or truncating
 // anything. preflightOutput and outputWriter both rely on it, so the check made
-// before a run cannot drift from the decision made after it.
+// before a run cannot drift from the decision made after it. A descriptor
+// alias is only recognized here; both callers inspect the descriptor itself
+// through openDescriptorOutput.
 func classifyOutputPath(path string) (outputDestination, error) {
 	if strings.TrimSpace(path) == "" || path == "-" {
 		return outputDestination{kind: outputToStdout}, nil
 	}
-	if isDescriptorOutputPath(path) {
-		// Follow the alias to the descriptor it names. A closed descriptor
-		// fails here, before the run, instead of when the report is opened.
-		info, err := statOutputPath(path)
-		if err != nil {
-			return outputDestination{}, fmt.Errorf("inspect output path: %w", err)
-		}
-		if info.IsDir() {
-			return outputDestination{}, fmt.Errorf("output path is a directory: %s", path)
-		}
-		return outputDestination{kind: outputInPlace, syncOnCommit: info.Mode().IsRegular()}, nil
+	if descriptor, ok := descriptorForOutputPath(path); ok {
+		return outputDestination{kind: outputToDescriptor, descriptor: descriptor}, nil
 	}
 	info, err := lstatOutputPath(path)
 	if err == nil && info.Mode()&fs.ModeSymlink != 0 {
@@ -1655,11 +1702,23 @@ func temporaryOutputPattern(path string) (directory, pattern string) {
 // opened for writing only to check its permissions, and left as it was. The
 // one probe it adds is for a file that does not exist yet. That file is
 // created by renaming a temporary file into place, so a throwaway temporary
-// file shows whether the directory accepts one. The check is advisory, because
-// the path can change while the benchmark runs; outputWriter makes the
-// authoritative decision when it opens the destination afterwards.
+// file shows whether the directory accepts one. A descriptor alias gets the
+// same inspection the writer makes, on a duplicate of the descriptor that is
+// closed straight away. The check is advisory, because the path can change
+// while the benchmark runs; outputWriter makes the authoritative decision when
+// it opens the destination afterwards.
 func preflightOutput(path string) error {
 	destination, err := classifyOutputPath(path)
+	if err == nil && destination.kind == outputToDescriptor {
+		file, _, err := openDescriptorOutput(path, destination.descriptor)
+		if err != nil {
+			return err
+		}
+		// This closes only the duplicate; the descriptor stays open for the
+		// report.
+		_ = file.Close()
+		return nil
+	}
 	if err != nil || destination.kind != outputReplace || destination.existing {
 		return err
 	}
@@ -1699,10 +1758,12 @@ func copyOutputInPlace(temporaryPath, path string) error {
 // in the destination directory and renamed over the target only after a
 // successful run. Destinations that cannot be replaced that way are written in
 // place instead. That covers non-regular files such as /dev/null and named
-// pipes, descriptor aliases such as /dev/stdout and /proc/self/fd/N, symlinks
-// to a named pipe, terminal or other character device, regular files with more
-// than one hard link, writable regular files inside directories that reject
-// new entries, and mount points that refuse the final rename.
+// pipes, symlinks to a named pipe, terminal or other character device, regular
+// files with more than one hard link, writable regular files inside
+// directories that reject new entries, and mount points that refuse the final
+// rename. A descriptor alias such as /dev/stdout or /dev/fd/N is not opened at
+// all: the report goes to the descriptor it names, through a duplicate that
+// the finalizer closes, so the descriptor itself stays open.
 func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 	destination, err := classifyOutputPath(path)
 	if err != nil {
@@ -1713,6 +1774,12 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 		return os.Stdout, func(bool) error { return nil }, nil
 	case outputInPlace:
 		return directOutputWriter(path, destination.syncOnCommit)
+	case outputToDescriptor:
+		file, regular, err := openDescriptorOutput(path, destination.descriptor)
+		if err != nil {
+			return nil, nil, err
+		}
+		return file, finalizeDirectOutput(file, regular), nil
 	}
 	directory, pattern := temporaryOutputPattern(path)
 	file, err := createTempOutputFile(directory, pattern)
@@ -1769,7 +1836,13 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 		// The destination is a mount point, typically a single-file bind
 		// mount in a container, which no rename can replace. The report is
 		// already complete, so write it into the mounted file rather than
-		// throw the finished run away.
+		// throw the finished run away. The copy leaves the destination's
+		// own mode in place, so the temporary file can first get back the
+		// owner-only mode it was created with. The destination's mode,
+		// applied to it for the rename, may deny even the owner read
+		// access, as 0200 does, and then neither the copy nor the owner of
+		// a kept report could read it.
+		_ = chmodOutputFile(temporaryPath, temporaryOutputMode)
 		if copyErr := copyOutputInPlace(temporaryPath, path); copyErr != nil {
 			// The copy may have truncated the destination already, which
 			// leaves the temporary file as the only complete report. Keep it

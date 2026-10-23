@@ -17,9 +17,9 @@ import (
 // shell's process substitution hands out, so a non-regular input is read the
 // same way a file is. Descriptor paths are a Unix concept, hence the build tag.
 func TestLoadStopsReadingAnEndlessStream(t *testing.T) {
-	oldLimit := maxReportBytes
-	t.Cleanup(func() { maxReportBytes = oldLimit })
-	maxReportBytes = 1 << 20
+	oldLimit := MaxReportBytes
+	t.Cleanup(func() { MaxReportBytes = oldLimit })
+	MaxReportBytes = 1 << 20
 
 	reader, writer, err := os.Pipe()
 	if err != nil {

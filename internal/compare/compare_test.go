@@ -549,16 +549,16 @@ func TestLoadRejectsUnusableInput(t *testing.T) {
 }
 
 // TestLoadCapsTheInputSize pins the boundary of the size cap: an input of
-// exactly maxReportBytes is still a report, one byte more is refused with an
+// exactly MaxReportBytes is still a report, one byte more is refused with an
 // error that names the limit. A regular file is refused by its size before it
 // is read, which the stated byte count in the error shows: a refusal made
 // while reading cannot know it. TestLoadStopsReadingAnEndlessStream covers
 // inputs without a size. The cap is lowered so the test needs no 256 MiB
 // fixture.
 func TestLoadCapsTheInputSize(t *testing.T) {
-	oldLimit := maxReportBytes
-	t.Cleanup(func() { maxReportBytes = oldLimit })
-	maxReportBytes = 1 << 20
+	oldLimit := MaxReportBytes
+	t.Cleanup(func() { MaxReportBytes = oldLimit })
+	MaxReportBytes = 1 << 20
 
 	document, err := os.ReadFile(writeReportFixture(t))
 	if err != nil {
@@ -574,10 +574,10 @@ func TestLoadCapsTheInputSize(t *testing.T) {
 		}
 		return path
 	}
-	if _, err := Load(padded(maxReportBytes)); err != nil {
+	if _, err := Load(padded(MaxReportBytes)); err != nil {
 		t.Fatalf("an input of exactly the cap must load: %v", err)
 	}
-	oversized := padded(maxReportBytes + 1)
+	oversized := padded(MaxReportBytes + 1)
 	_, err = Load(oversized)
 	if err == nil || !strings.Contains(err.Error(), oversized) || !strings.Contains(err.Error(), "1 MiB limit") ||
 		!strings.Contains(err.Error(), "is 1048577 bytes") {

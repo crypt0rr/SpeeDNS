@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -41,21 +42,6 @@ func redirectDescriptor(t *testing.T, fd int, target *os.File) func() {
 		t.Fatalf("redirect descriptor %d: %v", fd, err)
 	}
 	return restore
-}
-
-// drainPipe reads a pipe to its end in the background, so a writer never
-// blocks on a full pipe buffer.
-func drainPipe(reader *os.File) <-chan string {
-	received := make(chan string, 1)
-	go func() {
-		content, err := io.ReadAll(reader)
-		if err != nil {
-			received <- "read error: " + err.Error()
-			return
-		}
-		received <- string(content)
-	}()
-	return received
 }
 
 func TestOutputWriterWritesProcFD1PipeInPlace(t *testing.T) {
@@ -94,19 +80,35 @@ func TestOutputWriterWritesProcFD1PipeInPlace(t *testing.T) {
 // TestOutputWriterWritesDescriptorAliasesInPlace pins #228. /dev/stdout,
 // /dev/stderr and /dev/fd/N are symlinks into /proc/self/fd on Linux, and they
 // were refused as user symlinks even though they name the same descriptors as
-// the accepted /proc/self/fd/N spelling. Every alias must be written in place,
-// whatever the descriptor refers to, and must stay a link afterwards.
+// the accepted /proc/self/fd/N spelling. Every alias must be written to the
+// descriptor it names, whatever the descriptor refers to, and must stay a link
+// afterwards. Writing to the descriptor rather than reopening the path is what
+// lets `--output /dev/stdout >> run.log` append and lets a socket on standard
+// output, as under systemd's StandardOutput=journal, take the report at all.
 func TestOutputWriterWritesDescriptorAliasesInPlace(t *testing.T) {
+	const previous = "a previous report longer than the new one"
 	for _, tc := range []struct {
 		name string
 		// fd is redirected to the target for the duration of the case; a
 		// negative fd addresses the target's own descriptor instead.
-		fd      int
-		alias   func(target *os.File) string
-		regular bool
+		fd    int
+		alias func(target *os.File) string
+		// file opens a regular file with these flags as the target, the way
+		// a shell redirection would; zero uses a pipe, or a socket.
+		file   int
+		socket bool
+		want   string
 	}{
 		{name: "/dev/stdout to a pipe", fd: 1, alias: func(*os.File) string { return "/dev/stdout" }},
-		{name: "/dev/stdout to a regular file", fd: 1, alias: func(*os.File) string { return "/dev/stdout" }, regular: true},
+		{name: "/dev/stdout to a socket", fd: 1, alias: func(*os.File) string { return "/dev/stdout" }, socket: true},
+		{
+			name: "/dev/stdout to a file opened with >", fd: 1, alias: func(*os.File) string { return "/dev/stdout" },
+			file: os.O_WRONLY | os.O_CREATE | os.O_TRUNC, want: "new report",
+		},
+		{
+			name: "/dev/stdout to a file opened with >>", fd: 1, alias: func(*os.File) string { return "/dev/stdout" },
+			file: os.O_WRONLY | os.O_CREATE | os.O_APPEND, want: previous + "new report",
+		},
 		{name: "/dev/stderr to a pipe", fd: 2, alias: func(*os.File) string { return "/dev/stderr" }},
 		{name: "/dev/fd/N of a pipe", fd: -1, alias: func(target *os.File) string { return fmt.Sprintf("/dev/fd/%d", target.Fd()) }},
 		{name: "/proc/thread-self/fd/N of a pipe", fd: -1, alias: func(target *os.File) string {
@@ -116,17 +118,29 @@ func TestOutputWriterWritesDescriptorAliasesInPlace(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var target *os.File
 			var received <-chan string
-			if tc.regular {
-				file, err := os.CreateTemp(t.TempDir(), "report-*")
+			switch {
+			case tc.file != 0:
+				name := filepath.Join(t.TempDir(), "run.log")
+				if err := os.WriteFile(name, []byte(previous), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				file, err := os.OpenFile(name, tc.file, 0o600)
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer file.Close()
-				if _, err := io.WriteString(file, "a previous report longer than the new one"); err != nil {
+				target = file
+			case tc.socket:
+				pair, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+				if err != nil {
 					t.Fatal(err)
 				}
-				target = file
-			} else {
+				peer := os.NewFile(uintptr(pair[1]), "peer")
+				defer peer.Close()
+				target = os.NewFile(uintptr(pair[0]), "socket")
+				defer target.Close()
+				received = drainPipe(peer)
+			default:
 				reader, pipeWriter, err := os.Pipe()
 				if err != nil {
 					t.Fatal(err)
@@ -159,9 +173,9 @@ func TestOutputWriterWritesDescriptorAliasesInPlace(t *testing.T) {
 			assertProcFDLink(t, path)
 			restore()
 
-			if tc.regular {
-				if content, err := os.ReadFile(target.Name()); err != nil || string(content) != "new report" {
-					t.Fatalf("descriptor referent = %q/%v", content, err)
+			if tc.file != 0 {
+				if content, err := os.ReadFile(target.Name()); err != nil || string(content) != tc.want {
+					t.Fatalf("descriptor referent = %q/%v, want %q", content, err, tc.want)
 				}
 				return
 			}
@@ -221,13 +235,16 @@ func TestCommandsWriteThroughDevStdout(t *testing.T) {
 	}
 }
 
+// TestOutputWriterWritesRegularProcFDInPlace pins that /proc/self/fd/N of a
+// regular file is written through the descriptor, at its current offset, as
+// `>&N` would write it, and that the file is neither reopened nor replaced.
 func TestOutputWriterWritesRegularProcFDInPlace(t *testing.T) {
 	target, err := os.CreateTemp(t.TempDir(), "report-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer target.Close()
-	if _, err := io.WriteString(target, "old report"); err != nil {
+	if _, err := io.WriteString(target, "old report, "); err != nil {
 		t.Fatal(err)
 	}
 
@@ -245,7 +262,7 @@ func TestOutputWriterWritesRegularProcFDInPlace(t *testing.T) {
 	}
 	assertProcFDLink(t, path)
 	content, err := os.ReadFile(target.Name())
-	if err != nil || string(content) != "new report" {
+	if err != nil || string(content) != "old report, new report" {
 		t.Fatalf("descriptor referent = %q/%v", content, err)
 	}
 }
@@ -260,7 +277,7 @@ func TestOutputWriterRejectsDirectoryProcFD(t *testing.T) {
 
 	for _, path := range []string{
 		fmt.Sprintf("/proc/self/fd/%d", target.Fd()),
-		fmt.Sprintf("/dev/fd/%d", target.Fd()),
+		fmt.Sprintf("/proc/thread-self/fd/%d", target.Fd()),
 	} {
 		assertProcFDLink(t, path)
 		if _, _, err := outputWriter(path); err == nil || !strings.Contains(err.Error(), "output path is a directory") {

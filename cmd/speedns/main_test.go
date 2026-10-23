@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -387,21 +388,28 @@ func TestOutputWriterRejectsSymlinkDestinations(t *testing.T) {
 	}
 }
 
-// TestIsDescriptorOutputPathAcceptsOnlyCanonicalAliases pins the spellings
-// that are written through in place without following the link. Anything
-// else that happens to be a symlink stays rejected, so the matcher must not
-// accept near misses such as relative, unclean or padded forms.
-func TestIsDescriptorOutputPathAcceptsOnlyCanonicalAliases(t *testing.T) {
+// TestDescriptorForOutputPathMapsOnlyCanonicalAliases pins the spellings that
+// are written to an open descriptor instead of being opened, and the
+// descriptor each one names: /dev/stdout is 1 and /dev/stderr is 2, exactly as
+// a report on standard output or standard error would be written, and the
+// numbered forms name their number. Anything else that happens to be a
+// symlink stays rejected, so the matcher must not accept near misses such as
+// relative, unclean or padded forms, or a number no descriptor can have.
+func TestDescriptorForOutputPathMapsOnlyCanonicalAliases(t *testing.T) {
 	for _, tc := range []struct {
-		path string
-		want bool
+		path       string
+		descriptor int
+		want       bool
 	}{
-		{path: "/dev/stdout", want: true},
-		{path: "/dev/stderr", want: true},
-		{path: "/dev/fd/0", want: true},
-		{path: "/dev/fd/63", want: true},
-		{path: "/proc/self/fd/1", want: true},
-		{path: "/proc/thread-self/fd/2", want: true},
+		{path: "/dev/stdout", descriptor: 1, want: true},
+		{path: "/dev/stderr", descriptor: 2, want: true},
+		{path: "/dev/fd/0", descriptor: 0, want: true},
+		{path: "/dev/fd/1", descriptor: 1, want: true},
+		{path: "/dev/fd/63", descriptor: 63, want: true},
+		{path: "/dev/fd/2147483647", descriptor: 2147483647, want: true},
+		{path: "/proc/self/fd/1", descriptor: 1, want: true},
+		{path: "/proc/self/fd/12", descriptor: 12, want: true},
+		{path: "/proc/thread-self/fd/2", descriptor: 2, want: true},
 		{path: "/dev/stdin"},
 		{path: "/dev/stdout/"},
 		{path: "/dev/./stdout"},
@@ -410,6 +418,9 @@ func TestIsDescriptorOutputPathAcceptsOnlyCanonicalAliases(t *testing.T) {
 		{path: "/dev/fd/"},
 		{path: "/dev/fd/-1"},
 		{path: "/dev/fd/1x"},
+		{path: "/dev/fd/2147483648"},
+		{path: "/dev/fd/4294967297"},
+		{path: "/dev/fd/99999999999999999999"},
 		{path: "/proc/1/fd/1"},
 		{path: "/proc/thread-self/fd/01"},
 		{path: "proc/self/fd/1"},
@@ -423,8 +434,9 @@ func TestIsDescriptorOutputPathAcceptsOnlyCanonicalAliases(t *testing.T) {
 		// The aliases are POSIX paths, so on a platform with another
 		// separator nothing may match, including the canonical spellings.
 		want := tc.want && filepath.Separator == '/'
-		if got := isDescriptorOutputPath(filepath.FromSlash(tc.path)); got != want {
-			t.Errorf("isDescriptorOutputPath(%q) = %v, want %v", tc.path, got, want)
+		descriptor, got := descriptorForOutputPath(filepath.FromSlash(tc.path))
+		if got != want || (want && descriptor != tc.descriptor) {
+			t.Errorf("descriptorForOutputPath(%q) = %d, %v, want %d, %v", tc.path, descriptor, got, tc.descriptor, want)
 		}
 	}
 }
@@ -1595,68 +1607,6 @@ func TestOutputWriterErrorPaths(t *testing.T) {
 		t.Fatalf("create output error = %v", err)
 	}
 
-	// Descriptor aliases are symlinks too, but they are written in place.
-	// Synthetic Stat results cover this branch on every system with POSIX
-	// path syntax, including those without Linux procfs. Lstat must not be
-	// consulted at all: on macOS /dev/fd/N is not a link, and a closed
-	// descriptor has no entry to inspect.
-	if filepath.Separator == '/' {
-		lstatOutputPath = func(string) (os.FileInfo, error) {
-			return nil, errors.New("lstat must not inspect a descriptor alias")
-		}
-		for _, alias := range []string{"/proc/self/fd/1", "/dev/stdout", "/dev/fd/3"} {
-			statOutputPath = func(string) (os.FileInfo, error) { return nil, errors.New("stat failed") }
-			if _, _, err := outputWriter(alias); err == nil || !strings.Contains(err.Error(), "stat failed") {
-				t.Fatalf("%s inspection error = %v", alias, err)
-			}
-			// A closed descriptor cannot be opened either, so it is refused
-			// before anything is written instead of after the run.
-			statOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
-			if _, _, err := outputWriter(alias); !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), "inspect output path") {
-				t.Fatalf("%s closed descriptor error = %v", alias, err)
-			}
-			statOutputPath = func(string) (os.FileInfo, error) {
-				return fakeOutputPathInfo{mode: fs.ModeDir, isDir: true}, nil
-			}
-			if _, _, err := outputWriter(alias); err == nil || !strings.Contains(err.Error(), "output path is a directory") {
-				t.Fatalf("%s directory error = %v", alias, err)
-			}
-		}
-
-		statOutputPath = func(string) (os.FileInfo, error) {
-			return fakeOutputPathInfo{mode: 0o600}, nil
-		}
-		openOutputFile = func(string) (outputFileHandle, error) { return nil, errors.New("open failed") }
-		if _, _, err := outputWriter("/proc/self/fd/1"); err == nil || !strings.Contains(err.Error(), "open failed") {
-			t.Fatalf("proc descriptor open error = %v", err)
-		}
-
-		// A regular referent is flushed on commit; a pipe or terminal is not.
-		for _, tc := range []struct {
-			mode     fs.FileMode
-			wantSync bool
-		}{
-			{mode: 0o600, wantSync: true},
-			{mode: fs.ModeNamedPipe | 0o600},
-		} {
-			statOutputPath = func(string) (os.FileInfo, error) {
-				return fakeOutputPathInfo{mode: tc.mode}, nil
-			}
-			procFile := &fakeOutputFile{name: "proc-descriptor", syncErr: errors.New("sync called")}
-			openOutputFile = func(string) (outputFileHandle, error) { return procFile, nil }
-			writer, finalize, err := outputWriter("/proc/self/fd/1")
-			if err != nil || writer != procFile {
-				t.Fatalf("proc descriptor writer for %v = %#v/%v", tc.mode, writer, err)
-			}
-			if err := finalize(true); (err != nil) != tc.wantSync {
-				t.Fatalf("proc descriptor finalize for %v = %v, want sync %v", tc.mode, err, tc.wantSync)
-			}
-		}
-	}
-	lstatOutputPath = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
-	statOutputPath = oldStat
-	openOutputFile = oldOpen
-
 	newFile := func() *fakeOutputFile { return &fakeOutputFile{name: "temporary"} }
 	createTempOutputFile = func(string, string) (outputFileHandle, error) { return newFile(), nil }
 	removeOutputFile = func(string) error { return nil }
@@ -1712,6 +1662,186 @@ func TestOutputWriterErrorPaths(t *testing.T) {
 	}
 	if err := finalize(true); err == nil || !strings.Contains(err.Error(), "rename failed") {
 		t.Fatalf("rename error = %v", err)
+	}
+}
+
+// fakeOutputDescriptor is an open descriptor as openOutputDescriptor returns
+// one, with a scripted fstat result. It counts how often it is closed, which
+// for a real handle closes only the duplicate of the descriptor.
+type fakeOutputDescriptor struct {
+	fakeOutputFile
+	info    fs.FileInfo
+	statErr error
+	closes  int
+}
+
+func (f *fakeOutputDescriptor) Stat() (fs.FileInfo, error) { return f.info, f.statErr }
+
+func (f *fakeOutputDescriptor) Close() error {
+	f.closes++
+	return f.fakeOutputFile.Close()
+}
+
+// scriptOutputDescriptors makes openOutputDescriptor record the descriptor it
+// is asked for and hand out what open returns, so no test writes to its own
+// standard output or standard error. An alias must never be inspected by path:
+// on macOS /dev/fd/N is no link, a closed descriptor has no entry, and a socket
+// cannot be opened by name. The path seams therefore fail the test if called.
+func scriptOutputDescriptors(t *testing.T, open func() (outputDescriptorHandle, error)) *[]int {
+	t.Helper()
+	if filepath.Separator != '/' {
+		t.Skip("descriptor aliases are POSIX paths, which never match here")
+	}
+	oldOpen, oldStat, oldLstat := openOutputDescriptor, statOutputPath, lstatOutputPath
+	t.Cleanup(func() { openOutputDescriptor, statOutputPath, lstatOutputPath = oldOpen, oldStat, oldLstat })
+	byPath := func(path string) (os.FileInfo, error) {
+		t.Errorf("descriptor alias %s was inspected by path", path)
+		return nil, errors.New("inspected by path")
+	}
+	statOutputPath, lstatOutputPath = byPath, byPath
+	requested := new([]int)
+	openOutputDescriptor = func(descriptor int, _ string) (outputDescriptorHandle, error) {
+		*requested = append(*requested, descriptor)
+		return open()
+	}
+	return requested
+}
+
+// TestOutputWriterWritesToTheDescriptorAnAliasNames pins how a descriptor
+// alias is written since #228: to the descriptor it names, never by opening
+// the path again. Reopening /dev/stdout truncated a log the shell had opened
+// for appending, and a socket, which is standard output under systemd's
+// StandardOutput=journal, cannot be opened by name at all. /dev/stdout and
+// /dev/stderr name descriptors 1 and 2. Every open descriptor that is not a
+// directory takes the report, and only a regular file is flushed. The handle
+// is a duplicate, so the preflight and both finalizer outcomes close it.
+func TestOutputWriterWritesToTheDescriptorAnAliasNames(t *testing.T) {
+	for _, tc := range []struct {
+		path       string
+		descriptor int
+		mode       fs.FileMode
+		wantSync   bool
+	}{
+		{path: "/dev/stdout", descriptor: 1, mode: fs.ModeSocket | 0o777},
+		{path: "/dev/stderr", descriptor: 2, mode: fs.ModeDevice | fs.ModeCharDevice | 0o620},
+		{path: "/dev/fd/7", descriptor: 7, mode: fs.ModeNamedPipe | 0o600},
+		{path: "/proc/self/fd/9", descriptor: 9, mode: 0o644, wantSync: true},
+		{path: "/proc/thread-self/fd/3", descriptor: 3, mode: 0o600, wantSync: true},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			handle := &fakeOutputDescriptor{
+				fakeOutputFile: fakeOutputFile{name: tc.path, syncErr: errors.New("sync called")},
+				info:           fakeOutputPathInfo{mode: tc.mode},
+			}
+			requested := scriptOutputDescriptors(t, func() (outputDescriptorHandle, error) { return handle, nil })
+			if err := preflightOutput(tc.path); err != nil {
+				t.Fatalf("preflight = %v", err)
+			}
+			if handle.closes != 1 || handle.Len() != 0 {
+				t.Fatalf("preflight closed its duplicate %d time(s) and wrote %q", handle.closes, handle.String())
+			}
+			writer, finalize, err := outputWriter(tc.path)
+			if err != nil || writer != handle {
+				t.Fatalf("writer = %#v/%v", writer, err)
+			}
+			if _, err := io.WriteString(writer, "report"); err != nil {
+				t.Fatal(err)
+			}
+			if err := finalize(true); (err != nil) != tc.wantSync {
+				t.Fatalf("commit = %v, want a sync %v", err, tc.wantSync)
+			}
+			if handle.closes != 2 || handle.String() != "report" {
+				t.Fatalf("after commit: %d close(s), %q written", handle.closes, handle.String())
+			}
+			if _, finalize, err = outputWriter(tc.path); err != nil {
+				t.Fatal(err)
+			}
+			if err := finalize(false); err != nil || handle.closes != 3 {
+				t.Fatalf("discard = %v after %d close(s)", err, handle.closes)
+			}
+			if want := []int{tc.descriptor, tc.descriptor, tc.descriptor}; !slices.Equal(*requested, want) {
+				t.Fatalf("descriptors requested = %v, want %v", *requested, want)
+			}
+		})
+	}
+}
+
+// TestOutputRefusesAnUnusableDescriptorBeforeTheRun pins the descriptors an
+// alias cannot be written to: a closed one, one that fstat cannot describe,
+// and a directory. Each must fail before the first query with status 2, and
+// the writer must refuse it the same way if it changes during the run. A
+// duplicate that was made is closed again.
+func TestOutputRefusesAnUnusableDescriptorBeforeTheRun(t *testing.T) {
+	const path = "/dev/fd/5"
+	for _, tc := range []struct {
+		name   string
+		opened *fakeOutputDescriptor
+		wants  string
+	}{
+		{name: "closed", wants: "inspect output path: dup /dev/fd/5: "},
+		{
+			name:   "fstat fails",
+			opened: &fakeOutputDescriptor{statErr: &os.PathError{Op: "stat", Path: path, Err: syscall.EIO}},
+			wants:  "inspect output path: stat /dev/fd/5: ",
+		},
+		{
+			name:   "directory",
+			opened: &fakeOutputDescriptor{info: fakeOutputPathInfo{mode: fs.ModeDir | 0o755, isDir: true}},
+			wants:  "output path is a directory: /dev/fd/5",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scriptOutputDescriptors(t, func() (outputDescriptorHandle, error) {
+				if tc.opened == nil {
+					return nil, &os.PathError{Op: "dup", Path: path, Err: syscall.EBADF}
+				}
+				return tc.opened, nil
+			})
+			engineCalls := countEngineCalls(t)
+			if err := preflightOutput(path); err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("preflight = %v, want %q", err, tc.wants)
+			}
+			if _, _, err := outputWriter(path); err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("writer = %v, want %q", err, tc.wants)
+			}
+			config := cliConfigForTest(t)
+			config.output = path
+			err := runBenchmark(context.Background(), config)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) || exitCodeForError(err) != 2 {
+				t.Fatalf("run = %v (exit %d), want %q with status 2", err, exitCodeForError(err), tc.wants)
+			}
+			if *engineCalls != 0 {
+				t.Fatalf("the benchmark ran %d time(s) for an unusable descriptor", *engineCalls)
+			}
+			if tc.opened != nil && tc.opened.closes != 3 {
+				t.Fatalf("the duplicate was closed %d time(s), want 3", tc.opened.closes)
+			}
+		})
+	}
+}
+
+// TestRunBenchmarkWritesToASocketOnStandardOutput is the systemd case behind
+// #228. Under StandardOutput=journal standard output is a Unix socket, so the
+// preflight accepted --output /dev/stdout and reopening it after the whole run
+// failed with ENXIO. Written to descriptor 1 itself, the run exits 0 with its
+// report on the socket.
+func TestRunBenchmarkWritesToASocketOnStandardOutput(t *testing.T) {
+	socket := &fakeOutputDescriptor{
+		fakeOutputFile: fakeOutputFile{name: "/dev/stdout"},
+		info:           fakeOutputPathInfo{mode: fs.ModeSocket | 0o777},
+	}
+	requested := scriptOutputDescriptors(t, func() (outputDescriptorHandle, error) { return socket, nil })
+	engineCalls := countEngineCalls(t)
+	config := cliConfigForTest(t)
+	config.output = "/dev/stdout"
+	if err := runBenchmark(context.Background(), config); err != nil || *engineCalls != 1 {
+		t.Fatalf("run to a socket on standard output = %v after %d engine call(s)", err, *engineCalls)
+	}
+	if !strings.Contains(socket.String(), "\"results\"") {
+		t.Fatalf("socket received %q", socket.String())
+	}
+	if !slices.Equal(*requested, []int{1, 1}) || socket.closes != 2 {
+		t.Fatalf("descriptors requested = %v, closed %d time(s)", *requested, socket.closes)
 	}
 }
 
@@ -2155,6 +2285,86 @@ func TestOutputWriterWritesInPlaceWhenTheRenameHitsAMountPoint(t *testing.T) {
 			after, err := os.Stat(path)
 			if err != nil || !os.SameFile(before, after) || after.Mode() != before.Mode() || renames != 1 {
 				t.Fatalf("destination was not written in place: %v -> %v (%v, %d rename(s))", before, after, err, renames)
+			}
+			if entries, err := os.ReadDir(directory); err != nil || len(entries) != 1 {
+				t.Fatalf("the temporary file was left behind: %v/%v", entries, err)
+			}
+		})
+	}
+}
+
+// TestOutputWriterCopiesIntoAWriteOnlyMountPoint pins that the in-place
+// fallback after a refused rename works for a destination its owner may write
+// but not read. The destination's mode is applied to the temporary file for
+// the rename, so with 0200 neither the copy nor the owner of a kept report
+// could read the finished report afterwards. Root reads it either way, so
+// only an ordinary user can see the difference.
+func TestOutputWriterCopiesIntoAWriteOnlyMountPoint(t *testing.T) {
+	oldRename, oldOpen := renameOutputFile, openOutputFile
+	t.Cleanup(func() { renameOutputFile, openOutputFile = oldRename, oldOpen })
+	renameOutputFile = func(oldPath, newPath string) error {
+		return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: syscall.EBUSY}
+	}
+	for _, tc := range []struct {
+		name      string
+		copyFails bool
+	}{
+		{name: "copied into place"},
+		{name: "kept when the copy fails", copyFails: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			directory := t.TempDir()
+			path := filepath.Join(directory, "report.json")
+			if err := os.WriteFile(path, []byte("a previous report"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o200); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			openOutputFile = oldOpen
+			writer, finalize, err := outputWriter(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(writer, "new report"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.copyFails {
+				openOutputFile = func(string) (outputFileHandle, error) { return nil, errors.New("open failed") }
+			}
+			err = finalize(true)
+			if tc.copyFails {
+				entries, readErr := os.ReadDir(directory)
+				if err == nil || readErr != nil || len(entries) != 2 {
+					t.Fatalf("failed copy = %v, entries %v/%v", err, entries, readErr)
+				}
+				for _, entry := range entries {
+					kept := filepath.Join(directory, entry.Name())
+					if kept == path {
+						continue
+					}
+					if content, err := os.ReadFile(kept); err != nil || string(content) != "new report" {
+						t.Fatalf("the kept report cannot be read by its owner: %q/%v", content, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("fallback into a write-only destination = %v", err)
+			}
+			after, err := os.Stat(path)
+			if err != nil || !os.SameFile(before, after) || after.Mode() != before.Mode() {
+				t.Fatalf("destination was not written in place: %v -> %v (%v)", before, after, err)
+			}
+			if err := os.Chmod(path, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if content, err := os.ReadFile(path); err != nil || string(content) != "new report" {
+				t.Fatalf("destination = %q/%v", content, err)
 			}
 			if entries, err := os.ReadDir(directory); err != nil || len(entries) != 1 {
 				t.Fatalf("the temporary file was left behind: %v/%v", entries, err)

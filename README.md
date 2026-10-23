@@ -742,25 +742,29 @@ that copy fails, the temporary file holding the complete report is kept and
 named in the error. Writing in place gives up atomicity: an in-place
 destination, these two included, can keep partial output after a failed run
 or write. An existing file you cannot write is refused rather than replaced, as
-a shell redirection would refuse it, and a destination that is a directory or
-a socket is rejected.
+a shell redirection would refuse it. A directory is rejected, and so is a
+socket named by its own path, because a socket cannot be opened by name.
 
-The descriptor aliases `/dev/stdout`, `/dev/stderr`, `/dev/fd/N`,
-`/proc/self/fd/N` and `/proc/thread-self/fd/N` are written in place on systems
-that provide them, when spelled exactly like that. They include the
-`/dev/fd/N` paths that process substitution such as `--output >(jq .)` hands
-out. An alias is opened anew and truncated like any other destination, so on
-Linux `--output /dev/stdout >> run.log` overwrites `run.log` instead of
-appending to it; leave `--output` out to let the shell append. A symlink of
-your own is written through only when it points at a named pipe, a terminal or
-other character device. Any other symlink destination, including one to a
-regular file, a directory or a socket and a dangling one, is rejected before
-writing, leaving the link and its referent unchanged.
+On Unix systems the descriptor aliases `/dev/stdout`, `/dev/stderr`,
+`/dev/fd/N`, `/proc/self/fd/N` and `/proc/thread-self/fd/N`, spelled exactly
+like that, are not opened at all. The report is written to the descriptor the
+alias names, 1 for `/dev/stdout`, 2 for `/dev/stderr` and N for the others,
+the way a report without `--output` is written to standard output. That
+covers the `/dev/fd/N` paths that process substitution such as
+`--output >(jq .)` hands out. So `--output /dev/stdout >> run.log` appends
+to `run.log` and `> run.log` replaces its contents, just as leaving
+`--output` out would, and a socket on standard output, as under systemd's
+`StandardOutput=journal`, receives the report. The descriptor must be open
+and must not be a directory. A symlink of your own is written through only
+when it points at a named pipe, a terminal or other character device. Any
+other symlink destination, including one to a regular file, a directory or a
+socket and a dangling one, is rejected before writing, leaving the link and
+its referent unchanged.
 
 `run` checks the destination before it sends the first query, so a missing
-directory, a rejected symlink or an unwritable file fails with status 2 instead
-of costing a whole benchmark. The path can still change while the benchmark
-runs, so it is checked again when the report is written.
+directory, a rejected symlink, an unwritable file or a closed descriptor fails
+with status 2 instead of costing a whole benchmark. The path can still change
+while the benchmark runs, so it is checked again when the report is written.
 
 The versioned JSON contract is published as
 [`schema/report-v1.json`](schema/report-v1.json). It describes the current
@@ -818,9 +822,11 @@ stable columns, and the report CSV's append-only contract is not forked.
 The two inputs do not have to be regular files: a pipe, `/dev/stdin` and
 process substitution such as `speedns diff <(gunzip -c last.json.gz) now.json`
 are read the same way. Each input is read up to 256 MiB, far more than a
-default report, so an endless stream such as `/dev/zero` fails with status 2 and a size
-error instead of exhausting memory. `--output` for a diff follows the same
-rules as for a run.
+default report, so an endless stream such as `/dev/zero` fails with status 2
+and a size error instead of exhausting memory. `--output` for a diff follows
+the destination rules of a run, except that nothing checks the destination
+before the inputs are read: a diff measures nothing, so a bad destination
+costs no run and is reported when the diff is written.
 
 The two fields a machine consumer needs first are `comparable` and `blockers`.
 When `comparable` is false the document carries no count from either report,

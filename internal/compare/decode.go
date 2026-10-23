@@ -107,13 +107,13 @@ type DNSSEC struct {
 	Verdict string `json:"verdict"`
 }
 
-// maxReportBytes caps how much of one diff input is read. A default report
+// MaxReportBytes caps how much of one diff input is read. A default report
 // stays far below it; only --raw samples over a large custom --domains corpus
 // can approach it, because their size grows with the corpus. The cap exists so
 // an endless stream such as /dev/zero ends in a usage error instead of
-// exhausting memory. It is a variable only so tests can exercise the cap
-// without a stream of this size.
-var maxReportBytes int64 = 256 << 20
+// exhausting memory. It is an exported variable only so tests, the CLI's
+// among them, can exercise the cap without a stream of this size.
+var MaxReportBytes int64 = 256 << 20
 
 // reportReadChunk is how much of an input is read into one buffer.
 const reportReadChunk = 1 << 20
@@ -121,7 +121,7 @@ const reportReadChunk = 1 << 20
 // Load reads a published report. It decodes only the fields this package uses,
 // so a report carrying keys it does not know about is read without complaint.
 // The path need not be a regular file: a pipe, /dev/stdin and a shell's
-// process substitution are read the same way, up to maxReportBytes.
+// process substitution are read the same way, up to MaxReportBytes.
 func Load(path string) (Report, error) {
 	content, err := readReportInput(path)
 	if err != nil {
@@ -148,7 +148,7 @@ func Load(path string) (Report, error) {
 }
 
 // readReportInput returns the whole input at path, refusing one larger than
-// maxReportBytes. A regular file states its size, so one past the cap is
+// MaxReportBytes. A regular file states its size, so one past the cap is
 // refused before any of it is read, and one within it is read into a single
 // buffer of that size, as os.ReadFile would. Anything else is read in fixed
 // chunks that are joined only once the input has ended within the cap.
@@ -161,10 +161,10 @@ func readReportInput(path string) ([]byte, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	defer file.Close()
-	limit := fmt.Sprintf("the %d MiB limit for a report", maxReportBytes>>20)
+	limit := fmt.Sprintf("the %d MiB limit for a report", MaxReportBytes>>20)
 	chunkSize := int64(reportReadChunk)
 	if info, err := file.Stat(); err == nil && info.Mode().IsRegular() {
-		if info.Size() > maxReportBytes {
+		if info.Size() > MaxReportBytes {
 			return nil, fmt.Errorf("%s is %d bytes, larger than %s", path, info.Size(), limit)
 		}
 		// One byte more than the file holds lets the first read reach its
@@ -175,7 +175,7 @@ func readReportInput(path string) ([]byte, error) {
 	}
 	// One byte past the cap tells an input of exactly the cap from a larger
 	// one without reading the rest of an endless stream.
-	input := io.LimitReader(file, maxReportBytes+1)
+	input := io.LimitReader(file, MaxReportBytes+1)
 	var chunks [][]byte
 	var total int64
 	for {
@@ -190,7 +190,7 @@ func readReportInput(path string) ([]byte, error) {
 			return nil, fmt.Errorf("read %s: %w", path, err)
 		}
 	}
-	if total > maxReportBytes {
+	if total > MaxReportBytes {
 		return nil, fmt.Errorf("%s is larger than %s", path, limit)
 	}
 	if len(chunks) == 1 {

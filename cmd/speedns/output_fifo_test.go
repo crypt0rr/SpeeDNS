@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -231,48 +230,5 @@ func TestRunBenchmarkRefusesABoundSocketBeforeMeasuring(t *testing.T) {
 	}
 	if target, err := os.Readlink(link); err != nil || target != filepath.Base(socket) {
 		t.Fatalf("socket symlink target = %q/%v", target, err)
-	}
-}
-
-// TestOutputWriterWritesThroughDevFDOfAPipe exercises a real descriptor alias
-// on every Unix system, macOS included, where /dev/fd/N is not a symlink at
-// all. It is the path `--output >(jq .)` hands the command, so the report must
-// arrive through the pipe and nothing may be created beside it.
-func TestOutputWriterWritesThroughDevFDOfAPipe(t *testing.T) {
-	reader, pipeWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	defer pipeWriter.Close()
-	received := make(chan string, 1)
-	go func() {
-		content, readErr := io.ReadAll(reader)
-		if readErr != nil {
-			received <- "read error: " + readErr.Error()
-			return
-		}
-		received <- string(content)
-	}()
-
-	path := fmt.Sprintf("/dev/fd/%d", pipeWriter.Fd())
-	if err := preflightOutput(path); err != nil {
-		t.Fatalf("preflight for %s: %v", path, err)
-	}
-	writer, finalize, err := outputWriter(path)
-	if err != nil {
-		t.Fatalf("writer for %s: %v", path, err)
-	}
-	if _, err := io.WriteString(writer, "piped report"); err != nil {
-		t.Fatal(err)
-	}
-	if err := finalize(true); err != nil {
-		t.Fatalf("finalize for %s: %v", path, err)
-	}
-	if err := pipeWriter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if got := <-received; got != "piped report" {
-		t.Fatalf("pipe received %q", got)
 	}
 }
