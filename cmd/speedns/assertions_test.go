@@ -509,7 +509,7 @@ func TestSubjectLatencyAssertionsRequireScoredSamples(t *testing.T) {
 		// The lower bound matters as much as the upper ones: p95>=1ms used to
 		// fail with a fabricated p95=0.000ms instead of saying nothing was
 		// measured.
-		for _, bar := range []string{"p95<50ms", "median<=10", "score<100ms", "p95>=1ms"} {
+		for _, bar := range []string{"p95<50ms", "median<=10", "score<100ms", "p95>=1ms", "p95=0"} {
 			expression := subject.Target.Resolver.ID + ":" + bar
 			err := evaluate(expression)
 			if !errors.Is(err, ErrAssertionsFailed) || exitCodeForError(err) != 4 {

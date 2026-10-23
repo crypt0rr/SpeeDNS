@@ -292,7 +292,7 @@ func TestDiffRequireFailsClosed(t *testing.T) {
 			},
 			required: []string{"no-new-failed-targets"},
 			exit:     3,
-			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (2 incomplete-target)",
+			message:  "nothing compared: no --require condition can pass (2 incomplete-target)",
 		},
 		{
 			name:     "incomplete baseline",
@@ -300,7 +300,7 @@ func TestDiffRequireFailsClosed(t *testing.T) {
 			current:  []any{diffTarget("a@1.1.1.1/udp")},
 			required: []string{"no-behaviour-change"},
 			exit:     3,
-			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (1 incomplete-target)",
+			message:  "nothing compared: no --require condition can pass (1 incomplete-target)",
 		},
 		{
 			name:     "every target local or redacted",
@@ -308,7 +308,7 @@ func TestDiffRequireFailsClosed(t *testing.T) {
 			current:  []any{diffTarget("stub@127.0.0.1/udp", localDiffTarget), diffTarget("system-redacted-1", deadDiffTarget)},
 			required: []string{"no-new-failed-targets", "target-set-identical"},
 			exit:     3,
-			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (1 local-position, 1 redacted-identity)",
+			message:  "nothing compared: no --require condition can pass (1 local-position, 1 redacted-identity)",
 		},
 		{
 			// Disjoint target sets compare nothing; a condition that passes
@@ -318,13 +318,13 @@ func TestDiffRequireFailsClosed(t *testing.T) {
 			current:  []any{diffTarget("b@9.9.9.9/udp")},
 			required: []string{"no-new-failed-targets"},
 			exit:     3,
-			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (2 present in only one run)",
+			message:  "nothing compared: no --require condition can pass (2 present in only one run)",
 		},
 		{
 			name:     "neither run has a target",
 			required: []string{"no-behaviour-change"},
 			exit:     3,
-			message:  "nothing compared: 0 endpoint(s) compared, so no --require condition can pass (neither run has a target)",
+			message:  "nothing compared: no --require condition can pass (neither run has a target)",
 		},
 		{
 			// A PRESENCE failure needs no pairing, so it is a real failure
@@ -415,9 +415,11 @@ func TestDiffRequireFailsClosed(t *testing.T) {
 		})
 	}
 
-	// A refusal outranks every condition, including failing ones and a diff
-	// that would compare nothing: the runs measured different things.
-	t.Run("a refusal outranks failed conditions", func(t *testing.T) {
+	// A refused diff produces no findings, so no condition can fail on it; what
+	// this pins is that the refusal outranks the nothing-compared gate it would
+	// otherwise also trip. Refusal over failing conditions follows from runDiff
+	// checking comparability first.
+	t.Run("a refusal outranks the nothing-compared gate", func(t *testing.T) {
 		baseline := reportWith("baseline.json", diffTarget("a@1.1.1.1/udp"))
 		current := writeDiffFixture(t, "refused.json", func(d map[string]any) {
 			d["run"].(map[string]any)["seed"] = 99

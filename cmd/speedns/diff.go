@@ -95,7 +95,7 @@ func runDiff(stdout io.Writer, baselinePath, currentPath, format, output string,
 	// condition examined a single paired count, so reporting it as a pass
 	// would be a gate that could not evaluate saying everything is fine.
 	if len(required) > 0 && diff.Compared == 0 {
-		return fmt.Errorf("%w: 0 endpoint(s) compared, so no --require condition can pass (%s)",
+		return fmt.Errorf("%w: no --require condition can pass (%s)",
 			compare.ErrNothingCompared, notComparedSummary(diff))
 	}
 	return nil

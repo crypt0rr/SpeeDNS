@@ -823,6 +823,10 @@ warnings. The command returns a distinct non-zero status:
 - `4` — a requested benchmark assertion failed;
 - `130` — interrupted by the user or operating system.
 
+`speedns diff` uses `3` for runs that are not comparable or a `--require` gate
+that compared no endpoint, and `4` for a failed `--require` condition; see
+[Comparing two runs](#comparing-two-runs).
+
 An interrupted run reports `interrupted` on standard error and still writes the
 partial report. A second interrupt exits immediately.
 
@@ -860,11 +864,13 @@ resolver degrade" — a different question, and the one a monitoring gate usuall
 means. Every endpoint is checked rather than only the best, so a resolver that
 degrades on one transport cannot pass on the strength of another.
 
-An endpoint of the subject with no scored latency samples, because it timed
-out, refused every query or answered only `SERVFAIL`, fails every `median`,
+An endpoint of the subject with no scored latency samples fails every `median`,
 `p95` and `score` assertion with status 4, whichever way the comparison points:
 there is no latency to compare, so `mine:p95<50ms` cannot pass on a resolver
 that is down, and `mine:p95>=1ms` says so instead of reporting `p95=0.000ms`.
+That covers an endpoint that timed out, refused every query or answered only
+`SERVFAIL`, and also one whose every usable answer was divergent or arrived
+straight after a reconnect, since neither kind is a scored latency sample.
 `usable` and `success` are rates over every measured query, so they are still
 compared as usual.
 

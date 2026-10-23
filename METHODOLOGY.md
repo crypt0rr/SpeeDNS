@@ -437,7 +437,9 @@ and `score` assertion, whatever the operator. Those statistics are only
 computed from scored samples and stay zero without one, so comparing them would
 let a resolver that timed out, refused every query or answered only `SERVFAIL`
 pass an upper bound, and would report a fabricated `0.000ms` against a lower
-one. The structural rule above does not catch this case: it skips local
+one. The same holds for an endpoint whose every usable answer was divergent or
+followed a reconnect: it may be healthy, but it produced no latency the bar
+could be checked against, so the gate cannot confirm it. The structural rule above does not catch this case: it skips local
 resolvers and stays quiet while any other endpoint of the protocol answers.
 `usable` and `success` are rates over every measured query, so they keep their
 ordinary meaning. Unqualified assertions are unaffected, because a rank-one
