@@ -973,11 +973,58 @@ func newRunCommand(config *cliConfig) *cobra.Command {
 		// leaf accepts any positional argument unless told otherwise, so
 		// "speedns run json" -- --format with its dashes forgotten -- started
 		// a full public benchmark instead of failing as the typo it is.
-		Args: cobra.NoArgs,
+		Args: runArgs,
 		RunE: benchmarkRunE(config),
 	}
 	addBenchmarkFlags(command, config)
 	return command
+}
+
+// leafNoArgs rejects every positional argument to a command that has no
+// subcommands. cobra.NoArgs calls such an argument an unknown command, which
+// suggests that the command has subcommands to choose from; these have none,
+// so the message says the command takes no arguments and repeats what it got.
+// Each argument is quoted with %q, as every other CLI error that echoes input
+// is, so a control or bidirectional character in it is shown escaped instead
+// of reaching the terminal.
+func leafNoArgs(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, strconv.Quote(arg))
+	}
+	return fmt.Errorf("%q takes no arguments; got %s", cmd.CommandPath(), strings.Join(quoted, " "))
+}
+
+// runArgs is leafNoArgs for run, with a hint when a stray argument is the name
+// of an output format: that word is most likely --format with its dashes
+// forgotten. Any other argument gets no hint, because no guess about what it
+// was meant to be would be reliable.
+func runArgs(cmd *cobra.Command, args []string) error {
+	err := leafNoArgs(cmd, args)
+	if err == nil {
+		return nil
+	}
+	for _, arg := range args {
+		if isBenchmarkFormat(arg) {
+			return fmt.Errorf("%w (to choose the output format, use --format %s)", err, strings.ToLower(arg))
+		}
+	}
+	return err
+}
+
+// isBenchmarkFormat reports whether name, in any case, is an output format a
+// run can write. runBenchmark and runArgs share it so the hint can never name
+// a format the run would then refuse.
+func isBenchmarkFormat(name string) bool {
+	switch strings.ToLower(name) {
+	case "table", "json", "csv":
+		return true
+	default:
+		return false
+	}
 }
 
 // benchmarkRunE runs the benchmark for the root command and for run, which
@@ -1019,7 +1066,7 @@ func newVersionCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Show version information",
-		Args:  cobra.NoArgs,
+		Args:  leafNoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
 			buildVersion, buildCommit, buildDate := version.Values()
 			fmt.Fprintf(cmd.OutOrStdout(), "speedns %s\ncommit: %s\nbuilt: %s\n", buildVersion, buildCommit, buildDate)
@@ -1031,7 +1078,7 @@ func newResolversCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "resolvers",
 		Short: "List bundled resolver profiles and supported transports",
-		Args:  cobra.NoArgs,
+		Args:  leafNoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// A failed write to stdout is not reported, as for version and
 			// corpus: the listing has no other result to keep.
@@ -1070,7 +1117,7 @@ func newCorpusCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "corpus",
 		Short: "Show the embedded domain corpus provenance and checksum",
-		Args:  cobra.NoArgs,
+		Args:  leafNoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			metadata, err := verifyCorpusFunc()
 			if err != nil {
@@ -1098,13 +1145,8 @@ func newCorpusCommand() *cobra.Command {
 }
 
 func runBenchmark(ctx context.Context, config *cliConfig) error {
-	switch strings.ToLower(config.format) {
-	case "table", "json", "csv":
-	default:
+	if !isBenchmarkFormat(config.format) {
 		return fmt.Errorf("unsupported output format %q (choose table, json, or csv)", config.format)
-	}
-	for _, warning := range inertFlagWarnings(config) {
-		fmt.Fprintf(warningWriterFunc(), "warning: %s\n", warning)
 	}
 	if config.sample <= 0 && !config.full {
 		return errors.New("--sample must be greater than zero")
@@ -1247,6 +1289,14 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	// mistyped --output would cost a whole run and its results.
 	if err := preflightOutput(config.output); err != nil {
 		return err
+	}
+	// The inert-option warnings wait until every usage check above has
+	// passed. Printed any earlier, a run those checks then refused, such as
+	// --format csv --raw --sample 0, warned about an option of a run that
+	// never happened. They still come before the engine sends a query and
+	// before progress prints a line.
+	for _, warning := range inertFlagWarnings(config) {
+		fmt.Fprintf(warningWriterFunc(), "warning: %s\n", warning)
 	}
 	seed := config.seed
 	if seed == 0 {

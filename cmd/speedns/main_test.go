@@ -324,26 +324,38 @@ func TestCorpusCommandShowsTheLicenseNote(t *testing.T) {
 // positional argument, so "speedns run json" -- --format with its dashes
 // forgotten -- ran a full public benchmark instead of failing as a typo. Every
 // command that takes no argument must now exit 2 before anything is measured
-// or printed.
+// or printed, and say that it takes none rather than call the word an unknown
+// command, which only the root, the one command with subcommands, still does.
 func TestCommandsRejectStrayArguments(t *testing.T) {
 	engineCalls := countEngineCalls(t)
-	for _, args := range [][]string{
-		{"run", "json"},
-		{"run", "--format", "json", "out.json"},
-		{"json"},
-		{"version", "stray"},
-		{"resolvers", "x"},
-		{"corpus", "x"},
+	for _, testCase := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"run", "json"}, want: `"speedns run" takes no arguments; got "json" (to choose the output format, use --format json)`},
+		{args: []string{"run", "CSV"}, want: `"speedns run" takes no arguments; got "CSV" (to choose the output format, use --format csv)`},
+		// A word that is not a format name gets no guess about what it meant.
+		{args: []string{"run", "--format", "json", "out.json"}, want: `"speedns run" takes no arguments; got "out.json"`},
+		{args: []string{"run", "out.json", "table"}, want: `"speedns run" takes no arguments; got "out.json" "table" (to choose the output format, use --format table)`},
+		{args: []string{"json"}, want: `unknown command "json" for "speedns"`},
+		{args: []string{"version", "stray"}, want: `"speedns version" takes no arguments; got "stray"`},
+		// The format hint belongs to run: version has no --format to suggest.
+		{args: []string{"version", "json"}, want: `"speedns version" takes no arguments; got "json"`},
+		{args: []string{"resolvers", "x"}, want: `"speedns resolvers" takes no arguments; got "x"`},
+		{args: []string{"corpus", "x"}, want: `"speedns corpus" takes no arguments; got "x"`},
+		// The argument is echoed to a terminal, so a control or bidirectional
+		// character in it must arrive escaped, never as itself.
+		{args: []string{"corpus", "\x1b[2J\u202eevil"}, want: `"speedns corpus" takes no arguments; got "\x1b[2J\u202eevil"`},
 	} {
-		t.Run(strings.Join(args, " "), func(t *testing.T) {
+		t.Run(strings.Join(testCase.args, " "), func(t *testing.T) {
 			root := newRootCommand()
 			var output bytes.Buffer
 			root.SetOut(&output)
 			root.SetErr(&output)
-			root.SetArgs(args)
+			root.SetArgs(testCase.args)
 			err := root.Execute()
-			if err == nil || !strings.Contains(err.Error(), "unknown command") {
-				t.Fatalf("speedns %s = %v, want an unknown-command error", strings.Join(args, " "), err)
+			if err == nil || err.Error() != testCase.want {
+				t.Fatalf("speedns %q = %v, want %q", testCase.args, err, testCase.want)
 			}
 			if code := exitCodeForError(err); code != 2 {
 				t.Fatalf("exit code = %d, want 2", code)
@@ -384,7 +396,7 @@ func TestCommandsRejectStrayArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `unknown command "json" for "speedns run"`; !strings.Contains(string(message), want) {
+	if want := "\"speedns run\" takes no arguments; got \"json\" (to choose the output format, use --format json)\n"; string(message) != want {
 		t.Fatalf("speedns run json printed %q, want %q", message, want)
 	}
 }
@@ -1234,6 +1246,101 @@ func TestInertFlagCombinationsWarn(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestInertFlagWarningsWaitForUsageValidation pins when the inert-option
+// warnings are printed. They used to be written before the rest of the command
+// line was checked, so a run the CLI then refused, such as --format csv --raw
+// --sample 0, warned about an option of a run that never happened and then
+// exited 2. A refused run must print nothing about itself; an accepted one
+// still warns, and does so before the engine sends a query and before progress
+// prints a line.
+func TestInertFlagWarningsWaitForUsageValidation(t *testing.T) {
+	oldEngine, oldWarningWriter, oldProgressWriter, oldDetector := runBenchmarkEngine, warningWriterFunc, progressWriterFunc, terminalDetector
+	t.Cleanup(func() {
+		runBenchmarkEngine, warningWriterFunc, progressWriterFunc, terminalDetector = oldEngine, oldWarningWriter, oldProgressWriter, oldDetector
+	})
+	// Warnings and progress share standard error, so they share one buffer
+	// here too and the order they reach it in is the order a user sees.
+	var stderr bytes.Buffer
+	warningWriterFunc = func() io.Writer { return &stderr }
+	progressWriterFunc = func() io.Writer { return &stderr }
+	terminalDetector = func(*os.File) bool { return false }
+	engineCalls := 0
+	var beforeFirstQuery string
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		engineCalls++
+		beforeFirstQuery = stderr.String()
+		options.OnProgress(benchmark.Progress{Protocol: targets[0].Protocol, Phase: benchmark.ProgressComplete, TargetsCompleted: 1, TargetsTotal: 1})
+		return fakeCLIReport(), nil
+	}
+	// Both inert options are given, as table output with --raw and a
+	// cache-miss sample size without --cache-miss, so neither warning can slip
+	// out of a refused run unnoticed.
+	commandLine := func(t *testing.T, extra ...string) []string {
+		return append([]string{
+			"--no-defaults", "--resolver", "lab=udp://127.0.0.1:53", "--protocol", "udp",
+			"--sample", "1", "--seed", "7", "--type", "A", "--family", "4",
+			"--domains", cliDomainFile(t), "--output", filepath.Join(t.TempDir(), "report.out"),
+			"--format", "table", "--raw", "--cache-miss-sample", "5",
+		}, extra...)
+	}
+
+	// One refusal from each check that follows the place the warnings were
+	// printed, down to the last one, the --output preflight. Each names the
+	// error it expects, so a case refused earlier than it means to be is not
+	// mistaken for coverage of its check.
+	for _, testCase := range []struct {
+		name    string
+		extra   []string
+		refusal string
+	}{
+		{name: "sample", extra: []string{"--format", "csv", "--sample", "0"}, refusal: "--sample must be greater than zero"},
+		{name: "timeout", extra: []string{"--timeout", "0s"}, refusal: "--timeout must be greater than zero"},
+		{name: "profile view with csv", extra: []string{"--format", "csv", "--profile-view"}, refusal: "--profile-view requires table or json output"},
+		{name: "assertion syntax", extra: []string{"--assert", "nonsense"}, refusal: `invalid --assert "nonsense"`},
+		{name: "family", extra: []string{"--family", "7"}, refusal: `unsupported address family "7"`},
+		{name: "protocol", extra: []string{"--protocol", "smtp"}, refusal: `unsupported protocol "smtp"`},
+		{name: "query type", extra: []string{"--type", "AXFR"}, refusal: `DNS query type "AXFR"`},
+		{name: "cache-miss with domains", extra: []string{"--cache-miss"}, refusal: "--cache-miss cannot be combined with --domains"},
+		{name: "domain file", extra: []string{"--domains", filepath.Join(t.TempDir(), "missing.txt")}, refusal: "open domain list"},
+		{name: "assertion subject", extra: []string{"--assert", "nobody:p95<50ms"}, refusal: `no selected resolver matches "nobody"`},
+		{name: "output", extra: []string{"--output", filepath.Join(t.TempDir(), "missing", "report.out")}, refusal: "create temporary output file"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stderr.Reset()
+			root := newRootCommand()
+			root.SetArgs(commandLine(t, testCase.extra...))
+			err := root.Execute()
+			if err == nil || !strings.Contains(err.Error(), testCase.refusal) {
+				t.Fatalf("run = %v, want it refused with %q", err, testCase.refusal)
+			}
+			if code := exitCodeForError(err); code != 2 {
+				t.Fatalf("a refused run exited %d, want 2", code)
+			}
+			if engineCalls != 0 {
+				t.Fatalf("a refused run reached the engine %d time(s)", engineCalls)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("a refused run warned about its own options: %q", stderr.String())
+			}
+		})
+	}
+
+	stderr.Reset()
+	root := newRootCommand()
+	root.SetArgs(commandLine(t))
+	if err := root.Execute(); err != nil {
+		t.Fatalf("an accepted run with inert options failed: %v", err)
+	}
+	warnings := "warning: --raw only adds per-query observations to JSON output; it has no effect on table output\n" +
+		"warning: --cache-miss-sample has no effect without --cache-miss\n"
+	if engineCalls != 1 || beforeFirstQuery != warnings {
+		t.Fatalf("standard error before the engine's first query (%d engine call(s)) = %q, want %q", engineCalls, beforeFirstQuery, warnings)
+	}
+	if progress, found := strings.CutPrefix(stderr.String(), warnings); !found || !strings.Contains(progress, "tested udp 1/1 targets") {
+		t.Fatalf("standard error = %q, want the warnings followed by the progress lines", stderr.String())
 	}
 }
 
