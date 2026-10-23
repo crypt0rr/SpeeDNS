@@ -460,7 +460,9 @@ compared without regard to case or a trailing dot) are one resolver, as is any
 profile linked to them by another shared address or name, so two `--resolver`
 flags at one server and the bundled `google-8888` and `google-8844`, both
 `dns.google`, are measured once. Nothing beyond those identical endpoints is
-inferred. The endpoint kept is the earliest declared profile's first transport
+inferred. Every declared address counts, including those `--family` leaves
+out, because a cache belongs to the server rather than to the family a run
+selects. The endpoint kept is the earliest declared profile's first transport
 in the documented protocol order at its earliest declared address. The bundled
 catalog declares IPv4 first, so a dual-stack run measures every bundled
 resolver over IPv4; the kept endpoint used to be the lowest-sorting target ID,
@@ -585,9 +587,12 @@ membership, because a tie means the run cannot say the resolver did not win. The
 targets selected for the run before any query is sent, so an ID that no
 selected profile or target carries is invalid input (status 2) rather than a
 lost comparison; a benchmark never reports that a resolver failed to win when
-it was never measured. The ordinary report is emitted before an assertion
-failure; invalid expressions return status 2 and failed assertions return
-status 4. No-comparable and interruption statuses retain precedence.
+it was never measured. Under `--cache-miss` the same holds for an ID that names
+only endpoints the mode dropped because they share a cache with a measured one;
+the error names that measured endpoint rather than calling the ID a typo. The
+ordinary report is emitted before an assertion failure; invalid expressions
+return status 2 and failed assertions return status 4. No-comparable and
+interruption statuses retain precedence.
 
 ## Address-family selection
 

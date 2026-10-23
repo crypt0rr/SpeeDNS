@@ -91,12 +91,14 @@ Opt in to bounded random names below the reserved example.com zone. It cannot
 be combined with --domains or --full. Each resolver is measured exactly once
 and each generated name is asked exactly one question, because a resolver holds
 one cache across its transports and addresses and caches a negative answer for
-the whole name. Profiles that share an address or a TLS name (a DoH URL host or
-a server_name) count as one resolver, measured over the earliest declared
-profile's first transport at its earliest declared address. Dropped endpoints
-are named in a report warning. A cache-miss
-run therefore cannot produce a sound transport comparison, and speedns diff
-refuses cache-miss reports by design. The rules keep any name from being asked
+the whole name. Profiles that share an address, including one --family leaves
+out, or a TLS name (a DoH URL host or a server_name) count as one resolver,
+measured over the earliest declared profile's first transport at its earliest
+declared address. Dropped endpoints are named in a report warning; under
+--redact-system a dropped system resolver endpoint is counted instead. A
+cache-miss run therefore cannot produce a sound transport comparison, and
+speedns diff refuses cache-miss reports by design. An --assert that names only
+dropped endpoints is invalid input. The rules keep any name from being asked
 twice at one resolver; they do not prove the resolver recursed, because a
 validating resolver using RFC 8198 aggressive NSEC/NSEC3 synthesis can answer
 an unseen name from a cached denial proof, including one cached for a name

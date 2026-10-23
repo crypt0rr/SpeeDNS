@@ -232,7 +232,7 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 }
 
 // cacheMissTargets keeps one endpoint per cache and returns the endpoints it
-// dropped.
+// dropped, each with the endpoint measured for its cache instead.
 //
 // A resolver holds one cache, shared across every transport it offers and every
 // address it answers on. So once a generated name has been measured at a
@@ -251,6 +251,13 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 // transport reach one server, and every profile linked through such a chain is
 // one cache. Nothing beyond those identical endpoints is inferred, so siblings
 // that answer on different names and addresses stay separate.
+//
+// profiles is every selected profile in declared order, before --family
+// filtering. Cache identity belongs to the server, not to the family a run
+// selects. Grouping only the filtered profiles would let --family stop an
+// address from linking two profiles, so two that share only an IPv6 address
+// would both be measured under --family 4. targets is what catalog.Expand made
+// of the filtered profiles, so only an endpoint the run selected is ever kept.
 //
 // Together with asking each generated name one question, that means no
 // measured query repeats a question SpeeDNS has already asked that resolver,
@@ -274,7 +281,7 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 // The consequence is deliberate: a cache-miss run does not compare transports.
 // Comparing transports needs the same name measured twice, which is exactly
 // what makes the second measurement warm.
-func cacheMissTargets(profiles []catalog.ResolverProfile, targets []catalog.Target) ([]catalog.Target, []catalog.Target) {
+func cacheMissTargets(profiles []catalog.ResolverProfile, targets []catalog.Target) ([]catalog.Target, []cacheMissDrop) {
 	declared := make(map[string]int, len(profiles))
 	for index, profile := range profiles {
 		declared[profile.ID] = index
@@ -289,15 +296,25 @@ func cacheMissTargets(profiles []catalog.ResolverProfile, targets []catalog.Targ
 		}
 	}
 	kept := make([]catalog.Target, 0, len(chosen))
-	dropped := make([]catalog.Target, 0, len(targets)-len(chosen))
+	dropped := make([]cacheMissDrop, 0, len(targets)-len(chosen))
 	for index, target := range targets {
-		if chosen[cacheOf(target)] == index {
+		measured := chosen[cacheOf(target)]
+		if measured == index {
 			kept = append(kept, target)
 			continue
 		}
-		dropped = append(dropped, target)
+		dropped = append(dropped, cacheMissDrop{target: target, instead: targets[measured]})
 	}
 	return kept, dropped
+}
+
+// cacheMissDrop is an endpoint cache-miss mode did not measure, and the one it
+// measures for the same cache instead. The pair is kept because a dropped
+// endpoint was selected: an --assert that names it is not a typo, and the
+// error has to say which endpoint to name instead.
+type cacheMissDrop struct {
+	target  catalog.Target
+	instead catalog.Target
 }
 
 // cacheGroups returns, for each profile, the index of the earliest declared
@@ -358,15 +375,15 @@ func cacheMissPrefers(candidate, current catalog.Target, declared map[string]int
 // measured, and a dropped one's ID still spells out the address -- which,
 // now that a system resolver can collapse into a bundled or named profile at
 // the same address, would also say which resolver the host uses.
-func cacheMissDroppedNames(dropped []catalog.Target, redactSystem bool) string {
+func cacheMissDroppedNames(dropped []cacheMissDrop, redactSystem bool) string {
 	names := make([]string, 0, len(dropped))
 	redacted := 0
-	for _, target := range dropped {
-		if redactSystem && report.IsSystemTarget(target) {
+	for _, drop := range dropped {
+		if redactSystem && report.IsSystemTarget(drop.target) {
 			redacted++
 			continue
 		}
-		names = append(names, target.ID())
+		names = append(names, drop.target.ID())
 	}
 	if redacted > 0 {
 		names = append(names, fmt.Sprintf("%d redacted system endpoint(s)", redacted))
@@ -1135,11 +1152,11 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
 	}
-	var cacheMissDropped []catalog.Target
+	var cacheMissDropped []cacheMissDrop
 	if config.cacheMiss {
-		targets, cacheMissDropped = cacheMissTargets(profiles, targets)
+		targets, cacheMissDropped = cacheMissTargets(selection.all(), targets)
 	}
-	if err := validateAssertionTargets(assertions, targets); err != nil {
+	if err := validateAssertionTargets(assertions, targets, cacheMissDropped); err != nil {
 		return err
 	}
 	// The destination is otherwise first touched after the benchmark, so a

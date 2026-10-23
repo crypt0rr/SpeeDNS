@@ -130,7 +130,7 @@ func TestValidateAssertionTargetsRejectsUnknownWinners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateAssertionTargets(accepted, targets); err != nil {
+	if err := validateAssertionTargets(accepted, targets, nil); err != nil {
 		t.Fatalf("validateAssertionTargets() = %v", err)
 	}
 
@@ -138,7 +138,7 @@ func TestValidateAssertionTargetsRejectsUnknownWinners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = validateAssertionTargets(rejected, targets)
+	err = validateAssertionTargets(rejected, targets, nil)
 	if err == nil || !strings.Contains(err.Error(), "no selected resolver matches") || !strings.Contains(err.Error(), "secnod") {
 		t.Fatalf("unknown winner error = %v", err)
 	}
@@ -148,14 +148,14 @@ func TestValidateAssertionTargetsRejectsUnknownWinners(t *testing.T) {
 
 	// A profile that is filtered out of the run, for example by --protocol,
 	// must be rejected rather than silently reported as a loser.
-	if err := validateAssertionTargets(rejected, targets[:1]); err == nil {
+	if err := validateAssertionTargets(rejected, targets[:1], nil); err == nil {
 		t.Fatal("expected unknown winner error against the reduced target set")
 	}
 	unselected, err := parseAssertions([]string{"winner=second"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateAssertionTargets(unselected, targets[:1]); err == nil {
+	if err := validateAssertionTargets(unselected, targets[:1], nil); err == nil {
 		t.Fatal("expected error for a profile that is not part of the run")
 	}
 }
@@ -582,7 +582,7 @@ func TestSubjectAssertionParsingAndValidation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := validateAssertionTargets(checks, targets); err != nil {
+		if err := validateAssertionTargets(checks, targets, nil); err != nil {
 			t.Fatalf("%q should be an accepted spelling: %v", spelling, err)
 		}
 	}
@@ -590,7 +590,7 @@ func TestSubjectAssertionParsingAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateAssertionTargets(typo, targets); err == nil ||
+	if err := validateAssertionTargets(typo, targets, nil); err == nil ||
 		!strings.Contains(err.Error(), "no selected resolver matches") {
 		t.Fatalf("a typo'd subject must be invalid input: %v", err)
 	}

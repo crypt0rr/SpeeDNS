@@ -86,7 +86,16 @@ dropped endpoint is named in the warning while a warm read measured as a miss
 is not disclosed anywhere: two independent resolvers on different ports of
 one address, or DoH services told apart only by their URL path, are measured
 as one. Under `--redact-system` a dropped system resolver endpoint is counted
-in the warning rather than named.
+in the warning rather than named. The comparison uses every address a profile
+declares, including those `--family` leaves out, because a cache belongs to
+the server rather than to the address family a run selects: two profiles that
+share only an IPv6 address are one resolver under `--family 4` too.
+
+An `--assert` that names only dropped endpoints — `winner=google-8844` on a
+default cache-miss run, or the second of two `--resolver` flags aimed at one
+server — is invalid input (status 2), checked before any query is sent,
+because nothing it names will be measured. The error names the endpoint
+measured for that resolver instead, which the assertion can name.
 
 The endpoint kept for a resolver is chosen by an explicit rule: the earliest
 declared profile, its first transport in the documented order (UDP, TCP, DoH,
