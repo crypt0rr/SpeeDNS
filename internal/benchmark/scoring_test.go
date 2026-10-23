@@ -2,6 +2,7 @@ package benchmark
 
 import (
 	"math"
+	"sort"
 	"testing"
 	"time"
 
@@ -186,8 +187,10 @@ func TestCalculateStatisticsPinsFailurePenalty(t *testing.T) {
 	if stats.MedianMS != 110 || stats.P95MS != 200 {
 		t.Fatalf("median/p95 = %v/%v, want exactly 110/200", stats.MedianMS, stats.P95MS)
 	}
-	// 0.60*110 + 0.40*200 + 0.25*2000 = 66 + 80 + 500.
-	want := scoreMedianWeight*stats.MedianMS + scoreP95Weight*stats.P95MS + stats.ScoringFailureRate*timeoutMS
+	// 0.60*110 + 0.40*200 + 0.25*2000 = 66 + 80 + 500. Each product is
+	// rounded, as compositeScore rounds it, so the exact comparison below
+	// holds on arm64, where a product could otherwise be fused into the sum.
+	want := float64(scoreMedianWeight*stats.MedianMS) + float64(scoreP95Weight*stats.P95MS) + float64(stats.ScoringFailureRate*timeoutMS)
 	if stats.ScoreMS != want {
 		t.Fatalf("ScoreMS = %v, want exactly %v", stats.ScoreMS, want)
 	}
@@ -240,13 +243,22 @@ func TestBootstrapCIIsDeterministicAndPinsQuantiles(t *testing.T) {
 
 	// Pinned bounds for this exact sample vector and seed: the 0.025 and
 	// 0.975 quantiles of the 1000 bootstrap replicates. Widening the
-	// interval to 80% or narrowing it changes these numbers.
+	// interval to 80% or narrowing it changes these numbers. Their bits,
+	// taken on amd64, are pinned too: METHODOLOGY promises the same bounds
+	// bit for bit on arm64, and the tolerance alone would accept a bound one
+	// rounding away (the upper one is already an ulp below 1223.68).
 	const (
-		wantLow  = 20.4
-		wantHigh = 1223.68
+		wantLow      = 20.4
+		wantHigh     = 1223.68
+		wantLowBits  = 0x4034666666666666
+		wantHighBits = 0x40931eb851eb851e
 	)
 	if !nearlyEqual(low, wantLow) || !nearlyEqual(high, wantHigh) {
 		t.Fatalf("bootstrap interval = %v/%v, want %v/%v", low, high, wantLow, wantHigh)
+	}
+	if math.Float64bits(low) != wantLowBits || math.Float64bits(high) != wantHighBits {
+		t.Fatalf("bootstrap interval bits = %#016x/%#016x, want %#016x/%#016x as computed on amd64",
+			math.Float64bits(low), math.Float64bits(high), uint64(wantLowBits), uint64(wantHighBits))
 	}
 
 	score := scoreFromSamples(samples, timeoutMS)
@@ -265,6 +277,84 @@ func TestBootstrapCIIsDeterministicAndPinsQuantiles(t *testing.T) {
 	pointLow, pointHigh := bootstrapCI([]scoreSample{{latencyMS: 12, success: true}}, timeout, seed)
 	if pointLow != 12 || pointHigh != 12 {
 		t.Fatalf("single-sample interval = %v/%v, want exactly 12/12", pointLow, pointHigh)
+	}
+}
+
+// TestStatisticsArePinnedBitForBit pins the exact bits, taken on amd64, of the
+// statistics a report carries for two targets and for one paired effect.
+// METHODOLOGY promises that the same observations and seed give bit-identical
+// medians, p95 values, scores and interval bounds on amd64 and arm64, and the
+// ubuntu (amd64) and macOS (arm64) CI jobs both run this test, so this is
+// where the promise is enforced. A tolerance could not enforce it: a multiply
+// fused into the following add or subtract rounds once instead of twice and
+// moves a result by an ulp or two.
+//
+// The first target is the pinned vector of
+// TestBootstrapCIIsDeterministicAndPinsQuantiles. Its bootstrap quantiles fall
+// between equal or nearly equal replicate scores, so only a fused composite
+// score moves its pins. The second target and the paired deltas are chosen so
+// that the p95 and the interval bounds interpolate between distinct values
+// with inexact weights, where a fused percentile position or interpolation
+// moves a pin as well.
+func TestStatisticsArePinnedBitForBit(t *testing.T) {
+	const seed = 42
+	timeout := 2 * time.Second
+	pinned := calculateStatistics(TargetResult{Target: scoringTarget("scoring"), Observations: []Observation{
+		scoredObservation(10), scoredObservation(20), scoredObservation(30), scoredObservation(40), timedOutObservation(),
+	}}, timeout, seed)
+
+	// 25 scored latencies in a fixed, unsorted order, with a timeout after
+	// the 7th and the 18th, so the failure rate is 2/27.
+	latencies := []float64{
+		14.66, 11.37, 22.9, 12.91, 98.6, 15.87, 12.08, 31.2, 13.4, 17.45, 61.4, 16.3, 18.1,
+		19.76, 140.3, 21.33, 24.18, 26.5, 45.1, 28.07, 15.02, 34.95, 39.6, 52.8, 77.25,
+	}
+	observations := make([]Observation, 0, len(latencies)+2)
+	for index, latency := range latencies {
+		observations = append(observations, scoredObservation(latency))
+		if index == 6 || index == 17 {
+			observations = append(observations, timedOutObservation())
+		}
+	}
+	varied := calculateStatistics(TargetResult{Target: scoringTarget("scoring"), Observations: observations}, timeout, seed)
+
+	// The deltas are sorted before the median and the bootstrap, as
+	// calculatePairedEffects sorts them. Seed 9 places the upper bound between
+	// two distinct replicate medians.
+	deltas := []float64{
+		-38.4, -21.7, -12.95, -7.3, -3.85, -1.2, 0.45, 2.1, 3.6, 5.25, 7.9, 11.4,
+		16.05, 24.3, 37.8, 58.2, -2.6, 1.35, 4.4, 9.15, -5.5, 13.6, 19.95,
+	}
+	sort.Float64s(deltas)
+	pairedLow, pairedHigh := bootstrapPairedCI(deltas, 9)
+
+	for _, pin := range []struct {
+		name string
+		got  float64
+		bits uint64
+	}{
+		{"pinned vector median", pinned.MedianMS, 0x4039000000000000},
+		{"pinned vector p95", pinned.P95MS, 0x4043400000000000},
+		{"pinned vector MAD", pinned.MADMS, 0x4024000000000000},
+		{"pinned vector score", pinned.ScoreMS, 0x407ae66666666666},
+		{"pinned vector CI low", pinned.CILowMS, 0x4034666666666666},
+		{"pinned vector CI high", pinned.CIHighMS, 0x40931eb851eb851e},
+		{"varied vector median", varied.MedianMS, 0x4036e66666666666},
+		// Of all the pins, only this one moves when the interpolation is
+		// fused, so a change to the vector must keep a p95 that does.
+		{"varied vector p95", varied.P95MS, 0x4057951eb851eb80},
+		{"varied vector MAD", varied.MADMS, 0x402099999999999a},
+		{"varied vector score", varied.ScoreMS, 0x4068f3d840eddf14},
+		{"varied vector CI low", varied.CILowMS, 0x4043627d566cf41f},
+		{"varied vector CI high", varied.CIHighMS, 0x407a7f360c59432f},
+		{"paired median delta", percentile(deltas, 0.5), 0x400ccccccccccccd},
+		{"paired CI low", pairedLow, 0xbff3333333333333},
+		{"paired CI high", pairedHigh, 0x402269999999997d},
+	} {
+		if bits := math.Float64bits(pin.got); bits != pin.bits {
+			t.Errorf("%s = %v (bits %#016x), want %v (bits %#016x) as computed on amd64",
+				pin.name, pin.got, bits, math.Float64frombits(pin.bits), pin.bits)
+		}
 	}
 }
 

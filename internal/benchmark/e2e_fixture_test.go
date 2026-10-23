@@ -301,7 +301,7 @@ func TestInterruptedRunListsEverySelectedTarget(t *testing.T) {
 			failed: targets[2].ID(),
 		},
 		{
-			name: "while preparing the second tcp target",
+			name: "during the first tcp cold probe",
 			interrupt: func(target catalog.Target, cancel context.CancelFunc) transport.Factory {
 				if target.Protocol != catalog.TCP {
 					return dnssecFactory(&fakeSession{})

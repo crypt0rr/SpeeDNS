@@ -246,21 +246,10 @@ func WriteJSONWithOptions(writer io.Writer, report benchmark.Report, raw bool, o
 	stream.literal("{\n" + jsonMemberPrefix + `"schema_version": `)
 	stream.value(document.SchemaVersion, jsonMemberPrefix)
 	stream.member("run", document.Run)
-	stream.literal(",\n" + jsonMemberPrefix + `"results": [`)
-	for index, result := range report.Targets {
-		if stream.err != nil {
-			break
-		}
-		if index > 0 {
-			stream.literal(",")
-		}
-		stream.literal("\n" + jsonElementPrefix)
-		stream.value(jsonResultFor(result, raw, options, redactedIDs), jsonElementPrefix)
-	}
-	if len(report.Targets) > 0 {
-		stream.literal("\n" + jsonMemberPrefix)
-	}
-	stream.literal("]")
+	stream.literal(",\n" + jsonMemberPrefix + `"results": `)
+	streamArray(stream, len(report.Targets), func(index int) JSONResult {
+		return jsonResultFor(report.Targets[index], raw, options, redactedIDs)
+	})
 	stream.member("rankings", document.Rankings)
 	if len(document.PairedEffects) > 0 {
 		stream.member("paired_effects", document.PairedEffects)
@@ -311,10 +300,40 @@ func (s *jsonStream) literal(text string) {
 }
 
 // member writes a top-level member after the first one. Member names are
-// fixed ASCII identifiers, which JSON quotes without escaping.
+// fixed ASCII identifiers, which JSON quotes without escaping. The member is
+// passed by value on purpose: the single-value encoding reaches it as a field
+// of the JSONReport value, which is not addressable, so a pointer here would
+// call a pointer-receiver MarshalJSON or MarshalText that the encoder skips.
 func (s *jsonStream) member(name string, value any) {
 	s.literal(",\n" + jsonMemberPrefix + `"` + name + `": `)
 	s.value(value, jsonMemberPrefix)
+}
+
+// streamArray writes a top-level member's array of count elements, building
+// each with element(index) only when it is written, so one element is held at
+// a time.
+//
+// Each element is encoded through a pointer to it. The single-value encoding
+// reaches an element through its slice, and a slice element is addressable,
+// so encoding/json calls a pointer-receiver MarshalJSON or MarshalText
+// declared on the element's type or on the type of a field inside it. An
+// element passed by value is not addressable and those methods would be
+// skipped, so the stream would stop matching the encoder the moment such a
+// type entered JSONResult.
+func streamArray[T any](s *jsonStream, count int, element func(int) T) {
+	s.literal("[")
+	for index := 0; index < count && s.err == nil; index++ {
+		if index > 0 {
+			s.literal(",")
+		}
+		s.literal("\n" + jsonElementPrefix)
+		item := element(index)
+		s.value(&item, jsonElementPrefix)
+	}
+	if count > 0 {
+		s.literal("\n" + jsonMemberPrefix)
+	}
+	s.literal("]")
 }
 
 // value writes v as the json.Encoder writes it at a depth whose lines begin

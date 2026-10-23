@@ -111,6 +111,74 @@ func TestStreamedJSONMatchesTheEncoderOnFixtures(t *testing.T) {
 	}
 }
 
+// addressedText declares MarshalText on its pointer only, so encoding/json
+// calls it for an addressable value and otherwise writes the struct's field.
+type addressedText struct{ Value string }
+
+func (text *addressedText) MarshalText() ([]byte, error) {
+	return []byte("addressed <" + text.Value + ">"), nil
+}
+
+// addressedField holds addressedText the way a JSONResult member would hold a
+// type with a pointer-receiver marshaller.
+type addressedField struct {
+	Name string        `json:"name"`
+	Text addressedText `json:"text"`
+}
+
+// addressedJSON declares MarshalJSON on its pointer only, on the element type
+// itself.
+type addressedJSON struct{ Value int }
+
+func (value *addressedJSON) MarshalJSON() ([]byte, error) {
+	return fmt.Appendf(nil, `{"addressed":[%d, "<%d>"]}`, value.Value, value.Value), nil
+}
+
+// requireStreamedArrayMatches streams elements through streamArray as the
+// results member of a document and requires the bytes the encoder writes for
+// the same elements as that member of one value. The reference must have
+// called the pointer-receiver method, or the comparison proves nothing.
+func requireStreamedArrayMatches[T any](t *testing.T, name string, elements []T) {
+	t.Helper()
+	var want bytes.Buffer
+	encoder := json.NewEncoder(&want)
+	encoder.SetIndent("", jsonIndent)
+	if err := encoder.Encode(struct {
+		Results []T `json:"results"`
+	}{Results: elements}); err != nil {
+		t.Fatalf("%s: reference encoding failed: %v", name, err)
+	}
+	if !bytes.Contains(want.Bytes(), []byte("addressed")) {
+		t.Fatalf("%s: the encoder did not call the pointer-receiver method, so nothing is compared: %s", name, want.Bytes())
+	}
+	var got bytes.Buffer
+	stream := newJSONStream(&got)
+	stream.literal("{\n" + jsonMemberPrefix + `"results": `)
+	streamArray(stream, len(elements), func(index int) T { return elements[index] })
+	stream.literal("\n}\n")
+	if err := stream.close(); err != nil {
+		t.Fatalf("%s: streamed encoding failed: %v", name, err)
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatalf("%s: streamed array\n%s\ndiffers from the encoder's\n%s", name, got.Bytes(), want.Bytes())
+	}
+}
+
+// TestStreamedArrayCallsPointerReceiverMarshalers proves that the results
+// array matches the single-value encoding whatever receiver a marshaller
+// inside JSONResult is declared on. No type in JSONResult declares one today,
+// and a test type cannot be placed inside it, so this streams arrays of test
+// types through streamArray, the function that writes the results, and covers
+// both places such a method can sit. Encoding an element by value rather than
+// through a pointer fails both.
+func TestStreamedArrayCallsPointerReceiverMarshalers(t *testing.T) {
+	requireStreamedArrayMatches(t, "MarshalText inside the element", []addressedField{
+		{Name: "first", Text: addressedText{Value: "one"}},
+		{Name: "second", Text: addressedText{Value: "two"}},
+	})
+	requireStreamedArrayMatches(t, "MarshalJSON on the element", []addressedJSON{{Value: 1}, {Value: 2}})
+}
+
 // jsonFuzzText returns short strings that exercise every escaping rule the
 // encoder applies: HTML characters, quotes and backslashes, control
 // characters, U+2028/U+2029, invalid UTF-8, and plain text.

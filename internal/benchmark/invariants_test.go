@@ -327,7 +327,9 @@ func TestRankingsArePermutationInvariantWithChainedOverlaps(t *testing.T) {
 // tieOrderTarget builds a 200-observation UDP target through
 // calculateStatistics at the default timeout. Latencies are base plus up to
 // spread of jitter from random; failures observations at random positions are
-// copies of failed.
+// copies of failed. The jitter is rounded before base is added, so no
+// compiler fuses the two and the scenario holds the same latencies on every
+// architecture.
 func tieOrderTarget(random *rand.Rand, seed int64, address string, base, spread float64, failures int, failed Observation) TargetResult {
 	result := TargetResult{Target: testTarget(catalog.UDP, address)}
 	failedAt := make(map[int]bool, failures)
@@ -337,7 +339,7 @@ func tieOrderTarget(random *rand.Rand, seed int64, address string, base, spread 
 	for index := 0; index < 200; index++ {
 		observation := Observation{
 			Success: true, Usable: true, RCode: dns.RcodeSuccess, ResponseClass: "answer",
-			LatencyMS: base + random.Float64()*spread,
+			LatencyMS: base + float64(random.Float64()*spread),
 		}
 		if failedAt[index] {
 			observation = failed

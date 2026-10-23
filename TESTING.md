@@ -37,12 +37,38 @@ byte with what one `json.Encoder` writes for the whole document, over the
 fixture reports, hundreds of random reports and a multi-megabyte `--raw`
 report. `TestJSONReportMembersMatchTheStreamer` pins the document's top-level
 members, so one added to `JSONReport` fails until the streamer writes it too.
+`TestStreamedArrayCallsPointerReceiverMarshalers` streams test types whose
+`MarshalJSON` or `MarshalText` has a pointer receiver through the same array
+writer: a slice element is addressable in the single encoding, so the writer
+encodes each result through a pointer, or such a method would be skipped.
 The confidence-interval bootstraps read each replicate's percentiles
 from rank counts instead of sorting the resample; the previous implementation
 is kept in `internal/benchmark/bootstrap_equivalence_test.go`, and
 `TestRankCountBootstrapMatchesSortedResampling` requires bit-identical
 intervals from both over random sample vectors and seeds, next to the pinned
 interval in `scoring_test.go`.
+
+`TestStatisticsArePinnedBitForBit` pins the exact bits, taken on amd64, of the
+medians, p95 values, MADs, scores and interval bounds of two targets and of a
+paired effect. The ubuntu (amd64) and macOS (arm64) CI jobs both run it, so a
+change that makes the two architectures disagree on those vectors fails CI.
+What keeps METHODOLOGY's promise of bit-identical statistics is the code
+itself: a multiply the compiler fuses with the following add or subtract
+rounds once instead of twice, so every product that is added to or subtracted
+from in the statistics, and in the expected values the tests compare them
+with, is wrapped in an explicit `float64(...)` conversion, which the Go
+specification guarantees rounds. The pins are the tripwire for a product that
+loses its conversion. To check that no fused instruction remains, search the
+assembly of the shipped targets; both commands print nothing:
+
+```sh
+GOOS=darwin GOARCH=arm64 go build -gcflags=-S ./internal/... ./cmd/... 2>&1 | grep -E 'FN?M(ADD|SUB)[DS]'
+GOOS=darwin GOARCH=arm64 go test -c -o /dev/null -gcflags=-S ./internal/benchmark 2>&1 | grep -E 'FN?M(ADD|SUB)[DS]'
+```
+
+`GOOS=linux` gives the same answer for linux/arm64. The amd64 release builds
+target the baseline instruction set, which has no fused multiply-add; a build
+with `GOAMD64=v3` would, and its form to search for is `VFN?M(ADD|SUB)`.
 
 Go benchmarks compare those two paths with the ones they replaced, and query
 construction from an already-normalized corpus with normalizing it again. They

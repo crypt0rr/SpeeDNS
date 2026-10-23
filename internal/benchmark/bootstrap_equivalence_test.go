@@ -176,6 +176,12 @@ func TestRankValuesOrdersLikeSortFloat64s(t *testing.T) {
 // benchmarkScoreSamples builds a deterministic sample vector shaped like a
 // real target: mostly successes with long-tailed latencies and a few
 // failures. 200 is the default run's 100 names x A,AAAA; 2,000 is --full.
+// The latency's product is rounded before the offset is added, so this file
+// adds no fused instruction for the assembly scan in TESTING.md to find. The
+// vector still differs in its last bits between architectures, because
+// math/rand's ExpFloat64 and NormFloat64 are themselves compiled with fused
+// multiply-adds on arm64; a benchmark only needs the same vector from run to
+// run on one machine.
 func benchmarkScoreSamples(size int) ([]scoreSample, []float64) {
 	rng := rand.New(rand.NewSource(int64(size)))
 	samples := make([]scoreSample, size)
@@ -183,7 +189,7 @@ func benchmarkScoreSamples(size int) ([]scoreSample, []float64) {
 	for index := range samples {
 		deltas[index] = rng.NormFloat64() * 4
 		if rng.Intn(50) != 0 {
-			samples[index] = scoreSample{latencyMS: 5 + rng.ExpFloat64()*20, success: true}
+			samples[index] = scoreSample{latencyMS: 5 + float64(rng.ExpFloat64()*20), success: true}
 		}
 	}
 	return samples, deltas
