@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -53,19 +54,27 @@ func TestWorkflowsParse(t *testing.T) {
 // the raw text: a substring check is satisfied just as well by a YAML comment
 // or by an unrelated step's script.
 type workflowStep struct {
+	ID   string         `yaml:"id"`
+	Name string         `yaml:"name"`
 	Uses string         `yaml:"uses"`
 	Run  string         `yaml:"run"`
 	With map[string]any `yaml:"with"`
+	Env  map[string]any `yaml:"env"`
 }
 
 type workflowJob struct {
-	If    string         `yaml:"if"`
-	Uses  string         `yaml:"uses"`
-	Steps []workflowStep `yaml:"steps"`
+	If          string            `yaml:"if"`
+	Uses        string            `yaml:"uses"`
+	Needs       any               `yaml:"needs"`
+	Environment any               `yaml:"environment"`
+	Permissions any               `yaml:"permissions"`
+	Outputs     map[string]string `yaml:"outputs"`
+	Steps       []workflowStep    `yaml:"steps"`
 }
 
 type workflowFile struct {
-	Jobs map[string]workflowJob `yaml:"jobs"`
+	Permissions any                    `yaml:"permissions"`
+	Jobs        map[string]workflowJob `yaml:"jobs"`
 }
 
 func workflowPaths(t *testing.T) []string {
@@ -137,12 +146,12 @@ func TestReleaseWorkflowFetchesFullHistory(t *testing.T) {
 	}
 }
 
-// TestReleaseWorkflowDisablesGoCache keeps the signing job off shared caches.
-// setup-go caches by default, and a tag or dispatch run can restore what
-// main-branch CI, CodeQL or the scheduled live smoke saved. go mod verify
+// TestReleaseWorkflowDisablesGoCache keeps both release builds off shared
+// caches. setup-go caches by default, and a tag or dispatch run can restore
+// what main-branch CI, CodeQL or the scheduled live smoke saved. go mod verify
 // checks only the module cache; GOCACHE entries are trusted as written, and
-// both GoReleaser builds would read the same restored entries, so the
-// reproducibility comparison cannot catch a planted one either.
+// the reference and the signed build would both read the same restored
+// entries, so the reproducibility comparison cannot catch a planted one.
 func TestReleaseWorkflowDisablesGoCache(t *testing.T) {
 	setups := stepsUsing(releaseWorkflow(t), "actions/setup-go")
 	if len(setups) == 0 {
@@ -150,7 +159,7 @@ func TestReleaseWorkflowDisablesGoCache(t *testing.T) {
 	}
 	for _, step := range setups {
 		if cache := withValue(step, "cache"); cache != "false" {
-			t.Fatalf("release.yml sets up Go with cache %s; the signing job must set cache: false, since setup-go caches when it is omitted", cache)
+			t.Fatalf("release.yml sets up Go with cache %s; every release job must set cache: false, since setup-go caches when it is omitted", cache)
 		}
 	}
 }
@@ -352,9 +361,9 @@ const githubActionsIssuer = "https://token.actions.githubusercontent.com"
 // TestHomebrewWorkflowVerifiesChecksumsBeforeTheCask guards the order that
 // makes the Homebrew channel as trustworthy as the documented manual check.
 // Every sha256 in the cask comes from the release's checksums.txt, an asset
-// that can be replaced after the release job signed it. So the signature is
-// verified, by the cosign build the release job signs with and against the
-// identity README.md tells users to require, before the cask is generated.
+// that can be replaced after release.yml's publish job signed it. So the
+// signature is verified, by the cosign build that job signs with and against
+// the identity README.md tells users to require, before the cask is generated.
 // Prereleases are skipped at the job level, before the protected environment
 // asks a reviewer to approve a run that could only fail.
 func TestHomebrewWorkflowVerifiesChecksumsBeforeTheCask(t *testing.T) {
@@ -499,11 +508,13 @@ func TestReleaseTagShapeIsTheSameEverywhere(t *testing.T) {
 			sources["scripts/"+filepath.Base(script)] = string(content)
 		}
 	}
-	for index, step := range releaseWorkflow(t).Jobs["release"].Steps {
-		if strings.Contains(step.Run, "valid_release_tag()") {
-			// Keyed per step: two release.yml steps defining the function
-			// must both be checked, not only the last one seen.
-			sources[fmt.Sprintf(".github/workflows/release.yml (step %d)", index+1)] = step.Run
+	for jobName, job := range releaseWorkflow(t).Jobs {
+		for index, step := range job.Steps {
+			if strings.Contains(step.Run, "valid_release_tag()") {
+				// Keyed per step: two release.yml steps defining the function
+				// must both be checked, not only the last one seen.
+				sources[fmt.Sprintf(".github/workflows/release.yml (job %s, step %d)", jobName, index+1)] = step.Run
+			}
 		}
 	}
 	for _, required := range []string{
@@ -515,7 +526,7 @@ func TestReleaseTagShapeIsTheSameEverywhere(t *testing.T) {
 	} {
 		found := false
 		for source := range sources {
-			found = found || source == required || strings.HasPrefix(source, required+" (step ")
+			found = found || source == required || strings.HasPrefix(source, required+" (job ")
 		}
 		if !found {
 			t.Errorf("%s no longer defines valid_release_tag(); update this test if the check moved", required)
@@ -560,21 +571,556 @@ func TestReleaseWorkflowExplainsAMissingTagSelectionScript(t *testing.T) {
 	const invocation = "bash scripts/previous-stable-tag.sh"
 	const guard = "[[ ! -f scripts/previous-stable-tag.sh ]]"
 	found := false
-	for _, step := range releaseWorkflow(t).Jobs["release"].Steps {
-		at := strings.Index(step.Run, invocation)
-		if at < 0 {
-			continue
-		}
-		found = true
-		guarded := strings.Index(step.Run, guard)
-		if guarded < 0 || guarded > at {
-			t.Errorf("release.yml runs %s without first checking %s:\n%s", invocation, guard, step.Run)
-		}
-		if !strings.Contains(step.Run, "RELEASE_CHECKLIST.md") {
-			t.Errorf("release.yml does not point a missing previous-stable-tag.sh at RELEASE_CHECKLIST.md:\n%s", step.Run)
+	for _, job := range releaseWorkflow(t).Jobs {
+		for _, step := range job.Steps {
+			at := strings.Index(step.Run, invocation)
+			if at < 0 {
+				continue
+			}
+			found = true
+			guarded := strings.Index(step.Run, guard)
+			if guarded < 0 || guarded > at {
+				t.Errorf("release.yml runs %s without first checking %s:\n%s", invocation, guard, step.Run)
+			}
+			if !strings.Contains(step.Run, "RELEASE_CHECKLIST.md") {
+				t.Errorf("release.yml does not point a missing previous-stable-tag.sh at RELEASE_CHECKLIST.md:\n%s", step.Run)
+			}
 		}
 	}
 	if !found {
 		t.Fatal("release.yml no longer runs scripts/previous-stable-tag.sh; update this test")
+	}
+}
+
+// grantsWrite reports whether a permissions block gives the token write
+// access to scope, or to any scope when scope is empty. write-all grants all.
+func grantsWrite(permissions any, scope string) bool {
+	switch value := permissions.(type) {
+	case string:
+		return value == "write-all"
+	case map[string]any:
+		for name, level := range value {
+			if (scope == "" || name == scope) && fmt.Sprint(level) == "write" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// jobPermissions is what a job's token may do: the job's own permissions
+// block when it has one, the workflow's otherwise.
+func jobPermissions(document workflowFile, job workflowJob) any {
+	if job.Permissions != nil {
+		return job.Permissions
+	}
+	return document.Permissions
+}
+
+// jobNeeds lists the jobs a job waits for; needs: takes a name or a list.
+func jobNeeds(job workflowJob) []string {
+	switch value := job.Needs.(type) {
+	case string:
+		return []string{value}
+	case []any:
+		names := make([]string, 0, len(value))
+		for _, name := range value {
+			names = append(names, fmt.Sprint(name))
+		}
+		return names
+	}
+	return nil
+}
+
+// environmentName reads environment: in either of its two spellings.
+func environmentName(environment any) string {
+	switch value := environment.(type) {
+	case string:
+		return value
+	case map[string]any:
+		if name, ok := value["name"].(string); ok {
+			return name
+		}
+	}
+	return ""
+}
+
+// signingJobForbidden matches what a job able to mint OIDC tokens must not
+// run: the project's tests and anything else that executes its dependencies'
+// code (go test, go run, go generate, go tool, coverage.sh, the release
+// fixture), and the binaries a build produced, whether through
+// artifact-smoke.sh or straight from dist/. A binary copied or extracted
+// elsewhere first is beyond what a pattern can see.
+var signingJobForbidden = regexp.MustCompile(
+	`(?m)\bgo\s+(?:test|run|generate|tool)\b|scripts/(?:coverage|artifact-smoke|release-fixture)\.sh|(?:^|[;&|(]|\$\()\s*"?(?:\./)?dist/`)
+
+// shellCommentLine is a run: script line holding only a comment.
+var shellCommentLine = regexp.MustCompile(`(?m)^\s*#.*$`)
+
+// shellCode drops a script's comment lines, which may well name a command
+// that the script does not run.
+func shellCode(script string) string {
+	return shellCommentLine.ReplaceAllString(script, "")
+}
+
+// configStrings collects every string in a parsed YAML document.
+func configStrings(node any) []string {
+	switch value := node.(type) {
+	case string:
+		return []string{value}
+	case []any:
+		var found []string
+		for _, item := range value {
+			found = append(found, configStrings(item)...)
+		}
+		return found
+	case map[string]any:
+		var found []string
+		for _, item := range value {
+			found = append(found, configStrings(item)...)
+		}
+		return found
+	}
+	return nil
+}
+
+// readGoReleaserConfig decodes .goreleaser.yaml into document.
+func readGoReleaserConfig(t *testing.T, document any) {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join("..", ".goreleaser.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(content, document); err != nil {
+		t.Fatalf(".goreleaser.yaml: %v", err)
+	}
+}
+
+// TestJobsThatCanSignRunNoTestsOrBuiltBinaries holds every workflow to the
+// release.yml split. Any code that runs in a job holding id-token: write can
+// request an OIDC token and have Sigstore certify it as that workflow, so a
+// test dependency or a built binary run there could sign a bundle that passes
+// the identity README.md documents. GitHub scopes permissions per job, not
+// per step, so such a job must not run them at all. A job that runs
+// GoReleaser runs its hooks and its SBOM and signing commands as well, so
+// .goreleaser.yaml is held to the same rule.
+func TestJobsThatCanSignRunNoTestsOrBuiltBinaries(t *testing.T) {
+	signers := 0
+	for _, workflowPath := range workflowPaths(t) {
+		name := filepath.Base(workflowPath)
+		document := readWorkflow(t, workflowPath)
+		for jobName, job := range document.Jobs {
+			if !grantsWrite(jobPermissions(document, job), "id-token") {
+				continue
+			}
+			signers++
+			for _, step := range job.Steps {
+				if found := signingJobForbidden.FindString(shellCode(step.Run)); found != "" {
+					t.Errorf("%s job %s can mint OIDC tokens but its step %q runs %q; move it to a job without id-token: write",
+						name, jobName, step.Name, strings.TrimSpace(found))
+				}
+				if !strings.HasPrefix(step.Uses, "goreleaser/goreleaser-action@") {
+					continue
+				}
+				var config any
+				readGoReleaserConfig(t, &config)
+				for _, command := range configStrings(config) {
+					if found := signingJobForbidden.FindString(command); found != "" {
+						t.Errorf(".goreleaser.yaml runs %q, and %s job %s, which can mint OIDC tokens, runs GoReleaser",
+							strings.TrimSpace(found), name, jobName)
+					}
+				}
+			}
+		}
+	}
+	if signers == 0 {
+		t.Fatal("no workflow job holds id-token: write; release.yml signs with one, so the structure no longer matches this test")
+	}
+}
+
+// neededOutput is an expression reading another job's output, and stepOutput
+// a job output mapped from one of the job's steps.
+var (
+	neededOutput = regexp.MustCompile(`^\$\{\{\s*needs\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}$`)
+	stepOutput   = regexp.MustCompile(`^\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}$`)
+)
+
+// outputSource follows expression, a needs.<source>.outputs.<name> read in
+// the job reader, to the step of source that sets the value. It returns that
+// step's index and the name of the step output it is mapped from, or ok false
+// when the expression reads anything else or the chain breaks on the way.
+func outputSource(document workflowFile, reader workflowJob, expression, source string) (index int, output string, ok bool) {
+	match := neededOutput.FindStringSubmatch(strings.TrimSpace(expression))
+	if match == nil || match[1] != source || !slices.Contains(jobNeeds(reader), source) {
+		return 0, "", false
+	}
+	mapped := stepOutput.FindStringSubmatch(strings.TrimSpace(document.Jobs[source].Outputs[match[2]]))
+	if mapped == nil {
+		return 0, "", false
+	}
+	for position, step := range document.Jobs[source].Steps {
+		if step.ID == mapped[1] {
+			return position, mapped[2], true
+		}
+	}
+	return 0, "", false
+}
+
+// stepIndex returns the first step of job that satisfies matches, or -1.
+func stepIndex(job workflowJob, matches func(workflowStep) bool) int {
+	for index, step := range job.Steps {
+		if matches(step) {
+			return index
+		}
+	}
+	return -1
+}
+
+// releaseGates are the checks a release must still pass after the split, in a
+// job that cannot sign: dropping one from the verify job must not go unseen
+// just because the publish job is no longer allowed to run it.
+var releaseGates = []string{
+	"go mod verify",
+	"gofmt -l",
+	"go test -count=1 ./...",
+	"go test -count=1 -race ./...",
+	"go vet ./...",
+	"scripts/coverage.sh",
+	"scripts/release-fixture.sh",
+	"scripts/release-assets.sh verify",
+	"scripts/artifact-smoke.sh linux",
+	"scripts/artifact-smoke.sh macos-archives",
+}
+
+// TestReleaseWorkflowVerifiesOnAnotherRunnerBeforeItSigns pins how the two
+// release jobs fit together. The workflow-level token is read-only, and one
+// job, behind the protected environment, can sign. Every gate runs in a
+// read-only job, and the signing job needs one that builds the
+// reproducibility reference, so the signed build is compared with a build
+// from another runner with a cold cache, not with one that shared its
+// machine. The comparison comes before anything is uploaded. The signing job
+// builds the commit the verify job tested, recorded before any of the tag's
+// code ran, with the Go release the reference was built with: GO_VERSION is
+// a range that two runners can resolve differently, which would fail the
+// comparison on the toolchain alone.
+func TestReleaseWorkflowVerifiesOnAnotherRunnerBeforeItSigns(t *testing.T) {
+	release := releaseWorkflow(t)
+	if release.Permissions == nil || grantsWrite(release.Permissions, "") {
+		t.Errorf("release.yml grants %v to every job; keep the workflow-level permissions read-only", release.Permissions)
+	}
+
+	var signerName string
+	for jobName, job := range release.Jobs {
+		if grantsWrite(jobPermissions(release, job), "id-token") {
+			if signerName != "" {
+				t.Fatalf("release.yml jobs %s and %s can both mint OIDC tokens; only the publish job should", signerName, jobName)
+			}
+			signerName = jobName
+		}
+	}
+	if signerName == "" {
+		t.Fatal("no release.yml job holds id-token: write, so nothing can sign or attest the release")
+	}
+	signer := release.Jobs[signerName]
+	if environmentName(signer.Environment) != "release" {
+		t.Errorf("release.yml job %s signs outside the protected release environment", signerName)
+	}
+
+	isGoReleaser := func(step workflowStep) bool {
+		return strings.HasPrefix(step.Uses, "goreleaser/goreleaser-action@")
+	}
+	isReference := func(step workflowStep) bool {
+		arguments := withValue(step, "args")
+		return isGoReleaser(step) && strings.Contains(arguments, "--skip=sign") && !strings.Contains(arguments, "--snapshot")
+	}
+	var verifierName string
+	for _, needed := range jobNeeds(signer) {
+		job, ok := release.Jobs[needed]
+		if !ok {
+			t.Fatalf("release.yml job %s needs %s, which does not exist", signerName, needed)
+		}
+		if grantsWrite(jobPermissions(release, job), "") {
+			t.Errorf("release.yml job %s, which %s needs, holds write permissions; the verification job must be read-only", needed, signerName)
+		}
+		if stepIndex(job, isReference) >= 0 {
+			verifierName = needed
+		}
+	}
+	if verifierName == "" {
+		t.Fatalf("release.yml job %s needs no read-only job that builds the unsigned reproducibility reference", signerName)
+	}
+	verifier := release.Jobs[verifierName]
+	// Behind an environment, the gates would wait for the same approval as
+	// the signing, and could read the environment's secrets while they ran.
+	if name := environmentName(verifier.Environment); name != "" {
+		t.Errorf("release.yml job %s runs in the %s environment; the verification job must need no approval and see no environment secrets", verifierName, name)
+	}
+	if stepIndex(signer, isReference) >= 0 {
+		t.Errorf("release.yml job %s builds the reproducibility reference itself; it must come from %s, on another runner", signerName, verifierName)
+	}
+
+	readOnly := ""
+	for _, job := range release.Jobs {
+		if !grantsWrite(jobPermissions(release, job), "") {
+			for _, step := range job.Steps {
+				readOnly += shellCode(step.Run) + "\n"
+			}
+		}
+	}
+	for _, gate := range releaseGates {
+		if !strings.Contains(readOnly, gate) {
+			t.Errorf("release.yml no longer runs %q in a read-only job", gate)
+		}
+	}
+
+	// The reference reaches the signing job only as an artifact.
+	uploaded := map[string]bool{}
+	for _, step := range verifier.Steps {
+		if strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
+			uploaded[withValue(step, "name")] = true
+		}
+	}
+	downloaded := stepIndex(signer, func(step workflowStep) bool {
+		return strings.HasPrefix(step.Uses, "actions/download-artifact@") && uploaded[withValue(step, "name")]
+	})
+	signed := stepIndex(signer, func(step workflowStep) bool {
+		return isGoReleaser(step) && !strings.Contains(withValue(step, "args"), "--skip=sign")
+	})
+	compared := stepIndex(signer, func(step workflowStep) bool {
+		return strings.Contains(step.Run, "scripts/compare-release-artifacts.sh")
+	})
+	published := stepIndex(signer, func(step workflowStep) bool {
+		return strings.Contains(step.Run, "gh release upload") || strings.Contains(step.Run, "scripts/ensure-release.sh") ||
+			strings.HasPrefix(step.Uses, "actions/attest@")
+	})
+	if downloaded < 0 || signed < 0 || compared < 0 || published < 0 ||
+		downloaded >= compared || signed >= compared || compared >= published {
+		t.Errorf("release.yml job %s must download the reference %s uploaded and build the signed artifacts, then compare them, "+
+			"before it creates, uploads or attests anything; got steps %d, %d, %d, %d", signerName, verifierName, downloaded, signed, compared, published)
+	}
+
+	// Built with the Go release the reference used.
+	goSetups := 0
+	for _, step := range signer.Steps {
+		if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
+			continue
+		}
+		goSetups++
+		index, output, ok := outputSource(release, signer, withValue(step, "go-version"), verifierName)
+		if !ok || output != "go-version" || !strings.HasPrefix(verifier.Steps[index].Uses, "actions/setup-go@") {
+			t.Errorf("release.yml job %s sets up Go %s, not the version %s's setup-go resolved; a different patch release cannot reproduce the reference",
+				signerName, withValue(step, "go-version"), verifierName)
+		}
+	}
+	if goSetups == 0 {
+		t.Errorf("release.yml job %s does not set up Go; update this test if Go is installed another way", signerName)
+	}
+
+	// Built from the commit the verify job tested.
+	confirmed := false
+	for _, step := range signer.Steps {
+		for _, value := range step.Env {
+			index, _, ok := outputSource(release, signer, fmt.Sprint(value), verifierName)
+			if !ok || !strings.Contains(verifier.Steps[index].Run, "git rev-parse HEAD") || !strings.Contains(step.Run, "git rev-parse HEAD") {
+				continue
+			}
+			confirmed = true
+			setup := stepIndex(verifier, func(step workflowStep) bool { return strings.HasPrefix(step.Uses, "actions/setup-go@") })
+			if setup >= 0 && index > setup {
+				t.Errorf("release.yml job %s records the verified commit after setting up Go; record it before any of the tag's code runs", verifierName)
+			}
+		}
+	}
+	if !confirmed {
+		t.Errorf("release.yml job %s does not check that it builds the commit %s recorded and tested", signerName, verifierName)
+	}
+}
+
+// credentialWorkflows hold a write token or the release environment's
+// secrets in some job.
+var credentialWorkflows = []string{"homebrew.yml", "live-smoke.yml", "release.yml"}
+
+// gitPush matches a git invocation that pushes.
+var gitPush = regexp.MustCompile(`\bgit\b[^\n]*\spush\b`)
+
+// TestWorkflowCheckoutsDoNotPersistCredentials keeps the checkout token out of
+// .git/config. By default actions/checkout leaves it there for every later
+// step, including the tests, the built binaries and any compromised action,
+// to read; in these workflows it can write the repository. The one step that
+// pushes must therefore bring its own token.
+func TestWorkflowCheckoutsDoNotPersistCredentials(t *testing.T) {
+	checkouts := 0
+	for _, name := range credentialWorkflows {
+		for jobName, job := range readWorkflow(t, filepath.Join("..", ".github", "workflows", name)).Jobs {
+			for _, step := range job.Steps {
+				if strings.HasPrefix(step.Uses, "actions/checkout@") {
+					checkouts++
+					if persist := withValue(step, "persist-credentials"); persist != "false" {
+						t.Errorf("%s job %s checks out with persist-credentials %s, want false", name, jobName, persist)
+					}
+				}
+				if !gitPush.MatchString(shellCode(step.Run)) {
+					continue
+				}
+				token := false
+				for _, value := range step.Env {
+					token = token || strings.Contains(fmt.Sprint(value), "secrets.GITHUB_TOKEN")
+				}
+				if !token {
+					t.Errorf("%s job %s step %q pushes without a token in the step's env; the checkout no longer persists one", name, jobName, step.Name)
+				}
+			}
+		}
+	}
+	if checkouts == 0 {
+		t.Fatal("no actions/checkout steps found; the workflow structure no longer matches this test")
+	}
+}
+
+// goreleaserConfig holds only the parts of .goreleaser.yaml the tests below
+// read.
+type goreleaserConfig struct {
+	NFPMs []struct {
+		ID      string   `yaml:"id"`
+		Formats []string `yaml:"formats"`
+		RPM     struct {
+			BuildHost string `yaml:"buildhost"`
+		} `yaml:"rpm"`
+	} `yaml:"nfpms"`
+	SBOMs []struct {
+		ID   string   `yaml:"id"`
+		Cmd  string   `yaml:"cmd"`
+		Args []string `yaml:"args"`
+		Env  []string `yaml:"env"`
+	} `yaml:"sboms"`
+}
+
+// smokeBuildHost is the build host scripts/artifact-smoke.sh expects every RPM
+// header to record.
+var smokeBuildHost = regexp.MustCompile(`(?m)^expected_rpm_buildhost=(\S+)$`)
+
+// TestReleaseRPMsRecordAFixedBuildHost keeps the build machine out of the
+// RPMs. nfpm writes os.Hostname() into every RPM header unless rpm.buildhost
+// is set, and the release builds its reference and its signed artifacts on
+// two runners, with two host names. Every RPM, its SBOM and checksums.txt
+// would then differ between the builds, compare-release-artifacts.sh would
+// stop every release, and nothing would be signed. A template is refused as
+// well, since one only exists to vary with the build. The value is the one
+// artifact-smoke.sh checks the built headers against, so the CI snapshot and
+// the release's verify job both prove the setting takes effect.
+func TestReleaseRPMsRecordAFixedBuildHost(t *testing.T) {
+	var config goreleaserConfig
+	readGoReleaserConfig(t, &config)
+	content, err := os.ReadFile(filepath.Join("..", "scripts", "artifact-smoke.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	smoke := smokeBuildHost.FindStringSubmatch(string(content))
+	if smoke == nil || !strings.Contains(string(content), "%{BUILDHOST}") {
+		t.Fatal("scripts/artifact-smoke.sh no longer checks the RPM BUILDHOST header against expected_rpm_buildhost; update this test")
+	}
+
+	rpms := 0
+	for _, entry := range config.NFPMs {
+		if !slices.Contains(entry.Formats, "rpm") {
+			continue
+		}
+		rpms++
+		host := entry.RPM.BuildHost
+		switch {
+		case strings.TrimSpace(host) == "":
+			t.Errorf(".goreleaser.yaml nfpms entry %s builds RPMs without rpm.buildhost, so each records its runner's host name", entry.ID)
+		case strings.Contains(host, "{{"):
+			t.Errorf(".goreleaser.yaml nfpms entry %s sets rpm.buildhost to the template %q; use a fixed literal", entry.ID, host)
+		case host != smoke[1]:
+			t.Errorf(".goreleaser.yaml nfpms entry %s records build host %q, but scripts/artifact-smoke.sh expects %q", entry.ID, host, smoke[1])
+		}
+	}
+	if rpms == 0 {
+		t.Fatal("no .goreleaser.yaml nfpms entry builds RPMs; update this test and scripts/artifact-smoke.sh")
+	}
+}
+
+// TestReleaseSBOMsStayOffline keeps every SBOM behind
+// scripts/reproducible-syft.sh, which normalizes the document and confines
+// Syft's license lookup to the local module cache, and keeps Syft's online
+// enrichment out of the configuration. The wrapper refuses --enrich itself,
+// but only when GoReleaser runs it, in the CI snapshot or during a release;
+// this finds it before either. GoReleaser's default command is syft itself,
+// with --enrich all.
+func TestReleaseSBOMsStayOffline(t *testing.T) {
+	var config goreleaserConfig
+	readGoReleaserConfig(t, &config)
+	if len(config.SBOMs) == 0 {
+		t.Fatal(".goreleaser.yaml generates no SBOMs; update this test")
+	}
+	for _, sbom := range config.SBOMs {
+		if sbom.Cmd != "../scripts/reproducible-syft.sh" {
+			t.Errorf(".goreleaser.yaml sboms entry %s runs %q, not ../scripts/reproducible-syft.sh", sbom.ID, sbom.Cmd)
+		}
+		for _, argument := range sbom.Args {
+			if strings.HasPrefix(strings.TrimSpace(argument), "--enrich") {
+				t.Errorf(".goreleaser.yaml sboms entry %s passes %q; Syft's enrichment looks licenses up on the network", sbom.ID, argument)
+			}
+		}
+		// The same option in the form of a variable, which GoReleaser
+		// passes to the command when the entry sets it.
+		for _, variable := range sbom.Env {
+			if strings.HasPrefix(strings.TrimSpace(variable), "SYFT_ENRICH=") {
+				t.Errorf(".goreleaser.yaml sboms entry %s sets %q; Syft's enrichment looks licenses up on the network", sbom.ID, variable)
+			}
+		}
+	}
+}
+
+// TestReleaseWorkflowChoosesTheNotesRangeBeforeApproval keeps the choice of
+// the release notes range where a tag that cannot make it fails early: in a
+// job behind no environment, so before the tests and before anyone is asked
+// to approve the signing. The signed build, whose changelog the draft release
+// is created with, must then use that choice. Without it GoReleaser falls back
+// to the nearest tag, which for a stable tag cut after a candidate covers only
+// rc..stable.
+func TestReleaseWorkflowChoosesTheNotesRangeBeforeApproval(t *testing.T) {
+	release := releaseWorkflow(t)
+	chooserName, chooser := "", -1
+	for jobName, job := range release.Jobs {
+		index := stepIndex(job, func(step workflowStep) bool {
+			return strings.Contains(shellCode(step.Run), "bash scripts/previous-stable-tag.sh")
+		})
+		if index >= 0 {
+			chooserName, chooser = jobName, index
+		}
+	}
+	if chooserName == "" {
+		t.Fatal("release.yml no longer runs scripts/previous-stable-tag.sh; update this test")
+	}
+	if name := environmentName(release.Jobs[chooserName].Environment); name != "" {
+		t.Errorf("release.yml chooses the release notes range in job %s, behind the %s environment; a tag without the script would fail only after approval",
+			chooserName, name)
+	}
+
+	builds := 0
+	for jobName, job := range release.Jobs {
+		if !grantsWrite(jobPermissions(release, job), "id-token") {
+			continue
+		}
+		for _, step := range job.Steps {
+			if !strings.HasPrefix(step.Uses, "goreleaser/goreleaser-action@") {
+				continue
+			}
+			builds++
+			previous := fmt.Sprint(step.Env["GORELEASER_PREVIOUS_TAG"])
+			index, output, ok := outputSource(release, job, previous, chooserName)
+			written := false
+			for _, line := range strings.Split(shellCode(release.Jobs[chooserName].Steps[chooser].Run), "\n") {
+				written = written || strings.Contains(line, output+"=") && strings.Contains(line, "GITHUB_OUTPUT")
+			}
+			if !ok || index != chooser || !written {
+				t.Errorf("release.yml job %s builds the release with GORELEASER_PREVIOUS_TAG %s, not the range job %s chose", jobName, previous, chooserName)
+			}
+		}
+	}
+	if builds == 0 {
+		t.Fatal("no release.yml job that can sign runs GoReleaser; update this test")
 	}
 }

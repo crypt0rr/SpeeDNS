@@ -51,10 +51,13 @@ jobs:
     environment:
       name: release
     steps:
+      # Nothing here pushes: the tap is written through the API with its own
+      # token, so the checkout keeps no credential in .git/config.
       - name: Check out release scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
+          persist-credentials: false
 
       - name: Validate published release
         shell: bash
@@ -92,9 +95,9 @@ jobs:
             --clobber
 
       # Every sha256 in the cask comes from checksums.txt, and release assets
-      # can be replaced after the release job signed them. Check the release
-      # workflow's signature, with the identity README.md tells users to
-      # require, before any of it reaches the tap.
+      # can be replaced after the release workflow's publish job signed them.
+      # Check that workflow's signature, with the identity README.md tells
+      # users to require, before any of it reaches the tap.
       - name: Verify checksums signature
         shell: bash
         run: |

@@ -70,6 +70,14 @@ nfpms:
     formats: [deb, rpm, apk, archlinux]
     bindir: /usr/bin
     mtime: "{{ .CommitDate }}"
+    # nfpm writes the build host's name into every RPM header, from
+    # os.Hostname() unless this is set. The release builds the reference and
+    # the signed artifacts on two runners and compares them byte for byte, so
+    # the name is fixed: a literal, never a template, which could read the
+    # machine. scripts/artifact-smoke.sh checks the header against it, and
+    # schema/workflows_test.go keeps the two equal.
+    rpm:
+      buildhost: speedns-release
     contents:
       - src: docs/speedns.1
         dst: /usr/share/man/man1/speedns.1
@@ -89,6 +97,9 @@ signs:
       - --bundle=${signature}
       - ${artifact}
 
+# Syft runs offline. scripts/reproducible-syft.sh points its Go license lookup
+# at the local module cache and refuses --enrich, which would let it fetch
+# from the network and make two builds of one commit disagree.
 sboms:
   - id: archive
     artifacts: archive
@@ -97,8 +108,6 @@ sboms:
       - $artifact
       - --output
       - spdx-json=$document
-      - --enrich
-      - all
     documents:
       - "{{ .ArtifactName }}.sbom.json"
   - id: package
@@ -108,8 +117,6 @@ sboms:
       - $artifact
       - --output
       - spdx-json=$document
-      - --enrich
-      - all
     documents:
       - "{{ .ArtifactName }}.sbom.json"
 
