@@ -367,6 +367,31 @@ func tieOrderScenario(seed int64, failed Observation) []TargetResult {
 	}
 }
 
+// TestTieGroupOrderPenalizesOneAndThreeFailures covers the neighbours of the
+// two-failure case. One failure in 200 already joins the leader's group with
+// a latency-only lower bound; three leave the target recommendation-ineligible
+// (usable 0.985), yet under median-only ordering it still took rank one and
+// became the target unqualified numeric --assert checks evaluate. The leader
+// that lost nothing must hold rank one in both.
+func TestTieGroupOrderPenalizesOneAndThreeFailures(t *testing.T) {
+	for _, failures := range []int{1, 3} {
+		random := rand.New(rand.NewSource(7))
+		results := []TargetResult{
+			tieOrderTarget(random, 7, "leader", 11.0, 2.0, 0, Observation{}),
+			tieOrderTarget(random, 7, "flaky", 9.9, 2.0, failures, Observation{Error: "timeout"}),
+		}
+		leader, flaky := results[0].Stats, results[1].Stats
+		if flaky.MedianMS >= leader.MedianMS || !confidenceIntervalsOverlap(leader, flaky) {
+			t.Fatalf("%d failures: precondition: flaky median %.3f vs leader %.3f, intervals [%.3f, %.3f] and [%.3f, %.3f]",
+				failures, flaky.MedianMS, leader.MedianMS, flaky.CILowMS, flaky.CIHighMS, leader.CILowMS, leader.CIHighMS)
+		}
+		rankings := makeRankings(results, DefaultTimeout)
+		if rankings[0].TargetID != results[0].Target.ID() || !rankings[0].Tie || !rankings[1].Tie {
+			t.Fatalf("%d failures: rankings = %#v, want the leader first in a two-member tie group", failures, rankings)
+		}
+	}
+}
+
 // firstRecommended applies report.recommendedResult's rule -- the first
 // ranked, complete, recommendation-eligible target of the protocol -- which
 // this package cannot call without an import cycle.

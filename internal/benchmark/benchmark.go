@@ -1606,7 +1606,9 @@ func makeRankings(results []TargetResult, timeout time.Duration) []Ranking {
 // them. Without failures the key is 0.60 x median, so the order is median
 // order.
 func tieOrderKey(stats Statistics, timeoutMS float64) float64 {
-	return 0.60*stats.MedianMS + stats.ScoringFailureRate*timeoutMS
+	// Each product is rounded before the sum so arm64 cannot fuse it into an
+	// FMA: the order then matches amd64 bit for bit, near-equal keys included.
+	return float64(0.60*stats.MedianMS) + float64(stats.ScoringFailureRate*timeoutMS)
 }
 
 func confidenceIntervalsOverlap(left, right Statistics) bool {

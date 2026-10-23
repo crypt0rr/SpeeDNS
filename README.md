@@ -715,7 +715,9 @@ The recommendation summary and every per-protocol comparison include a `Tie`
 column. `TIED` marks the protocol's rank-one tie group: the target that leads
 on score and every target whose 95% score confidence interval overlaps that
 leader's interval, so their order against the leader is not statistically
-distinguishable. `—` means only that the target is not in that group; its
+distinguishable. When no other target overlaps the leader there is no tie, and every row,
+the leader included, reads `—`. Otherwise `—` means only that the target is
+not in that group; its
 interval can still overlap another target outside the group, or a member other
 than the leader. Members are listed first and ordered by 0.60 × median latency
 plus the scoring-failure penalty — the score without its noisy p95 term — so a

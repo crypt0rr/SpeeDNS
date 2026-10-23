@@ -729,6 +729,9 @@ func rankedResult(report benchmark.Report, protocol catalog.Protocol, rank int) 
 	return benchmark.TargetResult{}, false
 }
 
+// recommendedResult's rule is mirrored by firstRecommended in
+// internal/benchmark/invariants_test.go, which cannot import this package;
+// change both together.
 func recommendedResult(report benchmark.Report, protocol catalog.Protocol) (benchmark.TargetResult, bool) {
 	for _, ranking := range report.Rankings {
 		if ranking.Protocol != protocol {

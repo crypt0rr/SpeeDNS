@@ -274,7 +274,8 @@ order. Each protocol therefore has at most one tie group, and
 Every output surfaces that flag, and it means membership in the leader's tie
 group, not overlap with any other ranked target. The human table has a `Tie`
 column in the recommendation summary and in each per-protocol comparison; a
-member reads `TIED` and every other row reads `—`. A `—` row is not in the
+member reads `TIED` and every other row reads `—`, and when no other target
+overlaps the leader every row, the leader included, reads `—`. A `—` row is not in the
 leader's group, but its interval may still overlap another row outside the
 group, or a member other than the leader. When a recommended or provisional
 winner is tied, the recommendation block also carries a `TIED:` note stating
