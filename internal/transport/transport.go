@@ -665,7 +665,7 @@ func (f *doHFactory) newSession() *doHSession {
 		// timeout is pinged and closed when the ping goes unanswered for
 		// another, and the next query reconnects, about as soon as TCP, DoT
 		// and DoQ do after their first failure. The interval is never shorter
-		// than the query timeout, so pings cannot crowd a measured exchange.
+		// than the query timeout, so a ping only rarely overlaps a measured exchange.
 		HTTP2: &http.HTTP2Config{SendPingTimeout: f.timeout, PingTimeout: f.timeout},
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			if conn := session.takePending(); conn != nil {

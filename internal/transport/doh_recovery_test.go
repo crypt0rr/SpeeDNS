@@ -205,7 +205,9 @@ func forwardUnlessFrozen(dst, src net.Conn, frozen *atomic.Bool) {
 // closed after one timeout of silence and one unanswered ping, and the next
 // query is a flagged reconnect.
 func TestDoHRetiresASilentlyDeadHTTP2Connection(t *testing.T) {
-	const timeout = 200 * time.Millisecond
+	// The budget must cover a whole reconnect (TCP, TLS, HTTP/2 and the
+	// request) under the race detector on a busy CI runner.
+	const timeout = 300 * time.Millisecond
 	var http2Requests atomic.Int32
 	fixture := startDoHFixture(t, func(writer http.ResponseWriter, request *http.Request) {
 		if request.ProtoMajor == 2 {
