@@ -130,7 +130,7 @@ func TestValidateAssertionTargetsRejectsUnknownWinners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateAssertionTargets(accepted, targets); err != nil {
+	if err := validateAssertionTargets(accepted, targets, nil, false); err != nil {
 		t.Fatalf("validateAssertionTargets() = %v", err)
 	}
 
@@ -138,7 +138,7 @@ func TestValidateAssertionTargetsRejectsUnknownWinners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = validateAssertionTargets(rejected, targets)
+	err = validateAssertionTargets(rejected, targets, nil, false)
 	if err == nil || !strings.Contains(err.Error(), "no selected resolver matches") || !strings.Contains(err.Error(), "secnod") {
 		t.Fatalf("unknown winner error = %v", err)
 	}
@@ -148,14 +148,14 @@ func TestValidateAssertionTargetsRejectsUnknownWinners(t *testing.T) {
 
 	// A profile that is filtered out of the run, for example by --protocol,
 	// must be rejected rather than silently reported as a loser.
-	if err := validateAssertionTargets(rejected, targets[:1]); err == nil {
+	if err := validateAssertionTargets(rejected, targets[:1], nil, false); err == nil {
 		t.Fatal("expected unknown winner error against the reduced target set")
 	}
 	unselected, err := parseAssertions([]string{"winner=second"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateAssertionTargets(unselected, targets[:1]); err == nil {
+	if err := validateAssertionTargets(unselected, targets[:1], nil, false); err == nil {
 		t.Fatal("expected error for a profile that is not part of the run")
 	}
 }
@@ -582,7 +582,7 @@ func TestSubjectAssertionParsingAndValidation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := validateAssertionTargets(checks, targets); err != nil {
+		if err := validateAssertionTargets(checks, targets, nil, false); err != nil {
 			t.Fatalf("%q should be an accepted spelling: %v", spelling, err)
 		}
 	}
@@ -590,7 +590,7 @@ func TestSubjectAssertionParsingAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateAssertionTargets(typo, targets); err == nil ||
+	if err := validateAssertionTargets(typo, targets, nil, false); err == nil ||
 		!strings.Contains(err.Error(), "no selected resolver matches") {
 		t.Fatalf("a typo'd subject must be invalid input: %v", err)
 	}
@@ -624,5 +624,26 @@ func TestAssertionFailureReasonsEscapeTargetIDs(t *testing.T) {
 		if !strings.Contains(message, `evil\x1b[2K\u{202e}@192.0.2.1/udp has p95=90.000ms`) {
 			t.Fatalf("failure message for %q does not name the escaped target: %q", expression, message)
 		}
+	}
+}
+
+// TestAssertionOnACollapsedProfileRespectsRedaction covers the cache-miss
+// refusal when the endpoint measured instead is a discovered system resolver:
+// its target ID carries the resolver's address, which --redact-system keeps
+// out of stderr just as it keeps it out of the report.
+func TestAssertionOnACollapsedProfileRespectsRedaction(t *testing.T) {
+	system := assertionTarget("system-resolver-1-10-0-0-1", catalog.UDP, "10.0.0.1")
+	dropped := []cacheMissDrop{{target: assertionTarget("google-8888", catalog.UDP, "10.0.0.1"), instead: system}}
+	checks, err := parseAssertions([]string{"winner=google-8888"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateAssertionTargets(checks, []catalog.Target{system}, dropped, true)
+	if err == nil || !strings.Contains(err.Error(), "a redacted system endpoint") || strings.Contains(err.Error(), "10.0.0.1") || strings.Contains(err.Error(), "10-0-0-1") {
+		t.Fatalf("redacted refusal = %v, want the kept system endpoint withheld", err)
+	}
+	err = validateAssertionTargets(checks, []catalog.Target{system}, dropped, false)
+	if err == nil || !strings.Contains(err.Error(), system.ID()) {
+		t.Fatalf("unredacted refusal = %v, want it to name %q", err, system.ID())
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -2815,6 +2816,450 @@ resolvers:
 	}
 	if options.CacheMiss {
 		t.Fatal("a warm-cache run must not set the cache-miss option")
+	}
+}
+
+// runCacheMissFixture runs one cache-miss benchmark against a stub engine and
+// returns the endpoints the engine was asked to measure and the JSON report.
+// Only the selection is under test, so the engine never touches a network.
+func runCacheMissFixture(t *testing.T, config cliConfig) ([]catalog.Target, string) {
+	t.Helper()
+	measured, content, err := runCacheMissRun(t, config, func([]catalog.Target) benchmark.Report { return fakeCLIReport() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return measured, content
+}
+
+// runCacheMissRun is runCacheMissFixture for a run that may fail. The stub
+// engine's report is built from the endpoints it was asked to measure, and
+// the run's error is returned with the report, which is empty when none was
+// written; measured stays nil when the run stopped before the engine.
+func runCacheMissRun(t *testing.T, config cliConfig, makeReport func([]catalog.Target) benchmark.Report) ([]catalog.Target, string, error) {
+	t.Helper()
+	oldEngine, oldNonce := runBenchmarkEngine, newCacheMissNonceFunc
+	defer func() { runBenchmarkEngine, newCacheMissNonceFunc = oldEngine, oldNonce }()
+	var measured []catalog.Target
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		measured = append([]catalog.Target(nil), targets...)
+		return makeReport(measured), nil
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+	config.cacheMiss, config.cacheMissSample, config.sample, config.seed = true, 2, 100, 7
+	config.queryTypes, config.timeout, config.concurrency, config.format = "A", time.Second, 1, "json"
+	config.output = filepath.Join(t.TempDir(), "cache-miss.json")
+	runErr := runBenchmark(context.Background(), &config)
+	content, err := os.ReadFile(config.output)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal(err)
+	}
+	return measured, string(content), runErr
+}
+
+func measuredIDs(targets []catalog.Target) []string {
+	ids := make([]string, 0, len(targets))
+	for _, target := range targets {
+		ids = append(ids, target.ID())
+	}
+	return ids
+}
+
+func writeResolverFixture(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "resolvers.yaml")
+	if err := os.WriteFile(path, []byte("version: 1\nresolvers:\n"+body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestCacheMissCollapsesProfilesThatReachOneServer pins #238 (a). A resolver
+// is not a profile: two --resolver flags at one server are two profiles, and
+// so are the bundled Google pair that both answer as dns.google. Keying on the
+// profile ID measured each of them with the same generated names, so all but
+// the first measured a warm read with no warning. Profiles that share an
+// address or a TLS identity are now one cache, measured once, and every
+// endpoint that was folded into it is named in the warning.
+func TestCacheMissCollapsesProfilesThatReachOneServer(t *testing.T) {
+	sharedDoH := writeResolverFixture(t, `  - id: doh-a
+    name: DoH A
+    owner: Lab
+    policy: unfiltered
+    addresses: ["192.0.2.1"]
+    transports:
+      doh:
+        url: https://doh.example.test/dns-query
+  - id: doh-b
+    name: DoH B
+    owner: Lab
+    policy: family filter
+    addresses: ["192.0.2.2"]
+    transports:
+      doh:
+        url: https://DOH.Example.Test./family-filter
+`)
+	// No DoH and no shared address: only the TLS name links these two, and
+	// it is configured on different encrypted transports.
+	sharedServerName := writeResolverFixture(t, `  - id: tls-a
+    name: TLS A
+    owner: Lab
+    policy: unfiltered
+    addresses: ["192.0.2.1"]
+    transports:
+      dot:
+        server_name: dns.example.test
+  - id: tls-b
+    name: TLS B
+    owner: Lab
+    policy: unfiltered
+    addresses: ["192.0.2.2"]
+    transports:
+      doq:
+        server_name: DNS.example.test
+`)
+	// The two share only an IPv6 address, which --family 4 filters out.
+	sharedIPv6 := writeResolverFixture(t, `  - id: dual-a
+    name: Dual A
+    owner: Lab
+    policy: unfiltered
+    addresses: ["192.0.2.1", "2001:db8::53"]
+    transports:
+      udp: {}
+  - id: dual-b
+    name: Dual B
+    owner: Lab
+    policy: unfiltered
+    addresses: ["192.0.2.2", "2001:db8::53"]
+    transports:
+      udp: {}
+`)
+	unrelated := writeResolverFixture(t, `  - id: lab-a
+    name: Lab A
+    owner: Lab
+    policy: unfiltered
+    addresses: ["192.0.2.1"]
+    transports:
+      dot:
+        server_name: a.example.test
+  - id: lab-b
+    name: Lab B
+    owner: Lab
+    policy: unfiltered
+    addresses: ["192.0.2.2"]
+    transports:
+      dot:
+        server_name: b.example.test
+`)
+	for _, test := range []struct {
+		name     string
+		config   cliConfig
+		measured []string
+		dropped  []string
+	}{
+		{
+			// The first resolver named is the one measured, even though DoH
+			// precedes DoT in the documented protocol order: the profile is
+			// chosen before its transport.
+			name: "two resolver flags at one host",
+			config: cliConfig{
+				protocols: "doh,dot", noDefaults: true, family: "both",
+				resolverFlags: []string{"private-dot=tls://dns.example.test:853", "private-doh=https://dns.example.test/dns-query"},
+			},
+			measured: []string{"custom-private-dot@dns.example.test/dot"},
+			dropped:  []string{"custom-private-doh@dns.example.test/doh"},
+		},
+		{
+			// One address is one server whatever port it is reached on.
+			name: "one address on two ports",
+			config: cliConfig{
+				protocols: "udp", noDefaults: true, family: "4",
+				resolverFlags: []string{"first=udp://127.0.0.1:53", "second=udp://127.0.0.1:5353"},
+			},
+			measured: []string{"custom-first@127.0.0.1/udp"},
+			dropped:  []string{"custom-second@127.0.0.1/udp"},
+		},
+		{
+			// Both answer as dns.google, so google-8844 is the same cache.
+			// The list is in catalog.Expand order, which both lists keep.
+			name:     "bundled google pair",
+			config:   cliConfig{protocols: "udp", family: "4"},
+			measured: []string{"cloudflare-1111@1.1.1.1/udp", "cloudflare-1112@1.1.1.2/udp", "dns4eu-11100@86.54.11.100/udp", "dns4eu-1112@86.54.11.12/udp", "dns4eu-1113@86.54.11.13/udp", "dns4eu-111@86.54.11.1/udp", "google-8888@8.8.8.8/udp", "quad9-99910@9.9.9.10/udp", "quad9-9999@9.9.9.9/udp"},
+			dropped:  []string{"google-8844@8.8.4.4/udp"},
+		},
+		{
+			// Different addresses and paths, one DoH host: case and a trailing
+			// dot do not make it a different server.
+			name:     "doh-only profiles sharing a host",
+			config:   cliConfig{protocols: "doh", noDefaults: true, family: "4", resolverFile: sharedDoH},
+			measured: []string{"doh-a@192.0.2.1/doh"},
+			dropped:  []string{"doh-b@192.0.2.2/doh"},
+		},
+		{
+			// A DoT and a DoQ server_name are one TLS identity, so one server,
+			// whatever the addresses: the only link here is the name.
+			name:     "dot and doq profiles sharing a server_name",
+			config:   cliConfig{protocols: "dot,doq", noDefaults: true, family: "4", resolverFile: sharedServerName},
+			measured: []string{"tls-a@192.0.2.1/dot"},
+			dropped:  []string{"tls-b@192.0.2.2/doq"},
+		},
+		{
+			// Cache identity belongs to the server rather than to the family a
+			// run selects, so an address --family filtered out still links
+			// two profiles. Grouping only the filtered profiles would measure
+			// both.
+			name:     "profiles sharing only a filtered-out address",
+			config:   cliConfig{protocols: "udp", noDefaults: true, family: "4", resolverFile: sharedIPv6},
+			measured: []string{"dual-a@192.0.2.1/udp"},
+			dropped:  []string{"dual-b@192.0.2.2/udp"},
+		},
+		{
+			// Sibling names under one parent are not one server; nothing beyond
+			// an identical endpoint is inferred.
+			name:     "unrelated profiles",
+			config:   cliConfig{protocols: "dot", noDefaults: true, family: "4", resolverFile: unrelated},
+			measured: []string{"lab-a@192.0.2.1/dot", "lab-b@192.0.2.2/dot"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			measured, content := runCacheMissFixture(t, test.config)
+			if got := measuredIDs(measured); !slices.Equal(got, test.measured) {
+				t.Fatalf("cache-miss measured %q, want %q", got, test.measured)
+			}
+			if len(test.dropped) == 0 {
+				if strings.Contains(content, "share a cache") {
+					t.Fatalf("unrelated profiles were collapsed: %s", content)
+				}
+				return
+			}
+			want := fmt.Sprintf("dropped %d endpoint(s) that share a cache with one already selected: %s",
+				len(test.dropped), strings.Join(test.dropped, ", "))
+			if !strings.Contains(content, want) {
+				t.Fatalf("warning %q missing from %s", want, content)
+			}
+		})
+	}
+
+	// A warm-cache run is untouched: every bundled endpoint is measured,
+	// google-8844 included, and nothing is reported as sharing a cache.
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	var measured []catalog.Target
+	runBenchmarkEngine = func(_ context.Context, targets []catalog.Target, _ benchmark.Options) (benchmark.Report, error) {
+		measured = append([]catalog.Target(nil), targets...)
+		return fakeCLIReport(), nil
+	}
+	warm := &cliConfig{
+		protocols: "udp", family: "4", domainFile: cliDomainFile(t), sample: 1, seed: 7, queryTypes: "A",
+		timeout: time.Second, concurrency: 1, format: "json", output: filepath.Join(t.TempDir(), "warm.json"),
+	}
+	if err := runBenchmark(context.Background(), warm); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := catalog.FilterProfilesByFamily(catalog.DefaultResolvers(), catalog.Family4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := measuredIDs(measured), measuredIDs(catalog.Expand(profiles, []catalog.Protocol{catalog.UDP})); !slices.Equal(got, want) {
+		t.Fatalf("warm-cache run measured %q, want every bundled endpoint %q", got, want)
+	}
+	content, err := os.ReadFile(warm.output)
+	if err != nil || strings.Contains(string(content), "share a cache") {
+		t.Fatalf("a warm-cache run must not drop endpoints: %q/%v", content, err)
+	}
+}
+
+// TestCacheMissKeepsEachProfilesDeclaredFirstAddress pins #238 (b). The kept
+// endpoint used to be the lowest-sorting target ID, so on a dual-stack host a
+// cache-miss run measured Cloudflare over IPv4 ("1.1.1.1" < "2606:") and every
+// other bundled resolver over IPv6 ("2001:" < "8.8.8.8"), and its one ranking
+// compared families by accident of string order. Each profile now contributes
+// its first transport at its first declared address, which for the bundled
+// catalog is IPv4 throughout, and the same input always selects the same set.
+func TestCacheMissKeepsEachProfilesDeclaredFirstAddress(t *testing.T) {
+	oldDetector := detectAddressFamiliesFunc
+	t.Cleanup(func() { detectAddressFamiliesFunc = oldDetector })
+	detectAddressFamiliesFunc = func() (map[catalog.AddressFamily]bool, error) {
+		return map[catalog.AddressFamily]bool{catalog.Family4: true, catalog.Family6: true}, nil
+	}
+	for _, test := range []struct {
+		family string
+		want   func(netip.Addr) bool
+	}{
+		{family: "auto", want: netip.Addr.Is4},
+		{family: "both", want: netip.Addr.Is4},
+		// With IPv4 filtered out, the first declared address left is IPv6.
+		{family: "6", want: netip.Addr.Is6},
+	} {
+		t.Run(test.family, func(t *testing.T) {
+			config := cliConfig{protocols: "udp,tcp,doh,dot,doq", family: test.family}
+			measured, _ := runCacheMissFixture(t, config)
+			if len(measured) != 9 {
+				t.Fatalf("cache-miss measured %d endpoints, want one per bundled cache (9): %q", len(measured), measuredIDs(measured))
+			}
+			for _, target := range measured {
+				address := netip.MustParseAddr(target.Address)
+				if !test.want(address) || target.Address != target.Resolver.Addresses[0] || target.Protocol != catalog.UDP {
+					t.Fatalf("kept %s, want udp at the first declared address of %q", target.ID(), target.Resolver.Addresses)
+				}
+			}
+			again, _ := runCacheMissFixture(t, config)
+			if !slices.Equal(measuredIDs(again), measuredIDs(measured)) {
+				t.Fatalf("selection is not deterministic: %q then %q", measuredIDs(measured), measuredIDs(again))
+			}
+		})
+	}
+}
+
+// TestCacheMissGroupsAreTransitive pins why cacheGroups is a union-find. Here
+// "bridge" shares an address with "first" and another with "second", which
+// share nothing with each other directly; all three are one server. A single
+// pass that compared each profile only with those kept before it would have
+// kept "second", because it was declared before the profile that links it.
+// It also pins the address rule: "v6first" declares IPv6 first, so IPv6 is
+// what it is measured over, although its IPv4 target ID sorts first.
+func TestCacheMissGroupsAreTransitive(t *testing.T) {
+	udp := map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}}
+	profiles := []catalog.ResolverProfile{
+		{ID: "first", Addresses: []string{"192.0.2.1"}, Transports: udp},
+		{ID: "second", Addresses: []string{"192.0.2.2"}, Transports: udp},
+		{ID: "bridge", Addresses: []string{"192.0.2.2", "192.0.2.1"}, Transports: udp},
+		{ID: "v6first", Addresses: []string{"2001:db8::9", "192.0.2.9"}, Transports: udp},
+	}
+	kept, dropped := cacheMissTargets(profiles, catalog.Expand(profiles, []catalog.Protocol{catalog.UDP}))
+	if got, want := measuredIDs(kept), []string{"first@192.0.2.1/udp", "v6first@2001:db8::9/udp"}; !slices.Equal(got, want) {
+		t.Fatalf("kept %q, want %q", got, want)
+	}
+	// Each dropped endpoint carries the one measured for its cache, which is
+	// what --assert validation names when an assertion asks for a dropped one.
+	got := make([]string, 0, len(dropped))
+	for _, drop := range dropped {
+		got = append(got, drop.target.ID()+" -> "+drop.instead.ID())
+	}
+	want := []string{
+		"bridge@192.0.2.1/udp -> first@192.0.2.1/udp", "bridge@192.0.2.2/udp -> first@192.0.2.1/udp",
+		"second@192.0.2.2/udp -> first@192.0.2.1/udp", "v6first@192.0.2.9/udp -> v6first@2001:db8::9/udp",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("dropped %q, want %q", got, want)
+	}
+	if got, want := cacheGroups(profiles), []int{0, 0, 0, 3}; !slices.Equal(got, want) {
+		t.Fatalf("cacheGroups = %v, want %v", got, want)
+	}
+}
+
+// TestCacheMissWarningRedactsDroppedSystemEndpoints covers the one place the
+// warning must not name an endpoint. A system resolver that is the same
+// server as a bundled profile is dropped in its favour, and the report only
+// redacts system endpoints it measured, so naming the dropped one would print
+// the system resolver's address in a report the operator asked to redact.
+func TestCacheMissWarningRedactsDroppedSystemEndpoints(t *testing.T) {
+	oldDiscover := discoverSystemResolvers
+	t.Cleanup(func() { discoverSystemResolvers = oldDiscover })
+	discoverSystemResolvers = func(context.Context) ([]catalog.ResolverProfile, error) {
+		return []catalog.ResolverProfile{{
+			ID: "system-8-8-8-8", Name: "System DNS", Owner: "configured locally", Policy: "unknown",
+			Addresses:  []string{"8.8.8.8"},
+			Transports: map[catalog.Protocol]catalog.TransportSpec{catalog.UDP: {Port: 53}, catalog.TCP: {Port: 53}},
+		}}, nil
+	}
+	config := cliConfig{protocols: "udp,tcp", family: "4", includeSystem: true}
+	_, named := runCacheMissFixture(t, config)
+	if !strings.Contains(named, "system-8-8-8-8@8.8.8.8/udp") {
+		t.Fatalf("the dropped system endpoint was not named: %s", named)
+	}
+	config.redactSystem = true
+	measured, redacted := runCacheMissFixture(t, config)
+	if slices.ContainsFunc(measured, report.IsSystemTarget) {
+		t.Fatalf("the system resolver was measured beside google-8888: %q", measuredIDs(measured))
+	}
+	if strings.Contains(redacted, "system-8-8-8-8") || !strings.Contains(redacted, "google-8844@8.8.4.4/udp") ||
+		!strings.Contains(redacted, "2 redacted system endpoint(s)") {
+		t.Fatalf("--redact-system warning = %s", redacted)
+	}
+}
+
+// TestCacheMissAssertionOnACollapsedEndpointSaysWhy pins the --assert side of
+// #238. Cache-miss mode used to keep an endpoint of every profile, so an
+// assertion naming a selected profile always passed validation. A profile can
+// now be folded whole into another that shares its cache -- google-8844 into
+// google-8888 on a default run -- and validation sees only what is measured.
+// Rejecting it is still right, because nothing it names will have a result,
+// but "no selected resolver matches" called a selected profile that "speedns
+// resolvers" lists a typo. The error now names the endpoint measured instead,
+// and the profile that is measured validates and is evaluated as before.
+func TestCacheMissAssertionOnACollapsedEndpointSaysWhy(t *testing.T) {
+	// google-8888 wins, so an assertion that passes validation also passes.
+	googleWins := func(targets []catalog.Target) benchmark.Report {
+		report := fakeCLIReport()
+		for _, target := range targets {
+			if target.Resolver.ID == "google-8888" {
+				report.Targets[0].Target = target
+				report.Rankings = []benchmark.Ranking{{Protocol: target.Protocol, TargetID: target.ID(), Rank: 1}}
+			}
+		}
+		return report
+	}
+	for _, expression := range []string{"winner=google-8888", "google-8888:usable>=0", "winner=google-8888@8.8.8.8/udp"} {
+		config := cliConfig{protocols: "udp,tcp", family: "4", assertions: []string{expression}}
+		if measured, _, err := runCacheMissRun(t, config, googleWins); err != nil || len(measured) != 9 {
+			t.Fatalf("--assert %s = %v after measuring %q, want the measured profile to validate and pass", expression, err, measuredIDs(measured))
+		}
+	}
+
+	for _, test := range []struct {
+		name    string
+		config  cliConfig
+		wanted  string
+		instead string
+	}{
+		{
+			name:   "winner on the collapsed google profile",
+			config: cliConfig{protocols: "udp,tcp", family: "4", assertions: []string{"winner=google-8844"}},
+			wanted: "google-8844", instead: "google-8888@8.8.8.8/udp",
+		},
+		{
+			name:   "threshold on the collapsed google profile",
+			config: cliConfig{protocols: "udp,tcp", family: "4", assertions: []string{"google-8844:usable>=0.5"}},
+			wanted: "google-8844", instead: "google-8888@8.8.8.8/udp",
+		},
+		{
+			// A transport of a measured profile that is not measured itself was
+			// called a typo before #238 too; it is the same case.
+			name:   "dropped transport of the measured profile",
+			config: cliConfig{protocols: "udp,tcp", family: "4", assertions: []string{"winner=google-8888@8.8.8.8/tcp"}},
+			wanted: "google-8888@8.8.8.8/tcp", instead: "google-8888@8.8.8.8/udp",
+		},
+		{
+			// The name given to --resolver is accepted, so it is the one quoted.
+			name: "second of two resolver flags at one server",
+			config: cliConfig{
+				protocols: "udp", noDefaults: true, family: "4", assertions: []string{"winner=second"},
+				resolverFlags: []string{"first=udp://192.0.2.53:53", "second=udp://192.0.2.53:5353"},
+			},
+			wanted: "second", instead: "custom-first@192.0.2.53/udp",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			measured, content, err := runCacheMissRun(t, test.config, googleWins)
+			want := fmt.Sprintf("invalid --assert %q: %q shares a cache with %q, which --cache-miss measures instead; name that endpoint or drop --cache-miss",
+				test.config.assertions[0], test.wanted, test.instead)
+			if err == nil || err.Error() != want {
+				t.Fatalf("error = %v, want %s", err, want)
+			}
+			if code := exitCodeForError(err); code != 2 {
+				t.Fatalf("exit code = %d, want 2: the assertion names nothing the run measures", code)
+			}
+			if measured != nil || content != "" {
+				t.Fatalf("an invalid assertion must stop the run before any query: measured %q, report %q", measuredIDs(measured), content)
+			}
+		})
+	}
+
+	// A name that no selected endpoint carries, dropped or kept, is still a
+	// typo and still says so.
+	typo := cliConfig{protocols: "udp,tcp", family: "4", assertions: []string{"winner=google-8484"}}
+	if _, _, err := runCacheMissRun(t, typo, googleWins); err == nil || !strings.Contains(err.Error(), `no selected resolver matches "google-8484"`) {
+		t.Fatalf("typo under --cache-miss = %v", err)
 	}
 }
 

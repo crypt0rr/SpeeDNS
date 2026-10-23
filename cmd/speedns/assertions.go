@@ -11,6 +11,7 @@ import (
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/report"
 	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
@@ -144,7 +145,16 @@ func parseLatencyMilliseconds(value string) (float64, error) {
 // the targets selected for the run. Without this check a mistyped profile or
 // target ID is reported as a lost benchmark instead of the invalid input it
 // is, telling the user their resolver did not win when it was never measured.
-func validateAssertionTargets(assertions []assertion, targets []catalog.Target) error {
+//
+// dropped lists the endpoints --cache-miss selected but will not measure,
+// because each shares a cache with one it does; it is empty otherwise. An
+// assertion naming only those is still rejected, since nothing it names will
+// have a result, but it is not a typo: the endpoint was selected, and saying
+// no selected resolver matches it -- for google-8844 under a default
+// --cache-miss run, say -- sent the user looking for a mistake they had not
+// made. The error names the endpoint measured instead, which the assertion
+// can name.
+func validateAssertionTargets(assertions []assertion, targets []catalog.Target, dropped []cacheMissDrop, redactSystem bool) error {
 	for _, check := range assertions {
 		// A named resolver is checked before any query is sent, so a typo is
 		// invalid input rather than a gate that runs the whole benchmark and
@@ -165,9 +175,21 @@ func validateAssertionTargets(assertions []assertion, targets []catalog.Target) 
 				break
 			}
 		}
-		if !matched {
-			return fmt.Errorf("invalid --assert %q: no selected resolver matches %q; use a profile id such as the ones listed by \"speedns resolvers\" or a target id", check.raw, wanted)
+		if matched {
+			continue
 		}
+		for _, drop := range dropped {
+			if targetMatchesID(drop.target, wanted) {
+				// The kept endpoint may be a discovered system resolver, whose ID
+				// carries its address; --redact-system keeps that out of stderr
+				// exactly as it keeps it out of the report.
+				if redactSystem && report.IsSystemTarget(drop.instead) {
+					return fmt.Errorf("invalid --assert %q: %q shares a cache with a redacted system endpoint, which --cache-miss measures instead; name another resolver or drop --cache-miss", check.raw, wanted)
+				}
+				return fmt.Errorf("invalid --assert %q: %q shares a cache with %q, which --cache-miss measures instead; name that endpoint or drop --cache-miss", check.raw, wanted, drop.instead.ID())
+			}
+		}
+		return fmt.Errorf("invalid --assert %q: no selected resolver matches %q; use a profile id such as the ones listed by \"speedns resolvers\" or a target id", check.raw, wanted)
 	}
 	return nil
 }

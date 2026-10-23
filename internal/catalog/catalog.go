@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 
@@ -430,6 +431,41 @@ func canonicalAddressKey(address string) string {
 		return "ip:" + ip.String()
 	}
 	return "host:" + strings.ToLower(strings.TrimSuffix(address, "."))
+}
+
+// CacheKeys returns the names by which the profile's server is reached: every
+// address, and the TLS identity of each encrypted transport -- the DoH URL host
+// and any configured server_name. Two profiles that share a key reach the same
+// server and therefore the same cache, which is what cache-miss mode needs to
+// know; the profile ID cannot tell it, because two --resolver flags aimed at
+// one server, or the two bundled Google profiles that both answer as
+// dns.google, are separate profiles.
+//
+// Addresses and TLS names share one key space, so a hostname address and the
+// same name used as a server_name match, and canonicalAddressKey makes the
+// comparison ignore IP spelling, hostname case and a trailing dot. The keys
+// are sorted and unique so the result does not depend on map order. They are
+// for comparison only and are never shown.
+func (p ResolverProfile) CacheKeys() []string {
+	keys := make([]string, 0, len(p.Addresses)+2*len(p.Transports))
+	for _, address := range p.Addresses {
+		keys = append(keys, canonicalAddressKey(address))
+	}
+	for protocol, spec := range p.Transports {
+		if protocol != DoH && protocol != DoT && protocol != DoQ {
+			continue
+		}
+		if protocol == DoH {
+			if endpoint, err := url.Parse(spec.URL); err == nil && endpoint.Hostname() != "" {
+				keys = append(keys, canonicalAddressKey(endpoint.Hostname()))
+			}
+		}
+		if serverName := strings.TrimSpace(spec.ServerName); serverName != "" {
+			keys = append(keys, canonicalAddressKey(serverName))
+		}
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys)
 }
 
 func defaultPort(protocol Protocol) int {

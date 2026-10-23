@@ -529,6 +529,15 @@ a name SpeeDNS generated earlier in the run. Read
 [`CACHE_MISS.md`](CACHE_MISS.md) before using the mode, especially for
 ownership, traffic, and abuse limits.
 
+A resolver here is a server, not a profile: profiles that share an address or
+a TLS name (a DoH URL host or a `server_name`) count as one, so two
+`--resolver` flags aimed at one server, or the two bundled Google profiles, are
+measured once. The endpoint kept is the earliest declared profile's first
+transport at its earliest declared address, which on a dual-stack run is IPv4
+for every bundled resolver. Profiles count in load order: the bundled catalog,
+then `--resolver-file` entries, then `--resolver` flags in the order given, then
+discovered system resolvers.
+
 ### What a default run sends
 
 A default run measures the ten bundled profiles across their declared
@@ -543,7 +552,7 @@ total. Narrow the run with `--protocol`, `--sample`, or `--no-defaults` plus
 `--sample` for repeated or scheduled runs.
 
 [`CACHE_MISS.md`](CACHE_MISS.md) states the separate, much smaller budget for
-`--cache-miss`, which sends 200 reserved-zone queries.
+`--cache-miss`, which sends 180 reserved-zone queries.
 
 ## Comparing two runs
 
@@ -1010,7 +1019,9 @@ compared as usual.
 The name may be a profile id, the name given to `--resolver`, or a full target
 id. It is validated against the selected resolvers before any query is sent, so
 a typo exits 2 as invalid input rather than running the benchmark and reporting
-that the resolver lost.
+that the resolver lost. Under `--cache-miss` a name that matches only endpoints
+the mode dropped because they share a cache, such as `google-8844`, is invalid
+input (status 2) too, and the error names the endpoint measured instead.
 
 A protocol whose endpoints all returned no usable DNS response fails the gate
 with status 4, so a completely unreachable transport cannot pass silently.
@@ -1026,7 +1037,9 @@ accepted. Operators are `>=`, `>`, `<=`, `<`, and `=`. `winner=` accepts a
 resolver profile ID or a complete target ID, and is checked against the
 targets actually selected for the run before any query is sent: a `winner=`
 value that matches no selected resolver is invalid input (status `2`), not a
-lost comparison. A tied rank-one result satisfies the winner assertion.
+lost comparison. Under `--cache-miss` so is a value that names only a
+collapsed profile or endpoint, which the run will not measure. A tied rank-one
+result satisfies the winner assertion.
 Invalid expressions return status `2`; failed assertions return status `4`
 after the normal report has been written. Status `3` for no comparable results
 and status `130` for interruption take precedence.

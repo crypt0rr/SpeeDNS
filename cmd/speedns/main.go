@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -229,8 +231,8 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 	return protocols
 }
 
-// cacheMissTargets keeps one endpoint per resolver profile and reports the
-// endpoints it dropped.
+// cacheMissTargets keeps one endpoint per cache and returns the endpoints it
+// dropped, each with the endpoint measured for its cache instead.
 //
 // A resolver holds one cache, shared across every transport it offers and every
 // address it answers on. So once a generated name has been measured at a
@@ -238,6 +240,24 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 // read, no matter which transport or address reaches it. Measuring a resolver
 // once is what keeps any name from being asked twice at one resolver, for
 // every query rather than only for whichever group happened to run first.
+//
+// A resolver is not the same thing as a profile. Two --resolver flags aimed at
+// one server are two profiles, and so are the bundled google-8888 and
+// google-8844, which both answer as dns.google. Keying on the profile ID kept
+// all of them and sent each the same generated names, so every one after the
+// first measured a warm read -- scored and ranked as a miss, with no warning.
+// Profiles are therefore grouped by catalog.ResolverProfile.CacheKeys: two
+// that share an address, on any port, or the TLS identity of an encrypted
+// transport reach one server, and every profile linked through such a chain is
+// one cache. Nothing beyond those identical endpoints is inferred, so siblings
+// that answer on different names and addresses stay separate.
+//
+// profiles is every selected profile in declared order, before --family
+// filtering. Cache identity belongs to the server, not to the family a run
+// selects. Grouping only the filtered profiles would let --family stop an
+// address from linking two profiles, so two that share only an IPv6 address
+// would both be measured under --family 4. targets is what catalog.Expand made
+// of the filtered profiles, so only an endpoint the run selected is ever kept.
 //
 // Together with asking each generated name one question, that means no
 // measured query repeats a question SpeeDNS has already asked that resolver,
@@ -247,26 +267,128 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 // proof cached for a different name -- including one of SpeeDNS's own earlier
 // generated names -- which CACHE_MISS.md names as a limit.
 //
-// catalog.Expand returns targets in documented protocol order, then by target
-// ID, so the endpoint kept for a profile is its earliest declared transport at
-// its lowest-sorting address -- deterministic across runs.
+// The endpoint kept for a cache is chosen by an explicit rule: the earliest
+// declared profile in the group, its first transport in the documented order
+// (udp, tcp, doh, dot, doq), at its earliest declared address. The kept
+// endpoint used to be the lowest-sorting target ID, which on a dual-stack host
+// measured Cloudflare over IPv4 ("1.1.1.1" sorts before "2606:") and Google,
+// Quad9 and DNS4EU over IPv6 ("2001:" sorts before "8.8.8.8"), so the one
+// ranking a cache-miss run produces compared network families by accident of
+// string order. Declared order puts every bundled profile on IPv4, which the
+// catalog lists first, and is as deterministic as the input. Both lists keep
+// the order catalog.Expand produced.
 //
 // The consequence is deliberate: a cache-miss run does not compare transports.
 // Comparing transports needs the same name measured twice, which is exactly
 // what makes the second measurement warm.
-func cacheMissTargets(targets []catalog.Target) ([]catalog.Target, []string) {
-	kept := make([]catalog.Target, 0, len(targets))
-	dropped := make([]string, 0)
-	measured := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		if _, seen := measured[target.Resolver.ID]; seen {
-			dropped = append(dropped, target.ID())
+func cacheMissTargets(profiles []catalog.ResolverProfile, targets []catalog.Target) ([]catalog.Target, []cacheMissDrop) {
+	declared := make(map[string]int, len(profiles))
+	for index, profile := range profiles {
+		declared[profile.ID] = index
+	}
+	caches := cacheGroups(profiles)
+	cacheOf := func(target catalog.Target) int { return caches[declared[target.Resolver.ID]] }
+	chosen := make(map[int]int, len(profiles))
+	for index, target := range targets {
+		cache := cacheOf(target)
+		if current, seen := chosen[cache]; !seen || cacheMissPrefers(target, targets[current], declared) {
+			chosen[cache] = index
+		}
+	}
+	kept := make([]catalog.Target, 0, len(chosen))
+	dropped := make([]cacheMissDrop, 0, len(targets)-len(chosen))
+	for index, target := range targets {
+		measured := chosen[cacheOf(target)]
+		if measured == index {
+			kept = append(kept, target)
 			continue
 		}
-		measured[target.Resolver.ID] = struct{}{}
-		kept = append(kept, target)
+		dropped = append(dropped, cacheMissDrop{target: target, instead: targets[measured]})
 	}
 	return kept, dropped
+}
+
+// cacheMissDrop is an endpoint cache-miss mode did not measure, and the one it
+// measures for the same cache instead. The pair is kept because a dropped
+// endpoint was selected: an --assert that names it is not a typo, and the
+// error has to say which endpoint to name instead.
+type cacheMissDrop struct {
+	target  catalog.Target
+	instead catalog.Target
+}
+
+// cacheGroups returns, for each profile, the index of the earliest declared
+// profile it shares a cache with. Sharing is transitive -- a profile that
+// shares an address with one profile and a server_name with another links all
+// three -- so this is a union-find over the profiles' cache keys rather than a
+// single pass that compares each profile only with the ones kept before it,
+// which would let the order of the profiles decide whether two of them are one
+// cache. A group's root is always its smallest index, so the result names the
+// earliest declared profile and does not depend on the order of the keys.
+func cacheGroups(profiles []catalog.ResolverProfile) []int {
+	root := make([]int, len(profiles))
+	for index := range root {
+		root[index] = index
+	}
+	find := func(index int) int {
+		for root[index] != index {
+			index = root[index]
+		}
+		return index
+	}
+	owner := make(map[string]int)
+	for index, profile := range profiles {
+		for _, key := range profile.CacheKeys() {
+			first, seen := owner[key]
+			if !seen {
+				owner[key] = index
+				continue
+			}
+			earlier, later := find(first), find(index)
+			if later < earlier {
+				earlier, later = later, earlier
+			}
+			root[later] = earlier
+		}
+	}
+	for index := range root {
+		root[index] = find(index)
+	}
+	return root
+}
+
+// cacheMissPrefers reports whether candidate should be kept for its cache
+// instead of current: earliest declared profile, then the documented protocol
+// order, then earliest declared address. catalog.Expand copies each address
+// from the profile, so the index lookup always finds it.
+func cacheMissPrefers(candidate, current catalog.Target, declared map[string]int) bool {
+	return cmp.Or(
+		cmp.Compare(declared[candidate.Resolver.ID], declared[current.Resolver.ID]),
+		catalog.CompareProtocols(candidate.Protocol, current.Protocol),
+		cmp.Compare(slices.Index(candidate.Resolver.Addresses, candidate.Address), slices.Index(current.Resolver.Addresses, current.Address)),
+	) < 0
+}
+
+// cacheMissDroppedNames lists the endpoints cache-miss mode dropped, for its
+// warning. Under --redact-system an endpoint of a system resolver is counted
+// rather than named: the report redacts only the system endpoints it
+// measured, and a dropped one's ID still spells out the address -- which,
+// now that a system resolver can collapse into a bundled or named profile at
+// the same address, would also say which resolver the host uses.
+func cacheMissDroppedNames(dropped []cacheMissDrop, redactSystem bool) string {
+	names := make([]string, 0, len(dropped))
+	redacted := 0
+	for _, drop := range dropped {
+		if redactSystem && report.IsSystemTarget(drop.target) {
+			redacted++
+			continue
+		}
+		names = append(names, drop.target.ID())
+	}
+	if redacted > 0 {
+		names = append(names, fmt.Sprintf("%d redacted system endpoint(s)", redacted))
+	}
+	return strings.Join(names, ", ")
 }
 
 func newProgressRenderer(writer io.Writer, interactive bool, selected []catalog.Protocol, targets []catalog.Target) *progressRenderer {
@@ -1030,11 +1152,11 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if len(targets) == 0 {
 		return errors.New("no resolver supports the selected protocol(s)")
 	}
-	var cacheMissDropped []string
+	var cacheMissDropped []cacheMissDrop
 	if config.cacheMiss {
-		targets, cacheMissDropped = cacheMissTargets(targets)
+		targets, cacheMissDropped = cacheMissTargets(selection.all(), targets)
 	}
-	if err := validateAssertionTargets(assertions, targets); err != nil {
+	if err := validateAssertionTargets(assertions, targets, cacheMissDropped, config.redactSystem); err != nil {
 		return err
 	}
 	// The destination is otherwise first touched after the benchmark, so a
@@ -1142,7 +1264,7 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if len(cacheMissDropped) > 0 {
 		result.Warnings = append(result.Warnings, benchmark.RunWarning(fmt.Sprintf(
 			"cache-miss mode measures each resolver once so no name is asked twice at one resolver; it dropped %d endpoint(s) that share a cache with one already selected: %s",
-			len(cacheMissDropped), strings.Join(cacheMissDropped, ", "))))
+			len(cacheMissDropped), cacheMissDroppedNames(cacheMissDropped, config.redactSystem))))
 	}
 	result.Warnings = append(result.Warnings, familyWarnings...)
 	writer, finalizeOutput, err := outputWriterFunc(config.output)
