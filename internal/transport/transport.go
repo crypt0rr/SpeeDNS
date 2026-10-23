@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ type Factory interface {
 type doqStream interface {
 	io.ReadWriter
 	Close() error
+	CancelRead(quic.StreamErrorCode)
 	SetDeadline(time.Time) error
 }
 
@@ -93,6 +95,57 @@ func (p dialPlan) openContext(ctx context.Context) (context.Context, context.Can
 	return context.WithDeadline(ctx, deadline)
 }
 
+// preferring returns the plan with address moved to the front and the other
+// candidates kept in their configured order. An address that is not one of
+// the candidates leaves the order unchanged.
+func (p dialPlan) preferring(address string) dialPlan {
+	for index, candidate := range p.addresses {
+		if candidate != address {
+			continue
+		}
+		ordered := make([]string, 0, len(p.addresses))
+		ordered = append(ordered, candidate)
+		ordered = append(ordered, p.addresses[:index]...)
+		ordered = append(ordered, p.addresses[index+1:]...)
+		return dialPlan{addresses: ordered, timeout: p.timeout}
+	}
+	return p
+}
+
+// after returns the candidate that follows address in configured order,
+// wrapping around at the end. An address that is not one of the candidates
+// is returned unchanged.
+func (p dialPlan) after(address string) string {
+	for index, candidate := range p.addresses {
+		if candidate == address {
+			return p.addresses[(index+1)%len(p.addresses)]
+		}
+	}
+	return address
+}
+
+// stickyReopen returns the reconnect function of a session whose first
+// connection went to start. Unlike Open, a reconnect runs inside one query's
+// deadline, so starting again at the first configured candidate let one that
+// silently drops traffic spend the whole budget of every later query, and the
+// address the session had actually reached was never tried in time. A
+// reconnect therefore tries the address that last connected first and the
+// others in configured order. When the budget runs out regardless, the next
+// reconnect starts at the following candidate, so successive queries work
+// through the list rather than all failing on the same address. Sessions call
+// the result with their mutex held, which is what serialises start.
+func stickyReopen[C any](plan dialPlan, start string, open func(context.Context, dialPlan) (C, string, error)) func(context.Context) (C, string, error) {
+	return func(ctx context.Context) (C, string, error) {
+		conn, address, err := open(ctx, plan.preferring(start))
+		if err == nil {
+			start = address
+		} else if ctx.Err() != nil {
+			start = plan.after(start)
+		}
+		return conn, address, err
+	}
+}
+
 func (p dialPlan) failed(errs []error) error {
 	if len(errs) == 0 {
 		return errors.New("no connection candidates configured")
@@ -105,6 +158,14 @@ func (p dialPlan) failed(errs []error) error {
 }
 
 func (p dialPlan) openStream(ctx context.Context, tlsConfig *tls.Config) (net.Conn, string, error) {
+	return p.openTrackedStream(ctx, tlsConfig, nil)
+}
+
+// openTrackedStream is openStream with a hook that sees every TCP connection
+// before TLS runs over it. DoH uses it to keep hold of connections owned by
+// the HTTP transport; wrapping underneath TLS leaves net/http the *tls.Conn it
+// needs to negotiate HTTP/2.
+func (p dialPlan) openTrackedStream(ctx context.Context, tlsConfig *tls.Config, track func(net.Conn) net.Conn) (net.Conn, string, error) {
 	dialer := &net.Dialer{Timeout: p.timeout}
 	errs := make([]error, 0, len(p.addresses))
 	for _, address := range p.addresses {
@@ -117,6 +178,9 @@ func (p dialPlan) openStream(ctx context.Context, tlsConfig *tls.Config) (net.Co
 				break
 			}
 			continue
+		}
+		if track != nil {
+			conn = track(conn)
 		}
 		if tlsConfig != nil {
 			tlsConn := tls.Client(conn, tlsConfig.Clone())
@@ -265,14 +329,17 @@ var resolveUDPAddress = func(ctx context.Context, address string) (string, error
 // timed region on every single query, measuring the local resolver's latency
 // as if it were the target's. METHODOLOGY.md states that UDP reports the DNS
 // transaction time only, and a bootstrap lookup is not part of that
-// transaction. An address that is already a literal costs nothing here.
+// transaction. An address that is already a literal costs nothing here. That
+// includes a zoned link-local literal such as fe80::1%en0: net.ParseIP rejects
+// the zone, and the resolver it used to fall through to returns the address
+// without it, so every query went to an undialable fe80:: destination.
 func (f *udpFactory) Open(ctx context.Context) (Session, error) {
 	address := f.address
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("invalid UDP endpoint %q: %w", address, err)
 	}
-	if net.ParseIP(host) == nil {
+	if _, literalErr := netip.ParseAddr(host); literalErr != nil {
 		resolvedHost, resolveErr := resolveUDPAddress(ctx, host)
 		if resolveErr != nil {
 			return nil, fmt.Errorf("resolve UDP endpoint %q: %w", host, resolveErr)
@@ -300,8 +367,10 @@ func (f *streamFactory) Open(ctx context.Context) (Session, error) {
 		return nil, err
 	}
 	return &streamSession{
-		conn:         conn,
-		reopen:       func(ctx context.Context) (net.Conn, string, error) { return plan.openStream(ctx, f.tlsConfig) },
+		conn: conn,
+		reopen: stickyReopen(plan, dialAddress, func(ctx context.Context, order dialPlan) (net.Conn, string, error) {
+			return order.openStream(ctx, f.tlsConfig)
+		}),
 		timeout:      f.timeout,
 		secure:       f.tlsConfig != nil,
 		dialAddress:  dialAddress,
@@ -322,14 +391,48 @@ func (s *udpSession) DialAddress() string { return s.address }
 func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	query := newQuery(name, qtype, dns.Id(), false, s.queryOptions)
 	client := &dns.Client{Net: "udp", Timeout: s.timeout}
-	response, _, err := client.ExchangeContext(ctx, query, s.address)
+	conn, err := client.DialContext(ctx, s.address)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateResponse(response, name, qtype, query.Id, false); err != nil {
+	defer conn.Close()
+	// This is the exchange dns.Client.ExchangeContext performs, written out
+	// so the reply's datagram stays available: miekg/dns ignores bytes after
+	// a complete message, and only the wire form shows them. The receive
+	// buffer, the deadline and the handling of stale replies are unchanged.
+	conn.UDPSize = ednsUDPSize
+	_ = conn.SetDeadline(queryDeadline(ctx, s.timeout))
+	if err := conn.WriteMsg(query); err != nil {
 		return nil, err
 	}
-	return response, nil
+	for {
+		wire, err := conn.ReadMsgHeader(nil)
+		if err != nil {
+			return nil, err
+		}
+		response := new(dns.Msg)
+		if err := response.Unpack(wire); err != nil {
+			return nil, err
+		}
+		// ExchangeContext verified a TSIG record against the client's key
+		// set, which is empty because SpeeDNS never signs a query, so every
+		// signed reply failed with this error. That stays so.
+		if response.IsTsig() != nil {
+			return nil, dns.ErrSecret
+		}
+		// A reply with another ID can be the late answer to an earlier query
+		// that timed out, so it is skipped rather than failing this one.
+		if response.Id != query.Id {
+			continue
+		}
+		if err := validateResponse(response, name, qtype, query.Id, false); err != nil {
+			return nil, err
+		}
+		if err := rejectTrailingBytes(wire, "UDP"); err != nil {
+			return nil, err
+		}
+		return response, nil
+	}
 }
 
 func (s *udpSession) Close() error { return nil }
@@ -512,29 +615,74 @@ func newDoHFactory(target catalog.Target, timeout time.Duration, options QueryOp
 	}, nil
 }
 
-func (f *doHFactory) Open(context.Context) (Session, error) {
+// Open dials the session's first connection here, under the caller's context,
+// as the stream and DoQ factories do. Left to the first exchange, that dial
+// ran inside the query's deadline, so a first candidate that stalled spent the
+// whole budget and the request failed before a later candidate was tried; here
+// every candidate gets its own timeout. A cold probe's clock starts before
+// Open, so it still covers this handshake.
+func (f *doHFactory) Open(ctx context.Context) (Session, error) {
+	session := f.newSession()
+	conn, address, err := session.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The connection is recorded once, here, so the exchange that takes it
+	// over is not counted as a reconnect.
+	session.pending = conn
+	session.dialAddr = address
+	session.connections = 1
+	return session, nil
+}
+
+// newSession builds a session and its private HTTP client without touching
+// the network.
+func (f *doHFactory) newSession() *doHSession {
 	plan := f.connectionPlan
 	if len(plan.addresses) == 0 {
 		plan = singleDialPlan(f.dialAddr, f.timeout)
 	}
-	session := &doHSession{endpoint: f.url, queryOptions: f.queryOptions}
 	tlsConfig := newDoHTLSConfig(f.serverName)
 	if len(tlsConfig.NextProtos) == 0 {
 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
+	}
+	session := &doHSession{
+		endpoint:     f.url,
+		queryOptions: f.queryOptions,
+		plan:         plan,
+		tlsConfig:    tlsConfig,
+		conns:        make(map[*doHConn]struct{}),
 	}
 	transport := &http.Transport{
 		ForceAttemptHTTP2:      true,
 		TLSClientConfig:        tlsConfig,
 		MaxResponseHeaderBytes: doHMaxResponseHeaderBytes,
+		// Without a health check, an HTTP/2 connection that dies without a
+		// FIN or RST stays pooled: each timed-out request resets its stream,
+		// but net/http keeps counting the slot until a PING is answered, so
+		// the session failed once per stream slot the server allows before
+		// it opened a new connection. With one, a connection silent for a
+		// timeout is pinged and closed when the ping goes unanswered for
+		// another, and the next query reconnects, about as soon as TCP, DoT
+		// and DoQ do after their first failure. The interval is never shorter
+		// than the query timeout, so pings cannot crowd a measured exchange.
+		HTTP2: &http.HTTP2Config{SendPingTimeout: f.timeout, PingTimeout: f.timeout},
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			conn, address, err := plan.openStream(ctx, tlsConfig)
-			if err == nil {
-				// http.Transport re-dials transparently when a pooled
-				// connection is gone, so this hook is the only place a new
-				// TCP+TLS(+HTTP/2) handshake becomes observable.
-				session.recordConnection(address)
+			if conn := session.takePending(); conn != nil {
+				return conn, nil
 			}
-			return conn, err
+			conn, address, err := session.dial(ctx)
+			if err != nil {
+				return nil, err
+			}
+			// http.Transport re-dials transparently when a pooled
+			// connection is gone, so this hook is the only place a new
+			// TCP+TLS(+HTTP/2) handshake becomes observable.
+			if err := session.recordConnection(address); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return conn, nil
 		},
 	}
 	client := &http.Client{
@@ -552,7 +700,7 @@ func (f *doHFactory) Open(context.Context) (Session, error) {
 	}
 	session.client = client
 	session.transport = transport
-	return session, nil
+	return session
 }
 
 func sameHost(a, b *url.URL) bool { return strings.EqualFold(a.Hostname(), b.Hostname()) }
@@ -591,19 +739,73 @@ type doHSession struct {
 	transport       *http.Transport
 	endpoint        string
 	queryOptions    QueryOptions
+	plan            dialPlan
+	tlsConfig       *tls.Config
 	mu              sync.RWMutex
 	dialAddr        string
 	connections     uint64
 	lastReconnected bool
+	// pending is the connection Open dialled, until the transport's first
+	// dial takes it over.
+	pending net.Conn
+	// conns holds the TCP connection under every TLS connection the session
+	// dialled that has not been closed yet.
+	conns  map[*doHConn]struct{}
+	closed bool
+}
+
+// doHConn is the TCP connection under one of a session's TLS connections. It
+// removes itself from the session when the HTTP transport, or the session,
+// closes it.
+type doHConn struct {
+	net.Conn
+	session *doHSession
+}
+
+func (c *doHConn) Close() error {
+	c.session.mu.Lock()
+	delete(c.session.conns, c)
+	c.session.mu.Unlock()
+	return c.Conn.Close()
+}
+
+// dial opens one connection through the session's ordered candidates and
+// tracks the TCP connection under it.
+func (s *doHSession) dial(ctx context.Context) (net.Conn, string, error) {
+	return s.plan.openTrackedStream(ctx, s.tlsConfig, s.track)
+}
+
+func (s *doHSession) track(conn net.Conn) net.Conn {
+	tracked := &doHConn{Conn: conn, session: s}
+	s.mu.Lock()
+	s.conns[tracked] = struct{}{}
+	s.mu.Unlock()
+	return tracked
+}
+
+// takePending hands the connection Open dialled to the transport, once.
+func (s *doHSession) takePending() net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conn := s.pending
+	s.pending = nil
+	return conn
 }
 
 // recordConnection is called from the transport dial hook, which runs on the
 // http.Transport's own goroutines, once per newly opened HTTPS connection.
-func (s *doHSession) recordConnection(address string) {
+// net/http finishes a dial even after the request that started it has gone,
+// so one can complete after Close; it is refused, because nothing would ever
+// close it.
+func (s *doHSession) recordConnection(address string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("DoH session is closed")
+	}
 	s.dialAddr = address
 	s.connections++
-	s.mu.Unlock()
+	return nil
 }
 
 // beginQuery resets the per-query reconnect state and returns the number of
@@ -615,13 +817,12 @@ func (s *doHSession) beginQuery() uint64 {
 	return s.connections
 }
 
-// endQuery records whether the exchange had to replace a connection that the
-// session had already established. The very first connection is opened lazily
-// by the first exchange and is the DoH analogue of the dial the stream
-// transports perform in Open, so it is not counted as a reconnect.
+// endQuery records whether the exchange had to open a connection. Open has
+// already recorded the session's first connection, as the stream transports
+// do, so only a connection dialled during an exchange is a reconnect.
 func (s *doHSession) endQuery(connectionsBefore uint64) {
 	s.mu.Lock()
-	s.lastReconnected = connectionsBefore > 0 && s.connections > connectionsBefore
+	s.lastReconnected = s.connections > connectionsBefore
 	s.mu.Unlock()
 }
 
@@ -682,6 +883,9 @@ func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	if err := validateResponse(message, name, qtype, 0, true); err != nil {
 		return nil, err
 	}
+	if err := rejectTrailingBytes(body, "DoH"); err != nil {
+		return nil, err
+	}
 	return message, nil
 }
 
@@ -693,8 +897,22 @@ func drainHTTPBody(body io.Reader) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, doHMaxResponseBodyBytes))
 }
 
+// Close tears down every connection the session opened. Closing the idle ones
+// is not enough: when the last exchange timed out, net/http has not released
+// that request's stream at the moment Close runs, so its connection is not
+// idle yet, and with the private transport dropped it stayed open, read loop
+// and all, until the server gave up on it.
 func (s *doHSession) Close() error {
 	s.transport.CloseIdleConnections()
+	s.mu.Lock()
+	s.closed = true
+	s.pending = nil
+	conns := s.conns
+	s.conns = make(map[*doHConn]struct{})
+	s.mu.Unlock()
+	for conn := range conns {
+		_ = conn.Close()
+	}
 	return nil
 }
 
@@ -716,11 +934,7 @@ func (f *doqFactory) dialConfig() *quic.Config {
 	}
 }
 
-func (f *doqFactory) open(ctx context.Context) (doqConn, string, error) {
-	plan := f.connectionPlan
-	if len(plan.addresses) == 0 {
-		plan = singleDialPlan(f.address, f.timeout)
-	}
+func (f *doqFactory) open(ctx context.Context, plan dialPlan) (doqConn, string, error) {
 	errs := make([]error, 0, len(plan.addresses))
 	for _, address := range plan.addresses {
 		openCtx, cancel := plan.openContext(ctx)
@@ -738,13 +952,17 @@ func (f *doqFactory) open(ctx context.Context) (doqConn, string, error) {
 }
 
 func (f *doqFactory) Open(ctx context.Context) (Session, error) {
-	conn, dialAddress, err := f.open(ctx)
+	plan := f.connectionPlan
+	if len(plan.addresses) == 0 {
+		plan = singleDialPlan(f.address, f.timeout)
+	}
+	conn, dialAddress, err := f.open(ctx, plan)
 	if err != nil {
 		return nil, err
 	}
 	return &doqSession{
 		conn:         conn,
-		reopen:       f.open,
+		reopen:       stickyReopen(plan, dialAddress, f.open),
 		timeout:      f.timeout,
 		dialAddress:  dialAddress,
 		queryOptions: f.queryOptions,
@@ -812,8 +1030,19 @@ func (s *doqSession) Query(ctx context.Context, name string, qtype uint16) (*dns
 	if err != nil {
 		return nil, s.fatal(err)
 	}
+	// The response has been read in full, but quic-go forgets a stream only
+	// once its receive side is finished as well. A server that sends its FIN
+	// in a later frame, or never, left the state of every answered query's
+	// stream behind until the connection closed. CancelRead does not block,
+	// so it adds nothing to the measured exchange, and it does nothing once
+	// the FIN has been read.
+	stream.CancelRead(doqNoError)
 	return response, nil
 }
+
+// doqNoError is DOQ_NO_ERROR (RFC 9250 section 4.3), the code for closing a
+// stream when there is no error to signal.
+const doqNoError quic.StreamErrorCode = 0
 
 func (s *doqSession) ensureConn(ctx context.Context) error {
 	if s.conn != nil {
@@ -897,18 +1126,22 @@ func (f framedStream) query(packed []byte, name string, qtype, queryID uint16, z
 	if err := validateResponse(response, name, qtype, queryID, zeroID); err != nil {
 		return nil, err
 	}
+	if err := rejectTrailingBytes(responseBytes, f.label); err != nil {
+		return nil, err
+	}
 	return response, nil
 }
 
 // exchange writes one length-prefixed request and reads the length-prefixed
-// response bytes.
+// response bytes. The prefix and the message go out in a single write, as RFC
+// 7766 section 8 asks: Go disables Nagle's algorithm, so two writes could put
+// the prefix in a TCP segment of its own, and they cost DoT a separate TLS
+// record for two bytes on every query.
 func (f framedStream) exchange(packed []byte) ([]byte, error) {
-	var prefix [2]byte
-	binary.BigEndian.PutUint16(prefix[:], uint16(len(packed)))
-	if _, err := f.stream.Write(prefix[:]); err != nil {
-		return nil, err
-	}
-	if _, err := f.stream.Write(packed); err != nil {
+	request := make([]byte, 2+len(packed))
+	binary.BigEndian.PutUint16(request, uint16(len(packed)))
+	copy(request[2:], packed)
+	if _, err := f.stream.Write(request); err != nil {
 		return nil, err
 	}
 	if f.closeSend != nil {
@@ -916,6 +1149,7 @@ func (f framedStream) exchange(packed []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
+	var prefix [2]byte
 	if _, err := io.ReadFull(f.stream, prefix[:]); err != nil {
 		return nil, err
 	}
@@ -930,6 +1164,62 @@ func (f framedStream) exchange(packed []byte) ([]byte, error) {
 	return responseBytes, nil
 }
 
+// dnsHeaderLength is the fixed size of a DNS message header (RFC 1035 section
+// 4.1.1).
+const dnsHeaderLength = 12
+
+// wireLength returns how many leading bytes of wire the DNS message occupies,
+// found by walking the sections its header counts describe. miekg/dns stops
+// unpacking once those sections are read and ignores whatever follows, so the
+// wire form is the only place appended bytes show. Comparing with a re-pack
+// would not work: name compression lets a valid reply be shorter or longer
+// than its re-encoding. Like the unpacker, the walk ends where the message
+// does when the counts claim more records than it holds.
+func wireLength(wire []byte) (int, error) {
+	if len(wire) < dnsHeaderLength {
+		return 0, dns.ErrShortRead
+	}
+	questions := int(binary.BigEndian.Uint16(wire[4:]))
+	records := int(binary.BigEndian.Uint16(wire[6:])) + int(binary.BigEndian.Uint16(wire[8:])) + int(binary.BigEndian.Uint16(wire[10:]))
+	offset := dnsHeaderLength
+	var err error
+	for index := 0; index < questions && offset < len(wire); index++ {
+		if _, offset, err = dns.UnpackDomainName(wire, offset); err != nil {
+			return 0, err
+		}
+		// QTYPE and QCLASS follow the name.
+		if offset += 4; offset > len(wire) {
+			return 0, dns.ErrBuf
+		}
+	}
+	for index := 0; index < records && offset < len(wire); index++ {
+		if _, offset, err = dns.UnpackRR(wire, offset); err != nil {
+			return 0, err
+		}
+	}
+	return offset, nil
+}
+
+// rejectTrailingBytes fails a reply whose wire form carries bytes after the
+// DNS message. miekg/dns accepts such a reply as the message alone, so a body,
+// frame or datagram that a broken proxy or middlebox extended was scored as a
+// clean answer; it is a protocol error instead. Callers run it after
+// validateResponse, so a reply that was rejected before keeps its reason.
+func rejectTrailingBytes(wire []byte, label string) error {
+	length, err := wireLength(wire)
+	if err != nil {
+		return fmt.Errorf("measure %s response: %w", label, err)
+	}
+	if length < len(wire) {
+		return fmt.Errorf("%s response has trailing data after the DNS message (%d of %d bytes)", label, length, len(wire))
+	}
+	return nil
+}
+
+// ednsUDPSize is the EDNS(0) UDP payload size every query advertises, and so
+// the size of the buffer a UDP reply is read into.
+const ednsUDPSize = 1232
+
 func newQuery(name string, qtype, id uint16, padded bool, options QueryOptions) *dns.Msg {
 	query := &dns.Msg{
 		MsgHdr: dns.MsgHdr{
@@ -939,7 +1229,7 @@ func newQuery(name string, qtype, id uint16, padded bool, options QueryOptions) 
 		},
 		Question: []dns.Question{{Name: dns.Fqdn(name), Qtype: qtype, Qclass: dns.ClassINET}},
 	}
-	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 1232}}
+	opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: ednsUDPSize}}
 	if options.DNSSEC {
 		// RFC 4035: the DO bit asks the resolver for DNSSEC records and, for a
 		// validating resolver, for validated answers with the AD flag. It is
@@ -1001,7 +1291,9 @@ func validateResponse(response *dns.Msg, name string, qtype uint16, queryID uint
 		return fmt.Errorf("DNS transaction ID mismatch: got %d, want %d", response.Id, queryID)
 	}
 	if zeroID && response.Id != 0 {
-		return fmt.Errorf("DoQ transaction ID must be zero, got %d", response.Id)
+		// DoH and DoQ both send ID 0 (RFC 8484 section 4.1, RFC 9250
+		// section 4.2.1), so the message names neither.
+		return fmt.Errorf("DNS transaction ID must be zero, got %d", response.Id)
 	}
 	if len(response.Question) != 1 {
 		return fmt.Errorf("DNS response has %d questions, want 1", len(response.Question))

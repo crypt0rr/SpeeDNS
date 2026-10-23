@@ -3,11 +3,14 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,11 +39,8 @@ func (c *delayedStreamConn) Read(p []byte) (int, error) {
 func mismatchedResponseConn() *scriptedConn {
 	conn := &scriptedConn{}
 	conn.onWrite = func(p []byte) {
-		if len(p) <= 2 {
-			return
-		}
-		query := new(dns.Msg)
-		if err := query.Unpack(p); err != nil || len(query.Question) != 1 {
+		query, ok := unframeQuery(p)
+		if !ok {
 			return
 		}
 		conn.readBuf.Write(frameMessage(replyFor("other.example", query.Question[0].Qtype, query.Id)))
@@ -54,8 +54,7 @@ func TestStreamSessionReconnectsAfterFatalErrors(t *testing.T) {
 		first func() net.Conn
 	}{
 		{name: "deadline", first: func() net.Conn { return &scriptedConn{setDeadlineErr: errors.New("deadline failed")} }},
-		{name: "prefix write", first: func() net.Conn { return &scriptedConn{writeErrAt: 1} }},
-		{name: "payload write", first: func() net.Conn { return &scriptedConn{writeErrAt: 2} }},
+		{name: "write", first: func() net.Conn { return &scriptedConn{writeErrAt: 1} }},
 		{name: "prefix read", first: func() net.Conn { return &scriptedConn{readErr: errors.New("prefix read failed")} }},
 		{name: "empty response", first: func() net.Conn {
 			conn := &scriptedConn{}
@@ -390,5 +389,186 @@ func TestDoTSessionRecoversAfterServerClosesConnection(t *testing.T) {
 	result := <-done
 	if result.err != nil || result.connections != 2 || result.queries != 2 {
 		t.Fatalf("DoT recovery fixture = %#v, want two connections and two queries", result)
+	}
+}
+
+// candidateMode is what a connection candidate fixture does with one
+// accepted connection.
+type candidateMode int
+
+const (
+	// candidateAnswers answers every query until the client goes away.
+	candidateAnswers candidateMode = iota
+	// candidateDropsSecond answers one query, then reads the next and drops
+	// the connection without answering, as a mid-session loss does.
+	candidateDropsSecond
+	// candidateSilent accepts and never speaks, like a path that drops
+	// traffic: a TLS handshake against it spends the whole budget.
+	candidateSilent
+)
+
+func listenLoopback(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return listener
+}
+
+// serveDoTCandidate runs a DoT connection candidate on listener. mode picks
+// the behaviour of each accepted connection by its 1-based index; the counter
+// reports how many connections the candidate accepted.
+func serveDoTCandidate(t *testing.T, listener net.Listener, config *tls.Config, mode func(connection int32) candidateMode) *atomic.Int32 {
+	t.Helper()
+	accepts := new(atomic.Int32)
+	var mu sync.Mutex
+	var held []net.Conn
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, conn)
+			mu.Unlock()
+			switch mode(accepts.Add(1)) {
+			case candidateSilent:
+			case candidateDropsSecond:
+				go answerThenDrop(tls.Server(conn, config))
+			default:
+				go serveFramedQueries(tls.Server(conn, config))
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+	})
+	return accepts
+}
+
+func answerThenDrop(conn net.Conn) {
+	defer conn.Close()
+	query, err := readFramedQuery(conn)
+	if err != nil {
+		return
+	}
+	if _, err := conn.Write(frameMessage(replyFor(query.Question[0].Name, query.Question[0].Qtype, query.Id))); err != nil {
+		return
+	}
+	_, _ = readFramedQuery(conn)
+}
+
+// queryOutcomes runs count queries, each under its own deadline as the
+// benchmark does, and describes each one as ok, failed, reconnected (a
+// reconnect that answered) or reconnect-failed.
+func queryOutcomes(t *testing.T, session Session, count int, timeout time.Duration) []string {
+	t.Helper()
+	reconnects, ok := session.(interface{ LastQueryReconnected() bool })
+	if !ok {
+		t.Fatalf("%T does not report reconnects", session)
+	}
+	outcomes := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		_, err := session.Query(ctx, "example.com", dns.TypeA)
+		cancel()
+		switch reconnected := reconnects.LastQueryReconnected(); {
+		case err == nil && reconnected:
+			outcomes = append(outcomes, "reconnected")
+		case err == nil:
+			outcomes = append(outcomes, "ok")
+		case reconnected:
+			outcomes = append(outcomes, "reconnect-failed")
+		default:
+			outcomes = append(outcomes, "failed")
+		}
+	}
+	return outcomes
+}
+
+func dotFixtureFactory(roots *x509.CertPool, timeout time.Duration, addresses ...string) *streamFactory {
+	return &streamFactory{
+		connectionPlan: dialPlan{addresses: addresses, timeout: timeout},
+		timeout:        timeout,
+		tlsConfig:      &tls.Config{MinVersion: tls.VersionTLS12, ServerName: "dns.example", RootCAs: roots},
+	}
+}
+
+// TestDoTReconnectReturnsToTheCandidateThatConnected pins sticky reconnects.
+// The first bootstrap candidate is a black hole that Open gets past with its
+// own budget. After a mid-session loss the reconnect runs inside one query's
+// deadline, and starting again at the black hole spent all of it, so every
+// remaining query failed although the second candidate was healthy.
+func TestDoTReconnectReturnsToTheCandidateThatConnected(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	certificate, roots := testServerCertificate(t, "dns.example")
+	serverConfig := &tls.Config{Certificates: []tls.Certificate{certificate}}
+	blackhole, good := listenLoopback(t), listenLoopback(t)
+	blackholeAccepts := serveDoTCandidate(t, blackhole, serverConfig, func(int32) candidateMode { return candidateSilent })
+	serveDoTCandidate(t, good, serverConfig, func(connection int32) candidateMode {
+		if connection == 1 {
+			return candidateDropsSecond
+		}
+		return candidateAnswers
+	})
+
+	session, err := dotFixtureFactory(roots, timeout, blackhole.Addr().String(), good.Addr().String()).Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	got := strings.Join(queryOutcomes(t, session, 4, timeout), ",")
+	if want := "ok,failed,reconnected,ok"; got != want {
+		t.Fatalf("DoT queries after a mid-session loss = %s, want %s", got, want)
+	}
+	if address := session.(*streamSession).DialAddress(); address != good.Addr().String() {
+		t.Fatalf("DoT reconnected to %q, want %q", address, good.Addr().String())
+	}
+	if accepts := blackholeAccepts.Load(); accepts != 1 {
+		t.Fatalf("the black-hole candidate was dialled %d times, want only by Open", accepts)
+	}
+}
+
+// TestDoTReconnectMovesOnWhenTheLastGoodCandidateGoesSilent covers the other
+// half: when the address that last connected is the one that stopped
+// answering, its reconnect fails once and the next one starts at the
+// following candidate instead of spending every later budget on it again.
+func TestDoTReconnectMovesOnWhenTheLastGoodCandidateGoesSilent(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	certificate, roots := testServerCertificate(t, "dns.example")
+	serverConfig := &tls.Config{Certificates: []tls.Certificate{certificate}}
+	first, second := listenLoopback(t), listenLoopback(t)
+	firstAccepts := serveDoTCandidate(t, first, serverConfig, func(connection int32) candidateMode {
+		if connection == 1 {
+			return candidateDropsSecond
+		}
+		return candidateSilent
+	})
+	secondAccepts := serveDoTCandidate(t, second, serverConfig, func(int32) candidateMode { return candidateAnswers })
+
+	session, err := dotFixtureFactory(roots, timeout, first.Addr().String(), second.Addr().String()).Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	got := strings.Join(queryOutcomes(t, session, 5, timeout), ",")
+	if want := "ok,failed,reconnect-failed,reconnected,ok"; got != want {
+		t.Fatalf("DoT queries after the last good candidate went silent = %s, want %s", got, want)
+	}
+	if address := session.(*streamSession).DialAddress(); address != second.Addr().String() {
+		t.Fatalf("DoT reconnected to %q, want %q", address, second.Addr().String())
+	}
+	if firstDials, secondDials := firstAccepts.Load(), secondAccepts.Load(); firstDials != 2 || secondDials != 1 {
+		t.Fatalf("candidate dials = %d/%d, want 2/1", firstDials, secondDials)
 	}
 }

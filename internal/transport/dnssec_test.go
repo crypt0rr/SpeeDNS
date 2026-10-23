@@ -136,9 +136,9 @@ func TestStreamSessionSendsDOBitOnTheWire(t *testing.T) {
 	if _, err := session.Query(context.Background(), "example.com", dns.TypeA); err != nil {
 		t.Fatal(err)
 	}
-	sent := new(dns.Msg)
-	if err := sent.Unpack(conn.lastWrite); err != nil {
-		t.Fatal(err)
+	sent, ok := unframeQuery(conn.lastWrite)
+	if !ok {
+		t.Fatalf("stream query is not one framed write: %x", conn.lastWrite)
 	}
 	opt := sent.IsEdns0()
 	if opt == nil || !opt.Do() {
