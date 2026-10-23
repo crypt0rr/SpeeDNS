@@ -524,7 +524,8 @@ separate runs used different names under different network conditions, and
 use `--profile-view` on an ordinary run. The two rules keep any name from
 being asked twice at one resolver, but they do not prove the resolver
 recursed: a validating resolver using RFC 8198 aggressive NSEC/NSEC3 synthesis
-can answer an unseen name from a cached denial proof. Read
+can answer an unseen name from a cached denial proof, including one cached for
+a name SpeeDNS generated earlier in the run. Read
 [`CACHE_MISS.md`](CACHE_MISS.md) before using the mode, especially for
 ownership, traffic, and abuse limits.
 

@@ -1973,9 +1973,6 @@ func TestParseQueryTypesRejectsZoneTransferAndPseudoTypes(t *testing.T) {
 	}
 }
 
-// TestCacheMissWarnsWhenMoreThanOneProtocolIsMeasured pins the disclosure that
-// only the first measured protocol group observes a genuine cache miss: every
-// group replays the same generated names against the same resolver cache.
 // TestCacheMissMeasuresEachResolverExactlyOnce pins the #108 fix. A resolver
 // holds one cache across every transport and address it offers, so measuring it
 // twice makes the second measurement a warm read of a name the first already

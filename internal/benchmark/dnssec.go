@@ -98,8 +98,8 @@ type DNSSECAssessment struct {
 // report keeps target-ID order no matter which probe finishes first.
 func probeDNSSECTargets(ctx context.Context, runners []*targetRunner, concurrency int, probed func(int)) {
 	// Queue every runner up front: a worker that finds the run cancelled gets
-	// false from probeDNSSEC, so no target begins probing after an interrupt
-	// and the dispatcher never has to race a cancellation against a send.
+	// false from probeDNSSEC, so no probe is sent after an interrupt and the
+	// dispatcher never has to race a cancellation against a send.
 	jobs := make(chan *targetRunner, len(runners))
 	for _, runner := range runners {
 		jobs <- runner
@@ -125,13 +125,21 @@ func probeDNSSECTargets(ctx context.Context, runners []*targetRunner, concurrenc
 // probeDNSSEC runs the pinned probes on the already warmed session, after all
 // measured rounds for the target, so it can never influence latency samples.
 // The probe names are never added to the measured query matrix. It reports
-// whether the probes ran.
+// whether both probes ran.
 func (runner *targetRunner) probeDNSSEC(ctx context.Context) bool {
 	if !runner.opts.DNSSEC || !runner.ready || runner.session == nil || ctx.Err() != nil {
 		return false
 	}
 	names := runner.opts.DNSSECProbe.withDefaults()
 	signed := runner.dnssecProbe(ctx, DNSSECRoleSigned, names.Signed)
+	// An interrupt during the signed probe must not start the bogus one. Its
+	// cancelled context would fail at once, and the verdict would then call
+	// the resolver inconclusive over a probe the operator cut short. The
+	// target is left without a verdict, like every target the pool had not
+	// reached yet, and is marked incomplete with them.
+	if ctx.Err() != nil {
+		return false
+	}
 	bogus := runner.dnssecProbe(ctx, DNSSECRoleBogus, names.Bogus)
 	assessment := assessDNSSEC(signed, bogus)
 	runner.result.DNSSEC = &assessment

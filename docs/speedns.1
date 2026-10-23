@@ -96,7 +96,8 @@ run therefore cannot produce a sound transport comparison, and speedns diff
 refuses cache-miss reports by design. The rules keep any name from being asked
 twice at one resolver; they do not prove the resolver recursed, because a
 validating resolver using RFC 8198 aggressive NSEC/NSEC3 synthesis can answer
-an unseen name from a cached denial proof.
+an unseen name from a cached denial proof, including one cached for a name
+SpeeDNS generated earlier in the run.
 .TP
 .B --cache-miss-sample N
 Generate N unique reserved-zone names, at most 20 and 20 by default, for
@@ -130,8 +131,9 @@ selection, or a lower --timeout shortens such a run.
 .B --concurrency N
 Set the maximum number of targets prepared at once, of measured exchanges in
 flight, and of targets receiving --dnssec probes, per transport. Defaults to 4.
-Unresponsive targets beyond this limit stretch every measured round by another
-timeout.
+Every measured round waits about ceil(unresponsive / N) timeouts for targets
+that never answer, so each further group of up to N unresponsive targets adds
+another timeout to every round.
 .TP
 .B --format table|json|csv
 Choose human-readable, JSON, or CSV output. Defaults to table.
@@ -221,9 +223,9 @@ deliberately mis-signed name that a validating resolver must refuse with
 SERVFAIL. Up to --concurrency targets are probed at once, each with its two
 probes in sequence. The report gains a per-target verdict of validating,
 not-validating, or inconclusive, together with the raw AD and CD flags. The
-probe describes
-those two names at that moment and is not a DNSSEC audit. Without this option
-SpeeDNS sends its unchanged default queries and contacts no probe names.
+probe describes those two names at that moment and is not a DNSSEC audit.
+Without this option SpeeDNS sends its unchanged default queries and contacts
+no probe names.
 .SH OUTPUT
 Table output is written to standard output by default. JSON output has a
 versioned schema and CSV output has one aggregate row per target. Table runs

@@ -47,11 +47,12 @@ concurrency) × timeout` to the run, and every healthy target in the group is
 paced at that slower rate. One silent UDP target in a default run costs about
 200 × 2 s, close to seven minutes, and about 67 minutes with `--full`. Its
 cold probes and warm-ups add a few more timeouts during preparation, and a
-`--dnssec` run up to two more for its probes. There is deliberately no
-cutoff: a resolver that stops answering is measured and reported as failed
-rather than silently dropped mid-run. On a network where one address family
-or resolver is black-holed, `--family`, a smaller resolver selection, or a
-lower `--timeout` shortens the run.
+`--dnssec` run adds about `2 × ceil(unresponsive / concurrency) × timeout` for
+its probes, which share the same pool. There is deliberately no cutoff: a
+resolver that stops answering is measured and reported as failed rather than
+silently dropped mid-run. On a network where one address family or resolver
+is black-holed, `--family`, a smaller resolver selection, or a lower
+`--timeout` shortens the run.
 
 Three excluded warm-up queries are sent before the measured phase. Encrypted
 and stream transports reuse their connections during measured queries. UDP
@@ -394,15 +395,17 @@ generated name exactly one question, rotating the selected query types across
 the corpus rather than pairing them per name. A resolver caches an NXDOMAIN for
 the name rather than for the query type, so asking one name for both `A` and
 `AAAA` measured a miss and then a cache hit. Both rules together mean that no
-generated name is asked twice at one resolver, so no measured query reads back
-an answer SpeeDNS itself caused to be cached. That is not proof the resolver
-recursed: a validating resolver using RFC 8198 aggressive NSEC/NSEC3 synthesis
-can answer an unseen name from a denial proof cached for another one, which
-`CACHE_MISS.md` names as a limit. The cost of the rules is that a cache-miss
-run cannot compare transports, because doing so requires measuring one name
-twice at one resolver. Separate runs cannot stand in for that either -- each
-generates fresh names, and cross-run latency is dominated by path and time of
-day -- so `speedns diff` refuses every cache-miss report.
+measured query repeats a question SpeeDNS has already asked that resolver, so
+none is answered from the cached reply to its own earlier question. That is
+not proof the resolver recursed: a validating resolver using RFC 8198
+aggressive NSEC/NSEC3 synthesis can answer an unseen name from a denial proof
+cached for a different name, and that proof can come from SpeeDNS's own earlier
+generated names in the run, which `CACHE_MISS.md` names as a limit. The cost of
+the rules is that a cache-miss run cannot compare transports, because doing so
+requires measuring one name twice at one resolver. Separate runs cannot stand
+in for that either -- each generates fresh names, and cross-run latency is
+dominated by the network conditions at the time of each run, which no report
+captures -- so `speedns diff` refuses every cache-miss report.
 
 `--profile-view` groups the measured target rows by resolver profile and
 address, then lists each available selected transport side by side in a
@@ -420,7 +423,9 @@ after all of its measured rounds have finished. The CD (checking disabled) bit
 is never set, because the point of the probe is to observe validation rather
 than to suppress it. Up to `--concurrency` targets are probed at once; a
 target's two probes run one after the other on its own measured session, and
-no target begins probing after an interrupt.
+no probe is sent after an interrupt. A target whose probes the interrupt cut
+short gets no verdict, like the targets not yet reached, and is marked
+incomplete with them.
 
 The two probe names are pinned constants in `internal/benchmark/dnssec.go`:
 

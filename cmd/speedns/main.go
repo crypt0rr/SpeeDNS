@@ -239,10 +239,13 @@ func canonicalProtocols(selected []catalog.Protocol) []catalog.Protocol {
 // once is what keeps any name from being asked twice at one resolver, for
 // every query rather than only for whichever group happened to run first.
 //
-// That rules out reading back an answer SpeeDNS itself caused to be cached;
-// it does not prove the resolver recursed. A validating resolver doing RFC
-// 8198 aggressive NSEC/NSEC3 synthesis can answer an unseen name from a denial
-// proof cached for another one, which CACHE_MISS.md names as a limit.
+// Together with asking each generated name one question, that means no
+// measured query repeats a question SpeeDNS has already asked that resolver,
+// so none is answered from the cached reply to its own earlier question. It
+// does not prove the resolver recursed: a validating resolver doing RFC 8198
+// aggressive NSEC/NSEC3 synthesis can answer an unseen name from a denial
+// proof cached for a different name -- including one of SpeeDNS's own earlier
+// generated names -- which CACHE_MISS.md names as a limit.
 //
 // catalog.Expand returns targets in documented protocol order, then by target
 // ID, so the endpoint kept for a profile is its earliest declared transport at
@@ -807,7 +810,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.Int64Var(&config.seed, "seed", 0, "random seed (0 chooses and prints a new seed)")
 	flags.StringVar(&config.queryTypes, "type", "A,AAAA", "comma-separated DNS record types; zone-transfer, meta and pseudo-record types are rejected")
 	flags.DurationVar(&config.timeout, "timeout", benchmark.DefaultTimeout, "per-query and connection timeout; every measured round waits for its slowest target, up to this long")
-	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum concurrent target preparations, measured DNS exchanges and DNSSEC probes per protocol; each round waits about ceil(unresponsive/concurrency) timeouts for unresponsive targets")
+	flags.IntVar(&config.concurrency, "concurrency", benchmark.DefaultConcurrency, "maximum concurrent target preparations, measured exchanges and DNSSEC probes per protocol; n silent targets cost about ceil(n/concurrency) timeouts per round")
 	flags.BoolVar(&config.includeSystem, "include-system", false, "include the configured system resolver as a baseline")
 	flags.StringVar(&config.format, "format", "table", "output format: table, json, or csv")
 	flags.StringVar(&config.output, "output", "", "write output to a file instead of stdout")

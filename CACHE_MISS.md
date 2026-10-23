@@ -80,26 +80,28 @@ each name exactly one question, rotating the selected types across the corpus,
 so a multi-type selection is still represented without any name being asked
 twice.
 
-Together the two rules mean that no measured query reads back an answer that
-SpeeDNS itself caused a resolver to cache. They do not prove that the resolver
-had to recurse. A validating resolver that uses RFC 8198 aggressive
-NSEC/NSEC3 synthesis can answer a generated name it has never seen from a
-denial proof cached for another name in the zone, so later names in a run may
-be answered from cache. Whether that happens depends on how `example.com`
-signs its denials, which SpeeDNS neither controls nor detects; a warm-up that
-asks `example.com` for a record type the apex lacks can cache such a proof
-before the first measured query.
+Together the two rules mean that no measured query repeats a question SpeeDNS
+has already asked that resolver, so none is answered from the cached reply to
+its own earlier question. That is all they guarantee: they do not prove that
+the resolver had to recurse. A validating resolver that uses RFC 8198
+aggressive NSEC/NSEC3 synthesis can answer a generated name it has never seen
+from a denial proof cached for a different name in the zone, and that proof
+can come from SpeeDNS's own earlier generated names in the same run, so later
+names in a run may be answered from cache. Whether that happens depends on how
+`example.com` signs its denials, which SpeeDNS neither controls nor detects; a
+warm-up that asks `example.com` for a record type the apex lacks can cache
+such a proof before the first measured query.
 
 The deliberate consequence of the two rules is that **a cache-miss run does
 not compare transports.** Comparing two transports requires measuring the same
 name twice at the same resolver, which is exactly what makes the second
 measurement warm. Separate runs cannot stand in for that: every run generates
 fresh names, and the latency difference between two runs is dominated by the
-network path and the time of day, which no report records. Cache-miss mode
-therefore cannot produce a sound transport comparison, and `speedns diff`
-refuses every cache-miss report by design, including against another
-cache-miss run. Reading two single-transport cache-miss reports side by side
-is an anecdote, not a comparison.
+network conditions at the time of each run, which no report captures.
+Cache-miss mode therefore cannot produce a sound transport comparison, and
+`speedns diff` refuses every cache-miss report by design, including against
+another cache-miss run. Reading two single-transport cache-miss reports side by
+side is an anecdote, not a comparison.
 
 For the same reason `--profile-view` is a warm-cache tool: in cache-miss mode a
 resolver contributes a single transport, so the view has nothing to compare.

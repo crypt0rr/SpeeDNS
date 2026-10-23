@@ -388,8 +388,10 @@ func TestDNSSECProbesShareTheBoundedPool(t *testing.T) {
 
 // TestDNSSECProbesStartNothingAfterCancellation covers the pool's cancel
 // path. One worker takes the first target, whose signed probe is where the
-// interrupt lands; the targets still queued behind it must never reach their
-// sessions, and the phase must count only the target that was probed.
+// interrupt lands. Nothing is sent after it: not that target's bogus probe,
+// and not the probes of the targets still queued behind it. No target
+// finished both probes, so the phase counts none and no target gains a
+// verdict built from a probe the interrupt cut short.
 func TestDNSSECProbesStartNothingAfterCancellation(t *testing.T) {
 	oldFactory := newFactory
 	t.Cleanup(func() { newFactory = oldFactory })
@@ -398,12 +400,12 @@ func TestDNSSECProbesStartNothingAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var mu sync.Mutex
-	probes := make(map[string]int)
+	probes := make(map[string][]string)
 	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
 		warm := &fakeSession{query: func(_ context.Context, name string, qtype uint16) (*dns.Msg, error) {
 			if isDNSSECProbeName(name) {
 				mu.Lock()
-				probes[target.Address]++
+				probes[target.Address] = append(probes[target.Address], name)
 				mu.Unlock()
 				if target.Address == "1" && name == DNSSECProbeSignedName {
 					cancel()
@@ -414,28 +416,29 @@ func TestDNSSECProbesStartNothingAfterCancellation(t *testing.T) {
 		return dnssecFactory(warm), nil
 	}
 
-	var maxProbed int
+	maxProbed, dnssecEvents := 0, 0
 	results := runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "1"), testTarget(catalog.UDP, "2"), testTarget(catalog.UDP, "3")},
 		[]Query{{Name: "a.example", QType: dns.TypeA}}, Options{
 			QueryTypes: []uint16{dns.TypeA}, Timeout: time.Second, Concurrency: 1, DNSSEC: true,
 			OnProgress: func(progress Progress) {
 				if progress.Phase == ProgressDNSSEC {
+					dnssecEvents++
 					maxProbed = max(maxProbed, progress.DNSSECCompleted)
 				}
 			},
 		})
-	if probes["1"] == 0 || probes["2"] != 0 || probes["3"] != 0 {
-		t.Fatalf("probes after cancellation = %v, want only the target in flight", probes)
+	if got := probes["1"]; len(got) != 1 || got[0] != DNSSECProbeSignedName || len(probes["2"]) != 0 || len(probes["3"]) != 0 {
+		t.Fatalf("probes after cancellation = %v, want only the signed probe in flight", probes)
 	}
-	if maxProbed != 1 {
-		t.Fatalf("DNSSEC progress counted %d probed targets, want 1", maxProbed)
+	if dnssecEvents == 0 || maxProbed != 0 {
+		t.Fatalf("DNSSEC progress counted %d probed targets over %d events, want an opened phase counting 0", maxProbed, dnssecEvents)
 	}
 	for _, result := range results {
 		if !result.Incomplete {
 			t.Fatalf("%s was not marked incomplete after the interrupt", result.Target.ID())
 		}
-		if result.Target.Address != "1" && result.DNSSEC != nil {
-			t.Fatalf("%s gained an assessment without being probed: %+v", result.Target.ID(), result.DNSSEC)
+		if result.DNSSEC != nil {
+			t.Fatalf("%s gained an assessment from cut-short probes: %+v", result.Target.ID(), result.DNSSEC)
 		}
 	}
 }

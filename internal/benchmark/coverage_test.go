@@ -2043,3 +2043,49 @@ func TestSilentTargetPacesEveryMeasuredRound(t *testing.T) {
 		t.Fatalf("measured phase took %v, want at least queries × timeout = %v", elapsed, floor)
 	}
 }
+
+// TestRunInterruptedAfterTheLastGroupIsComplete pins the engine behaviour the
+// CLI's interrupt warning relies on. An interrupt that lands on the last
+// group's completion event, after every measured round and before statistics
+// and rankings are computed, still makes Run return the cancellation -- which
+// is what keeps the exit status at 130 -- but no target is left incomplete and
+// the report is ranked. That is the evidence the CLI reads when it says the
+// results are complete, so this test must fail if the engine ever starts
+// marking such targets incomplete.
+func TestRunInterruptedAfterTheLastGroupIsComplete(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
+	useFairScheduler(t)
+	newFactory = func(catalog.Target, time.Duration, transport.QueryOptions) (transport.Factory, error) {
+		return dnssecFactory(&fakeSession{}), nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	targets := []catalog.Target{
+		testTarget(catalog.UDP, "1"), testTarget(catalog.UDP, "2"),
+		testTarget(catalog.TCP, "3"), testTarget(catalog.TCP, "4"),
+	}
+	report, err := Run(ctx, targets, Options{
+		Domains: []string{"measured.example"}, QueryTypes: []uint16{dns.TypeA}, Sample: 1, Seed: 3,
+		Timeout: time.Second, Concurrency: 2,
+		OnProgress: func(progress Progress) {
+			// Progress events are emitted on Run's goroutine, so the cancel
+			// lands before the group's results are handed back.
+			if progress.Protocol == catalog.TCP && progress.Phase == ProgressComplete {
+				cancel()
+			}
+		},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want the cancellation", err)
+	}
+	if len(report.Targets) != len(targets) || len(report.Rankings) != len(targets) {
+		t.Fatalf("report targets/rankings = %d/%d, want every target measured and ranked", len(report.Targets), len(report.Rankings))
+	}
+	for _, result := range report.Targets {
+		if result.Incomplete || len(result.Observations) != 1 || !result.Observations[0].Success {
+			t.Fatalf("%s = %+v, want a complete measured target", result.Target.ID(), result)
+		}
+	}
+}
