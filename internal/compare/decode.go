@@ -112,7 +112,8 @@ type DNSSEC struct {
 // can approach it, because their size grows with the corpus. The cap exists so
 // an endless stream such as /dev/zero ends in a usage error instead of
 // exhausting memory. It is an exported variable only so tests, the CLI's
-// among them, can exercise the cap without a stream of this size.
+// among them, can exercise the cap without a stream of this size. Tests only:
+// production code must never set it, because the documented limit is 256 MiB.
 var MaxReportBytes int64 = 256 << 20
 
 // reportReadChunk is how much of an input is read into one buffer.

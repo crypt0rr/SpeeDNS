@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // These tests write to real descriptors through their aliases. They need Unix
@@ -173,6 +175,76 @@ func TestOutputRefusesADirectoryDescriptor(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(directory); err != nil || len(entries) != 0 {
 		t.Fatalf("the directory gained entries: %v/%v", entries, err)
+	}
+}
+
+// TestRunBenchmarkRefusesADescriptorNotOpenForWriting pins that an alias of a
+// descriptor open only for reading, as with `--output /dev/fd/0 < file` or the
+// read end of a pipe, fails before the first query with status 2. The dup and
+// the fstat accept such a descriptor, so the run used to complete and then
+// lose its report to EBADF. The descriptor stays open for its owner, and what
+// it reads is left as it was.
+func TestRunBenchmarkRefusesADescriptorNotOpenForWriting(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "input")
+	if err := os.WriteFile(name, []byte("input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer pipeWriter.Close()
+
+	for _, tc := range []struct {
+		name       string
+		descriptor uintptr
+	}{
+		{name: "a file opened with <", descriptor: file.Fd()},
+		{name: "the read end of a pipe", descriptor: reader.Fd()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Linux and macOS pipes are one-way, but the BSDs hand out
+			// pipe ends that are open for writing in both directions.
+			if flags, err := unix.FcntlInt(tc.descriptor, unix.F_GETFL, 0); err != nil || flags&unix.O_ACCMODE != unix.O_RDONLY {
+				t.Skipf("descriptor %d is not read-only here: flags %#x/%v", tc.descriptor, flags, err)
+			}
+			path := fmt.Sprintf("/dev/fd/%d", tc.descriptor)
+			wants := "output path is a descriptor not open for writing: " + path
+			engineCalls := countEngineCalls(t)
+			if err := preflightOutput(path); err == nil || err.Error() != wants {
+				t.Fatalf("preflight = %v, want %q", err, wants)
+			}
+			if _, _, err := outputWriter(path); err == nil || err.Error() != wants {
+				t.Fatalf("writer = %v, want %q", err, wants)
+			}
+			config := cliConfigForTest(t)
+			config.output = path
+			err := runBenchmark(context.Background(), config)
+			if err == nil || err.Error() != wants || exitCodeForError(err) != 2 || *engineCalls != 0 {
+				t.Fatalf("run = %v (exit %d) after %d engine call(s), want %q with status 2 and no run",
+					err, exitCodeForError(err), *engineCalls, wants)
+			}
+			var stat syscall.Stat_t
+			if err := syscall.Fstat(int(tc.descriptor), &stat); err != nil {
+				t.Fatalf("the descriptor was closed behind its owner: %v", err)
+			}
+		})
+	}
+	if content, err := os.ReadFile(name); err != nil || string(content) != "input" {
+		t.Fatalf("input = %q/%v", content, err)
+	}
+	if _, err := io.WriteString(pipeWriter, "still open"); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len("still open"))
+	if _, err := io.ReadFull(reader, buffer); err != nil || string(buffer) != "still open" {
+		t.Fatalf("the pipe = %q/%v after the refusals", buffer, err)
 	}
 }
 

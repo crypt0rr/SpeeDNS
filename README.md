@@ -754,17 +754,22 @@ covers the `/dev/fd/N` paths that process substitution such as
 `--output >(jq .)` hands out. So `--output /dev/stdout >> run.log` appends
 to `run.log` and `> run.log` replaces its contents, just as leaving
 `--output` out would, and a socket on standard output, as under systemd's
-`StandardOutput=journal`, receives the report. The descriptor must be open
-and must not be a directory. A symlink of your own is written through only
+`StandardOutput=journal`, receives the report. The descriptor must be open for
+writing and must not be a directory, so `--output /dev/fd/0 < file` is
+refused. Descriptors 0, 1 and 2 are never found closed: the Go runtime opens
+any of them that is closed at startup on `/dev/null`, so
+`--output /dev/stdout >&-` discards the report without an error, as a run
+without `--output` would. A symlink of your own is written through only
 when it points at a named pipe, a terminal or other character device. Any
 other symlink destination, including one to a regular file, a directory or a
 socket and a dangling one, is rejected before writing, leaving the link and
 its referent unchanged.
 
 `run` checks the destination before it sends the first query, so a missing
-directory, a rejected symlink, an unwritable file or a closed descriptor fails
-with status 2 instead of costing a whole benchmark. The path can still change
-while the benchmark runs, so it is checked again when the report is written.
+directory, a rejected symlink, an unwritable file or a closed or read-only
+descriptor fails with status 2 instead of costing a whole benchmark. The path
+can still change while the benchmark runs, so it is checked again when the
+report is written.
 
 The versioned JSON contract is published as
 [`schema/report-v1.json`](schema/report-v1.json). It describes the current

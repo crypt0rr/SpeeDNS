@@ -1561,14 +1561,14 @@ func descriptorForOutputPath(path string) (int, bool) {
 }
 
 // openDescriptorOutput opens the descriptor an alias names and checks that a
-// report can be written to it. The descriptor must be open and must not be a
-// directory. Anything else, a regular file, a pipe, a terminal or a socket,
-// takes the report as standard output would. The result also says whether the
-// descriptor is a regular file, the only kind worth flushing. preflightOutput
-// makes the same check before the run, so a closed descriptor or a directory
-// fails before the first query.
+// report can be written to it. The descriptor must be open for writing and
+// must not be a directory. Anything else, a regular file, a pipe, a terminal or
+// a socket, takes the report as standard output would. The result also says
+// whether the descriptor is a regular file, the only kind worth flushing.
+// preflightOutput makes the same check before the run, so a closed or
+// read-only descriptor or a directory fails before the first query.
 func openDescriptorOutput(path string, descriptor int) (outputDescriptorHandle, bool, error) {
-	file, err := openOutputDescriptor(descriptor, path)
+	file, writable, err := openOutputDescriptor(descriptor, path)
 	if err != nil {
 		return nil, false, fmt.Errorf("inspect output path: %w", err)
 	}
@@ -1580,6 +1580,15 @@ func openDescriptorOutput(path string, descriptor int) (outputDescriptorHandle, 
 	if info.IsDir() {
 		_ = file.Close()
 		return nil, false, fmt.Errorf("output path is a directory: %s", path)
+	}
+	if !writable {
+		// A descriptor open only for reading, such as /dev/fd/0 under
+		// `< file`, or for no I/O at all, such as a Linux O_PATH descriptor,
+		// passes the dup and the fstat. Only the write after the whole run
+		// would fail. A directory is always open for reading only, so it is
+		// named as a directory above instead.
+		_ = file.Close()
+		return nil, false, fmt.Errorf("output path is a descriptor not open for writing: %s", path)
 	}
 	return file, info.Mode().IsRegular(), nil
 }
@@ -1841,7 +1850,10 @@ func outputWriter(path string) (io.Writer, outputFinalizer, error) {
 		// owner-only mode it was created with. The destination's mode,
 		// applied to it for the rename, may deny even the owner read
 		// access, as 0200 does, and then neither the copy nor the owner of
-		// a kept report could read it.
+		// a kept report could read it. A report kept after a failed copy is
+		// therefore owner-only, also when the destination's mode or the mode
+		// a new file would get was wider, such as 0644: it is a recovery copy
+		// for whoever ran the command, not the published report.
 		_ = chmodOutputFile(temporaryPath, temporaryOutputMode)
 		if copyErr := copyOutputInPlace(temporaryPath, path); copyErr != nil {
 			// The copy may have truncated the destination already, which

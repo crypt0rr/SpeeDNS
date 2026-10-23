@@ -1666,13 +1666,14 @@ func TestOutputWriterErrorPaths(t *testing.T) {
 }
 
 // fakeOutputDescriptor is an open descriptor as openOutputDescriptor returns
-// one, with a scripted fstat result. It counts how often it is closed, which
-// for a real handle closes only the duplicate of the descriptor.
+// one, with a scripted fstat result and access mode. It counts how often it is
+// closed, which for a real handle closes only the duplicate of the descriptor.
 type fakeOutputDescriptor struct {
 	fakeOutputFile
-	info    fs.FileInfo
-	statErr error
-	closes  int
+	info     fs.FileInfo
+	statErr  error
+	readOnly bool
+	closes   int
 }
 
 func (f *fakeOutputDescriptor) Stat() (fs.FileInfo, error) { return f.info, f.statErr }
@@ -1687,7 +1688,7 @@ func (f *fakeOutputDescriptor) Close() error {
 // standard output or standard error. An alias must never be inspected by path:
 // on macOS /dev/fd/N is no link, a closed descriptor has no entry, and a socket
 // cannot be opened by name. The path seams therefore fail the test if called.
-func scriptOutputDescriptors(t *testing.T, open func() (outputDescriptorHandle, error)) *[]int {
+func scriptOutputDescriptors(t *testing.T, open func() (*fakeOutputDescriptor, error)) *[]int {
 	t.Helper()
 	if filepath.Separator != '/' {
 		t.Skip("descriptor aliases are POSIX paths, which never match here")
@@ -1700,9 +1701,13 @@ func scriptOutputDescriptors(t *testing.T, open func() (outputDescriptorHandle, 
 	}
 	statOutputPath, lstatOutputPath = byPath, byPath
 	requested := new([]int)
-	openOutputDescriptor = func(descriptor int, _ string) (outputDescriptorHandle, error) {
+	openOutputDescriptor = func(descriptor int, _ string) (outputDescriptorHandle, bool, error) {
 		*requested = append(*requested, descriptor)
-		return open()
+		handle, err := open()
+		if err != nil {
+			return nil, false, err
+		}
+		return handle, !handle.readOnly, nil
 	}
 	return requested
 }
@@ -1733,7 +1738,7 @@ func TestOutputWriterWritesToTheDescriptorAnAliasNames(t *testing.T) {
 				fakeOutputFile: fakeOutputFile{name: tc.path, syncErr: errors.New("sync called")},
 				info:           fakeOutputPathInfo{mode: tc.mode},
 			}
-			requested := scriptOutputDescriptors(t, func() (outputDescriptorHandle, error) { return handle, nil })
+			requested := scriptOutputDescriptors(t, func() (*fakeOutputDescriptor, error) { return handle, nil })
 			if err := preflightOutput(tc.path); err != nil {
 				t.Fatalf("preflight = %v", err)
 			}
@@ -1767,10 +1772,10 @@ func TestOutputWriterWritesToTheDescriptorAnAliasNames(t *testing.T) {
 }
 
 // TestOutputRefusesAnUnusableDescriptorBeforeTheRun pins the descriptors an
-// alias cannot be written to: a closed one, one that fstat cannot describe,
-// and a directory. Each must fail before the first query with status 2, and
-// the writer must refuse it the same way if it changes during the run. A
-// duplicate that was made is closed again.
+// alias cannot be written to: a closed one, one that fstat cannot describe, a
+// directory, and one open for reading only. Each must fail before the first
+// query with status 2, and the writer must refuse it the same way if it
+// changes during the run. A duplicate that was made is closed again.
 func TestOutputRefusesAnUnusableDescriptorBeforeTheRun(t *testing.T) {
 	const path = "/dev/fd/5"
 	for _, tc := range []struct {
@@ -1785,13 +1790,20 @@ func TestOutputRefusesAnUnusableDescriptorBeforeTheRun(t *testing.T) {
 			wants:  "inspect output path: stat /dev/fd/5: ",
 		},
 		{
+			// A directory descriptor is always open for reading only, and is
+			// still named as a directory.
 			name:   "directory",
-			opened: &fakeOutputDescriptor{info: fakeOutputPathInfo{mode: fs.ModeDir | 0o755, isDir: true}},
+			opened: &fakeOutputDescriptor{info: fakeOutputPathInfo{mode: fs.ModeDir | 0o755, isDir: true}, readOnly: true},
 			wants:  "output path is a directory: /dev/fd/5",
+		},
+		{
+			name:   "open for reading only",
+			opened: &fakeOutputDescriptor{info: fakeOutputPathInfo{mode: 0o644}, readOnly: true},
+			wants:  "output path is a descriptor not open for writing: /dev/fd/5",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			scriptOutputDescriptors(t, func() (outputDescriptorHandle, error) {
+			scriptOutputDescriptors(t, func() (*fakeOutputDescriptor, error) {
 				if tc.opened == nil {
 					return nil, &os.PathError{Op: "dup", Path: path, Err: syscall.EBADF}
 				}
@@ -1830,7 +1842,7 @@ func TestRunBenchmarkWritesToASocketOnStandardOutput(t *testing.T) {
 		fakeOutputFile: fakeOutputFile{name: "/dev/stdout"},
 		info:           fakeOutputPathInfo{mode: fs.ModeSocket | 0o777},
 	}
-	requested := scriptOutputDescriptors(t, func() (outputDescriptorHandle, error) { return socket, nil })
+	requested := scriptOutputDescriptors(t, func() (*fakeOutputDescriptor, error) { return socket, nil })
 	engineCalls := countEngineCalls(t)
 	config := cliConfigForTest(t)
 	config.output = "/dev/stdout"
@@ -2490,8 +2502,11 @@ func TestOutputWriterSyncsTheDirectoryAfterARename(t *testing.T) {
 	if err := commit(true); err != nil {
 		t.Fatalf("a failed directory sync must not fail the run: %v", err)
 	}
-	if len(synced) != 1 || synced[0] != directory {
-		t.Fatalf("synced directories = %q, want [%q]", synced, directory)
+	// The writer takes the directory from the cleaned destination path, so a
+	// TMPDIR spelled with a ".." segment must not make the same directory
+	// look different here.
+	if want := filepath.Dir(path); len(synced) != 1 || synced[0] != want {
+		t.Fatalf("synced directories = %q, want [%q]", synced, want)
 	}
 	if content, err := os.ReadFile(path); err != nil || string(content) != "report" {
 		t.Fatalf("report = %q/%v", content, err)

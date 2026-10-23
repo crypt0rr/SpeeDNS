@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // redirectDescriptor points descriptor fd at target and returns a function
@@ -287,6 +289,34 @@ func TestOutputWriterRejectsDirectoryProcFD(t *testing.T) {
 			t.Fatalf("directory descriptor preflight for %s = %v", path, err)
 		}
 		assertProcFDLink(t, path)
+	}
+}
+
+// TestOutputRefusesAnOPathDescriptor pins that a descriptor open for no I/O at
+// all, which Linux hands out for O_PATH, is refused like a read-only one: dup
+// and fstat accept it, and only a write would fail.
+func TestOutputRefusesAnOPathDescriptor(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(name, []byte("previous report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := syscall.Open(name, unix.O_PATH|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		t.Skipf("opening an O_PATH descriptor is unavailable: %v", err)
+	}
+	defer syscall.Close(descriptor)
+
+	path := fmt.Sprintf("/proc/self/fd/%d", descriptor)
+	assertProcFDLink(t, path)
+	wants := "output path is a descriptor not open for writing: " + path
+	if err := preflightOutput(path); err == nil || err.Error() != wants {
+		t.Fatalf("O_PATH preflight = %v, want %q", err, wants)
+	}
+	if _, _, err := outputWriter(path); err == nil || err.Error() != wants {
+		t.Fatalf("O_PATH writer = %v, want %q", err, wants)
+	}
+	if content, err := os.ReadFile(name); err != nil || string(content) != "previous report" {
+		t.Fatalf("the file behind the descriptor = %q/%v", content, err)
 	}
 }
 
