@@ -364,7 +364,7 @@ func Run(ctx context.Context, targets []catalog.Target, opts Options) (Report, e
 	sort.Slice(report.Targets, func(i, j int) bool {
 		return report.Targets[i].Target.ID() < report.Targets[j].Target.ID()
 	})
-	report.Rankings = makeRankings(report.Targets)
+	report.Rankings = makeRankings(report.Targets, opts.Timeout)
 	report.PairedEffects = calculatePairedEffects(report.Targets, report.Rankings, report.Seed)
 	report.Warnings = append(report.Warnings, collectWarnings(report.Targets)...)
 	if ctx.Err() != nil {
@@ -1521,7 +1521,12 @@ func bootstrapPairedCI(deltas []float64, seed int64) (float64, float64) {
 // local cache lookup that excludes the upstream resolution it forwards to, so
 // placing it in the same order as a network resolver would compare two
 // different quantities.
-func makeRankings(results []TargetResult) []Ranking {
+//
+// timeout is the run's per-query timeout, the same one calculateStatistics
+// priced every scoring failure at. Statistics does not carry it, and the tie
+// group's order needs it to keep that failure penalty; see tieOrderKey.
+func makeRankings(results []TargetResult, timeout time.Duration) []Ranking {
+	timeoutMS := durationMS(timeout)
 	byProtocol := make(map[catalog.Protocol][]int)
 	for index, result := range results {
 		if result.Stats.Scored > 0 && !result.Incomplete && !result.Target.Resolver.Local {
@@ -1535,8 +1540,8 @@ func makeRankings(results []TargetResult) []Ranking {
 		// for every pair would not define a valid sort order: A can compare before
 		// B, B before C, and C before A. The score-order leader is the only
 		// anchor used for the tie decision; its overlapping members are then
-		// presented by median. Targets outside that leader tie group retain the
-		// strict score order.
+		// presented by tieOrderKey. Targets outside that leader tie group retain
+		// the strict score order.
 		sort.Slice(indexes, func(i, j int) bool {
 			left, right := results[indexes[i]], results[indexes[j]]
 			if left.Stats.ScoreMS != right.Stats.ScoreMS {
@@ -1554,10 +1559,15 @@ func makeRankings(results []TargetResult) []Ranking {
 			}
 			remaining = append(remaining, index)
 		}
-		// A median/ID sort is safe within one explicitly selected group: both
-		// keys define a total order and no pair outside the group participates.
+		// A key/median/ID sort is safe within one explicitly selected group:
+		// every key is a per-target value, so together they define a total
+		// order, and no pair outside the group participates.
 		sort.Slice(tieGroup, func(i, j int) bool {
 			left, right := results[tieGroup[i]], results[tieGroup[j]]
+			leftKey, rightKey := tieOrderKey(left.Stats, timeoutMS), tieOrderKey(right.Stats, timeoutMS)
+			if leftKey != rightKey {
+				return leftKey < rightKey
+			}
 			if left.Stats.MedianMS != right.Stats.MedianMS {
 				return left.Stats.MedianMS < right.Stats.MedianMS
 			}
@@ -1581,6 +1591,22 @@ func makeRankings(results []TargetResult) []Ranking {
 		return rankings[i].Rank < rankings[j].Rank
 	})
 	return rankings
+}
+
+// tieOrderKey orders the members of a protocol's leader tie group: the score
+// with only its 0.40 x p95 term removed. p95 is the unstable half of the score
+// -- ordering a tie group by raw score made rank one a function of run-to-run
+// noise -- but the failure penalty is the score's only reliability signal.
+// Ordering by median alone discarded it. A target that lost one to three
+// queries in 200 still has resamples that draw no failure, so its interval
+// reaches down to its latency-only score and joins the leader's group; with a
+// slightly better median it then took rank one and the recommendation from a
+// target that lost none. ScoringFailureRate, not FailureRate, keeps SERVFAIL,
+// REFUSED and truncated responses penalised exactly as the score penalises
+// them. Without failures the key is 0.60 x median, so the order is median
+// order.
+func tieOrderKey(stats Statistics, timeoutMS float64) float64 {
+	return 0.60*stats.MedianMS + stats.ScoringFailureRate*timeoutMS
 }
 
 func confidenceIntervalsOverlap(left, right Statistics) bool {

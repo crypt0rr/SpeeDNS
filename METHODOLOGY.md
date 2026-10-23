@@ -200,16 +200,50 @@ in the additive `local` field on the target and CSV in its `local` column, so
 a consumer can tell a missing rank caused by non-comparability apart from one
 caused by a failure.
 
-Targets whose 95% score confidence intervals overlap are ordered among
-themselves by median latency rather than by score. The score is 60% median and
-40% p95, and p95 is by far the less stable half: over the same observations the
-median interval is 9-14% of its point estimate while the p95 interval is
-66-143%. Ordering indistinguishable targets by score therefore made the
-presented order a function of run-to-run noise -- four runs of one command at
-one seed produced three different orders, and the target with the worst median
-in every run took rank one twice. Using the median settles that order with the
-most stable statistic available. No measured value changes, and targets whose
-intervals do not overlap are still ranked by score.
+Members of the score-order leader's tie group -- the leader and every target
+whose 95% score confidence interval overlaps the leader's, as defined under
+"Confidence intervals and ties" below -- are ordered among themselves by the
+score with only its p95 term removed, then by median latency, then by target
+ID:
+
+```text
+tie_order_ms = 0.60 × median_ms
+             + scoring_failure_rate × timeout_ms
+```
+
+The score is 60% median and 40% p95, and p95 is by far the less stable half:
+over the same observations the median interval is 9-14% of its point estimate
+while the p95 interval is 66-143%. Ordering indistinguishable targets by score
+therefore made the presented order a function of run-to-run noise -- four runs
+of one command at one seed produced three different orders, and the target with
+the worst median in every run took rank one twice. Dropping the p95 term settles
+that order with the most stable latency statistic available. When no member has
+a scoring failure, the order is exactly median order.
+
+The failure term stays because it is the score's only reliability signal. With
+one to three scoring failures in a default 200-query run, enough bootstrap
+replicates draw no failure at all that the target's interval reaches down to
+its latency-only score. A target about as fast as the leader therefore joins
+the leader's group however large its failure penalty, and ordering the group
+by median alone gave rank one -- and `RECOMMENDED`, while the target still had
+99% usable responses -- to a resolver that lost 2 of 200 queries over one that
+lost none, because its median was 1 ms lower. The key uses the scoring-failure
+rate, so timeouts, transport failures, truncated responses and resolver errors
+such as SERVFAIL or REFUSED count exactly as they do in the score, priced at
+the run's `--timeout`.
+
+That is a deliberate trade-off. Failure counts are sampled too: two resolvers
+with the same true loss rate can lose different numbers of queries in one run,
+and for two otherwise near-identical resolvers that difference can now swap
+their order within the group where median order would have kept it. SpeeDNS
+prefers that to recommending the less reliable resolver. Membership does not
+depend on the order, so both remain `TIED` either way.
+
+No measured value changes. Targets outside the leader's tie group keep the
+score/ID order, even when their intervals overlap each other or a member other
+than the leader. Every member is presented ahead of every non-member, so a
+member with a large failure penalty can still be listed above a non-member
+whose score is better but whose interval does not reach the leader's.
 
 ## Confidence intervals and ties
 
@@ -227,20 +261,27 @@ upper bound and change which targets are reported as tied.
 Rank order is deterministic. SpeeDNS first orders eligible targets by score,
 then target ID, and selects that order's leader. A target is in the leader's
 tie group when its 95% bootstrap interval overlaps the leader's interval.
-Members of that one leader-anchored group are presented by median, then target
-ID; targets outside it keep the score/ID order. The leader is marked as tied
-too, so the tie is visible from either row. The group is deliberately anchored
-to one leader: interval overlap is not transitive, and treating every pair as
-a separate sort decision would not define a stable order.
+Members of that one leader-anchored group are presented by
+`0.60 × median_ms + scoring_failure_rate × timeout_ms`, then median, then
+target ID, for the reasons given under "Scoring and divergence" above; targets
+outside it keep the score/ID order. The leader is marked as tied too whenever
+another target overlaps it, so the tie is visible from either row. The group is
+deliberately anchored to one leader: interval overlap is not transitive, and
+treating every pair as a separate sort decision would not define a stable
+order. Each protocol therefore has at most one tie group, and
+`--assert winner=` counts membership in it as sharing rank one.
 
-Every output surfaces that flag. The human table has a `Tie` column in the
-recommendation summary and in each per-protocol comparison; a tied row reads
-`TIED`, an untied row reads `—`. When a recommended or provisional winner is
-tied, the recommendation block also carries a `TIED:` note stating that the
-ordering is not statistically distinguishable, so a rank-one row is never
-presented as an unqualified winner. CSV keeps its `tie` column and JSON keeps
-`tie` on both `rankings[]` and `results[].stats`. The strict `1..N` rank is
-still reported: a tie qualifies the ordering, it does not remove it.
+Every output surfaces that flag, and it means membership in the leader's tie
+group, not overlap with any other ranked target. The human table has a `Tie`
+column in the recommendation summary and in each per-protocol comparison; a
+member reads `TIED` and every other row reads `—`. A `—` row is not in the
+leader's group, but its interval may still overlap another row outside the
+group, or a member other than the leader. When a recommended or provisional
+winner is tied, the recommendation block also carries a `TIED:` note stating
+that the ordering is not statistically distinguishable, so a rank-one row is
+never presented as an unqualified winner. CSV keeps its `tie` column and JSON
+keeps `tie` on both `rankings[]` and `results[].stats`. The strict `1..N` rank
+is still reported: a tie qualifies the ordering, it does not remove it.
 
 The report also includes paired latency effects. For each protocol, the
 best-ranked target of that protocol is the reference, and each other target is
