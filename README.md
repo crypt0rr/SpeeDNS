@@ -755,10 +755,10 @@ the requested address `family` and `dnssec` setting, elapsed duration, and the
 SHA-256 digest plus entry count of the exact normalized domain sequence used by
 the run. This makes custom-domain and cache-miss results auditable without
 downloading anything at runtime. The `--redact-system` option replaces
-interface names with `redacted` along with other local resolver details. CSV
-carries only two provenance fields, `speedns_version` and `corpus_sha256`,
-beside the run-identity columns described below; it has no interface names,
-so redaction leaves those two columns as they are.
+interface names with `redacted` along with other local resolver details. Of
+the provenance, CSV carries only `speedns_version` and `corpus_sha256`, as two
+of the run-identity columns described below; it has no interface names, so
+redaction leaves those columns as they are.
 
 ### CSV columns
 

@@ -105,7 +105,9 @@ type Progress struct {
 	// read "preparing 0/N" for as long as their probes took to time out.
 	ColdCompleted int
 	// DNSSECCompleted counts targets whose two DNSSEC probes have finished,
-	// out of DNSSECTotal targets that were ready to be probed.
+	// out of DNSSECTotal targets that were ready to be probed. The probe
+	// workers report it concurrently, so successive events may carry it out
+	// of order; a renderer keeps the maximum, as it does for preparation.
 	DNSSECCompleted int
 	DNSSECTotal     int
 }
