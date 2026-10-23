@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/crypt0rr/SpeeDNS/internal/compare"
 )
@@ -431,4 +432,39 @@ func TestDiffRequireFailsClosed(t *testing.T) {
 			t.Fatalf("a refused diff must exit 3 as not comparable, got %v (%d)", err, exitCodeForError(err))
 		}
 	})
+}
+
+// TestDiffRequireFailureEscapesReportText covers what `speedns diff` prints
+// when a --require condition fails: the diff table on stdout and the failure
+// on stderr. Both quote a target ID and an open error read from the report
+// files, which a crafted or hostile report can fill with control and
+// bidirectional characters.
+func TestDiffRequireFailureEscapesReportText(t *testing.T) {
+	const hostileID = "evil\x1b[2K\u202e@1.1.1.1/udp"
+	hostile := func(document map[string]any) {
+		results := document["results"].([]any)
+		results[0].(map[string]any)["target"].(map[string]any)["id"] = hostileID
+	}
+	baseline := writeDiffFixture(t, "baseline.json", hostile)
+	current := writeDiffFixture(t, "current.json", func(document map[string]any) {
+		hostile(document)
+		results := document["results"].([]any)
+		results[0].(map[string]any)["open_error"] = "DoH HTTP status 418 \x1b[2J\x1b[H\u200bteapot"
+	})
+	var out bytes.Buffer
+	err := runDiff(&out, baseline, current, "table", "", []string{"no-new-failed-targets"})
+	if exitCodeForError(err) != 4 {
+		t.Fatalf("a failed condition must exit 4, got %v (%d)", err, exitCodeForError(err))
+	}
+	for label, text := range map[string]string{"stdout": out.String(), "stderr": errorMessage(err)} {
+		for _, value := range text {
+			if (unicode.IsControl(value) && value != '\n') || unicode.Is(unicode.Cf, value) {
+				t.Fatalf("%s kept a raw U+%04X: %q", label, value, text)
+			}
+		}
+	}
+	want := `--require no-new-failed-targets: evil\x1b[2K\u{202e}@1.1.1.1/udp: opened -> DoH HTTP status 418 \x1b[2J\x1b[H\u{200b}teapot`
+	if !strings.Contains(errorMessage(err), want) {
+		t.Fatalf("stderr = %q, want it to contain %q", errorMessage(err), want)
+	}
 }

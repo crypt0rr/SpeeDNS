@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/crypt0rr/SpeeDNS/internal/safetext"
 )
 
 func intPtr(v int) *int       { return &v }
@@ -539,5 +541,116 @@ func TestLoadRejectsUnusableInput(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(dir, "absent.json")); err == nil {
 		t.Fatal("a missing file must be an error")
+	}
+}
+
+// TestRequireDetailsEscapeReportText covers the gate's failure message. It is
+// printed to stderr beside the escaped diff table, and both of its parts come
+// from the report files: a target ID carrying a resolver ID from
+// --resolver-file, and an open error quoting endpoint-chosen text. A crafted
+// report must not reach the terminal through the gate either.
+func TestRequireDetailsEscapeReportText(t *testing.T) {
+	const (
+		hostileID        = "evil\x1b[2K\u202e@1.1.1.1/udp"
+		hostileIDEscaped = `evil\x1b[2K\u{202e}@1.1.1.1/udp`
+	)
+	hostile := func(path string) Report {
+		report := baseReport(path)
+		report.Results[0].Target.ID = hostileID
+		return report
+	}
+	opened := hostile("b.json")
+	opened.Results[0].OpenError = "x509: valid for \x1b[2J\u200bspoofed"
+	removed := baseReport("b.json")
+	validating, regressed := hostile("a.json"), hostile("b.json")
+	validating.Results[0].DNSSEC = &DNSSEC{Verdict: "validating"}
+	regressed.Results[0].DNSSEC = &DNSSEC{Verdict: "not-validating"}
+	// added puts the hostile target beside the baseline's own, so it is the
+	// only PRESENCE finding. Removing the baseline target instead would add a
+	// second one, and target IDs sort, so that one would be reported first.
+	added := func(stats Stats) Report {
+		report := baseReport("b.json")
+		extra := hostile("").Results[0]
+		extra.Stats = stats
+		report.Results = append(report.Results, extra)
+		return report
+	}
+	healthy := baseReport("").Results[0].Stats
+
+	for _, testCase := range []struct {
+		name, condition   string
+		baseline, current Report
+		want              string
+	}{
+		{"open error", "no-new-failed-targets", hostile("a.json"), opened, hostileIDEscaped + `: opened -> x509: valid for \x1b[2J\u{200b}spoofed`},
+		{"dead added target", "no-new-failed-targets", baseReport("a.json"), added(Stats{Total: 40}), hostileIDEscaped + ": only in the current run, with successes 0 of 40"},
+		{"removed target", "no-removed-targets", hostile("a.json"), removed, hostileIDEscaped + " is absent from the current run"},
+		{"added target", "target-set-identical", baseReport("a.json"), added(healthy), hostileIDEscaped + ": only in the current run"},
+		{"validation regression", "no-dnssec-regression", validating, regressed, hostileIDEscaped + " stopped validating"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			results, err := Require(Compare(testCase.baseline, testCase.current), []string{testCase.condition})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if results[0].Passed {
+				t.Fatalf("%s passed on a hostile report", testCase.condition)
+			}
+			if results[0].Detail != testCase.want {
+				t.Fatalf("detail = %q, want %q", results[0].Detail, testCase.want)
+			}
+			if again := safetext.Escape(results[0].Detail); again != results[0].Detail {
+				t.Fatalf("detail is not fully escaped: %q", results[0].Detail)
+			}
+		})
+	}
+}
+
+// TestWriteJSONEscapesReportText covers the machine form of a diff. Every
+// string it echoes -- paths, blocker values, target IDs, details, scopes and
+// warnings -- comes from the command line or the two report files, so a
+// crafted report must not reach a consumer that decodes and prints the JSON,
+// just as it cannot reach the escaped table.
+func TestWriteJSONEscapesReportText(t *testing.T) {
+	const hostileID = "evil\x1b[2K\u202e@1.1.1.1/udp"
+	diff := Diff{
+		Baseline:        Report{Path: "base\x1b[2J.json"},
+		Current:         Report{Path: "current\u2066.json"},
+		Blockers:        []Blocker{{Field: "run.seed", Baseline: "1\x1b[2J", Current: "2\u202e", Reason: "the query matrix differs"}},
+		Findings:        []Finding{{Code: "FAILED", TargetID: hostileID, Detail: "successes 40 -> 0\u200b"}},
+		Suppressions:    []Suppression{{Reason: "local-position", Scope: "scope\x1b", Detail: "detail\u202e"}},
+		Disclosures:     []Disclosure{{Reason: "reason", Detail: "disclosed\x1b[H"}},
+		AddedWarnings:   []string{"added\x1b[2J"},
+		RemovedWarnings: []string{"removed\u2066"},
+	}
+	var output bytes.Buffer
+	if err := WriteJSON(&output, diff); err != nil {
+		t.Fatal(err)
+	}
+	var document any
+	if err := json.Unmarshal(output.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	var walk func(value any)
+	walk = func(value any) {
+		switch typed := value.(type) {
+		case string:
+			if again := safetext.Escape(typed); again != typed {
+				t.Fatalf("decoded JSON kept raw untrusted text: %q", typed)
+			}
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			for _, item := range typed {
+				walk(item)
+			}
+		}
+	}
+	walk(document)
+	findings := document.(map[string]any)["findings"].([]any)
+	if got := findings[0].(map[string]any)["target_id"]; got != `evil\x1b[2K\u{202e}@1.1.1.1/udp` {
+		t.Fatalf("target_id = %q, want the escaped form", got)
 	}
 }

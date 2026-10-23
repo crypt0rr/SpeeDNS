@@ -3,6 +3,7 @@ package report
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -197,10 +198,20 @@ func TestDNSSECProbeErrorsAreRedactedForSystemTargets(t *testing.T) {
 	if strings.Contains(table.String(), "127.0.0.53") {
 		t.Fatalf("redacted table leaked the system address:\n%s", table.String())
 	}
-	// Public targets keep their assessment untouched.
+	// Public targets keep their assessment's content. It is still a copy,
+	// because escaping applies to every target, and the copy must leave the
+	// measured result untouched.
 	public := reportTarget("public", catalog.UDP, 2, true)
 	public.DNSSEC = dnssecAssessment(benchmark.DNSSECValidating)
-	if got := redactDNSSEC(public, true, redactedValue); got != public.DNSSEC {
-		t.Fatal("a public target's assessment was copied unnecessarily")
+	got := redactDNSSEC(public, true, redactedValue)
+	if !reflect.DeepEqual(got, public.DNSSEC) {
+		t.Fatalf("a public target's assessment changed: %#v", got)
+	}
+	got.Probes[0].Error = "mutated"
+	if public.DNSSEC.Probes[0].Error != "" {
+		t.Fatal("the rendered assessment shares its probes with the measured result")
+	}
+	if redactDNSSEC(benchmark.TargetResult{}, true, redactedValue) != nil {
+		t.Fatal("a target without an assessment gained one")
 	}
 }
