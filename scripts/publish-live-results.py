@@ -546,6 +546,17 @@ def metric(stats: dict[str, Any], key: str, suffix: str = "") -> str:
     return "—"
 
 
+def latency_metric(stats: dict[str, Any], key: str) -> str:
+    # A transport with no scored sample measured no latency: the report
+    # encodes its median, p95 and score as 0, and the CLI table prints "—"
+    # for them. Printed as numbers, a failed transport read "0.00 ms", the
+    # best possible score. Success rate stays a number, since 0.00 is a
+    # measured rate.
+    if stats.get("scored") == 0:
+        return "—"
+    return metric(stats, key, " ms")
+
+
 def render_index(records: list[dict[str, Any]]) -> str:
     latest = records[-1]
     latest_run = latest["run"]
@@ -561,10 +572,10 @@ def render_index(records: list[dict[str, Any]]) -> str:
             f"<td>{text(winner.get('owner', '—'))}</td>"
             f"<td>{text(winner.get('address', '—'))}</td>"
             f"<td>{text(winner.get('policy', '—'))}</td>"
-            f"<td>{text(metric(stats, 'median_ms', ' ms'))}</td>"
-            f"<td>{text(metric(stats, 'p95_ms', ' ms'))}</td>"
+            f"<td>{text(latency_metric(stats, 'median_ms'))}</td>"
+            f"<td>{text(latency_metric(stats, 'p95_ms'))}</td>"
             f"<td>{text(metric(stats, 'success_rate'))}</td>"
-            f"<td>{text(metric(stats, 'score_ms', ' ms'))}</td>"
+            f"<td>{text(latency_metric(stats, 'score_ms'))}</td>"
             "</tr>"
         )
     history_rows = []

@@ -68,8 +68,18 @@ DNS or other Internet services; use the deterministic local fixtures instead.
 - Update `METHODOLOGY.md` when ranking, scoring, divergence, timing, or
   recommendation semantics change.
 - Keep JSON schema changes additive unless a deliberate schema-version change
-  is discussed first. CSV changes require corresponding consumer and fixture
-  updates.
+  is discussed first. Within one `schema_version` a new field is optional:
+  add it to `properties`, never to `required`, so the schema keeps accepting
+  every report that version has produced. Making a field required, removing
+  one, or renaming one needs a new `schema_version`. A release that adds a
+  report field vendors a report its own encoder writes with every optional
+  section filled, such as `schemaReport()` in
+  `internal/report/schema_test.go` encoded raw, into
+  `internal/report/testdata/released/`, where a test validates every one
+  against the current schema. The golden report is not enough: it has no
+  run provenance, so it did not change when v0.6.0 added provenance fields.
+  CSV columns are only ever appended after the last one, and CSV changes
+  require corresponding consumer and fixture updates.
 - Add an offline regression test for every transport, parser, report, or
   release-workflow behavior change.
 

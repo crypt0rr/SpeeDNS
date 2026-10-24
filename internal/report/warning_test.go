@@ -91,7 +91,7 @@ func TestWarningAttributionSurvivesProducerLabelDrift(t *testing.T) {
 	run.Warnings[0] = benchmark.TargetWarning(drifted, "had 3/4 failed queries [drifted label]")
 
 	rendered := run.Warnings[0].String()
-	if strings.HasPrefix(rendered, targetWarningLabelWithOptions(run.Targets[0], false)) {
+	if strings.HasPrefix(rendered, targetWarningLabelWithOptions(run.Targets[0], false, "")) {
 		t.Fatalf("drifted warning still matches the report label prefix: %q", rendered)
 	}
 
@@ -115,7 +115,9 @@ func TestWarningAttributionSurvivesProducerLabelDrift(t *testing.T) {
 // TestRedactedWarningsUseWarningAttribution asserts that redaction substitutes
 // the identity of the endpoint a warning belongs to, including when that
 // endpoint is no longer present in the results, and leaves other endpoints and
-// run-level text handling unchanged.
+// run-level text handling unchanged. A redacted label carries the redacted
+// target ID, the one identity results[].target.id also shows; an endpoint with
+// no result has no such ID and keeps the generic label.
 func TestRedactedWarningsUseWarningAttribution(t *testing.T) {
 	systemTarget := catalog.Target{
 		Resolver: catalog.ResolverProfile{
@@ -146,7 +148,7 @@ func TestRedactedWarningsUseWarningAttribution(t *testing.T) {
 
 	redacted := renderWarnings(run, true, redactedTargetIDs(run, true))
 	want := []string{
-		"System DNS (redacted) redacted/udp could not open a session: dial udp redacted: timeout",
+		"System DNS (redacted) system-redacted-1@redacted/udp could not open a session: dial udp redacted: timeout",
 		public.Target.DisplayName() + " " + public.Target.Address + "/udp had 1/2 failed queries",
 		"System DNS (redacted) redacted/udp could not open a session: dial udp redacted:53: timeout",
 		"global diagnostic mentions redacted",
@@ -175,7 +177,7 @@ func TestRedactedWarningsUseWarningAttribution(t *testing.T) {
 	if !strings.Contains(table.String(), "  - global diagnostic mentions redacted\n") {
 		t.Fatalf("redacted default table lost the run-level warning: %s", table.String())
 	}
-	if !strings.Contains(table.String(), "System DNS (redacted) redacted/udp: unavailable; 1/1 queries failed") {
+	if !strings.Contains(table.String(), "System DNS (redacted) system-redacted-1@redacted/udp: unavailable; 1/1 queries failed") {
 		t.Fatalf("redacted default table lost the compact per-target warning: %s", table.String())
 	}
 }
@@ -191,6 +193,64 @@ func TestIsSystemTargetIsTheRedactionRule(t *testing.T) {
 		}
 		if got, want := IsSystemTarget(target), strings.HasPrefix(id, "system-"); got != want {
 			t.Fatalf("IsSystemTarget(%q) = %v, want %v", id, got, want)
+		}
+	}
+}
+
+// TestRedactedWarningsTellSystemResolversApart pins #252: with two system
+// resolvers on one protocol, every redacted label used to read "System DNS
+// (redacted) redacted/udp", so their warnings were identical strings in JSON
+// and could not be matched to the results they describe.
+func TestRedactedWarningsTellSystemResolversApart(t *testing.T) {
+	systemTarget := func(id, address string) catalog.Target {
+		return catalog.Target{
+			Resolver: catalog.ResolverProfile{ID: id, Name: "System DNS", Owner: "local stub", Policy: "local forwarding"},
+			Protocol: catalog.UDP, Address: address, Spec: catalog.TransportSpec{Port: 53},
+		}
+	}
+	first, second := systemTarget("system-stub-127-0-0-53", "127.0.0.53"), systemTarget("system-stub-127-0-0-54", "127.0.0.54")
+	run := benchmark.Report{
+		Seed: 7, SampleSize: 1, Queries: 1, QueryTypes: []uint16{1},
+		// Each resolver answered one of two queries, so the compact table
+		// keeps a line per endpoint rather than collapsing them.
+		Targets: []benchmark.TargetResult{
+			{Target: first, Stats: benchmark.Statistics{Total: 2, Successes: 1, Failures: 1, UsableResponses: 1, Scored: 1}},
+			{Target: second, Stats: benchmark.Statistics{Total: 2, Successes: 1, Failures: 1, UsableResponses: 1, Scored: 1}},
+		},
+		Warnings: []benchmark.Warning{
+			benchmark.TargetWarning(first, "had 1/2 failed queries"),
+			benchmark.TargetWarning(second, "had 1/2 failed queries"),
+		},
+	}
+	var output bytes.Buffer
+	if err := WriteJSONWithOptions(&output, run, false, JSONOptions{RedactSystem: true}); err != nil {
+		t.Fatal(err)
+	}
+	var decoded JSONReport
+	if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Warnings) != 2 || decoded.Warnings[0] == decoded.Warnings[1] {
+		t.Fatalf("redacted warnings for two system resolvers must differ: %#v", decoded.Warnings)
+	}
+	for index, warning := range decoded.Warnings {
+		id := decoded.Results[index].Target.ID
+		if want := "System DNS (redacted) " + id + " had 1/2 failed queries"; warning != want {
+			t.Fatalf("warning %d = %q, want %q naming results[%d].target.id", index, warning, want, index)
+		}
+	}
+	if strings.Contains(output.String(), "127.0.0.5") {
+		t.Fatalf("redacted JSON leaked a system address: %s", output.String())
+	}
+	for _, details := range []bool{false, true} {
+		var table bytes.Buffer
+		if err := WriteTableWithOptions(&table, run, TableOptions{Details: details, RedactSystem: true, Protocols: []catalog.Protocol{catalog.UDP}}); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range []string{"system-redacted-1@redacted/udp", "system-redacted-2@redacted/udp"} {
+			if !strings.Contains(table.String(), "System DNS (redacted) "+id) {
+				t.Fatalf("redacted table (details=%v) does not label a warning with %s:\n%s", details, id, table.String())
+			}
 		}
 	}
 }

@@ -3,29 +3,54 @@ package report
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
-	"math"
-	"reflect"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
+	"github.com/crypt0rr/SpeeDNS/internal/schematest"
+	"github.com/crypt0rr/SpeeDNS/internal/transport"
 	"github.com/crypt0rr/SpeeDNS/schema"
-	"time"
 )
 
-func TestJSONReportsMatchPublishedSchema(t *testing.T) {
-	var schemaDocument map[string]any
-	if err := json.Unmarshal(schema.ReportV1(), &schemaDocument); err != nil {
-		t.Fatal(err)
-	}
+// schemaReport is completeReport with everything the schema describes and the
+// minimal fixtures leave out: provenance, paired effects -- a reference, a
+// measured delta and one below the sample floor -- a divergence detail with
+// an ambiguous plurality and exclusions, and the connection a target made.
+// Each section is validated as encoded, so a renamed field in any of them
+// fails against the schema's additionalProperties:false.
+func schemaReport() benchmark.Report {
 	run := completeReport()
 	run.Provenance = &benchmark.RunProvenance{
 		Version: "dev", Commit: "unknown", BuildDate: "unknown", OS: "linux", Architecture: "amd64",
 		Interfaces: []string{"lo"}, Protocols: []catalog.Protocol{catalog.UDP}, CorpusEntries: 1,
 		CorpusSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		Timeout:      time.Second, Concurrency: 1,
+		Timeout:      time.Second, Concurrency: 1, Family: "auto",
 	}
+	run.Targets[2].Connection = transport.ConnectionInfo{RemoteAddress: "[2001:db8::53]:443", TLSVersion: "TLS 1.3", HTTPProtocol: "h2"}
+	winner := run.Targets[1].Target.ID()
+	run.PairedEffects = []benchmark.PairedEffect{
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: winner, ReferenceTargetID: winner, Reference: true, Indistinguishable: true},
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: "other@192.0.2.9/udp", ReferenceTargetID: winner, Samples: 40, MedianDeltaMS: 1.5, CILowMS: 0.5, CIHighMS: 2.5},
+		{Protocol: catalog.UDP, Policy: "unfiltered", TargetID: "few@192.0.2.8/udp", ReferenceTargetID: winner, Samples: 3, Reason: "fewer than 20 paired samples"},
+	}
+	run.Divergence = []benchmark.DivergenceDetail{
+		{
+			Name: "example.com", QType: 1, Policy: "unfiltered", Compared: 3, Baseline: "answer",
+			Classes:  map[string]int{"answer": 2, "nxdomain": 1},
+			Excluded: []benchmark.DivergenceExclusion{{TargetID: winner, ResponseClass: "nxdomain", Treatment: "latency-excluded"}},
+		},
+		{Name: "example.org", QType: 28, Policy: "unfiltered", Compared: 2, Ambiguous: true, Classes: map[string]int{"answer": 1, "nodata": 1}},
+	}
+	return run
+}
+
+func TestJSONReportsMatchPublishedSchema(t *testing.T) {
+	run := schemaReport()
 	cases := []struct {
 		name    string
 		write   func(*bytes.Buffer) error
@@ -43,14 +68,13 @@ func TestJSONReportsMatchPublishedSchema(t *testing.T) {
 			if err := tc.write(&output); err != nil {
 				t.Fatal(err)
 			}
-			var instance any
-			decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
-			decoder.UseNumber()
-			if err := decoder.Decode(&instance); err != nil {
-				t.Fatal(err)
-			}
-			if err := validateJSONSchema(schemaDocument, instance, schemaDocument, "$"); err != nil {
+			if err := schematest.Validate(schema.ReportV1(), output.Bytes()); err != nil {
 				t.Fatalf("JSON does not match schema: %v\n%s", err, output.String())
+			}
+			for _, section := range []string{`"paired_effects"`, `"divergence"`, `"remote_address"`, `"http_protocol"`} {
+				if !bytes.Contains(output.Bytes(), []byte(section)) {
+					t.Fatalf("the schema fixture lost its %s section, so it is no longer validated:\n%s", section, output.String())
+				}
 			}
 			if tc.wantRaw && !bytes.Contains(output.Bytes(), []byte(`"samples"`)) {
 				t.Fatal("raw report did not include samples")
@@ -59,147 +83,96 @@ func TestJSONReportsMatchPublishedSchema(t *testing.T) {
 	}
 }
 
-func validateJSONSchema(document map[string]any, instance any, root map[string]any, path string) error {
-	if reference, ok := document["$ref"].(string); ok {
-		const prefix = "#/$defs/"
-		if len(reference) <= len(prefix) || reference[:len(prefix)] != prefix {
-			return fmt.Errorf("%s uses unsupported schema reference %q", path, reference)
-		}
-		name := reference[len(prefix):]
-		definitions, ok := root["$defs"].(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s cannot resolve %q", path, reference)
-		}
-		definition, ok := definitions[name].(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s references unknown definition %q", path, name)
-		}
-		return validateJSONSchema(definition, instance, root, path)
+// TestEncoderStillEmitsFieldsTheSchemaNoLongerRequires guards the other half
+// of #253. status, answers, answer_rate, family and dnssec were added to the
+// schema's required lists after v0.3.0, which made the v1 schema reject every
+// older v1 report; they are optional again, but every report this release
+// writes must still carry them.
+func TestEncoderStillEmitsFieldsTheSchemaNoLongerRequires(t *testing.T) {
+	var output bytes.Buffer
+	if err := WriteJSON(&output, schemaReport(), false); err != nil {
+		t.Fatal(err)
 	}
-	if expected, ok := document["const"]; ok {
-		if expectedNumber, expectedIsNumber := numberValue(expected); expectedIsNumber {
-			actualNumber, actualIsNumber := numberValue(instance)
-			if !actualIsNumber || actualNumber != expectedNumber {
-				return fmt.Errorf("%s = %v, want constant %v", path, instance, expected)
-			}
-		} else if !reflect.DeepEqual(expected, instance) {
-			return fmt.Errorf("%s = %v, want constant %v", path, instance, expected)
+	var decoded struct {
+		Run struct {
+			Provenance map[string]any `json:"provenance"`
+		} `json:"run"`
+		Results []map[string]any `json:"results"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"family", "dnssec"} {
+		if _, ok := decoded.Run.Provenance[field]; !ok {
+			t.Fatalf("provenance.%s is no longer emitted", field)
 		}
 	}
-	if enum, ok := document["enum"].([]any); ok {
-		matched := false
-		for _, candidate := range enum {
-			if reflect.DeepEqual(candidate, instance) {
-				matched = true
-				break
+	for _, result := range decoded.Results {
+		stats, _ := result["stats"].(map[string]any)
+		for _, field := range []string{"answers", "answer_rate"} {
+			if _, ok := stats[field]; !ok {
+				t.Fatalf("stats.%s is no longer emitted: %v", field, result)
 			}
 		}
-		if !matched {
-			return fmt.Errorf("%s = %v, not in enum %v", path, instance, enum)
+		if _, ok := result["status"]; !ok {
+			t.Fatalf("status is no longer emitted: %v", result)
 		}
 	}
-	if minimum, ok := numberValue(document["minimum"]); ok {
-		value, valid := numberValue(instance)
-		if !valid || value < minimum {
-			return fmt.Errorf("%s = %v, below minimum %v", path, instance, minimum)
-		}
-	}
-	if maximum, ok := numberValue(document["maximum"]); ok {
-		value, valid := numberValue(instance)
-		if !valid || value > maximum {
-			return fmt.Errorf("%s = %v, above maximum %v", path, instance, maximum)
-		}
-	}
-
-	schemaType, hasType := document["type"]
-	if !hasType {
-		return nil
-	}
-	switch schemaType {
-	case "object":
-		object, ok := instance.(map[string]any)
-		if !ok {
-			return fmt.Errorf("%s has type %T, want object", path, instance)
-		}
-		if required, ok := document["required"].([]any); ok {
-			for _, field := range required {
-				name, ok := field.(string)
-				if !ok {
-					return fmt.Errorf("%s has invalid required field %v", path, field)
-				}
-				if _, exists := object[name]; !exists {
-					return fmt.Errorf("%s is missing required field %q", path, name)
-				}
-			}
-		}
-		properties, _ := document["properties"].(map[string]any)
-		additional, hasAdditional := document["additionalProperties"]
-		for name, value := range object {
-			property, exists := properties[name].(map[string]any)
-			if exists {
-				if err := validateJSONSchema(property, value, root, path+"."+name); err != nil {
-					return err
-				}
-				continue
-			}
-			if !hasAdditional || additional == true {
-				continue
-			}
-			if additional == false {
-				return fmt.Errorf("%s has unexpected field %q", path, name)
-			}
-			if property, ok := additional.(map[string]any); ok {
-				if err := validateJSONSchema(property, value, root, path+"."+name); err != nil {
-					return err
-				}
-			}
-		}
-	case "array":
-		array, ok := instance.([]any)
-		if !ok {
-			return fmt.Errorf("%s has type %T, want array", path, instance)
-		}
-		if items, ok := document["items"].(map[string]any); ok {
-			for index, value := range array {
-				if err := validateJSONSchema(items, value, root, fmt.Sprintf("%s[%d]", path, index)); err != nil {
-					return err
-				}
-			}
-		}
-	case "string":
-		if _, ok := instance.(string); !ok {
-			return fmt.Errorf("%s has type %T, want string", path, instance)
-		}
-	case "boolean":
-		if _, ok := instance.(bool); !ok {
-			return fmt.Errorf("%s has type %T, want boolean", path, instance)
-		}
-	case "integer":
-		value, ok := numberValue(instance)
-		if !ok || math.Trunc(value) != value {
-			return fmt.Errorf("%s has value %v, want integer", path, instance)
-		}
-	case "number":
-		if _, ok := numberValue(instance); !ok {
-			return fmt.Errorf("%s has type %T, want number", path, instance)
-		}
-	default:
-		return fmt.Errorf("%s uses unsupported schema type %v", path, schemaType)
-	}
-	return nil
 }
 
-func numberValue(value any) (float64, bool) {
-	switch value := value.(type) {
-	case json.Number:
-		parsed, err := value.Float64()
-		return parsed, err == nil
-	case float64:
-		return value, true
-	case int:
-		return float64(value), true
-	default:
-		return 0, false
+// TestReleasedReportsMatchTheCurrentSchema pins the schema_version contract:
+// report-v1.json must accept every version 1 report any release wrote. The
+// required lists grew in v0.4.0 (status, answers, answer_rate) and v0.6.0
+// (family, dnssec) while schema_version stayed 1, so the published schema
+// rejected v0.1.0-v0.5.x output and a consumer selecting rules by version
+// could not validate archived reports.
+//
+// testdata/released holds what those releases produced, vendored because CI
+// checks out a shallow clone and the tags are not there to read:
+//   - golden-vX.json is internal/report/testdata/golden/report.json at that
+//     tag, taken with git show, one per distinct golden: v0.1.0, v0.2.0 (also
+//     v0.3.0) and v0.4.0 (also v0.5.0 through v0.6.9, and still the current
+//     golden). The goldens carry no provenance.
+//   - provenance-vX.json is that release's own encoder writing the report its
+//     schema test validated: completeReport() with run provenance, raw. They
+//     cover provenance before family and dnssec existed.
+//
+// The golden alone did not change when v0.6.0 added fields to provenance, so
+// a release that adds a field vendors a report its own encoder writes with
+// every optional section, such as schemaReport() encoded raw.
+func TestReleasedReportsMatchTheCurrentSchema(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("testdata", "released", "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(paths)
+	var names []string
+	for _, path := range paths {
+		names = append(names, filepath.Base(path))
+	}
+	want := "golden-v0.1.0.json golden-v0.2.0.json golden-v0.4.0.json provenance-v0.1.0.json provenance-v0.3.0.json provenance-v0.5.0.json"
+	if got := strings.Join(names, " "); got != want {
+		t.Fatalf("released fixtures = %s, want %s", got, want)
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			document, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := schematest.Validate(schema.ReportV1(), document); err != nil {
+				t.Fatalf("a report v1 wrote no longer matches the v1 schema: %v", err)
+			}
+		})
+	}
+	// The current golden is validated beside them: it is the only fixture
+	// whose divergence section the golden test byte-compares.
+	golden, err := os.ReadFile(filepath.Join("testdata", "golden", "report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := schematest.Validate(schema.ReportV1(), golden); err != nil {
+		t.Fatalf("the current golden report does not match the schema: %v", err)
 	}
 }
 
@@ -207,10 +180,6 @@ func numberValue(value any) (float64, bool) {
 // exists to reveal: every endpoint failed, so nothing is ranked. The published
 // schema requires "rankings" to be an array, and a nil slice marshals as null.
 func TestJSONReportWithNoComparableResultsMatchesSchema(t *testing.T) {
-	var schemaDocument map[string]any
-	if err := json.Unmarshal(schema.ReportV1(), &schemaDocument); err != nil {
-		t.Fatal(err)
-	}
 	failed := reportTarget("1", catalog.UDP, 0, false)
 	failed.Stats = benchmark.Statistics{}
 	failed.OpenError = "open failed"
@@ -226,13 +195,7 @@ func TestJSONReportWithNoComparableResultsMatchesSchema(t *testing.T) {
 	if bytes.Contains(output.Bytes(), []byte(`"rankings": null`)) {
 		t.Fatalf("rankings marshalled as null:\n%s", output.String())
 	}
-	var instance any
-	decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
-	decoder.UseNumber()
-	if err := decoder.Decode(&instance); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateJSONSchema(schemaDocument, instance, schemaDocument, "$"); err != nil {
+	if err := schematest.Validate(schema.ReportV1(), output.Bytes()); err != nil {
 		t.Fatalf("JSON does not match schema: %v\n%s", err, output.String())
 	}
 }

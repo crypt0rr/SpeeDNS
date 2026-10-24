@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/crypt0rr/SpeeDNS/internal/safetext"
+	"github.com/crypt0rr/SpeeDNS/internal/schematest"
+	"github.com/crypt0rr/SpeeDNS/schema"
 )
 
 func intPtr(v int) *int       { return &v }
@@ -463,7 +467,7 @@ func TestOutputNeverNamesALatencyStatistic(t *testing.T) {
 		write func(*bytes.Buffer) error
 	}{
 		{"table", func(b *bytes.Buffer) error { return WriteTable(b, diff) }},
-		{"json", func(b *bytes.Buffer) error { return WriteJSON(b, diff) }},
+		{"json", func(b *bytes.Buffer) error { return WriteJSON(b, diff, nil) }},
 	} {
 		t.Run(render.name, func(t *testing.T) {
 			var buffer bytes.Buffer
@@ -482,34 +486,187 @@ func TestOutputNeverNamesALatencyStatistic(t *testing.T) {
 	}
 }
 
-// TestWriteJSONMatchesTheCompareSchema keeps the emitted document and the
-// published contract in step, in both outcomes.
+// TestWriteJSONMatchesTheCompareSchema validates the emitted document against
+// schema/compare-v1.json, in every shape a diff can take. The scenarios
+// between them produce every finding code, every suppression reason and every
+// condition outcome, and the test reads those enums from the schema itself, so
+// renaming a value on either side -- or adding one to the code without the
+// schema -- fails here instead of in a consumer.
 func TestWriteJSONMatchesTheCompareSchema(t *testing.T) {
-	for _, testCase := range []struct {
-		name   string
-		mutate func(*Report)
+	var document struct {
+		Definitions map[string]struct {
+			Properties map[string]struct {
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(schema.CompareV1(), &document); err != nil {
+		t.Fatal(err)
+	}
+	enum := func(definition, property string) []string {
+		values := append([]string(nil), document.Definitions[definition].Properties[property].Enum...)
+		if len(values) == 0 {
+			t.Fatalf("compare-v1 $defs/%s.%s has no enum", definition, property)
+		}
+		sort.Strings(values)
+		return values
+	}
+	if got, want := enum("condition", "name"), RequireNames(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("compare-v1 condition names = %v, want the --require conditions %v", got, want)
+	}
+
+	statusDrop := func(usable, scored int) func(_, c *Report) {
+		return func(_, c *Report) {
+			c.Results[0].Status = "ineligible"
+			c.Results[0].Stats.UsableResponses = usable
+			c.Results[0].Stats.Scored = scored
+		}
+	}
+	every := RequireNames()
+	scenarios := []struct {
+		name     string
+		mutate   func(baseline, current *Report)
+		required []string
 	}{
-		{"comparable", func(r *Report) { r.Results[0].Stats.UsableResponses = 10 }},
-		{"refused", func(r *Report) { r.Run.Seed = int64Ptr(99) }},
+		{name: "identical, gated", required: every},
+		{name: "refused, gated", mutate: func(_, c *Report) { c.Run.Seed = int64Ptr(99) }, required: every},
+		{name: "nothing compared, gated", mutate: func(_, c *Report) { c.Results[0].Incomplete = true }, required: every},
+		{name: "target added and removed", mutate: func(_, c *Report) { c.Results[0].Target.ID = "b@9.9.9.9/udp" }},
+		{name: "open error", mutate: func(_, c *Report) { c.Results[0].OpenError = "i/o timeout" }, required: every},
+		{name: "all queries failed", mutate: func(_, c *Report) { c.Results[0].Stats.Successes = 0 }},
+		{name: "different matrix", mutate: func(_, c *Report) { c.Results[0].Stats.Total = 30 }},
+		{name: "usable dropped with status", mutate: statusDrop(10, 40)},
+		{name: "answers dropped", mutate: func(_, c *Report) { c.Results[0].Stats.Answers = 0 }},
+		{name: "truncation appeared", mutate: func(_, c *Report) { c.Results[0].Stats.Truncated = 9 }},
+		{name: "rcode moved", mutate: func(_, c *Report) {
+			c.Results[0].Stats.RCodeCounts = map[string]int{"NOERROR": 10, "SERVFAIL": 30}
+		}},
+		{name: "boundary crossing", mutate: statusDrop(39, 40)},
+		{name: "peer relative", mutate: statusDrop(40, 39)},
+		{name: "dnssec decided", mutate: func(b, c *Report) {
+			b.Results[0].DNSSEC, c.Results[0].DNSSEC = &DNSSEC{Verdict: "validating"}, &DNSSEC{Verdict: "not-validating"}
+		}},
+		{name: "dnssec undecided", mutate: func(b, c *Report) {
+			b.Results[0].DNSSEC, c.Results[0].DNSSEC = &DNSSEC{Verdict: "validating"}, &DNSSEC{Verdict: "inconclusive"}
+		}},
+		{name: "local resolver", mutate: func(_, c *Report) { c.Results[0].Target.Local = true }},
+		{name: "redacted identity", mutate: func(b, c *Report) {
+			b.Results[0].Target.ID, c.Results[0].Target.ID = "system-redacted-1@x/udp", "system-redacted-1@x/udp"
+		}},
+		{name: "warnings changed", mutate: func(b, c *Report) {
+			b.Warnings, c.Warnings = []string{"old warning"}, []string{"new warning"}
+		}},
+	}
+	seen := map[string]map[string]bool{"code": {}, "reason": {}, "outcome": {}}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			baseline, current := baseReport("a.json"), baseReport("b.json")
+			if scenario.mutate != nil {
+				scenario.mutate(&baseline, &current)
+			}
+			diff := Compare(baseline, current)
+			var conditions []Condition
+			if len(scenario.required) > 0 {
+				results, err := Require(diff, scenario.required)
+				if err != nil {
+					t.Fatal(err)
+				}
+				conditions = Conditions(diff, results)
+			}
+			var buffer bytes.Buffer
+			if err := WriteJSON(&buffer, diff, conditions); err != nil {
+				t.Fatal(err)
+			}
+			if err := schematest.Validate(schema.CompareV1(), buffer.Bytes()); err != nil {
+				t.Fatalf("diff JSON does not match compare-v1: %v\n%s", err, buffer.String())
+			}
+			var decoded struct {
+				Comparable bool `json:"comparable"`
+			}
+			if err := json.Unmarshal(buffer.Bytes(), &decoded); err != nil || decoded.Comparable != diff.Comparable() {
+				t.Fatalf("comparable = %v, want %v (%v)", decoded.Comparable, diff.Comparable(), err)
+			}
+			if gated := bytes.Contains(buffer.Bytes(), []byte(`"conditions"`)); gated != (len(conditions) > 0) {
+				t.Fatalf("conditions present = %v, want it only when --require ran:\n%s", gated, buffer.String())
+			}
+			for _, finding := range diff.Findings {
+				seen["code"][finding.Code] = true
+			}
+			for _, suppression := range diff.Suppressions {
+				seen["reason"][suppression.Reason] = true
+			}
+			for _, condition := range conditions {
+				seen["outcome"][condition.Outcome] = true
+			}
+		})
+	}
+	for key, definition := range map[string]string{"code": "finding", "reason": "suppression", "outcome": "condition"} {
+		produced := make([]string, 0, len(seen[key]))
+		for value := range seen[key] {
+			produced = append(produced, value)
+		}
+		sort.Strings(produced)
+		if got, want := strings.Join(produced, ","), strings.Join(enum(definition, key), ","); got != want {
+			t.Fatalf("scenarios produced %s values %s, want every value compare-v1 allows: %s", key, got, want)
+		}
+	}
+}
+
+// TestConditionsNeverPassAGateThatCouldNotEvaluate pins the JSON half of #230:
+// a condition's own result holds on a refused diff and on one that compared
+// nothing, because it read no finding, and recording that as passed would
+// archive a pass for a gate the exit status refused.
+func TestConditionsNeverPassAGateThatCouldNotEvaluate(t *testing.T) {
+	gate := func(mutate func(baseline, current *Report), names ...string) []Condition {
+		baseline, current := baseReport("a.json"), baseReport("b.json")
+		mutate(&baseline, &current)
+		diff := Compare(baseline, current)
+		results, err := Require(diff, names)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Conditions(diff, results)
+	}
+	refused := gate(func(_, c *Report) { c.Run.Seed = int64Ptr(99) }, "no-behaviour-change")
+	if want := (Condition{Name: "no-behaviour-change", Outcome: OutcomeNotEvaluated, Detail: "not evaluated: the runs are not comparable"}); refused[0] != want {
+		t.Fatalf("refused condition = %#v, want %#v", refused[0], want)
+	}
+	unpaired := gate(func(_, c *Report) { c.Results[0].Target.ID = "b@9.9.9.9/udp" }, "no-new-failed-targets", "no-removed-targets")
+	want := []Condition{
+		{Name: "no-new-failed-targets", Outcome: OutcomeNotEvaluated, Detail: "not evaluated: no endpoint was compared (2 present in only one run)"},
+		{Name: "no-removed-targets", Outcome: OutcomeFailed, Detail: "a@1.1.1.1/udp is absent from the current run"},
+	}
+	if !reflect.DeepEqual(unpaired, want) {
+		t.Fatalf("unpaired conditions = %#v, want %#v", unpaired, want)
+	}
+	passed := gate(func(*Report, *Report) {}, "no-behaviour-change")
+	if !passed[0].Passed || passed[0].Outcome != OutcomePassed || passed[0].Detail != "no findings" {
+		t.Fatalf("a condition that held over a compared endpoint = %#v, want passed", passed[0])
+	}
+	for _, condition := range append(refused, unpaired...) {
+		if condition.Passed {
+			t.Fatalf("a condition the gate did not pass reports passed: %#v", condition)
+		}
+	}
+}
+
+// TestNotComparedSummaryNamesEveryReason covers each way a diff can compare
+// nothing, counted in a stable order.
+func TestNotComparedSummaryNamesEveryReason(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		diff Diff
+		want string
+	}{
+		{name: "empty", want: "neither run has a target"},
+		{name: "suppressed and unpaired", diff: Diff{
+			Suppressions: []Suppression{{Reason: "local-position"}, {Reason: "incomplete-target"}, {Reason: "local-position"}},
+			Findings:     []Finding{{Code: "PRESENCE"}, {Code: "FAILED"}},
+		}, want: "1 incomplete-target, 2 local-position, 1 present in only one run"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			baseline, current := baseReport("a.json"), baseReport("b.json")
-			testCase.mutate(&current)
-			var buffer bytes.Buffer
-			if err := WriteJSON(&buffer, Compare(baseline, current)); err != nil {
-				t.Fatal(err)
-			}
-			var document map[string]any
-			if err := json.Unmarshal(buffer.Bytes(), &document); err != nil {
-				t.Fatal(err)
-			}
-			for _, key := range []string{"schema_version", "comparable", "baseline", "current", "blockers", "findings", "not_compared", "disclosures", "warnings", "compared"} {
-				if _, ok := document[key]; !ok {
-					t.Fatalf("%s JSON has no %q", testCase.name, key)
-				}
-			}
-			if testCase.name == "refused" && document["comparable"] != false {
-				t.Fatal("a refused diff must report comparable=false")
+			if got := NotComparedSummary(testCase.diff); got != testCase.want {
+				t.Fatalf("summary = %q, want %q", got, testCase.want)
 			}
 		})
 	}
@@ -683,8 +840,9 @@ func TestWriteJSONEscapesReportText(t *testing.T) {
 		AddedWarnings:   []string{"added\x1b[2J"},
 		RemovedWarnings: []string{"removed\u2066"},
 	}
+	conditions := []Condition{{Name: "no-new-failed-targets", Outcome: OutcomeFailed, Detail: hostileID + ": successes 40 -> 0"}}
 	var output bytes.Buffer
-	if err := WriteJSON(&output, diff); err != nil {
+	if err := WriteJSON(&output, diff, conditions); err != nil {
 		t.Fatal(err)
 	}
 	var document any
@@ -712,5 +870,9 @@ func TestWriteJSONEscapesReportText(t *testing.T) {
 	findings := document.(map[string]any)["findings"].([]any)
 	if got := findings[0].(map[string]any)["target_id"]; got != `evil\x1b[2K\u{202e}@1.1.1.1/udp` {
 		t.Fatalf("target_id = %q, want the escaped form", got)
+	}
+	recorded := document.(map[string]any)["conditions"].([]any)
+	if got := recorded[0].(map[string]any)["detail"]; got != `evil\x1b[2K\u{202e}@1.1.1.1/udp: successes 40 -> 0` {
+		t.Fatalf("condition detail = %q, want the escaped form", got)
 	}
 }

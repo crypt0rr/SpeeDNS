@@ -12,6 +12,7 @@ import (
 	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
 	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/safetext"
+	"github.com/crypt0rr/SpeeDNS/internal/transport"
 )
 
 // hostileSAN is the kind of string a certificate can carry into a TLS error:
@@ -45,6 +46,14 @@ const (
 	// --resolver-file entry carries both into endpoint_url.
 	hostileDoHURL        = "https://doh.example/dns-query\u009b2J\u202e"
 	hostileDoHURLEscaped = `https://doh.example/dns-query\x9b2J\u{202e}`
+	// hostileTLSVersion and hostileHTTPProtocol stand in for the negotiated
+	// versions a session describes. crypto/tls cannot produce such text
+	// today, but the fields are escaped like every other endpoint string, so
+	// no sink depends on where a value came from.
+	hostileTLSVersion          = "TLS 1.3\x1b[2K"
+	hostileTLSVersionEscaped   = `TLS 1.3\x1b[2K`
+	hostileHTTPProtocol        = "h2\u202e"
+	hostileHTTPProtocolEscaped = `h2\u{202e}`
 )
 
 func hostileReport() benchmark.Report {
@@ -67,8 +76,11 @@ func hostileReport() benchmark.Report {
 	result := benchmark.TargetResult{
 		Target:      target,
 		DialAddress: hostileDialAddress,
-		OpenError:   "x509: certificate is valid for " + hostileSAN + ", not resolver.example",
-		Stats:       benchmark.Statistics{Total: 1, Failures: 1},
+		Connection: transport.ConnectionInfo{
+			RemoteAddress: hostileDialAddress, TLSVersion: hostileTLSVersion, HTTPProtocol: hostileHTTPProtocol,
+		},
+		OpenError: "x509: certificate is valid for " + hostileSAN + ", not resolver.example",
+		Stats:     benchmark.Statistics{Total: 1, Failures: 1},
 		DNSSEC: &benchmark.DNSSECAssessment{
 			Verdict: benchmark.DNSSECInconclusive,
 			Reason:  "the bogus probe did not complete: " + hostileDoHStatus,
@@ -394,6 +406,9 @@ func TestJSONEscapesEndpointText(t *testing.T) {
 		{"target.tls_server_name", result.Target.TLSServerName, hostileServerNameEscaped},
 		{"target.bootstrap_addresses[0]", result.Target.BootstrapAddresses[0], hostileBootstrapEscaped},
 		{"target.dial_address", result.Target.DialAddress, hostileDialAddressEscaped},
+		{"target.remote_address", result.Target.RemoteAddress, hostileDialAddressEscaped},
+		{"target.tls_version", result.Target.TLSVersion, hostileTLSVersionEscaped},
+		{"target.http_protocol", result.Target.HTTPProtocol, hostileHTTPProtocolEscaped},
 		{"doh target.endpoint_url", doh.Target.EndpointURL, hostileDoHURLEscaped},
 		{"dnssec.reason", result.DNSSEC.Reason, "the bogus probe did not complete: " + hostileDoHStatusEscaped},
 		{"dnssec.probes[0].error", result.DNSSEC.Probes[0].Error, "x509: certificate is valid for " + hostileSANEscaped + ", not resolver.example"},
@@ -442,6 +457,9 @@ func TestCSVCarriesTheSameEscapedValuesAsJSON(t *testing.T) {
 			{"tls_server_name", result.Target.TLSServerName},
 			{"bootstrap_addresses", strings.Join(result.Target.BootstrapAddresses, ";")},
 			{"dial_address", result.Target.DialAddress},
+			{"remote_address", result.Target.RemoteAddress},
+			{"tls_version", result.Target.TLSVersion},
+			{"http_protocol", result.Target.HTTPProtocol},
 			{"owner", result.Target.Owner},
 		} {
 			if values[check.column] != check.json {

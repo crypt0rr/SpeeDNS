@@ -1,0 +1,200 @@
+{
+  "schema_version": 1,
+  "run": {
+    "started_at": "1970-01-01T00:00:00.000Z",
+    "finished_at": "1970-01-01T00:00:01.000Z",
+    "seed": 42,
+    "provenance": {
+      "speedns_version": "dev",
+      "commit": "unknown",
+      "build_date": "unknown",
+      "os": "linux",
+      "architecture": "amd64",
+      "interfaces": [
+        "lo"
+      ],
+      "protocols": [
+        "udp"
+      ],
+      "corpus_entries": 1,
+      "corpus_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "timeout_ms": 1000,
+      "concurrency": 1,
+      "duration_ms": 1000
+    },
+    "sample_size": 2,
+    "queries_per_target": 4,
+    "query_types": [
+      1,
+      65000
+    ]
+  },
+  "results": [
+    {
+      "target": {
+        "id": "2@192.0.2.2/tcp",
+        "name": "Resolver 2",
+        "owner": "Owner 2",
+        "policy": "unfiltered",
+        "address": "192.0.2.2",
+        "protocol": "tcp",
+        "tls_identity_source": "none",
+        "bootstrap_mode": "none"
+      },
+      "stats": {
+        "total": 0,
+        "successes": 0,
+        "failures": 0,
+        "usable_responses": 0,
+        "resolver_failures": 0,
+        "scored": 0,
+        "divergent": 0,
+        "truncated": 0,
+        "reconnects": 0,
+        "success_rate": 0,
+        "failure_rate": 0,
+        "usable_rate": 0,
+        "resolver_failure_rate": 0,
+        "scoring_failure_rate": 0,
+        "median_ms": 0,
+        "p95_ms": 0,
+        "min_ms": 0,
+        "max_ms": 0,
+        "mad_ms": 0,
+        "cold_median_ms": 0,
+        "score_ms": 0,
+        "ci_low_ms": 0,
+        "ci_high_ms": 0,
+        "recommended": false,
+        "tie": false
+      },
+      "open_error": "open failed"
+    },
+    {
+      "target": {
+        "id": "1@192.0.2.1/udp",
+        "name": "Resolver 1",
+        "owner": "Owner 1",
+        "policy": "unfiltered",
+        "address": "192.0.2.1",
+        "protocol": "udp",
+        "tls_identity_source": "none",
+        "bootstrap_mode": "none",
+        "dial_address": "192.0.2.1:53"
+      },
+      "stats": {
+        "total": 2,
+        "successes": 2,
+        "failures": 0,
+        "usable_responses": 2,
+        "resolver_failures": 0,
+        "scored": 2,
+        "divergent": 0,
+        "truncated": 0,
+        "reconnects": 0,
+        "success_rate": 1,
+        "failure_rate": 0,
+        "usable_rate": 1,
+        "resolver_failure_rate": 0,
+        "scoring_failure_rate": 0,
+        "median_ms": 2,
+        "p95_ms": 3,
+        "min_ms": 1,
+        "max_ms": 4,
+        "mad_ms": 0.5,
+        "cold_median_ms": 5,
+        "score_ms": 2.4,
+        "ci_low_ms": 1,
+        "ci_high_ms": 4,
+        "recommended": true,
+        "tie": false
+      },
+      "samples": [
+        {
+          "name": "example.com",
+          "qtype": 1,
+          "latency_ms": 2,
+          "success": true,
+          "usable": false
+        }
+      ],
+      "cold": [
+        {
+          "name": "example.com",
+          "qtype": 1,
+          "latency_ms": 5,
+          "success": true
+        }
+      ]
+    },
+    {
+      "target": {
+        "id": "3@192.0.2.3/doh",
+        "name": "Resolver 3",
+        "owner": "Owner 3",
+        "policy": "unfiltered",
+        "address": "192.0.2.3",
+        "protocol": "doh",
+        "endpoint_url": "https://cdn.example/dns-query",
+        "tls_server_name": "resolver.example",
+        "tls_identity_source": "configured",
+        "bootstrap_mode": "explicit",
+        "bootstrap_addresses": [
+          "192.0.2.53",
+          "2001:db8::53"
+        ],
+        "dial_address": "2001:db8::53:443"
+      },
+      "stats": {
+        "total": 2,
+        "successes": 2,
+        "failures": 0,
+        "usable_responses": 2,
+        "resolver_failures": 0,
+        "scored": 2,
+        "divergent": 0,
+        "truncated": 0,
+        "reconnects": 0,
+        "success_rate": 1,
+        "failure_rate": 0,
+        "usable_rate": 1,
+        "resolver_failure_rate": 0,
+        "scoring_failure_rate": 0,
+        "median_ms": 2,
+        "p95_ms": 3,
+        "min_ms": 1,
+        "max_ms": 4,
+        "mad_ms": 0.5,
+        "cold_median_ms": 5,
+        "score_ms": 2.4,
+        "ci_low_ms": 1,
+        "ci_high_ms": 4,
+        "recommended": false,
+        "tie": false
+      }
+    }
+  ],
+  "rankings": [
+    {
+      "protocol": "doh",
+      "target_id": "missing-target",
+      "rank": 1,
+      "tie": false
+    },
+    {
+      "protocol": "udp",
+      "target_id": "1@192.0.2.1/udp",
+      "rank": 1,
+      "tie": false
+    },
+    {
+      "protocol": "udp",
+      "target_id": "1@192.0.2.1/udp",
+      "rank": 2,
+      "tie": false
+    }
+  ],
+  "warnings": [
+    "example warning"
+  ]
+}

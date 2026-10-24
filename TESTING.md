@@ -78,6 +78,25 @@ are offline, assert nothing about timing, and run only when asked:
 go test -run '^$' -bench . -benchmem ./internal/benchmark ./internal/report
 ```
 
+JSON output is validated against the published schemas with the shared
+`internal/schematest` validator, which implements the keywords the schemas use
+and rejects any other keyword rather than ignoring it. The report tests
+validate a report carrying every optional section, including paired effects,
+divergence and the connection fields, and `internal/compare` validates diff
+JSON in scenarios that between them produce every finding code, suppression
+reason and `--require` outcome, reading those enums from `compare-v1.json`.
+`internal/report/testdata/released/` holds the reports earlier releases wrote:
+each distinct golden `report.json`, taken from its tag with `git show`, and the
+report each of v0.1.0, v0.3.0 and v0.5.0 encoded with run provenance. They are
+vendored because CI clones shallowly and has no tags to read, and every one
+must still validate against the current `report-v1.json`.
+
+`scripts/publish-live-results-fixture.sh` feeds the live-results publisher
+evidence written by the real report encoder, with statistics derived from
+observations by `benchmark.CalculateStatistics`, the function a run uses. It
+checks that a transport with no scored sample is published with `—` for its
+latency and score cells and a numeric success rate.
+
 `TestDeterministicResolverFixtureCoversBenchmarkOutcomes` uses in-memory
 resolver sessions to exercise the full benchmark scheduler and statistics
 path. Its targets cover:

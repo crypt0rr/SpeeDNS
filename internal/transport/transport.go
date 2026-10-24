@@ -47,6 +47,64 @@ type doqStream interface {
 type doqConn interface {
 	OpenStreamSync(context.Context) (doqStream, error)
 	CloseWithError(quic.ApplicationErrorCode, string) error
+	RemoteAddr() net.Addr
+	ConnectionState() quic.ConnectionState
+}
+
+// ConnectionInfo describes the connection a session holds, or held last: the
+// peer it actually reached and what its handshake negotiated. A session
+// reports it through an optional Connection method, as it reports its dial
+// address through DialAddress.
+//
+// The dial address is the configured candidate. For a hostname endpoint
+// without bootstrap addresses that is the hostname:port on every transport but
+// UDP, so it cannot say which address family a transport used: a hostname with
+// both an IPv4 and an IPv6 address let one report mix families with nothing
+// showing which. The remote address is the literal the connection reached.
+type ConnectionInfo struct {
+	// RemoteAddress is the IP address and port of the peer: the resolved
+	// literal for UDP, the connected socket's peer for every other transport.
+	RemoteAddress string
+	// TLSVersion is the negotiated TLS version, such as "TLS 1.3", for DoT,
+	// DoH and DoQ, and empty for UDP and TCP.
+	TLSVersion string
+	// HTTPProtocol is the HTTP version a DoH connection speaks, as its ALPN
+	// negotiation decided it: "h2", or "http/1.1" when the server chose it or
+	// negotiated no protocol at all. It is empty for every other transport.
+	HTTPProtocol string
+}
+
+// streamConnectionInfo describes a TCP or TLS stream. Every stream comes from
+// net.Dialer, so its peer is always known.
+func streamConnectionInfo(conn net.Conn) ConnectionInfo {
+	info := ConnectionInfo{RemoteAddress: conn.RemoteAddr().String()}
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		info.TLSVersion = tls.VersionName(tlsConn.ConnectionState().Version)
+	}
+	return info
+}
+
+// doHConnectionInfo adds the HTTP version to a DoH connection's description.
+// DoH offers h2 first and accepts http/1.1, and net/http speaks HTTP/2 over a
+// connection only when ALPN settled on h2, so the negotiated protocol is the
+// one every exchange on that connection used. A server that negotiates no
+// ALPN protocol gets HTTP/1.1.
+func doHConnectionInfo(conn net.Conn) ConnectionInfo {
+	info := streamConnectionInfo(conn)
+	info.HTTPProtocol = "http/1.1"
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" {
+			info.HTTPProtocol = protocol
+		}
+	}
+	return info
+}
+
+func doqConnectionInfo(conn doqConn) ConnectionInfo {
+	return ConnectionInfo{
+		RemoteAddress: conn.RemoteAddr().String(),
+		TLSVersion:    tls.VersionName(conn.ConnectionState().TLS.Version),
+	}
 }
 
 // dialPlan contains the ordered network addresses used to open one logical
@@ -211,6 +269,10 @@ func (c quicConnAdapter) CloseWithError(code quic.ApplicationErrorCode, message 
 	return c.conn.CloseWithError(code, message)
 }
 
+func (c quicConnAdapter) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
+
+func (c quicConnAdapter) ConnectionState() quic.ConnectionState { return c.conn.ConnectionState() }
+
 var dialDoQ = func(ctx context.Context, address string, tlsConfig *tls.Config, config *quic.Config) (doqConn, error) {
 	conn, err := quic.DialAddr(ctx, address, tlsConfig, config)
 	if err != nil {
@@ -306,21 +368,36 @@ type udpFactory struct {
 // empty address, and an untested branch there would dial "":port.
 var lookupNetIP = net.DefaultResolver.LookupNetIP
 
-// resolveUDPAddress is a seam so the bootstrap lookup can be exercised without
-// a real system resolver.
-var resolveUDPAddress = func(ctx context.Context, address string) (string, error) {
-	resolved, err := lookupNetIP(ctx, "ip", address)
+// resolveHost looks a hostname up once and returns its addresses in the order
+// the resolver gave them, which for the system resolver is the RFC 6724
+// destination order the stream transports' net.Dialer follows as well.
+func resolveHost(ctx context.Context, host string) ([]netip.Addr, error) {
+	resolved, err := lookupNetIP(ctx, "ip", host)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(resolved) == 0 {
-		return "", fmt.Errorf("no addresses for %q", address)
+		return nil, fmt.Errorf("no addresses for %q", host)
 	}
 	// LookupNetIP reports IPv4 results as IPv4-mapped IPv6 ("::ffff:8.8.8.8").
 	// Dialing that literal needs an AF_INET6 socket, so an IPv4-only host
 	// cannot reach a hostname target that resolves to IPv4 at all. Unmap
 	// restores the family the address actually belongs to.
-	return resolved[0].Unmap().String(), nil
+	addresses := make([]netip.Addr, 0, len(resolved))
+	for _, address := range resolved {
+		addresses = append(addresses, address.Unmap())
+	}
+	return addresses, nil
+}
+
+// resolveUDPAddress is a seam so the bootstrap lookup can be exercised without
+// a real system resolver.
+var resolveUDPAddress = func(ctx context.Context, address string) (string, error) {
+	resolved, err := resolveHost(ctx, address)
+	if err != nil {
+		return "", err
+	}
+	return resolved[0].String(), nil
 }
 
 // Open resolves a hostname endpoint once, here, rather than leaving it to every
@@ -374,6 +451,7 @@ func (f *streamFactory) Open(ctx context.Context) (Session, error) {
 		timeout:      f.timeout,
 		secure:       f.tlsConfig != nil,
 		dialAddress:  dialAddress,
+		connection:   streamConnectionInfo(conn),
 		queryOptions: f.queryOptions,
 	}, nil
 }
@@ -387,6 +465,26 @@ type udpSession struct {
 // DialAddress reports the literal endpoint the session exchanges with, which
 // for a hostname target is the address resolved once when the session opened.
 func (s *udpSession) DialAddress() string { return s.address }
+
+// Connection reports that same literal as the peer: UDP has no connection to
+// ask, and every datagram goes to the address resolved when the session
+// opened. The literal is written the way the other transports' sockets write
+// their peer, unmapped and in canonical case, so one address configured as
+// ::ffff:192.0.2.1 or 2001:DB8::1 reads the same remote_address on every
+// transport.
+func (s *udpSession) Connection() ConnectionInfo {
+	return ConnectionInfo{RemoteAddress: canonicalPeer(s.address)}
+}
+
+// canonicalPeer writes an IP:port literal as net.Addr.String does for a
+// connected socket. Anything that does not parse as one is returned as given.
+func canonicalPeer(address string) string {
+	peer, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return address
+	}
+	return netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port()).String()
+}
 
 func (s *udpSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
 	query := newQuery(name, qtype, dns.Id(), false, s.queryOptions)
@@ -444,6 +542,7 @@ type streamSession struct {
 	timeout         time.Duration
 	secure          bool
 	dialAddress     string
+	connection      ConnectionInfo
 	queryOptions    QueryOptions
 	lastReconnected bool
 	closed          bool
@@ -453,6 +552,14 @@ func (s *streamSession) DialAddress() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dialAddress
+}
+
+// Connection describes the session's most recent connection, which a
+// reconnect replaces, so it stays readable after the connection is gone.
+func (s *streamSession) Connection() ConnectionInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connection
 }
 
 // LastQueryReconnected reports whether the most recent Query had to open a
@@ -516,6 +623,7 @@ func (s *streamSession) ensureConn(ctx context.Context) error {
 	}
 	s.conn = conn
 	s.dialAddress = dialAddress
+	s.connection = streamConnectionInfo(conn)
 	return nil
 }
 
@@ -631,6 +739,7 @@ func (f *doHFactory) Open(ctx context.Context) (Session, error) {
 	// over is not counted as a reconnect.
 	session.pending = conn
 	session.dialAddr = address
+	session.connection = doHConnectionInfo(conn)
 	session.connections = 1
 	return session, nil
 }
@@ -677,8 +786,9 @@ func (f *doHFactory) newSession() *doHSession {
 			}
 			// http.Transport re-dials transparently when a pooled
 			// connection is gone, so this hook is the only place a new
-			// TCP+TLS(+HTTP/2) handshake becomes observable.
-			if err := session.recordConnection(address); err != nil {
+			// TCP+TLS(+HTTP/2) handshake becomes observable, and the only
+			// place its peer and negotiated protocols can be read.
+			if err := session.recordConnection(address, doHConnectionInfo(conn)); err != nil {
 				_ = conn.Close()
 				return nil, err
 			}
@@ -743,6 +853,7 @@ type doHSession struct {
 	tlsConfig       *tls.Config
 	mu              sync.RWMutex
 	dialAddr        string
+	connection      ConnectionInfo
 	connections     uint64
 	lastReconnected bool
 	// pending is the connection Open dialled, until the transport's first
@@ -797,13 +908,14 @@ func (s *doHSession) takePending() net.Conn {
 // net/http finishes a dial even after the request that started it has gone,
 // so one can complete after Close; it is refused, because nothing would ever
 // close it.
-func (s *doHSession) recordConnection(address string) error {
+func (s *doHSession) recordConnection(address string, connection ConnectionInfo) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return errors.New("DoH session is closed")
 	}
 	s.dialAddr = address
+	s.connection = connection
 	s.connections++
 	return nil
 }
@@ -838,6 +950,15 @@ func (s *doHSession) DialAddress() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.dialAddr
+}
+
+// Connection describes the HTTPS connection the session opened last. Requests
+// can still be served by an older pooled one until it is dropped, but a
+// session opens a new connection only when the previous one is gone.
+func (s *doHSession) Connection() ConnectionInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.connection
 }
 
 func (s *doHSession) Query(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
@@ -934,21 +1055,95 @@ func (f *doqFactory) dialConfig() *quic.Config {
 	}
 }
 
-func (f *doqFactory) open(ctx context.Context, plan dialPlan) (doqConn, string, error) {
+// open dials the plan's candidates in order. A hostname candidate is resolved
+// first and its addresses dialled in the order the resolver returned them,
+// each with its own timeout budget, so an address family without a route
+// fails over to the next address rather than failing the candidate. The
+// returned address is still the configured candidate: dial_address keeps its
+// meaning, and the peer actually reached is the connection's remote address.
+//
+// reached is the session's own address preference, which open both reads and
+// updates; Open starts it empty and the session's reconnects share it. A
+// resolved address equal to it is dialled first. Reconnects need that because
+// they have to fit in one query's deadline: starting again at the resolver's
+// first address spent all of it there when that address silently drops
+// packets, the one Open had waited out before reaching the next, so after one
+// lost connection every later query of the session failed. A connection moves
+// the preference to the address it reached. An attempt that runs out of time
+// moves it to the address after the one that attempt started at, in the
+// resolver's order, as stickyReopen moves its start through the candidates,
+// so each reconnect that runs out of time starts one address further on and
+// within as many reconnects as there are addresses every one has been dialled
+// first. Rotating from the address that used up the budget instead came back
+// to the preferred address whenever that one failed at once and an earlier
+// one was silent, and rotating over the reordered list bounced between the
+// first two addresses; either way a later address was never reached.
+func (f *doqFactory) open(ctx context.Context, plan dialPlan, reached *string) (doqConn, string, error) {
 	errs := make([]error, 0, len(plan.addresses))
+candidates:
 	for _, address := range plan.addresses {
-		openCtx, cancel := plan.openContext(ctx)
-		conn, err := dialDoQ(openCtx, address, f.tlsConfig.Clone(), f.dialConfig())
+		resolveCtx, cancel := plan.openContext(ctx)
+		literals, err := doqDialAddresses(resolveCtx, address)
 		cancel()
-		if err == nil {
-			return conn, address, nil
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", address, err))
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
-		errs = append(errs, fmt.Errorf("%s: %w", address, err))
-		if ctx.Err() != nil {
-			break
+		resolverOrder := dialPlan{addresses: literals}
+		ordered := resolverOrder.preferring(*reached)
+		for _, literal := range ordered.addresses {
+			openCtx, cancel := plan.openContext(ctx)
+			conn, err := dialDoQ(openCtx, literal, f.tlsConfig.Clone(), f.dialConfig())
+			cancel()
+			if err == nil {
+				*reached = literal
+				return conn, address, nil
+			}
+			attempt := address
+			if literal != address {
+				attempt = address + " via " + literal
+			}
+			errs = append(errs, fmt.Errorf("%s: %w", attempt, err))
+			if ctx.Err() != nil {
+				*reached = resolverOrder.after(ordered.addresses[0])
+				break candidates
+			}
 		}
 	}
 	return nil, "", plan.failed(errs)
+}
+
+// doqDialAddresses returns the literal addresses to dial for one DoQ candidate.
+//
+// quic.DialAddr resolves a hostname itself, through net.ResolveUDPAddr, which
+// prefers an IPv4 address and ignores the context. On a dual-stack host DoQ
+// alone therefore reached a hostname endpoint over IPv4 while UDP, TCP, DoT and
+// DoH followed the resolver's RFC 6724 order, usually to IPv6, and on a host
+// with no IPv4 route it failed with "network is unreachable" where they
+// succeeded. Resolving here, with the lookup UDP uses, keeps every transport on
+// the same order. A literal, including a zoned link-local one, is dialled as
+// given; the TLS server name is configured separately, so dialling a resolved
+// literal verifies the same certificate identity the hostname would.
+func doqDialAddresses(ctx context.Context, address string) ([]string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if _, literalErr := netip.ParseAddr(host); literalErr == nil {
+		return []string{address}, nil
+	}
+	resolved, err := resolveHost(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve DoQ endpoint %q: %w", host, err)
+	}
+	literals := make([]string, 0, len(resolved))
+	for _, ip := range resolved {
+		literals = append(literals, net.JoinHostPort(ip.String(), port))
+	}
+	return literals, nil
 }
 
 func (f *doqFactory) Open(ctx context.Context) (Session, error) {
@@ -956,15 +1151,22 @@ func (f *doqFactory) Open(ctx context.Context) (Session, error) {
 	if len(plan.addresses) == 0 {
 		plan = singleDialPlan(f.address, f.timeout)
 	}
-	conn, dialAddress, err := f.open(ctx, plan)
+	// reached is shared by this Open and the session's reconnects, which run
+	// with the session's mutex held, as stickyReopen's start is.
+	var reached string
+	open := func(ctx context.Context, plan dialPlan) (doqConn, string, error) {
+		return f.open(ctx, plan, &reached)
+	}
+	conn, dialAddress, err := open(ctx, plan)
 	if err != nil {
 		return nil, err
 	}
 	return &doqSession{
 		conn:         conn,
-		reopen:       stickyReopen(plan, dialAddress, f.open),
+		reopen:       stickyReopen(plan, dialAddress, open),
 		timeout:      f.timeout,
 		dialAddress:  dialAddress,
+		connection:   doqConnectionInfo(conn),
 		queryOptions: f.queryOptions,
 	}, nil
 }
@@ -975,6 +1177,7 @@ type doqSession struct {
 	mu              sync.Mutex
 	timeout         time.Duration
 	dialAddress     string
+	connection      ConnectionInfo
 	queryOptions    QueryOptions
 	lastReconnected bool
 	closed          bool
@@ -984,6 +1187,13 @@ func (s *doqSession) DialAddress() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dialAddress
+}
+
+// Connection describes the session's most recent QUIC connection.
+func (s *doqSession) Connection() ConnectionInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connection
 }
 
 // LastQueryReconnected reports whether the most recent Query had to open a
@@ -1063,6 +1273,7 @@ func (s *doqSession) ensureConn(ctx context.Context) error {
 	}
 	s.conn = conn
 	s.dialAddress = dialAddress
+	s.connection = doqConnectionInfo(conn)
 	return nil
 }
 

@@ -40,6 +40,8 @@ type scriptedConn struct {
 	deadlines      []time.Time
 	lastWrite      []byte
 	onWrite        func([]byte)
+	// remote is the peer the fake reports; empty reads as "remote".
+	remote string
 }
 
 func (c *scriptedConn) Read(p []byte) (int, error) {
@@ -67,8 +69,13 @@ func (c *scriptedConn) Close() error {
 	c.closeCalls++
 	return c.closeErr
 }
-func (c *scriptedConn) LocalAddr() net.Addr  { return fakeAddr("local") }
-func (c *scriptedConn) RemoteAddr() net.Addr { return fakeAddr("remote") }
+func (c *scriptedConn) LocalAddr() net.Addr { return fakeAddr("local") }
+func (c *scriptedConn) RemoteAddr() net.Addr {
+	if c.remote == "" {
+		return fakeAddr("remote")
+	}
+	return fakeAddr(c.remote)
+}
 func (c *scriptedConn) SetDeadline(deadline time.Time) error {
 	c.deadlines = append(c.deadlines, deadline)
 	return c.setDeadlineErr
@@ -623,12 +630,23 @@ type fakeDoQConn struct {
 	openErr    error
 	closeErr   error
 	closeCalls int
+	// remote is the peer the fake reports; empty reads as "doq-remote".
+	remote string
 }
 
 func (c *fakeDoQConn) OpenStreamSync(context.Context) (doqStream, error) { return c.stream, c.openErr }
 func (c *fakeDoQConn) CloseWithError(quic.ApplicationErrorCode, string) error {
 	c.closeCalls++
 	return c.closeErr
+}
+func (c *fakeDoQConn) RemoteAddr() net.Addr {
+	if c.remote == "" {
+		return fakeAddr("doq-remote")
+	}
+	return fakeAddr(c.remote)
+}
+func (c *fakeDoQConn) ConnectionState() quic.ConnectionState {
+	return quic.ConnectionState{TLS: tls.ConnectionState{Version: tls.VersionTLS13}}
 }
 
 func newFakeDoQStream() (*fakeDoQStream, *fakeDoQConn) {

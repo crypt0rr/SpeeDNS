@@ -42,7 +42,7 @@ func TestRenderPropagatesEveryWriteError(t *testing.T) {
 			write func(w *failAfterWriter) error
 		}{
 			{"table", func(w *failAfterWriter) error { return WriteTable(w, diff) }},
-			{"json", func(w *failAfterWriter) error { return WriteJSON(w, diff) }},
+			{"json", func(w *failAfterWriter) error { return WriteJSON(w, diff, nil) }},
 		} {
 			t.Run(name+"/"+renderer.label, func(t *testing.T) {
 				// A generous bound: any attempt below the real write count must

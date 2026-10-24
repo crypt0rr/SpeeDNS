@@ -32,6 +32,11 @@ and verification instructions are in `README.md`.
    checksums, SBOMs, Cosign bundle, Homebrew cask update, and artifact
    attestations are present.
 
+A release that adds a JSON report field must have vendored, in its candidate
+PR, a report its own encoder writes with every optional section into
+`internal/report/testdata/released/`, as `CONTRIBUTING.md` describes, so that
+every later schema change is tested against what this release wrote.
+
 ## Verification
 
 Download one archive together with `checksums.txt` and

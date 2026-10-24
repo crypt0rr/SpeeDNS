@@ -339,7 +339,7 @@ The available transports are:
 | --- | --- |
 | `udp` | Traditional DNS over UDP |
 | `tcp` | Traditional DNS over TCP |
-| `doh` | DNS over HTTPS using RFC 8484 and HTTP/2 |
+| `doh` | DNS over HTTPS using RFC 8484; HTTP/2 is offered first through ALPN, and HTTP/1.1 is accepted when the server chooses it |
 | `dot` | DNS over TLS |
 | `doq` | Dedicated DNS over QUIC using RFC 9250 |
 
@@ -486,16 +486,20 @@ its own error before any query is sent:
 Bootstrap addresses are connection candidates, not separately ranked resolvers. SpeeDNS retains the configured hostname for HTTPS/TLS certificate validation and tries candidates in order when a session opens. Duplicate candidates are dropped by canonical address, so `2001:DB8::1` and `2001:db8::1` are tried once. A profile that lists several addresses still gets one row per address, and when its encrypted transports dial `bootstrap_addresses` those rows measure the same candidates; the report warns about such a profile, and listing one address avoids the duplicate rows. A DoT or DoQ session that has to reconnect during the run tries the address it last connected to first, then the others in order, and starts at the next candidate if that reconnect runs out of time. TLS certificate validation is always enabled.
 
 For a hostname-only custom encrypted endpoint, SpeeDNS uses the operating
-system resolver to find the connection address. To make bootstrap deterministic
-and avoid that lookup, add `bootstrap_addresses` in a YAML profile; these must
-be explicit IPv4 or IPv6 literals and are tried in the order listed. A
-`server_name` value is the explicit TLS identity and may intentionally differ
+system resolver to find the connection address. Every transport, DoQ
+included, starts with the first address that lookup returns, so the address
+family a hostname endpoint is measured over follows the resolver's order, and
+the report's `remote_address` records the peer each transport reached. To make
+bootstrap deterministic and avoid that lookup, add `bootstrap_addresses` in a
+YAML profile; these must be explicit IPv4 or IPv6 literals and are tried in the
+order listed. A `server_name` value is the explicit TLS identity and may intentionally differ
 from the endpoint address or DoH URL host, for example when testing a CDN
 alias. It changes certificate validation only; it does not change the dial
 candidates. Use `--details`, JSON, or CSV to audit the effective TLS name,
 identity source, bootstrap mode, configured candidates, and selected dial
 address, endpoint URL, effective TLS identity, identity source, and bootstrap
-mode/candidates.
+mode/candidates. JSON and CSV also record the remote address each connection
+reached and the TLS and HTTP versions it negotiated.
 
 Resolver profile files must contain exactly one YAML document. SpeeDNS rejects
 additional documents instead of silently ignoring them.
@@ -601,7 +605,10 @@ speedns diff week33.json week34.json
 ```
 
 **Pin `--seed`.** Without it each run picks a fresh seed, which selects
-different names, and the diff will always refuse.
+different names, and the diff will always refuse. A seed the run picked
+itself is recorded in the report, and rerunning with it reproduces the same
+names and order. It is drawn from 1 to 2^31-2, every distinct seed the
+generator has, so it survives a JSON reader that parses numbers as doubles.
 
 ### It never compares latency
 
@@ -661,6 +668,14 @@ the targets each reason excluded. A condition that fails without a comparison,
 such as `no-removed-targets` for a target missing from the current run, still
 exits 4, and a refusal outranks every condition.
 
+With `--format json`, a gated diff records each condition's verdict in a
+`conditions` array, in the order given: `name`, `outcome` (`passed`, `failed`
+or `not-evaluated`), `passed`, and `detail`. These are the verdicts the exit
+status is read from. A condition that held on a refused diff, or on one that
+compared no endpoint, is `not-evaluated` and never `passed: true`, so an
+archived diff cannot show a pass for a gate that refused. Without `--require`
+the array is absent.
+
 ## System resolver baseline
 
 Use `--include-system` to include the resolver configured by the operating system:
@@ -709,10 +724,12 @@ column to `true`.
 
 When sharing a report that includes the system resolver, add
 `--redact-system`. It keeps the measurements and rankings but replaces local
-resolver addresses, identifying labels, selected dial addresses, and matching
-error text with redacted values in table, JSON, and CSV output. A failed
-`--assert` names a system resolver on stderr by the same
-`system-redacted-N@redacted/<protocol>` ID the report uses. Redaction is
+resolver addresses, identifying labels, selected dial and remote addresses, and
+matching error text with redacted values in table, JSON, and CSV output. Each
+system target is identified by a redacted ID such as
+`system-redacted-1@redacted/udp`, and its warnings carry the same ID, so the
+warnings of two system resolvers stay apart and match their results. A failed
+`--assert` names a system resolver on stderr by that ID too. Redaction is
 opt-in; local diagnostics are shown by default.
 
 System resolvers are tested only over transports discoverable from the operating system configuration, normally UDP and TCP.
@@ -851,6 +868,25 @@ comparisons, paired effects, divergence details, the optional per-target
 should select their parser and validation rules from the reported schema
 version rather than assuming that table or CSV output has the same shape.
 
+Within one `schema_version`, a field a release adds is optional, so the
+current schema accepts every report that version has ever produced; making a
+field required needs a new `schema_version`. SpeeDNS still writes every such
+field; only a report from before a field existed lacks it. `status`,
+`answers` and `answer_rate` arrived in v0.4.0, provenance `family` and
+`dnssec` in v0.6.0, and the target's `remote_address`, `tls_version` and
+`http_protocol` in v0.7.0. A strict validator pinned to an older copy of the
+schema rejects the fields added after it; validate with the current one.
+
+Each result's target records how the connection was made. `dial_address` is
+the configured candidate that connected: an IP literal, a bootstrap address, or
+the `hostname:port` of a hostname endpoint, except over UDP, which resolves the
+hostname once and records that IP.
+`remote_address` is the peer the connection actually reached, so it shows
+which address family a hostname endpoint used. `tls_version` is the TLS
+version DoT, DoH and DoQ negotiated, and `http_protocol` is `h2` or
+`http/1.1`, whichever a DoH connection speaks. Each is the last connection the
+measuring session made, and is omitted when no session opened.
+
 CLI-generated JSON reports also include `run.provenance`. It records the
 SpeeDNS build version, commit, build date, operating system, architecture,
 active interface names, selected protocols, effective timeout and concurrency,
@@ -880,6 +916,9 @@ Three columns hold lists, each with its own fixed delimiter:
 - `query_types` — record-type mnemonics joined with a pipe, for example
   `A|AAAA`.
 
+The `remote_address`, `tls_version` and `http_protocol` columns carry the
+connection fields described above and are empty where JSON omits them.
+
 `success_rate`, `usable_rate`, `resolver_failure_rate` and `answer_rate` are
 proportions of `total`, the measured queries of that target;
 `scoring_failure_rate` is a proportion of the observations eligible for
@@ -907,7 +946,8 @@ costs no run and is reported when the diff is written.
 
 The two fields a machine consumer needs first are `comparable` and `blockers`.
 When `comparable` is false the document carries no count from either report,
-exactly like the table.
+exactly like the table. A diff run with `--require` adds the `conditions`
+array described under [Gating a change in CI](#gating-a-change-in-ci).
 
 ### Scheduled live results
 
@@ -928,9 +968,9 @@ Useful flags include:
 --full              test the complete domain list
 --cache-miss        opt in to bounded reserved-zone cache-miss names
 --cache-miss-sample N  number of unique cache-miss names (default and maximum 20)
---seed N            reproduce a domain order
+--seed N            reproduce a domain order (default: a recorded seed from 1 to 2^31-2)
 --type A,AAAA       record types to query (zone-transfer, meta and pseudo-record types are rejected)
---timeout 2s        per-query and connection timeout; every measured round waits for its slowest target
+--timeout 2s        per-query and connection timeout in whole milliseconds; every measured round waits for its slowest target
 --concurrency 4    maximum concurrent target preparations, measured DNS exchanges and DNSSEC probes per protocol
 --format table|json|csv
 --output PATH       write output to a file, /dev/null, or a pipe

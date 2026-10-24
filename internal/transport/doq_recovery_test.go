@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,12 +27,14 @@ func TestDoQSessionRecoversAfterConnectionAndIdleFailures(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			first := &fakeDoQConn{openErr: tc.err}
+			first := &fakeDoQConn{openErr: tc.err, remote: "192.0.2.1:853"}
 			_, second := newFakeDoQStream()
+			second.remote = "192.0.2.2:853"
 			opens := 0
 			session := &doqSession{
-				conn:    first,
-				timeout: time.Second,
+				conn:       first,
+				timeout:    time.Second,
+				connection: doqConnectionInfo(first),
 				reopen: func(context.Context) (doqConn, string, error) {
 					opens++
 					return second, "reconnected:853", nil
@@ -60,6 +63,13 @@ func TestDoQSessionRecoversAfterConnectionAndIdleFailures(t *testing.T) {
 			}
 			if session.DialAddress() != "reconnected:853" {
 				t.Fatalf("reconnected DoQ address = %q", session.DialAddress())
+			}
+			// The session began with the first connection's description, as
+			// Open leaves it, so only a reconnect that replaced it reports
+			// the peer the session now talks to.
+			want := ConnectionInfo{RemoteAddress: "192.0.2.2:853", TLSVersion: "TLS 1.3"}
+			if got := session.Connection(); got != want {
+				t.Fatalf("DoQ connection after the reconnect = %#v, want %#v", got, want)
 			}
 			if err := session.Close(); err != nil {
 				t.Fatal(err)
@@ -349,11 +359,159 @@ func TestDoQReconnectReturnsToTheCandidateThatConnected(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
+	// Open reached the same server, so its description is cleared: only the
+	// reconnect can restore it, from the new QUIC connection.
+	doq := session.(*doqSession)
+	doq.mu.Lock()
+	doq.connection = ConnectionInfo{}
+	doq.mu.Unlock()
 	got := strings.Join(queryOutcomes(t, session, 4, timeout), ",")
 	if want := "ok,failed,reconnected,ok"; got != want {
 		t.Fatalf("DoQ queries after a mid-session loss = %s, want %s", got, want)
 	}
-	if address := session.(*doqSession).DialAddress(); address != good.Addr().String() {
+	if address := doq.DialAddress(); address != good.Addr().String() {
 		t.Fatalf("DoQ reconnected to %q, want %q", address, good.Addr().String())
+	}
+	want := ConnectionInfo{RemoteAddress: good.Addr().String(), TLSVersion: "TLS 1.3"}
+	if got := connectionOf(t, session); got != want {
+		t.Fatalf("DoQ connection after a reconnect = %#v, want %#v", got, want)
+	}
+}
+
+// TestDoQReconnectReturnsToTheAddressItReached covers a hostname candidate
+// whose resolved addresses DoQ dials one after another. When the first one
+// silently drops packets, such as an IPv6 path that is routed but broken,
+// Open waits it out and reaches the next. A reconnect has to fit in one
+// query's deadline, and starting again at the resolver's first address spent
+// all of it there: after one lost connection every later query of the
+// session failed, although the address it had been using still answered.
+func TestDoQReconnectReturnsToTheAddressItReached(t *testing.T) {
+	const timeout = 250 * time.Millisecond
+	for _, testCase := range []struct {
+		name     string
+		resolved []string
+		// silentAtOpen drop packets while the session opens and
+		// silentLater replace them once the first connection is lost;
+		// from then on the refusedLater addresses fail at once.
+		silentAtOpen, silentLater, refusedLater []string
+		want, wantDials, wantRemote             string
+	}{
+		{
+			name:     "the address it reached still answers",
+			resolved: []string{"2001:db8::1", "192.0.2.1"}, silentAtOpen: []string{"[2001:db8::1]:853"}, silentLater: []string{"[2001:db8::1]:853"},
+			want:       "failed,reconnected,ok",
+			wantDials:  "[2001:db8::1]:853,192.0.2.1:853,192.0.2.1:853",
+			wantRemote: "192.0.2.1:853",
+		},
+		{
+			// An address that used up the budget of a reconnect it started
+			// is not tried first again: the next reconnect starts at the
+			// address after it, as a candidate's reconnects do.
+			name:     "the resolver's first address goes silent",
+			resolved: []string{"192.0.2.1", "192.0.2.2"}, silentLater: []string{"192.0.2.1:853"},
+			want:       "failed,reconnect-failed,reconnected,ok",
+			wantDials:  "192.0.2.1:853,192.0.2.1:853,192.0.2.2:853",
+			wantRemote: "192.0.2.2:853",
+		},
+		{
+			name:     "the address it reached goes silent",
+			resolved: []string{"192.0.2.1", "192.0.2.2"}, silentAtOpen: []string{"192.0.2.1:853"}, silentLater: []string{"192.0.2.2:853"},
+			want:       "failed,reconnect-failed,reconnected,ok",
+			wantDials:  "192.0.2.1:853,192.0.2.2:853,192.0.2.2:853,192.0.2.1:853",
+			wantRemote: "192.0.2.1:853",
+		},
+		{
+			// The address after the one a timed-out reconnect started at
+			// is taken in the resolver's order. Taking it in the order
+			// that reconnect had dialled, which put the preferred address
+			// first, sent the next reconnect back to the first silent
+			// address, so the reconnects alternated between the two and
+			// never reached the third.
+			name:     "the first two of three addresses go silent",
+			resolved: []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"}, silentLater: []string{"192.0.2.1:853", "192.0.2.2:853"},
+			want:       "failed,reconnect-failed,reconnect-failed,reconnected,ok",
+			wantDials:  "192.0.2.1:853,192.0.2.1:853,192.0.2.2:853,192.0.2.3:853",
+			wantRemote: "192.0.2.3:853",
+		},
+		{
+			// A reconnect dials the preferred address first and then the
+			// others in the resolver's order. When the preferred one fails
+			// at once and an earlier one uses up the budget, the next
+			// reconnect starts after the preferred address. Starting after
+			// the one that used up the budget came back to the preferred
+			// address, so the reconnects repeated the same two dials and
+			// never reached the third.
+			name:     "the address it reached fails at once and an earlier one is silent",
+			resolved: []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"}, silentAtOpen: []string{"192.0.2.1:853"}, silentLater: []string{"192.0.2.1:853"}, refusedLater: []string{"192.0.2.2:853"},
+			want:       "failed,reconnect-failed,reconnected,ok",
+			wantDials:  "192.0.2.1:853,192.0.2.2:853,192.0.2.2:853,192.0.2.1:853,192.0.2.3:853",
+			wantRemote: "192.0.2.3:853",
+		},
+		{
+			// The dns.google shape on a host whose IPv6 is routed but
+			// broken: Open waits out both IPv6 addresses, and once the
+			// IPv4 address it reached fails at once, the other IPv4
+			// address is the next reconnect's first.
+			name:         "both IPv6 addresses are silent and the IPv4 address it reached fails at once",
+			resolved:     []string{"2001:4860:4860::8888", "2001:4860:4860::8844", "8.8.8.8", "8.8.4.4"},
+			silentAtOpen: []string{"[2001:4860:4860::8888]:853", "[2001:4860:4860::8844]:853"},
+			silentLater:  []string{"[2001:4860:4860::8888]:853", "[2001:4860:4860::8844]:853"},
+			refusedLater: []string{"8.8.8.8:853"},
+			want:         "failed,reconnect-failed,reconnected,ok",
+			wantDials:    "[2001:4860:4860::8888]:853,[2001:4860:4860::8844]:853,8.8.8.8:853,8.8.8.8:853,[2001:4860:4860::8888]:853,8.8.4.4:853",
+			wantRemote:   "8.8.4.4:853",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stubLookup(t, testCase.resolved...)
+			oldDial := dialDoQ
+			t.Cleanup(func() { dialDoQ = oldDial })
+			silent := testCase.silentAtOpen
+			var refused []string
+			var dialed []string
+			connected := 0
+			dialDoQ = func(ctx context.Context, address string, _ *tls.Config, _ *quic.Config) (doqConn, error) {
+				dialed = append(dialed, address)
+				if slices.Contains(silent, address) {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				if slices.Contains(refused, address) {
+					return nil, errors.New("CRYPTO_ERROR 0x128 (remote): tls: handshake failure")
+				}
+				connected++
+				_, conn := newFakeDoQStream()
+				conn.remote = address
+				if connected == 1 {
+					// The connection Open made is lost on its first query.
+					conn.openErr = errors.New("DoQ connection closed")
+				}
+				return conn, nil
+			}
+			factory := &doqFactory{
+				connectionPlan: dialPlan{addresses: []string{"dns.example:853"}, timeout: timeout},
+				timeout:        timeout,
+				tlsConfig:      &tls.Config{ServerName: "dns.example", NextProtos: []string{"doq"}},
+			}
+			session, err := factory.Open(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			silent, refused = testCase.silentLater, testCase.refusedLater
+			got := strings.Join(queryOutcomes(t, session, strings.Count(testCase.want, ",")+1, timeout), ",")
+			if got != testCase.want {
+				t.Fatalf("DoQ queries after the connection was lost = %s, want %s", got, testCase.want)
+			}
+			if got := strings.Join(dialed, ","); got != testCase.wantDials {
+				t.Fatalf("DoQ dials = %s, want %s", got, testCase.wantDials)
+			}
+			if got := connectionOf(t, session).RemoteAddress; got != testCase.wantRemote {
+				t.Fatalf("DoQ remote address = %q, want %q", got, testCase.wantRemote)
+			}
+			if got := session.(*doqSession).DialAddress(); got != "dns.example:853" {
+				t.Fatalf("DoQ dial address = %q, want the configured candidate", got)
+			}
+		})
 	}
 }

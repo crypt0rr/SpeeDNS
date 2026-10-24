@@ -96,6 +96,86 @@ func Require(diff Diff, names []string) ([]RequireResult, error) {
 	return results, nil
 }
 
+// Outcomes of a --require condition as the gate decided it.
+const (
+	OutcomePassed = "passed"
+	OutcomeFailed = "failed"
+	// OutcomeNotEvaluated is a condition the gate could not evaluate: the runs
+	// were not comparable, or no endpoint was compared. It is never a pass.
+	OutcomeNotEvaluated = "not-evaluated"
+)
+
+// Condition is one --require condition as the compare JSON records it. Passed
+// is true only for OutcomePassed, so a consumer that reads nothing else still
+// fails closed.
+type Condition struct {
+	Name    string `json:"name"`
+	Passed  bool   `json:"passed"`
+	Outcome string `json:"outcome"`
+	Detail  string `json:"detail"`
+}
+
+// Conditions turns the results of Require into the gate's verdict on each
+// condition, which is also what decides the exit status. A condition's own
+// result is not that verdict: on a refused diff every condition reads no
+// findings and holds, and on a diff that compared no endpoint a condition
+// that holds read no paired count, so both are recorded as not evaluated --
+// a gate that could not evaluate must never report a pass. A condition that
+// failed on such a pair still failed: a target missing from one run is a real
+// finding that needs no pairing.
+func Conditions(diff Diff, results []RequireResult) []Condition {
+	conditions := make([]Condition, 0, len(results))
+	for _, result := range results {
+		condition := Condition{Name: result.Name, Outcome: OutcomeFailed, Detail: result.Detail}
+		switch {
+		case !diff.Comparable():
+			condition.Outcome = OutcomeNotEvaluated
+			condition.Detail = "not evaluated: the runs are not comparable"
+		case !result.Passed:
+		case diff.Compared == 0:
+			condition.Outcome = OutcomeNotEvaluated
+			condition.Detail = fmt.Sprintf("not evaluated: no endpoint was compared (%s)", NotComparedSummary(diff))
+		default:
+			condition.Passed, condition.Outcome = true, OutcomePassed
+		}
+		conditions = append(conditions, condition)
+	}
+	return conditions
+}
+
+// NotComparedSummary names why a diff compared no endpoint, counting each
+// reason, so a refused gate says what to fix rather than only that it refused.
+// With nothing compared the only suppressions are the per-target ones that
+// precede pairing, and every remaining target was present in one run only.
+func NotComparedSummary(diff Diff) string {
+	counts := make(map[string]int)
+	for _, suppression := range diff.Suppressions {
+		counts[suppression.Reason]++
+	}
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	parts := make([]string, 0, len(reasons)+1)
+	for _, reason := range reasons {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[reason], reason))
+	}
+	unpaired := 0
+	for _, finding := range diff.Findings {
+		if finding.Code == "PRESENCE" {
+			unpaired++
+		}
+	}
+	if unpaired > 0 {
+		parts = append(parts, fmt.Sprintf("%d present in only one run", unpaired))
+	}
+	if len(parts) == 0 {
+		return "neither run has a target"
+	}
+	return strings.Join(parts, ", ")
+}
+
 // newlyFailed reports whether a finding records a target the current run lost.
 //
 // OPEN and FAILED are reported in both directions, because the diff answers

@@ -24,7 +24,12 @@
         "removed": {"type": "array", "items": {"type": "string"}}
       }
     },
-    "compared": {"type": "integer", "minimum": 0}
+    "compared": {"type": "integer", "minimum": 0},
+    "conditions": {
+      "description": "Present only when --require was given: the gate's verdict on each condition, in the order given. passed is true only for the passed outcome; a refused diff, or one that compared no endpoint, records a condition that held as not-evaluated.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/condition"}
+    }
   },
   "$defs": {
     "side": {
@@ -73,6 +78,17 @@
       "required": ["reason", "detail"],
       "properties": {
         "reason": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "passed", "outcome", "detail"],
+      "properties": {
+        "name": {"type": "string", "enum": ["no-behaviour-change", "no-dnssec-regression", "no-new-failed-targets", "no-removed-targets", "target-set-identical"]},
+        "passed": {"type": "boolean"},
+        "outcome": {"type": "string", "enum": ["passed", "failed", "not-evaluated"]},
         "detail": {"type": "string"}
       }
     }
