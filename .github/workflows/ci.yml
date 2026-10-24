@@ -166,10 +166,11 @@ jobs:
       # assigned and never read - both of which were present in this tree and
       # are fixed in the same change that adds this gate.
       #
-      # Pinned by module version, not by staticcheck's release name: v0.6.1 is
-      # the module version of release 2025.1.1. Renovate's go datasource knows
-      # only module versions, so the custom manager in renovate.json can find
-      # and bump this pin; a calendar version would never match an update.
+      # Pinned by module version, not by staticcheck's release name: each
+      # calendar release (2026.2.2, say) has a v0.N.N module version, which
+      # is what goes here. Renovate's go datasource knows only module
+      # versions, so the custom manager in renovate.json can find and bump
+      # this pin; a calendar version would never match an update.
       - name: Run staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
