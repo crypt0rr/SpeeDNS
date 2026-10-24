@@ -54,12 +54,14 @@ func TestWorkflowsParse(t *testing.T) {
 // the raw text: a substring check is satisfied just as well by a YAML comment
 // or by an unrelated step's script.
 type workflowStep struct {
-	ID   string         `yaml:"id"`
-	Name string         `yaml:"name"`
-	Uses string         `yaml:"uses"`
-	Run  string         `yaml:"run"`
-	With map[string]any `yaml:"with"`
-	Env  map[string]any `yaml:"env"`
+	ID               string         `yaml:"id"`
+	Name             string         `yaml:"name"`
+	Uses             string         `yaml:"uses"`
+	Run              string         `yaml:"run"`
+	Shell            string         `yaml:"shell"`
+	WorkingDirectory string         `yaml:"working-directory"`
+	With             map[string]any `yaml:"with"`
+	Env              map[string]any `yaml:"env"`
 }
 
 type workflowJob struct {
@@ -69,20 +71,41 @@ type workflowJob struct {
 	Needs       any               `yaml:"needs"`
 	Environment any               `yaml:"environment"`
 	Permissions any               `yaml:"permissions"`
+	Env         map[string]any    `yaml:"env"`
+	Defaults    workflowDefaults  `yaml:"defaults"`
 	Outputs     map[string]string `yaml:"outputs"`
 	Steps       []workflowStep    `yaml:"steps"`
 }
 
 type workflowFile struct {
 	Permissions any                    `yaml:"permissions"`
+	Env         map[string]any         `yaml:"env"`
+	Defaults    workflowDefaults       `yaml:"defaults"`
 	Jobs        map[string]workflowJob `yaml:"jobs"`
 }
 
+// workflowDefaults is a defaults: block, at the workflow or the job level. It
+// gives the shell and the working directory of every run: step that does not
+// set its own.
+type workflowDefaults struct {
+	Run struct {
+		Shell            string `yaml:"shell"`
+		WorkingDirectory string `yaml:"working-directory"`
+	} `yaml:"run"`
+}
+
+// workflowPaths lists every workflow file GitHub runs. It runs .yaml files in
+// .github/workflows as well as .yml ones, so a test that read only one
+// spelling would let a new workflow escape every invariant below by its name.
 func workflowPaths(t *testing.T) []string {
 	t.Helper()
-	paths, err := filepath.Glob(filepath.Join("..", ".github", "workflows", "*.yml"))
-	if err != nil {
-		t.Fatal(err)
+	var paths []string
+	for _, pattern := range []string{"*.yml", "*.yaml"} {
+		matches, err := filepath.Glob(filepath.Join("..", ".github", "workflows", pattern))
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, matches...)
 	}
 	if len(paths) == 0 {
 		t.Fatal("no workflows found; the glob no longer matches the repository layout")
@@ -646,55 +669,118 @@ func environmentName(environment any) string {
 	return ""
 }
 
-// signingJobForbidden matches what a job able to mint OIDC tokens must not
-// run: the project's tests and anything else that executes its dependencies'
-// code (go test, go run, go generate, go tool, coverage.sh, the release
-// fixture), and the binaries a build produced, through artifact-smoke.sh or
-// directly. A binary counts as run when the script has
+// signingJobTools are what a job able to mint OIDC tokens must not run
+// because they execute the project's tests or its dependencies' code: go
+// test, go run, go generate, go tool, the coverage gate, the release fixture,
+// and artifact-smoke.sh, which runs the built binaries.
+const signingJobTools = `\bgo\s+(?:test|run|generate|tool)\b|` +
+	`scripts/(?:coverage|artifact-smoke|release-fixture)\.sh`
+
+// signingJobBuildOutput matches a path into what GoReleaser built, wherever it
+// is written: in a script, an env: value or a working directory alike.
 //
-//   - a dist/ path where a command starts: at the start of a line, after one
-//     of ; & | ( { ! or a backtick, or after if, elif, then, else, do, while,
-//     until, exec, command, time, nohup or sudo, and past any VAR=value
-//     assignments. The path may begin with ./, ../, $VAR, ${VAR} or a
-//     $(command), quoted or not, so "${GITHUB_WORKSPACE}/dist/..." and
-//     "$(pwd)/dist/..." count;
-//   - GoReleaser's per-target build directory, dist/speedns_<os>_<arch>...,
-//     named anywhere at all, which catches cd dist &&
-//     ./speedns_linux_amd64_v1/speedns and a path kept in a variable first.
-//     A release file name has the version, which always holds a dot, where a
-//     build directory has the OS, so the archives and packages do not match;
+//   - GoReleaser's per-target build directory, speedns_<os>_<arch>..., which
+//     catches cd dist && ./speedns_linux_amd64_v1/speedns. A release file
+//     name has the version, which always holds a dot, where a build
+//     directory has the OS, so the archives and packages do not match;
 //   - any path into a subdirectory of dist/, such as the glob dist/*/speedns;
-//   - find -exec or -execdir with the found file itself as the command.
+//   - the binary's own name, speedns or speedns.exe, ending a path behind
+//     dist, ., .., ~, the glob *, a quote, a variable or a $(command), which
+//     catches for b in */speedns run inside dist/,
+//     "${dir}/${target}/speedns" and bin=dist/speedns; "${bin}". The Go
+//     package ./cmd/speedns, the cask dist/speedns.rb and
+//     ${RUNNER_TEMP}/speedns-repro-reference do not match.
 //
-// The second and third refuse reading those paths as well as running them.
-// That costs nothing: a signing job compares, uploads and attests only what
-// sits at the top of dist/ (archives, packages, SBOMs, checksums.txt, the
-// changelog), and once a path is in a variable nothing tells an argument from
-// a command. A top-level dist/ file read as an argument or through a
-// redirection passes, as the publish job's hashing and uploads must.
+// These refuse reading those paths as well as running them. That costs
+// nothing: a signing job compares, uploads and attests only what sits at the
+// top of dist/ (archives, packages, SBOMs, checksums.txt, the changelog), and
+// once a path is in a variable nothing tells an argument from a command.
+const signingJobBuildOutput = `\bspeedns_[a-z0-9]+_|` +
+	`\bdist/[^\s/"';|&)]+/|` +
+	`(?:[*}).~"']|\bdist|\$\w+)/speedns(?:\.exe)?(?:$|[\s"';|&)\x60])`
+
+// shellPathPart is one part of a path as a script writes it, between slashes:
+// ~, a variable, an expression, a $(command) or a plain name such as . or ..,
+// quoted or not.
+const shellPathPart = `["']?(?:~|\$\{\{[^}]*\}\}|\$\{[^}]*\}|\$\w+|\$\([^)]*\)|[\w.-]+)["']?`
+
+// signingJobForbidden matches what a job able to mint OIDC tokens must not
+// run, in a run: script as shellCode leaves it, in a shell: or in any string
+// of .goreleaser.yaml. That is signingJobTools, signingJobBuildOutput, and a
+// file run straight from dist/, which the script does with
 //
-// What a static pattern cannot see is left to review: a path assembled at
-// run time from pieces such as dir=dist and "${dir}/${target}/speedns", a
-// top-level dist/ binary kept in a variable (bin=dist/speedns; "${bin}"), a
-// binary run through env, xargs, sh -c or any other command that takes it as
-// an argument, and a binary copied, moved or extracted out of dist/ first.
+//   - a dist/ path where a command starts: at the start of a line; after one
+//     of ; & | { ! or a backtick; after a ( that opens no array, as x=( and
+//     x+=( do; after if, elif, then, else, do, while or until; or after
+//     exec, command, time, nohup, sudo, env, xargs, bash or sh and any of
+//     their options written as single words that begin with -. VAR=value
+//     assignments may come first, the value bare, quoted or a substitution.
+//     The path may have parts in front of dist/, each a name, ., .., ~, a
+//     variable, an expression or a $(command), quoted or not, so
+//     ./dist/..., ../../dist/..., ~/work/dist/...,
+//     /srv/work/SpeeDNS/dist/..., "${GITHUB_WORKSPACE}/dist/...",
+//     "${{ github.workspace }}/dist/..." and "$(pwd)/dist/..." all count;
+//   - find -exec, -execdir, -ok or -okdir with the found file itself, {} or
+//     ./{}, as the command.
+//
+// A top-level dist/ file passes as an argument of any command but the
+// wrappers above, whether on that command's line, on a continuation line or
+// inside a $(command), as an item of an array written on one line, and as a
+// redirection target, as the publish job's hashing and uploads need. Where a
+// dist/ path stands where a command could start, the pattern cannot tell a
+// read from a run, so it refuses those reads as well: an array or a
+// here-document written one item per line, a brace list such as
+// {dist/a,dist/b}, and a dist/ file given to an option of one of the
+// wrappers, which reads as the command that follows the options
+// (xargs -a dist/release-assets.txt).
+//
+// What a static pattern cannot see is left to review: a path whose every part
+// comes from a variable, such as "${dir}/${target}/${name}"; a file that find
+// lists and xargs runs (find dist -name speedns | xargs -I{} {} version); a
+// top-level dist/ file with any name but the binary's that is kept in a
+// variable or an env: value before it runs, or run as the argument of a
+// command other than the wrappers above (sh -c '"$1" version' _ dist/tool); a
+// wrapper option that takes a separate argument (env -u NAME ./dist/tool); a
+// binary extracted from an archive, or a top-level dist/ file copied out of
+// it, under another name; and whatever an action does with its with: inputs.
 var signingJobForbidden = regexp.MustCompile(`(?m)` + strings.Join([]string{
-	`\bgo\s+(?:test|run|generate|tool)\b`,
-	`scripts/(?:coverage|artifact-smoke|release-fixture)\.sh`,
-	`(?:^|[;&|({!\x60]|\b(?:if|elif|then|else|do|while|until|exec|command|time|nohup|sudo)\s)\s*` +
-		`(?:[A-Za-z_]\w*=\S*\s+)*["']?(?:\.\.?|\$\{[^}]*\}|\$\w+|\$\([^)]*\))?["']?/?dist/`,
-	`\bspeedns_[a-z0-9]+_`,
-	`\bdist/[^\s/"';|&)]+/`,
-	`-exec(?:dir)?\s+["']?\{\}`,
+	signingJobTools,
+	signingJobBuildOutput,
+	`(?:^|[;&|{!\x60]|(?:^|[^=])\(|(?:^|[\s;&|({!\x60])` +
+		`(?:if|elif|then|else|do|while|until|exec|command|time|nohup|sudo|env|xargs|bash|sh)\s+(?:-\S*\s+)*)\s*` +
+		`(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\$\([^)]*\)|\x60[^\x60]*\x60|[^\s"'(]+)*\s+)*` +
+		`(?:` + shellPathPart + `)?(?:/` + shellPathPart + `)*/?dist/`,
+	`-(?:exec|ok)(?:dir)?\s+["']?(?:\./)?\{\}`,
 }, "|"))
+
+// signingJobForbiddenValue is signingJobForbidden for an env: value: the tools
+// and the paths into the build output only. A variable naming a top-level
+// dist/ file is a read as often as not, and only the script that uses it
+// would tell.
+var signingJobForbiddenValue = regexp.MustCompile(`(?m)` + signingJobTools + `|` + signingJobBuildOutput)
+
+// signingJobDirectory matches a working directory, or a local action, inside
+// dist/ or the build output. A script run there can name a built file with
+// no dist/ in front of it and no name the pattern knows, as
+// for b in */*; do "$b" version; done does, so only the directory tells, and
+// a signing job has nothing to run there.
+var signingJobDirectory = regexp.MustCompile(`(?m)(?:^|/)dist(?:/|$)|` + signingJobBuildOutput)
 
 // shellCommentLine is a run: script line holding only a comment.
 var shellCommentLine = regexp.MustCompile(`(?m)^\s*#.*$`)
 
+// shellContinuation is a backslash that ends a line, and so continues the
+// command on the next one: the backslashes before it, if any, come in pairs
+// that only escape each other.
+var shellContinuation = regexp.MustCompile(`(?m)((?:^|[^\\])(?:\\\\)*)\\\n`)
+
 // shellCode drops a script's comment lines, which may well name a command
-// that the script does not run.
+// that the script does not run, and then joins each continued line to the
+// next, as the shell does, so an argument on a continuation line reads as the
+// argument it is, not as a command at the start of a line. The comments go
+// first because a backslash at the end of one continues nothing.
 func shellCode(script string) string {
-	return shellCommentLine.ReplaceAllString(script, "")
+	return shellContinuation.ReplaceAllString(shellCommentLine.ReplaceAllString(script, ""), "${1} ")
 }
 
 // configStrings collects every string in a parsed YAML document.
@@ -741,30 +827,10 @@ func readGoReleaserConfig(t *testing.T, document any) {
 func TestJobsThatCanSignRunNoTestsOrBuiltBinaries(t *testing.T) {
 	signers := 0
 	for _, workflowPath := range workflowPaths(t) {
-		name := filepath.Base(workflowPath)
-		document := readWorkflow(t, workflowPath)
-		for jobName, job := range document.Jobs {
-			if !grantsWrite(jobPermissions(document, job), "id-token") {
-				continue
-			}
-			signers++
-			for _, step := range job.Steps {
-				if found := signingJobForbidden.FindString(shellCode(step.Run)); found != "" {
-					t.Errorf("%s job %s can mint OIDC tokens but its step %q runs %q; move it to a job without id-token: write",
-						name, jobName, step.Name, strings.TrimSpace(found))
-				}
-				if !strings.HasPrefix(step.Uses, "goreleaser/goreleaser-action@") {
-					continue
-				}
-				var config any
-				readGoReleaserConfig(t, &config)
-				for _, command := range configStrings(config) {
-					if found := signingJobForbidden.FindString(command); found != "" {
-						t.Errorf(".goreleaser.yaml runs %q, and %s job %s, which can mint OIDC tokens, runs GoReleaser",
-							strings.TrimSpace(found), name, jobName)
-					}
-				}
-			}
+		found, findings := signingJobFindings(t, filepath.Base(workflowPath), readWorkflow(t, workflowPath))
+		signers += found
+		for _, finding := range findings {
+			t.Error(finding)
 		}
 	}
 	if signers == 0 {
@@ -772,12 +838,147 @@ func TestJobsThatCanSignRunNoTestsOrBuiltBinaries(t *testing.T) {
 	}
 }
 
+// signingJobFindings returns what each job of the workflow file name that can
+// mint OIDC tokens runs, or is pointed at, that such a job must not, and the
+// number of those jobs. A step can be pointed at a built binary from outside
+// its run: script as well: by an env: value that the script runs, by its
+// working directory or its shell, each set on the step, the job or the whole
+// workflow, and by a local action. Each of those is read.
+func signingJobFindings(t *testing.T, name string, document workflowFile) (signers int, findings []string) {
+	t.Helper()
+	for jobName, job := range document.Jobs {
+		if !grantsWrite(jobPermissions(document, job), "id-token") {
+			continue
+		}
+		signers++
+		check := func(where, value string, pattern *regexp.Regexp) {
+			if found := pattern.FindString(value); found != "" {
+				findings = append(findings, fmt.Sprintf("%s job %s can mint OIDC tokens but %s points at %q; move it to a job without id-token: write",
+					name, jobName, where, strings.TrimSpace(found)))
+			}
+		}
+		for key, value := range document.Env {
+			check("the workflow's env "+key, fmt.Sprint(value), signingJobForbiddenValue)
+		}
+		for key, value := range job.Env {
+			check("its env "+key, fmt.Sprint(value), signingJobForbiddenValue)
+		}
+		for level, defaults := range map[string]workflowDefaults{"the workflow's": document.Defaults, "its": job.Defaults} {
+			check(level+" default shell", defaults.Run.Shell, signingJobForbidden)
+			check(level+" default working-directory", defaults.Run.WorkingDirectory, signingJobDirectory)
+		}
+		for _, step := range job.Steps {
+			if found := signingJobForbidden.FindString(shellCode(step.Run)); found != "" {
+				findings = append(findings, fmt.Sprintf("%s job %s can mint OIDC tokens but its step %q runs %q; move it to a job without id-token: write",
+					name, jobName, step.Name, strings.TrimSpace(found)))
+			}
+			for key, value := range step.Env {
+				check(fmt.Sprintf("its step %q env %s", step.Name, key), fmt.Sprint(value), signingJobForbiddenValue)
+			}
+			check(fmt.Sprintf("its step %q shell", step.Name), step.Shell, signingJobForbidden)
+			check(fmt.Sprintf("its step %q working-directory", step.Name), step.WorkingDirectory, signingJobDirectory)
+			if strings.HasPrefix(step.Uses, "./") {
+				check(fmt.Sprintf("the local action its step %q uses", step.Name), step.Uses, signingJobDirectory)
+			}
+			if !strings.HasPrefix(step.Uses, "goreleaser/goreleaser-action@") {
+				continue
+			}
+			var config any
+			readGoReleaserConfig(t, &config)
+			for _, command := range configStrings(config) {
+				if found := signingJobForbidden.FindString(command); found != "" {
+					findings = append(findings, fmt.Sprintf(".goreleaser.yaml runs %q, and %s job %s, which can mint OIDC tokens, runs GoReleaser",
+						strings.TrimSpace(found), name, jobName))
+				}
+			}
+		}
+	}
+	return signers, findings
+}
+
+// signingWorkflow is a workflow with one job, which can sign, and one step in
+// it. The YAML lines in workflow, job and step are added at those levels.
+func signingWorkflow(workflow, job, step string) string {
+	indent := func(text, prefix string) string {
+		if text == "" {
+			return ""
+		}
+		return prefix + strings.ReplaceAll(strings.TrimSuffix(text, "\n"), "\n", "\n"+prefix) + "\n"
+	}
+	return "permissions:\n  contents: read\n" + indent(workflow, "") +
+		"jobs:\n  publish:\n    runs-on: ubuntu-latest\n    permissions:\n      id-token: write\n" + indent(job, "    ") +
+		"    steps:\n      - name: Smoke\n" + indent(step, "        ")
+}
+
+// TestSigningJobFindingsReadMoreThanScripts pins what signingJobFindings reads
+// besides a run: script. The checks of the second review's fixes pointed a
+// publish step at a build directory five ways that no script names: through
+// an env: value set on the step, on the job or under the workspace, and
+// through working-directory:, in dist/ itself or in a build directory. A
+// shell: or a local action can do the same. The publish job's own env: values
+// must keep passing.
+func TestSigningJobFindingsReadMoreThanScripts(t *testing.T) {
+	cases := []struct {
+		name                string
+		workflow, job, step string
+		forbidden           bool
+	}{
+		{name: "build directory in a step's env", step: "env:\n  SPEEDNS_BIN: dist/speedns_linux_amd64_v1/speedns\nrun: '\"${SPEEDNS_BIN}\" version'", forbidden: true},
+		{name: "build directory under the workspace in a step's env", step: "env:\n  SPEEDNS_BIN: ${{ github.workspace }}/dist/speedns_linux_amd64_v1/speedns\nrun: '\"${SPEEDNS_BIN}\" version'", forbidden: true},
+		{name: "build directory in the job's env", job: "env:\n  SPEEDNS_BIN: dist/speedns_linux_amd64_v1/speedns", step: "run: '\"${SPEEDNS_BIN}\" version'", forbidden: true},
+		{name: "build directory in the workflow's env", workflow: "env:\n  SPEEDNS_BIN: dist/speedns_linux_amd64_v1/speedns", step: "run: '\"${SPEEDNS_BIN}\" version'", forbidden: true},
+		{name: "top-level binary in a step's env", step: "env:\n  SPEEDNS_BIN: dist/speedns\nrun: '\"${SPEEDNS_BIN}\" version'", forbidden: true},
+		{name: "test command in a step's env", step: "env:\n  CHECK: go test ./...\nrun: ${CHECK}", forbidden: true},
+		{name: "working directory in a build directory", step: "working-directory: dist/speedns_linux_amd64_v1\nrun: ./speedns version", forbidden: true},
+		{name: "working directory in dist", step: "working-directory: dist\nrun: for b in */speedns; do \"$b\" version; done", forbidden: true},
+		{name: "working directory in dist, no name in the script", step: "working-directory: dist\nrun: for b in */*; do \"$b\" version; done", forbidden: true},
+		{name: "working directory in dist under the workspace", step: "working-directory: ${{ github.workspace }}/dist\nrun: ./tool version", forbidden: true},
+		{name: "job default working directory", job: "defaults:\n  run:\n    working-directory: dist", step: "run: ./tool version", forbidden: true},
+		{name: "workflow default working directory", workflow: "defaults:\n  run:\n    working-directory: ./dist", step: "run: ./tool version", forbidden: true},
+		{name: "shell from dist", step: "shell: ./dist/tool {0}\nrun: version", forbidden: true},
+		{name: "job default shell from a build directory", job: "defaults:\n  run:\n    shell: dist/speedns_linux_amd64_v1/speedns {0}", step: "run: version", forbidden: true},
+		{name: "workflow default shell from dist", workflow: "defaults:\n  run:\n    shell: dist/tool {0}", step: "run: version", forbidden: true},
+		{name: "local action in dist", step: "uses: ./dist/action", forbidden: true},
+
+		{name: "the publish job's env", workflow: "env:\n  GO_VERSION: '1.26.x'\n  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}\n  GORELEASER_CURRENT_TAG: ${{ inputs.tag || github.ref_name }}",
+			step: "env:\n  VERIFIED_COMMIT: ${{ needs.verify.outputs.commit }}\n  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n  COSIGN_YES: 'true'\n  GORELEASER_PREVIOUS_TAG: ${{ needs.verify.outputs.previous-tag }}\nrun: git rev-parse HEAD"},
+		{name: "top-level file to read in env", step: "env:\n  CHECKSUMS: dist/checksums.txt\nrun: sha256sum \"${CHECKSUMS}\""},
+		{name: "reference as the working directory", step: "working-directory: ${{ runner.temp }}/speedns-repro-reference\nrun: sha256sum --check checksums.txt"},
+		{name: "bash as the shell", step: "shell: bash\nrun: bash scripts/release-assets.sh verify dist dist/release-assets.txt"},
+		{name: "defaults at the repository root", job: "defaults:\n  run:\n    shell: bash\n    working-directory: .", step: "run: git rev-parse HEAD"},
+		{name: "local action elsewhere", step: "uses: ./.github/actions/setup"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			text := signingWorkflow(tc.workflow, tc.job, tc.step)
+			var document workflowFile
+			if err := yaml.Unmarshal([]byte(text), &document); err != nil {
+				t.Fatalf("the case's workflow does not parse: %v\n%s", err, text)
+			}
+			signers, findings := signingJobFindings(t, "case.yml", document)
+			if signers != 1 {
+				t.Fatalf("signingJobFindings counts %d jobs that can sign in a workflow with one:\n%s", signers, text)
+			}
+			if tc.forbidden && len(findings) == 0 {
+				t.Fatalf("signingJobFindings lets a job that can sign be pointed at what it must not run by:\n%s", text)
+			}
+			if !tc.forbidden && len(findings) > 0 {
+				t.Fatalf("signingJobFindings refuses a job that runs nothing it built:\n%s\n%s", strings.Join(findings, "\n"), text)
+			}
+		})
+	}
+}
+
 // TestSigningJobPatternTellsRunsFromReads pins what signingJobForbidden
-// catches. The test above sees only the workflows as they stand, and the
-// second review of the release split ran a binary still inside dist/ five
-// ways that the pattern let through. The publish job's own reads of dist/
-// must keep passing: they are how it compares, uploads and attests the
-// release.
+// catches. The test above sees only the workflows as they stand, and each
+// review of the release split ran something the pattern let through: a binary
+// still inside dist/ five ways in the second review, and more forms in the
+// checks of that fix, among them quoted assignments, ../../, absolute paths,
+// expressions and find -exec ./{}. Each is a case here. The publish job's own
+// reads of dist/ must keep passing, on one line or continued over several,
+// since they are how it compares, uploads and attests the release. The reads
+// the pattern cannot tell from runs are pinned as refused, as its comment
+// says.
 func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -791,47 +992,101 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 		{name: "coverage gate", script: "bash scripts/coverage.sh", forbidden: true},
 		{name: "artifact smoke", script: "bash scripts/artifact-smoke.sh linux dist", forbidden: true},
 		{name: "release fixture", script: "bash scripts/release-fixture.sh", forbidden: true},
+
 		{name: "build directory binary", script: "dist/speedns_linux_amd64_v1/speedns version", forbidden: true},
-		{name: "dot-slash binary", script: "./dist/speedns_linux_amd64_v1/speedns version", forbidden: true},
-		{name: "workspace variable", script: `"${GITHUB_WORKSPACE}/dist/speedns_linux_amd64_v1/speedns" version`, forbidden: true},
-		{name: "pwd substitution", script: `"$(pwd)/dist/speedns_linux_amd64_v1/speedns" version`, forbidden: true},
+		{name: "dot-slash build directory binary", script: "./dist/speedns_linux_amd64_v1/speedns version", forbidden: true},
+		{name: "build directory under the workspace variable", script: `"${GITHUB_WORKSPACE}/dist/speedns_linux_amd64_v1/speedns" version`, forbidden: true},
+		{name: "build directory under a pwd substitution", script: `"$(pwd)/dist/speedns_linux_amd64_v1/speedns" version`, forbidden: true},
 		{name: "cd into dist", script: "cd dist && ./speedns_linux_amd64_v1/speedns version", forbidden: true},
-		{name: "binary in a variable", script: `bin=dist/speedns_linux_amd64_v1/speedns; "${bin}" version`, forbidden: true},
-		{name: "find exec", script: `find dist -name speedns -type f -exec {} version \;`, forbidden: true},
-		{name: "find execdir", script: `find dist -name speedns -type f -execdir "{}" version \;`, forbidden: true},
-		{name: "top-level binary through a variable", script: `"${GITHUB_WORKSPACE}/dist/speedns" version`, forbidden: true},
-		{name: "top-level binary through a substitution", script: `"$(pwd)/dist/speedns" version`, forbidden: true},
-		{name: "variable quoted apart", script: `"${GITHUB_WORKSPACE}"/dist/speedns version`, forbidden: true},
-		{name: "bare variable", script: "$PWD/dist/speedns version", forbidden: true},
-		{name: "parent directory", script: "../dist/speedns version", forbidden: true},
-		{name: "after and", script: "test -x dist/speedns && dist/speedns version", forbidden: true},
-		{name: "if condition", script: "if dist/speedns version; then echo ran; fi", forbidden: true},
-		{name: "negated", script: "! ./dist/speedns version", forbidden: true},
-		{name: "assignment prefix", script: "SPEEDNS_DEBUG=1 ./dist/speedns version", forbidden: true},
-		{name: "sudo", script: "sudo ./dist/speedns version", forbidden: true},
-		{name: "command substitution", script: `version="$(dist/speedns version)"`, forbidden: true},
-		{name: "backticks", script: "version=\x60dist/speedns version\x60", forbidden: true},
-		{name: "brace group", script: "{ dist/speedns version; }", forbidden: true},
-		{name: "loop body", script: "for target in a b; do\n  dist/speedns version\ndone", forbidden: true},
+		{name: "build directory binary in a variable", script: `bin=dist/speedns_linux_amd64_v1/speedns; "${bin}" version`, forbidden: true},
 		{name: "cd into a build directory", script: "cd dist/speedns_linux_amd64_v1 && ./speedns version", forbidden: true},
 		{name: "build directory with an interpolated arch", script: `"dist/speedns_linux_${arch}_v1/speedns" version`, forbidden: true},
 		{name: "glob over build directories", script: `for binary in dist/*/speedns; do "${binary}" version; done`, forbidden: true},
+		{name: "glob run inside dist", script: `cd dist; for b in */speedns; do "$b" version; done`, forbidden: true},
+		{name: "binary path assembled from parts", script: `"${dir}/${target}/speedns" version`, forbidden: true},
+		{name: "binary behind a bare variable", script: `"$dir/speedns" version`, forbidden: true},
+		{name: "top-level binary in a variable", script: `bin=dist/speedns; "${bin}" version`, forbidden: true},
+		{name: "binary in the current directory", script: "./speedns version", forbidden: true},
+		{name: "windows binary", script: `"${dir}/speedns.exe" version`, forbidden: true},
+
+		{name: "find exec", script: `find dist -name speedns -type f -exec {} version \;`, forbidden: true},
+		{name: "find execdir", script: `find dist -name speedns -type f -execdir "{}" version \;`, forbidden: true},
+		{name: "find exec dot-slash", script: `find dist -name speedns -type f -exec ./{} version \;`, forbidden: true},
+		{name: "find okdir", script: `find dist -type f -okdir {} version \;`, forbidden: true},
+
+		// A top-level dist/ file run from there. It is called tool, not
+		// speedns, so that only the rule for a dist/ path where a command
+		// starts can catch it.
+		{name: "top-level file", script: "dist/tool version", forbidden: true},
+		{name: "dot-slash", script: "./dist/tool version", forbidden: true},
+		{name: "parent directory", script: "../dist/tool version", forbidden: true},
+		{name: "two parent directories", script: "../../dist/tool version", forbidden: true},
+		{name: "home directory", script: "~/work/SpeeDNS/dist/tool version", forbidden: true},
+		{name: "absolute path", script: "/srv/work/SpeeDNS/dist/tool version", forbidden: true},
+		{name: "workspace variable", script: `"${GITHUB_WORKSPACE}/dist/tool" version`, forbidden: true},
+		{name: "workspace expression", script: `"${{ github.workspace }}/dist/tool" version`, forbidden: true},
+		{name: "pwd substitution", script: `"$(pwd)/dist/tool" version`, forbidden: true},
+		{name: "variable quoted apart", script: `"${GITHUB_WORKSPACE}"/dist/tool version`, forbidden: true},
+		{name: "bare variable", script: "$PWD/dist/tool version", forbidden: true},
+		{name: "variables then dist", script: `"${HOME}/${repository}/dist/tool" version`, forbidden: true},
+		{name: "after and", script: "test -x dist/tool && dist/tool version", forbidden: true},
+		{name: "if condition", script: "if dist/tool version; then echo ran; fi", forbidden: true},
+		{name: "negated", script: "! ./dist/tool version", forbidden: true},
+		{name: "assignment prefix", script: "SPEEDNS_DEBUG=1 ./dist/tool version", forbidden: true},
+		{name: "quoted assignment prefix", script: `SPEEDNS_LABEL="smoke run" ./dist/tool version`, forbidden: true},
+		{name: "single-quoted assignment prefix", script: `SPEEDNS_LABEL='smoke run' ./dist/tool version`, forbidden: true},
+		{name: "substitution in an assignment prefix", script: "SPEEDNS_DATE=$(date -u +%F) ./dist/tool version", forbidden: true},
+		{name: "sudo", script: "sudo ./dist/tool version", forbidden: true},
+		{name: "sudo with options", script: "sudo -E ./dist/tool version", forbidden: true},
+		{name: "env with an assignment", script: "env SPEEDNS_DEBUG=1 ./dist/tool version", forbidden: true},
+		{name: "env with options", script: "env -i ./dist/tool version", forbidden: true},
+		{name: "xargs", script: `printf '%s\n' --help | xargs -n1 ./dist/tool`, forbidden: true},
+		{name: "shell command string", script: `bash -c './dist/tool version'`, forbidden: true},
+		{name: "command substitution", script: `version="$(dist/tool version)"`, forbidden: true},
+		{name: "backticks", script: "version=\x60dist/tool version\x60", forbidden: true},
+		{name: "brace group", script: "{ dist/tool version; }", forbidden: true},
+		{name: "subshell", script: "(dist/tool version)", forbidden: true},
+		{name: "loop body", script: "for target in a b; do\n  dist/tool version\ndone", forbidden: true},
+		{name: "continued assignment prefix", script: "SPEEDNS_DEBUG=1 \\\n  ./dist/tool version", forbidden: true},
+		{name: "continued wrapper", script: "env \\\n  ./dist/tool version", forbidden: true},
+		{name: "line after an escaped backslash", script: "echo done \\\\\n./dist/tool version", forbidden: true},
+		{name: "line after a continued comment", script: "# no longer run here \\\n./dist/tool version", forbidden: true},
+
+		// Reads the pattern cannot tell from runs, refused as its comment says.
+		{name: "array written one item per line", script: "assets=(\n  dist/checksums.txt\n)", forbidden: true},
+		{name: "here-document listing", script: "cat >assets.txt <<'EOF'\ndist/checksums.txt\nEOF", forbidden: true},
+		{name: "brace list", script: "sha256sum {dist/checksums.txt,dist/CHANGELOG.md}", forbidden: true},
+		{name: "hash of a build directory binary", script: "sha256sum dist/speedns_linux_amd64_v1/speedns", forbidden: true},
+		{name: "wrapper option naming a dist/ file", script: `xargs -a dist/release-assets.txt gh release upload "${RELEASE_TAG}"`, forbidden: true},
 
 		{name: "reproducibility comparison", script: `bash scripts/compare-release-artifacts.sh "${RUNNER_TEMP}/speedns-repro-reference" dist`},
 		{name: "asset list check", script: "bash scripts/release-assets.sh verify dist dist/release-assets.txt"},
 		{name: "asset list read", script: "mapfile -t release_assets <dist/release-assets.txt"},
 		{name: "upload", script: `gh release upload "${RELEASE_TAG}" --clobber dist/checksums.txt dist/SpeeDNS_0.7.0_linux_amd64.tar.gz dist/speedns_0.7.0_linux_amd64.deb`},
 		{name: "upload a prerelease package", script: `gh release upload "${RELEASE_TAG}" dist/speedns_1.0.0-rc.1_linux_arm64.rpm`},
+		{name: "upload on continuation lines", script: "gh release upload \"${RELEASE_TAG}\" \\\n  --clobber \\\n  dist/checksums.txt \\\n  dist/*.tar.gz"},
 		{name: "hash with a glob", script: "sha256sum dist/*.tar.gz dist/*.deb dist/*.sbom.json"},
+		{name: "loop over the archives", script: `for archive in dist/*.tar.gz; do sha256sum "${archive}"; done`},
+		{name: "hash on continuation lines", script: "sha256sum \\\n  dist/checksums.txt \\\n  dist/*.tar.gz"},
 		{name: "hash through the workspace", script: `sha256sum "${GITHUB_WORKSPACE}/dist/checksums.txt"`},
+		{name: "hash through the workspace quoted apart", script: `sha256sum "${GITHUB_WORKSPACE}"/dist/checksums.txt`},
+		{name: "hash with a quoted assignment prefix", script: `LC_ALL="C.UTF-8" sha256sum dist/checksums.txt`},
+		{name: "array on one line", script: `assets=(dist/*.tar.gz dist/checksums.txt); sha256sum "${assets[@]}"`},
+		{name: "appended array", script: "assets+=(dist/checksums.txt)"},
+		{name: "listing in a substitution", script: `files="$(ls dist/*.sbom.json)"`},
 		{name: "check in a subshell", script: "(cd dist && sha256sum --check checksums.txt)"},
 		{name: "find hashing", script: `find dist -maxdepth 1 -name '*.sbom.json' -exec sha256sum {} +`},
 		{name: "compare with the reference", script: `cmp dist/checksums.txt "${RUNNER_TEMP}/speedns-repro-reference/checksums.txt"`},
+		{name: "reference directory", script: `ls "${RUNNER_TEMP}/speedns-repro-reference"`},
 		{name: "changelog", script: "if [[ -f dist/CHANGELOG.md ]]; then\n  bash scripts/ensure-release.sh \"${RELEASE_TAG}\" dist/CHANGELOG.md\nfi"},
 		{name: "changelog in a variable", script: `changelog=dist/CHANGELOG.md; test -s "${changelog}"`},
+		{name: "missing changelog", script: "if [[ ! -f dist/CHANGELOG.md ]]; then echo none; fi"},
+		{name: "cask beside the binary's name", script: "test -s dist/speedns.rb"},
+		{name: "the binary's Go package", script: "go list ./cmd/speedns"},
 		{name: "signature check", script: "cosign verify-blob --bundle dist/checksums.txt.sigstore.json dist/checksums.txt"},
 		{name: "artifact metadata", script: "jq -r '.[].path' dist/artifacts.json"},
 		{name: "log redirection", script: ": >dist/release-smoke.log"},
+		{name: "log through tee", script: "{\n  bash scripts/release-assets.sh verify dist dist/release-assets.txt\n} 2>&1 | tee dist/release-smoke.log"},
 		{name: "go version", script: "go version"},
 		{name: "module cache", script: "go env GOMODCACHE"},
 	}
