@@ -66,18 +66,19 @@ fi
 # Syft also reads configuration files. Unless one is named, it merges every
 # one it finds: .syft.yaml and .syft/config.yaml in the working directory
 # (dist/, under GoReleaser), ~/.syft.yaml, and syft/config.yaml in each XDG
-# configuration directory. The variables below outrank a file, but enrich:
-# all in one would still turn on the network lookups no variable here turns
-# off, Java's and JavaScript's among them. A file named with --config
-# replaces that search, and the first --config replaces SYFT_CONFIG as well;
-# a second would be merged in, so the loop above refuses one. The file is
-# the wrapper's own and sets nothing, so every key keeps Syft's default
-# unless a variable sets it, and it ends in .yaml because viper takes the
-# format from the extension. This is how Syft v1.42.3, the release the
-# pinned anchore/sbom-action/download-syft installs, loads its configuration
-# through anchore/fangs and spf13/pflag, as their sources read at the
-# versions it builds with; check it again when Renovate moves that pin to a
-# new Syft.
+# configuration directory, each name tried with every extension viper
+# supports, .yml, .json and .toml among them, not only .yaml. The variables
+# below outrank a file, but enrich: all in one would still turn on the
+# network lookups no variable here turns off, Java's and JavaScript's among
+# them. A file named with --config replaces that search, and the first
+# --config replaces SYFT_CONFIG as well; a second would be merged in, so the
+# loop above refuses one. The file is the wrapper's own and sets nothing, so
+# every key keeps Syft's default unless a variable sets it, and it ends in
+# .yaml because viper takes the format from the extension. This is how Syft
+# v1.42.3, the release the pinned anchore/sbom-action/download-syft
+# installs, loads its configuration through anchore/fangs and spf13/pflag,
+# as their sources read at the versions it builds with; check it again when
+# Renovate moves that pin to a new Syft.
 syft_config_dir="$(mktemp -d "${TMPDIR:-/tmp}/speedns-syft.XXXXXX")"
 trap 'rm -rf -- "${syft_config_dir}"' EXIT
 syft_config="${syft_config_dir}/config.yaml"
