@@ -20,6 +20,11 @@ case "${mode}" in
 		;;
 esac
 
+# The build host .goreleaser.yaml records in every RPM header instead of the
+# runner's own name, which would make two builds of one commit differ.
+# schema/workflows_test.go keeps this equal to the configured value.
+expected_rpm_buildhost=speedns-release
+
 smoke_dir="$(mktemp -d "${TMPDIR:-/tmp}/speedns-artifact-smoke.XXXXXX")"
 trap 'rm -rf -- "${smoke_dir}"' EXIT
 
@@ -114,7 +119,7 @@ check_linux() {
 check_package_format() {
 	local format="$1"
 	local -a package_artifacts=()
-	local artifact basename amd64_artifact arm64_artifact expected_arch package_name package_arch package_version package_license package_entries package_info
+	local artifact basename amd64_artifact arm64_artifact expected_arch package_name package_arch package_version package_license package_buildhost package_entries package_info
 	mapfile -t package_artifacts < <(find "${dist_dir}" -type f -iname "*.${format}" -print | sort)
 	if [[ "${#package_artifacts[@]}" -ne 2 ]]; then
 		echo "expected exactly two Linux ${format} packages, found ${#package_artifacts[@]}" >&2
@@ -178,6 +183,11 @@ check_package_format() {
 				fi
 				if ! rpm -qpl "${artifact}" | sed 's#^/##;s#^\./##' | grep -Fqx 'usr/bin/speedns'; then
 					echo "RPM package does not contain /usr/bin/speedns" >&2
+					exit 1
+				fi
+				package_buildhost="$(rpm -qp --queryformat '%{BUILDHOST}' "${artifact}")"
+				if [[ "${package_buildhost}" != "${expected_rpm_buildhost}" ]]; then
+					echo "RPM header records build host ${package_buildhost}, want ${expected_rpm_buildhost} from .goreleaser.yaml" >&2
 					exit 1
 				fi
 				;;

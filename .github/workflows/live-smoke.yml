@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -74,10 +76,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The token can write the whole repository, and only the final push
+      # needs it. Persisted in .git/config it would be readable by every step
+      # in between, the results generator included, so the push is handed the
+      # token for that one command instead.
       - name: Check out source and history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download smoke-test evidence
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -108,6 +115,8 @@ jobs:
 
       - name: Commit and push results branch
         shell: bash
+        env:
+          PUSH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git -C "${SPEEDNS_RESULTS_DIR}" config user.name "github-actions[bot]"
@@ -118,4 +127,13 @@ jobs:
             exit 0
           fi
           git -C "${SPEEDNS_RESULTS_DIR}" commit -m "Publish live DNS results for ${GITHUB_RUN_ID}"
-          git -C "${SPEEDNS_RESULTS_DIR}" push origin HEAD:results
+          # The same header actions/checkout would have persisted, given to this
+          # one git process through its environment: never written to
+          # .git/config and never on a command line. Actions masks the token
+          # but not its base64 form, so that is masked here.
+          credential="$(printf 'x-access-token:%s' "${PUSH_TOKEN}" | base64 | tr -d '\n')"
+          echo "::add-mask::${credential}"
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${credential}" \
+            git -C "${SPEEDNS_RESULTS_DIR}" push origin HEAD:results

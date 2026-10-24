@@ -308,6 +308,80 @@ if bash "${root_dir}/scripts/compare-release-artifacts.sh" \
 	exit 1
 fi
 
+# SBOMs. The release compares two builds of one commit, made on different
+# runners, byte for byte, so two scans of the same archive must yield the same
+# SBOM: reproducible-syft.sh replaces the fields Syft varies on every scan,
+# and runs Syft with its license lookup confined to the local module cache
+# and with a configuration file of its own, which keeps Syft from loading any
+# other. The caller's environment asks for the opposite; the wrapper must
+# win. The fake syft records what it ran with.
+syft_bin="${fixture_dir}/syft-bin"
+mkdir -p "${syft_bin}"
+ln -s "${root_dir}/scripts/testdata/fake-syft.sh" "${syft_bin}/syft"
+sbom_dir="${fixture_dir}/sbom"
+sbom_archive="${sbom_dir}/SpeeDNS_${version}_linux_amd64.tar.gz"
+# The wrapper's temporary directory, empty again once it exits.
+sbom_tmp="${sbom_dir}/tmp"
+mkdir -p "${sbom_dir}/first" "${sbom_dir}/second" "${sbom_tmp}"
+printf 'fixture archive\n' >"${sbom_archive}"
+# Both scans write the same path, as the two release builds each write
+# dist/<artifact>.sbom.json; the fake records its arguments, path included.
+for scan in first second; do
+	PATH="${syft_bin}:${PATH}" \
+		TMPDIR="${sbom_tmp}" \
+		SOURCE_DATE_EPOCH=1700000000 \
+		SYFT_GOLANG_SEARCH_REMOTE_LICENSES=true \
+		SYFT_GOLANG_SEARCH_LOCAL_MOD_CACHE_LICENSES=false \
+		SYFT_CHECK_FOR_APP_UPDATE=true \
+		bash "${root_dir}/scripts/reproducible-syft.sh" "${sbom_archive}" \
+		--output "spdx-json=${sbom_dir}/archive.sbom.json" >/dev/null
+	mv "${sbom_dir}/archive.sbom.json" "${sbom_dir}/${scan}/archive.sbom.json"
+done
+if ! cmp -s "${sbom_dir}/first/archive.sbom.json" "${sbom_dir}/second/archive.sbom.json"; then
+	echo "two scans of one archive produced different SBOMs" >&2
+	diff -u "${sbom_dir}/first/archive.sbom.json" "${sbom_dir}/second/archive.sbom.json" >&2 || true
+	exit 1
+fi
+# Exactly one configuration file, holding the wrapper's empty mapping while
+# Syft ran: a second would be merged with it.
+if ! jq -e --arg cache "$(go env GOMODCACHE)" '
+	.creationInfo.created == "2023-11-14T22:13:20Z" and
+	(.fixture.arguments | index("--enrich") | not) and
+	.fixture.configs == ["{}\n"] and
+	.fixture.settings.SYFT_GOLANG_SEARCH_REMOTE_LICENSES == "false" and
+	.fixture.settings.SYFT_GOLANG_SEARCH_LOCAL_MOD_CACHE_LICENSES == "true" and
+	.fixture.settings.SYFT_GOLANG_LOCAL_MOD_CACHE_DIR == $cache and
+	.fixture.settings.SYFT_CHECK_FOR_APP_UPDATE == "false"
+' "${sbom_dir}/first/archive.sbom.json" >/dev/null; then
+	echo "reproducible-syft.sh did not run Syft offline, on its own configuration file, with a normalized creation time:" >&2
+	jq '{created: .creationInfo.created, fixture}' "${sbom_dir}/first/archive.sbom.json" >&2
+	exit 1
+fi
+if [[ -n "$(find "${sbom_tmp}" -mindepth 1 -print -quit)" ]]; then
+	echo "reproducible-syft.sh left its Syft configuration behind:" >&2
+	find "${sbom_tmp}" -mindepth 1 >&2
+	exit 1
+fi
+# --enrich turns the network lookups back on, and another --config would be
+# merged into the wrapper's, enrich: lists included, so both are refused
+# before Syft runs, as separate, =-joined and attached values alike, and -c
+# also at the end of a cluster of the flags that take no value, -h, -q and -v.
+for refused_option in '--enrich all' '--enrich=golang' '--config planted.yaml' '--config=planted.yaml' '-c planted.yaml' '-cplanted.yaml' \
+	'-qc planted.yaml' '-vcplanted.yaml' '-hvc planted.yaml'; do
+	read -r -a refused_arguments <<<"${refused_option}"
+	refused="${sbom_dir}/refused.sbom.json"
+	if PATH="${syft_bin}:${PATH}" SOURCE_DATE_EPOCH=1700000000 \
+		bash "${root_dir}/scripts/reproducible-syft.sh" "${sbom_archive}" \
+		--output "spdx-json=${refused}" "${refused_arguments[@]}" 2>/dev/null; then
+		echo "reproducible-syft.sh accepted ${refused_option}" >&2
+		exit 1
+	fi
+	if [[ -e "${refused}" ]]; then
+		echo "reproducible-syft.sh ran Syft before refusing ${refused_option}" >&2
+		exit 1
+	fi
+done
+
 bash "${root_dir}/scripts/homebrew-tap-fixture.sh"
 
 echo "release script fixture passed"
