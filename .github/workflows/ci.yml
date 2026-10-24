@@ -171,7 +171,7 @@ jobs:
       # only module versions, so the custom manager in renovate.json can find
       # and bump this pin; a calendar version would never match an update.
       - name: Run staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
       # scripts/testdata holds the fake CLIs the release fixtures put on PATH;
       # they run in CI like any other script, so they are linted like one.
