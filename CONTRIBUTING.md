@@ -74,10 +74,11 @@ DNS or other Internet services; use the deterministic local fixtures instead.
   one, or renaming one needs a new `schema_version`. A release that adds a
   report field vendors a report its own encoder writes with every optional
   section filled, such as `schemaReport()` in
-  `internal/report/schema_test.go` encoded raw, into
-  `internal/report/testdata/released/`, where a test validates every one
-  against the current schema. The golden report is not enough: it has no
-  run provenance, so it did not change when v0.6.0 added provenance fields.
+  `internal/report/schema_test.go` encoded raw with `--profile-view`, into
+  `internal/report/testdata/released/` as `complete-vX.Y.Z.json`, where a test
+  validates every one against the current schema. The golden report is not
+  enough: it has no run provenance, so it did not change when v0.6.0 added
+  provenance fields.
   CSV columns are only ever appended after the last one, and CSV changes
   require corresponding consumer and fixture updates.
 - Add an offline regression test for every transport, parser, report, or
