@@ -713,10 +713,12 @@ const shellPathPart = `["']?(?:~|\$\{\{[^}]*\}\}|\{\{[^}]*\}\}|\$\{[^}]*\}|\$\w+
 
 // goreleaserBuiltBinary is a GoReleaser template that reads .Path, quoted or
 // not, and inside a quoted sh -c or bash -c script as well, where it has a
-// second quote in front of it. In a build hook, .Path is the binary the build
-// has just made, such as dist/speedns_linux_amd64_v1/speedns, so {{ .Path }}
-// where a command starts runs it.
-const goreleaserBuiltBinary = `["']{0,2}\{\{[^}]*\.Path\b[^}]*\}\}`
+// second quote in front of it. Either quote may have a backslash in front, as
+// the inner one does inside a double-quoted script:
+// sh -c "\"{{ .Path }}\" version". In a build hook, .Path is the binary the
+// build has just made, such as dist/speedns_linux_amd64_v1/speedns, so
+// {{ .Path }} where a command starts runs it.
+const goreleaserBuiltBinary = `(?:\\?["']){0,2}\{\{[^}]*\.Path\b[^}]*\}\}`
 
 // signingJobUnpacks matches a command that unpacks or installs a release
 // archive or package from dist/, as distCommand reads one:
@@ -775,15 +777,18 @@ func distCommand(tool, mode string) string {
 //     assignments may come first, the value bare, quoted or a substitution.
 //     The path may have parts in front of dist/, each a name, ., .., ~, a
 //     variable, an expression, a template or a $(command), quoted or not,
-//     and one more quote may open it, as it does inside a quoted sh -c or
-//     bash -c script, so "dist/...", ./dist/..., ../../dist/...,
-//     ~/work/dist/..., /srv/work/SpeeDNS/dist/...,
-//     "${GITHUB_WORKSPACE}/dist/...", "${{ github.workspace }}/dist/...",
-//     "$(pwd)/dist/...", {{ .Env.GITHUB_WORKSPACE }}/dist/... and
-//     bash -c '"./dist/..." version' all count;
+//     and one or two more quotes may open it, as the script's own quote
+//     does inside a quoted sh -c or bash -c script, each with a backslash in
+//     front or not, as an inner quote has inside a double-quoted script, so
+//     "dist/...", ./dist/..., ../../dist/..., ~/work/dist/...,
+//     /srv/work/SpeeDNS/dist/..., "${GITHUB_WORKSPACE}/dist/...",
+//     "${{ github.workspace }}/dist/...", "$(pwd)/dist/...",
+//     {{ .Env.GITHUB_WORKSPACE }}/dist/..., bash -c '"./dist/..." version'
+//     and bash -c "\"./dist/...\" version" all count;
 //   - goreleaserBuiltBinary where a command starts, as above. A GoReleaser
 //     build hook that runs it, as {{ .Path }} version,
-//     sh -c '"{{ .Path }}" version || true' and
+//     sh -c '"{{ .Path }}" version || true',
+//     sh -c "\"{{ .Path }}\" version" and
 //     sh -c 'test "{{ .Os }}" != linux || {{ .Path }} version' do, runs the
 //     binary in the job that signs, while
 //     ./scripts/normalize-build-mtime.sh {{ .Path }}, the template quoted or
@@ -821,8 +826,8 @@ func distCommand(tool, mode string) string {
 //
 // This is a tripwire for the direct ways a step would run a built binary, not
 // a sandbox: whoever can edit release.yml can edit this test as well, and
-// review of release.yml and .goreleaser.yaml stays the control. The pattern
-// does not see:
+// review of release.yml, .goreleaser.yaml and the scripts they call stays the
+// control. The pattern does not see:
 //
 //   - a built binary that reaches a path or a name the rules above do not
 //     know by any means but the commands of signingJobUnpacks: cp, mv, ln,
@@ -837,6 +842,15 @@ func distCommand(tool, mode string) string {
 //     (cd dist; for f in *), or kept in a variable, an env: value or, in
 //     .goreleaser.yaml, a hook's env: (BIN={{ .Path }} or
 //     PATH={{ dir .Path }}:...) before it runs;
+//   - a dist/ path or a name the rules above know, written so that its text
+//     differs from how they read it: a quote or a backslash inside the word
+//     anywhere but where the rules above allow one ("dist"/tool,
+//     ./"dist"/tool, "${GITHUB_WORKSPACE}"/"dist"/tool, di"st"/tool,
+//     d\ist/tool, ./"speedns", ./speedn's', -name 'spee'dns,
+//     tar -xf "dist"/..., or an escaped quote that closes a part of the path
+//     inside a double-quoted -c script), $'...' quoting ($'dist/tool'), a
+//     doubled slash (.//dist/tool) or a backslash-newline inside a word,
+//     which shellCode joins with a space where the shell joins with nothing;
 //   - a path handed to a program that runs its argument other than the
 //     wrappers above (timeout, nice, eval, source or ., a -c script that
 //     receives the path as "$1", xargs reading it from its input), to a
@@ -850,15 +864,19 @@ func distCommand(tool, mode string) string {
 //     -executable) or by none, before something runs what it lists;
 //   - a renamed GoReleaser build id or binary, which changes the names the
 //     rules above know;
-//   - a GoReleaser sign, SBOM or publisher command handed a binary as its
-//     artifact, and whatever an action does with its with: inputs.
+//   - the code a step or a hook calls: a repository script other than the
+//     three signingJobTools refuses by name, such as
+//     scripts/release-assets.sh or scripts/reproducible-syft.sh, that runs a
+//     built binary itself, a GoReleaser sign, SBOM or publisher command
+//     handed a binary as its artifact, and whatever an action does with its
+//     with: inputs.
 var signingJobForbidden = regexp.MustCompile(`(?m)` + strings.Join([]string{
 	signingJobTools,
 	signingJobBuildOutput,
 	`(?:^|[;&|{!\x60]|(?:^|[^=])\(|(?:^|[\s;&|({!\x60])` +
 		`(?:if|elif|then|else|do|while|until|exec|command|time|nohup|sudo|env|xargs|bash|sh)\s+(?:-\S*\s+)*)\s*` +
 		`(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\$\([^)]*\)|\x60[^\x60]*\x60|[^\s"'(]+)*\s+)*` +
-		`(?:["']?(?:(?:` + shellPathPart + `)?(?:/` + shellPathPart + `)*/)?["']?dist/|` + goreleaserBuiltBinary + `)`,
+		`(?:(?:\\?["']){0,2}(?:(?:` + shellPathPart + `)?(?:/` + shellPathPart + `)*/)?["']?dist/|` + goreleaserBuiltBinary + `)`,
 	`-(?:exec|ok)(?:dir)?\s+["']?(?:\./)?\{\}`,
 	`(?:^|\s)-i?(?:name|path|wholename)\s+["']?(?:[^\s"']*/)?(?i:speedns(?:\.exe)?)["']?` + shellWordEnd,
 	signingJobUnpacks,
@@ -1087,15 +1105,16 @@ func TestSigningJobFindingsReadMoreThanScripts(t *testing.T) {
 // five ways in the second review; more forms in the checks of that fix, among
 // them quoted assignments, ../../, absolute paths, expressions and
 // find -exec ./{}; in the checks after those, a binary that find picks by its
-// name and a GoReleaser build hook that runs {{ .Path }}; and in the checks of
+// name and a GoReleaser build hook that runs {{ .Path }}; in the checks of
 // that fix, a path quoted inside a quoted sh -c or bash -c script, a find
-// inside backticks and a release archive or package unpacked or installed.
-// Each is a case here. signingJobFindings holds every string of
-// .goreleaser.yaml to the pattern as well, so such strings are cases too. The
-// publish job's own reads of dist/ must keep passing, on one line or continued
-// over several, since they are how it compares, uploads and attests the
-// release, and so must the config's own strings. The reads the pattern cannot
-// tell from runs are pinned as refused, as its comment says.
+// inside backticks and a release archive or package unpacked or installed;
+// and in the checks of those, a path behind an escaped quote inside a
+// double-quoted script. Each is a case here. signingJobFindings holds every
+// string of .goreleaser.yaml to the pattern as well, so such strings are
+// cases too. The publish job's own reads of dist/ must keep passing, on one
+// line or continued over several, since they are how it compares, uploads and
+// attests the release, and so must the config's own strings. The reads the
+// pattern cannot tell from runs are pinned as refused, as its comment says.
 func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1157,6 +1176,7 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 		{name: "hook path under a template", script: "{{ .Env.GITHUB_WORKSPACE }}/dist/tool version", forbidden: true},
 		{name: "hook running the quoted built binary through sh -c", script: `sh -c '"{{ .Path }}" version || true'`, forbidden: true},
 		{name: "hook running the quoted built binary through bash -c", script: `bash -c '"{{ .Path }}" --help'`, forbidden: true},
+		{name: "hook running the built binary behind an escaped quote", script: `sh -c "\"{{ .Path }}\" version"`, forbidden: true},
 
 		// A top-level dist/ file run from there. It is called tool, not
 		// speedns, so that only the rule for a dist/ path where a command
@@ -1178,6 +1198,9 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 		{name: "quoted inside a shell command string", script: `bash -c '"./dist/tool" version'`, forbidden: true},
 		{name: "quoted without a prefix inside a shell command string", script: `bash -c '"dist/tool" version'`, forbidden: true},
 		{name: "quoted workspace variable inside a shell command string", script: `bash -c '"${GITHUB_WORKSPACE}/dist/tool" version'`, forbidden: true},
+		{name: "escaped quote inside a double-quoted shell command string", script: `bash -c "\"./dist/tool\" version"`, forbidden: true},
+		{name: "escaped quote without a prefix inside a double-quoted shell command string", script: `bash -c "\"dist/tool\" version"`, forbidden: true},
+		{name: "escaped quote around the workspace variable inside a double-quoted shell command string", script: `bash -c "\"${GITHUB_WORKSPACE}/dist/tool\" version"`, forbidden: true},
 		{name: "after and", script: "test -x dist/tool && dist/tool version", forbidden: true},
 		{name: "if condition", script: "if dist/tool version; then echo ran; fi", forbidden: true},
 		{name: "negated", script: "! ./dist/tool version", forbidden: true},
@@ -1281,6 +1304,7 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 
 		{name: "hook given the built binary", script: "./scripts/normalize-build-mtime.sh {{ .Path }}"},
 		{name: "hook given the quoted built binary through sh -c", script: `sh -c './scripts/normalize-build-mtime.sh "{{ .Path }}"'`},
+		{name: "hook given the built binary behind an escaped quote", script: `sh -c "./scripts/normalize-build-mtime.sh \"{{ .Path }}\""`},
 		{name: "archive name template", script: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"},
 		{name: "SBOM document name", script: "{{ .ArtifactName }}.sbom.json"},
 		{name: "commit timestamp", script: "{{ .CommitTimestamp }}"},
