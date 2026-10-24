@@ -62,6 +62,10 @@ type cliConfig struct {
 	assertions      []string
 	family          string
 	dnssec          bool
+
+	// cacheMissSampleSet records that --cache-miss-sample was given on the
+	// command line, which its value cannot show.
+	cacheMissSampleSet bool
 }
 
 var exit = os.Exit
@@ -725,7 +729,9 @@ func (p *progressRenderer) Finish() {
 }
 
 func tableColorEnabled(config *cliConfig) bool {
-	if config.noColor || (strings.TrimSpace(config.output) != "" && config.output != "-") {
+	// NO_COLOR follows no-color.org: present and not empty disables colour
+	// whatever its value, while an empty NO_COLOR leaves it on.
+	if config.noColor || os.Getenv("NO_COLOR") != "" || (strings.TrimSpace(config.output) != "" && config.output != "-") {
 		return false
 	}
 	return terminalDetector(os.Stdout)
@@ -917,9 +923,7 @@ func newRootCommand() *cobra.Command {
 		Short:         "Compare DNS resolver performance across modern transports",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runBenchmark(cmd.Context(), config)
-		},
+		RunE:          benchmarkRunE(config),
 	}
 	addBenchmarkFlags(root, config)
 	root.AddCommand(newRunCommand(config))
@@ -953,7 +957,7 @@ func addBenchmarkFlags(command *cobra.Command, config *cliConfig) {
 	flags.BoolVar(&config.details, "details", false, "show cold latency, jitter, response outcomes, and expanded metrics")
 	flags.BoolVar(&config.profileView, "profile-view", false, "show same-resolver transport comparisons with score confidence intervals")
 	flags.BoolVar(&config.raw, "raw", false, "include per-query observations in JSON output")
-	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling")
+	flags.BoolVar(&config.noColor, "no-color", false, "disable terminal styling (a non-empty NO_COLOR does the same)")
 	flags.BoolVar(&config.redactSystem, "redact-system", false, "redact local system resolver addresses and labels in reports")
 	flags.StringArrayVar(&config.assertions, "assert", nil, "assert a winner metric or profile condition (repeatable)")
 	flags.StringVar(&config.family, "family", "auto", "resolver address family: 4, 6, both, or auto")
@@ -965,12 +969,74 @@ func newRunCommand(config *cliConfig) *cobra.Command {
 		Use:          "run",
 		Short:        "Run a DNS resolver benchmark explicitly",
 		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runBenchmark(cmd.Context(), config)
-		},
+		// The root command rejects a stray word as an unknown command, but a
+		// leaf accepts any positional argument unless told otherwise, so
+		// "speedns run json" -- --format with its dashes forgotten -- started
+		// a full public benchmark instead of failing as the typo it is.
+		Args: runArgs,
+		RunE: benchmarkRunE(config),
 	}
 	addBenchmarkFlags(command, config)
 	return command
+}
+
+// leafNoArgs rejects every positional argument to a command that has no
+// subcommands. cobra.NoArgs calls such an argument an unknown command, which
+// suggests that the command has subcommands to choose from; these have none,
+// so the message says the command takes no arguments and repeats what it got.
+// Each argument is quoted with %q, as every other CLI error that echoes input
+// is, so a control or bidirectional character in it is shown escaped instead
+// of reaching the terminal.
+func leafNoArgs(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, strconv.Quote(arg))
+	}
+	return fmt.Errorf("%q takes no arguments; got %s", cmd.CommandPath(), strings.Join(quoted, " "))
+}
+
+// runArgs is leafNoArgs for run, with a hint when a stray argument is the name
+// of an output format: that word is most likely --format with its dashes
+// forgotten. Any other argument gets no hint, because no guess about what it
+// was meant to be would be reliable.
+func runArgs(cmd *cobra.Command, args []string) error {
+	err := leafNoArgs(cmd, args)
+	if err == nil {
+		return nil
+	}
+	for _, arg := range args {
+		if isBenchmarkFormat(arg) {
+			return fmt.Errorf("%w (to choose the output format, use --format %s)", err, strings.ToLower(arg))
+		}
+	}
+	return err
+}
+
+// isBenchmarkFormat reports whether name, in any case, is an output format a
+// run can write. runBenchmark and runArgs share it so the hint can never name
+// a format the run would then refuse.
+func isBenchmarkFormat(name string) bool {
+	switch strings.ToLower(name) {
+	case "table", "json", "csv":
+		return true
+	default:
+		return false
+	}
+}
+
+// benchmarkRunE runs the benchmark for the root command and for run, which
+// share one flag set.
+func benchmarkRunE(config *cliConfig) func(*cobra.Command, []string) error {
+	return func(cmd *cobra.Command, _ []string) error {
+		// Only the flag set knows whether --cache-miss-sample was given: its
+		// default is a valid count, so the value alone cannot tell an
+		// explicit request from the absence of one.
+		config.cacheMissSampleSet = cmd.Flags().Changed("cache-miss-sample")
+		return runBenchmark(cmd.Context(), config)
+	}
 }
 
 func newCompletionCommand() *cobra.Command {
@@ -1000,6 +1066,7 @@ func newVersionCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Show version information",
+		Args:  leafNoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
 			buildVersion, buildCommit, buildDate := version.Values()
 			fmt.Fprintf(cmd.OutOrStdout(), "speedns %s\ncommit: %s\nbuilt: %s\n", buildVersion, buildCommit, buildDate)
@@ -1011,24 +1078,46 @@ func newResolversCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "resolvers",
 		Short: "List bundled resolver profiles and supported transports",
+		Args:  leafNoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			for _, resolver := range catalog.DefaultResolvers() {
-				protocols := make([]string, 0, len(resolver.Transports))
-				for protocol := range resolver.Transports {
-					protocols = append(protocols, protocol.String())
-				}
-				sort.Strings(protocols)
-				fmt.Fprintf(cmd.OutOrStdout(), "%-16s %-22s %-24s %-34s %s\n", resolver.ID, resolver.Owner, strings.Join(resolver.Addresses, ","), resolver.Policy, strings.Join(protocols, ","))
-			}
+			// A failed write to stdout is not reported, as for version and
+			// corpus: the listing has no other result to keep.
+			_ = report.WriteAlignedTable(cmd.OutOrStdout(), []string{"Profile", "Owner", "Addresses", "Policy", "Transports"}, resolverListing(catalog.DefaultResolvers()))
 			return nil
 		},
 	}
+}
+
+// resolverListing renders one row per profile for speedns resolvers.
+//
+// Transports are listed in the documented benchmark order udp, tcp, doh, dot,
+// doq, the order of every report and of --protocol's default. Sorting the
+// names as strings printed doh,doq,dot,tcp,udp, the one place the CLI still
+// disagreed with catalog.CompareProtocols. The rows go through the report's
+// display-width table writer rather than fixed printf widths, which eight of
+// the ten bundled profiles overflowed with their IPv6 addresses.
+func resolverListing(profiles []catalog.ResolverProfile) [][]string {
+	rows := make([][]string, 0, len(profiles))
+	for _, resolver := range profiles {
+		protocols := make([]catalog.Protocol, 0, len(resolver.Transports))
+		for protocol := range resolver.Transports {
+			protocols = append(protocols, protocol)
+		}
+		sort.Slice(protocols, func(i, j int) bool { return catalog.CompareProtocols(protocols[i], protocols[j]) < 0 })
+		names := make([]string, 0, len(protocols))
+		for _, protocol := range protocols {
+			names = append(names, protocol.String())
+		}
+		rows = append(rows, []string{resolver.ID, resolver.Owner, strings.Join(resolver.Addresses, ","), resolver.Policy, strings.Join(names, ",")})
+	}
+	return rows
 }
 
 func newCorpusCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "corpus",
 		Short: "Show the embedded domain corpus provenance and checksum",
+		Args:  leafNoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			metadata, err := verifyCorpusFunc()
 			if err != nil {
@@ -1044,15 +1133,19 @@ func newCorpusCommand() *cobra.Command {
 			if metadata.DownloadURL != "" {
 				fmt.Fprintf(writer, "Source URL: %s\n", metadata.DownloadURL)
 			}
+			// The note asks whoever redistributes the snapshot to keep its
+			// attribution, so the command that shows the provenance shows it
+			// too rather than leaving it inside the binary.
+			if metadata.LicenseNote != "" {
+				fmt.Fprintf(writer, "License note: %s\n", metadata.LicenseNote)
+			}
 			return nil
 		},
 	}
 }
 
 func runBenchmark(ctx context.Context, config *cliConfig) error {
-	switch strings.ToLower(config.format) {
-	case "table", "json", "csv":
-	default:
+	if !isBenchmarkFormat(config.format) {
 		return fmt.Errorf("unsupported output format %q (choose table, json, or csv)", config.format)
 	}
 	if config.sample <= 0 && !config.full {
@@ -1197,6 +1290,14 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 	if err := preflightOutput(config.output); err != nil {
 		return err
 	}
+	// The inert-option warnings wait until every usage check above has
+	// passed. Printed any earlier, a run those checks then refused, such as
+	// --format csv --raw --sample 0, warned about an option of a run that
+	// never happened. They still come before the engine sends a query and
+	// before progress prints a line.
+	for _, warning := range inertFlagWarnings(config) {
+		fmt.Fprintf(warningWriterFunc(), "warning: %s\n", warning)
+	}
 	seed := config.seed
 	if seed == 0 {
 		seed = newSeedFunc()
@@ -1338,6 +1439,23 @@ func runBenchmark(ctx context.Context, config *cliConfig) error {
 		return runErr
 	}
 	return evaluateAssertionsWithOptions(result, assertions, assertionOptions{redactSystem: config.redactSystem})
+}
+
+// inertFlagWarnings names the options this command line accepts but whose
+// effect the rest of it rules out. Each one used to be dropped silently, so a
+// user who passed --raw to a CSV run, or sized a cache-miss corpus without
+// --cache-miss, read a report that lacked what they asked for and was not told
+// why. They are warned about rather than rejected: neither changes what is
+// measured, and a wrapper script that always passes one of them keeps working.
+func inertFlagWarnings(config *cliConfig) []string {
+	var warnings []string
+	if config.raw && !strings.EqualFold(config.format, "json") {
+		warnings = append(warnings, fmt.Sprintf("--raw only adds per-query observations to JSON output; it has no effect on %s output", strings.ToLower(config.format)))
+	}
+	if config.cacheMissSampleSet && !config.cacheMiss {
+		warnings = append(warnings, "--cache-miss-sample has no effect without --cache-miss")
+	}
+	return warnings
 }
 
 // interruptWarning describes an interrupted run from the evidence in its

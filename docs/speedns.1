@@ -15,6 +15,10 @@ speedns \- compare recursive DNS resolver performance
 .br
 .B speedns corpus
 .br
+.B speedns diff
+.RI [ options ]
+.I BASELINE.json CURRENT.json
+.br
 .B speedns version
 .SH DESCRIPTION
 .B speedns
@@ -39,13 +43,32 @@ Write a completion script for SHELL, which may be bash, zsh, fish, or
 PowerShell.
 .TP
 .B speedns resolvers
-List bundled resolver ownership, policy, addresses, and supported transports.
+List bundled resolver ownership, policy, addresses, and supported transports,
+one profile per row below a header, with transports in the benchmark order
+udp, tcp, doh, dot, doq.
 .TP
 .B speedns corpus
-Show the embedded domain corpus provenance and checksum.
+Show the embedded domain corpus provenance, checksum, and license note.
+.TP
+.B speedns diff BASELINE.json CURRENT.json
+Compare what two saved JSON reports measured; see
+.B DIFF
+below.
 .TP
 .B speedns version
 Show version, commit, and build information.
+.PP
+Apart from
+.BR help ,
+only
+.B completion
+and
+.B diff
+take arguments. A stray word after any other command, such as
+.B speedns run json
+with the dashes of
+.B --format
+forgotten, is rejected with status 2 before anything is measured.
 .SH OPTIONS
 .TP
 .B --protocol udp,tcp,doh,dot,doq
@@ -137,7 +160,8 @@ count. The
 generated names are still a corpus that --sample draws from: when --sample is
 smaller than N, only that many names are measured and the report warns about
 the truncation. Set --sample to N or higher, as the default of 100 is, to
-measure every generated name.
+measure every generated name. Without --cache-miss the option has no effect,
+and SpeeDNS says so in a warning on standard error.
 .TP
 .B --full
 Use the complete selected domain list.
@@ -242,7 +266,9 @@ Include cold latency, jitter, response outcomes, expanded diagnostics, and
 every row the default table collapses.
 .TP
 .B --raw
-Include per-query observations in JSON output.
+Include per-query observations in JSON output. Table and CSV output have no
+place for them, so with either the option has no effect and SpeeDNS says so in
+a warning on standard error.
 .TP
 .B --profile-view
 Show same-resolver transport comparisons with score confidence intervals.
@@ -279,7 +305,10 @@ An expression may be prefixed with
 .IR SUBJECT: ,
 naming a resolver by profile id, by the name given to
 .BR --resolver ,
-or by target id. The check then applies to every measured endpoint of that
+or by target id. A target id may carry an IPv6 address, as
+.I \%custom-v6@2001:db8::53/udp
+does; the subject ends at the last colon, since no metric name contains one.
+The check then applies to every measured endpoint of that
 resolver rather than to the winners, which is how a gate expresses "did our
 resolver degrade". An unmatched subject is invalid input. A subject endpoint
 with no scored latency samples fails every
@@ -310,7 +339,9 @@ servers only; split-DNS links, DNS-over-TLS settings and non-standard ports are
 not represented.
 .TP
 .B --no-color
-Disable ANSI styling in table output.
+Disable ANSI styling in table output. A non-empty
+.B NO_COLOR
+environment variable has the same effect.
 .TP
 .B --dnssec
 Opt in to DNSSEC probing. Every query of the run carries the EDNS(0) DO bit
@@ -328,8 +359,9 @@ Table output is written to standard output by default. JSON output has a
 versioned schema and CSV output has one aggregate row per target. Table runs
 write progress only to standard error: terminals receive one updating line,
 while redirected standard error receives deterministic preparation,
-measurement, and completion lines. JSON and CSV runs are silent on standard
-error.
+measurement, and completion lines. JSON and CSV runs write no progress, so
+their standard error carries only warnings, such as one about an option the
+chosen output ignores, and errors.
 .PP
 Within one schema version, fields a release adds are optional, so the
 published schema accepts every report of that version. Per target, JSON and
@@ -408,9 +440,9 @@ and its DNSSEC verdict.
 .PP
 It never compares latency \(em not median, p95, score, rank, or any interval.
 The difference between two runs is dominated by the network path and the time
-of day, which no field in a report records, so no threshold computed from two
-reports can bound it. To compare resolver speed, measure the resolvers together
-in one run.
+of day. A report records when it ran, but not which path or anycast site
+answered or how loaded they were, so no threshold computed from two reports can
+bound it. To compare resolver speed, measure the resolvers together in one run.
 .PP
 Both runs must have asked the same questions. The seed, sample size, query
 types, corpus, timeout, concurrency, address family, DNSSEC setting and feature
@@ -424,8 +456,17 @@ a regular file. Each is read up to 256 MiB, far more than a default report,
 so an endless stream such as /dev/zero fails with status 2 and a size error.
 .TP
 .B --format table|json
-Choose human-readable or machine-readable output. Defaults to table. There is
-no CSV form: a comparison is not a per-target row set.
+Choose human-readable or machine-readable output. Defaults to table. As for a
+run, the value is case-insensitive. There is no CSV form: a comparison is not a
+per-target row set.
+.TP
+.B --output PATH
+Write the diff to a file instead of standard output. The destination rules of
+a run's
+.B --output
+apply, except that nothing checks the destination before the reports are read:
+a diff measures nothing, so a bad destination costs no run and is reported
+when the diff is written.
 .TP
 .B --require CONDITION
 Exit 4 unless a named condition holds. Repeatable. Accepts
@@ -487,6 +528,15 @@ on standard error and writes the report it has, with a warning that says
 whether some target was left incomplete or missing, or whether the interrupt
 arrived after measurement had completed. Assertions are not evaluated. A
 second interrupt exits immediately.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+When set to a non-empty value, whatever it is, table output carries no ANSI
+styling, exactly as with
+.BR --no-color .
+An empty
+.B NO_COLOR
+leaves styling on. See https://no-color.org.
 .SH FILES
 .TP
 .I /etc/resolv.conf

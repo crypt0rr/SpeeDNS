@@ -2,13 +2,14 @@
 // resolver behave differently between them?
 //
 // It deliberately never answers "was it faster". The confound is not sampling
-// noise but an unobserved variable -- the network path, which anycast site
-// answered, the time of day -- and a report contains no field that bounds it,
-// so no threshold computed from two reports can bound it either. Measured on
-// one host, six byte-identical back-to-back runs moved p95 by up to 248% and
-// the composite score by up to 50%, while every categorical count stayed
-// identical across all six. That gap is the whole design: what a resolver DID
-// is stable enough to compare across runs, how fast it did it is not.
+// noise but an unobserved variable. A report records when it ran, in
+// started_at, but not which network path or anycast site answered or how
+// loaded they were at that time, so no threshold computed from two reports can
+// bound it. Measured on one host, six byte-identical back-to-back runs moved
+// p95 by up to 248% and the composite score by up to 50%, while every
+// categorical count stayed identical across all six. That gap is the whole
+// design: what a resolver DID is stable enough to compare across runs, how
+// fast it did it is not.
 package compare
 
 import (

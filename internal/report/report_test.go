@@ -208,6 +208,43 @@ func TestAlignedTableAlignsByDisplayWidth(t *testing.T) {
 	}
 }
 
+// WriteAlignedTable is the report's table writer without the section margin,
+// for standalone listings. It must align by the same display-width
+// measurement and otherwise render exactly the table the report would.
+func TestExportedAlignedTableStartsAtTheMargin(t *testing.T) {
+	headers := []string{"Owner", "Address", "Status"}
+	rows := [][]string{
+		{"東京", "192.0.2.1", "QUALIFIED"},
+		{"plain-ascii", "192.0.2.4", "FAILED"},
+	}
+	var exported, indented bytes.Buffer
+	if err := WriteAlignedTable(&exported, headers, rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAlignedTable(&indented, headers, rows); err != nil {
+		t.Fatal(err)
+	}
+	want := "Owner        Address    Status\n" +
+		"東京         192.0.2.1  QUALIFIED\n" +
+		"plain-ascii  192.0.2.4  FAILED\n"
+	if exported.String() != want {
+		t.Fatalf("exported table =\n%q\nwant\n%q", exported.String(), want)
+	}
+	// Apart from the margin, the two forms are the same table.
+	var reindented strings.Builder
+	for _, line := range strings.SplitAfter(exported.String(), "\n") {
+		if line != "" {
+			reindented.WriteString(tableMargin + line)
+		}
+	}
+	if indented.String() != reindented.String() {
+		t.Fatalf("report table =\n%q\nwant the exported table indented:\n%q", indented.String(), reindented.String())
+	}
+	if rows[0][0] != "東京" || rows[1][0] != "plain-ascii" {
+		t.Fatalf("rendering changed the caller's rows: %q", rows)
+	}
+}
+
 // styledStatus cells carry zero-width ANSI codes; they must not widen a column.
 func TestAlignedTableIgnoresColourCodesInWidths(t *testing.T) {
 	var plain, coloured bytes.Buffer

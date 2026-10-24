@@ -14,10 +14,11 @@ import (
 const notComparedNote = `WHAT IS NOT COMPARED
   Latency is not compared: not median, p95, score, rank, or any interval. The
   difference between two runs is dominated by the network path and the time of
-  day, which no field in either report records, so no threshold computed from
-  them can bound it. Six identical back-to-back runs on one host moved a
-  target's p95 by 248%% and its score by 50%% with nothing changed. To compare
-  resolver speed, measure them together in one run.
+  day. Each report records when it ran, but not which path or anycast site
+  answered or how loaded they were, so no threshold computed from them can
+  bound it. Six identical back-to-back runs on one host moved a target's p95
+  by 248%% and its score by 50%% with nothing changed. To compare resolver
+  speed, measure them together in one run.
 `
 
 // WriteTable renders the diff for a human.

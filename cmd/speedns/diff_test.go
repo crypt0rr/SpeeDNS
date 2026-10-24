@@ -150,6 +150,27 @@ func TestDiffCommandOutcomes(t *testing.T) {
 		}
 	})
 
+	// run accepts --format JSON, so diff must too: the same spelling asked
+	// for the same document and was refused on one command only.
+	t.Run("the format is case-insensitive", func(t *testing.T) {
+		var document bytes.Buffer
+		if err := runDiff(&document, baseline, baseline, "JSON", "", nil); err != nil {
+			t.Fatalf("--format JSON = %v", err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(document.Bytes(), &decoded); err != nil || decoded["comparable"] != true {
+			t.Fatalf("--format JSON did not write the JSON diff (%v): %s", err, document.String())
+		}
+		var table bytes.Buffer
+		if err := runDiff(&table, baseline, baseline, "Table", "", nil); err != nil || !strings.Contains(table.String(), "COMPARABLE") {
+			t.Fatalf("--format Table = %v:\n%s", err, table.String())
+		}
+		if err := runDiff(&bytes.Buffer{}, baseline, baseline, "CSV", "", nil); err == nil ||
+			!strings.Contains(err.Error(), `unsupported output format "CSV"`) {
+			t.Fatalf("--format CSV = %v, want the typed value echoed", err)
+		}
+	})
+
 	t.Run("an unreadable input is an error", func(t *testing.T) {
 		missing := filepath.Join(t.TempDir(), "absent.json")
 		if err := runDiff(&bytes.Buffer{}, missing, baseline, "table", "", nil); err == nil {

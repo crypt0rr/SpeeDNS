@@ -486,6 +486,30 @@ func TestOutputNeverNamesALatencyStatistic(t *testing.T) {
 	}
 }
 
+// TestNotComparedNoteDoesNotDenyTheStartTime keeps the table's explanation in
+// step with the header above it. Every report records started_at, and the same
+// output prints both stamps, so the note must name what is missing (the path
+// and its load) rather than claim that the time of day goes unrecorded.
+func TestNotComparedNoteDoesNotDenyTheStartTime(t *testing.T) {
+	baseline, current := baseReport("a.json"), baseReport("b.json")
+	var buffer bytes.Buffer
+	if err := WriteTable(&buffer, Compare(baseline, current)); err != nil {
+		t.Fatal(err)
+	}
+	// Joined on single spaces, so the assertions do not depend on where the
+	// note happens to wrap.
+	text := strings.Join(strings.Fields(buffer.String()), " ")
+	if !strings.Contains(text, "WHAT IS NOT COMPARED") {
+		t.Fatalf("a comparable diff must explain why latency is absent:\n%s", buffer.String())
+	}
+	if strings.Contains(text, "time of day, which no field") {
+		t.Fatalf("the note claims no field records the time of day, but started_at does:\n%s", buffer.String())
+	}
+	if !strings.Contains(text, "Each report records when it ran, but not which path or anycast site answered") {
+		t.Fatalf("the note must say what a report does and does not record:\n%s", buffer.String())
+	}
+}
+
 // TestWriteJSONMatchesTheCompareSchema validates the emitted document against
 // schema/compare-v1.json, in every shape a diff can take. The scenarios
 // between them produce every finding code, every suppression reason and every
