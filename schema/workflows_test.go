@@ -684,11 +684,13 @@ const signingJobTools = `\bgo\s+(?:test|run|generate|tool)\b|` +
 //     name has the version, which always holds a dot, where a build
 //     directory has the OS, so the archives and packages do not match;
 //   - any path into a subdirectory of dist/, such as the glob dist/*/speedns;
-//   - the binary's own name, speedns or speedns.exe, ending a path behind
-//     dist, ., .., ~, the glob *, a quote, a variable or a $(command), which
+//   - the binary's own name, speedns or speedns.exe, or {{ .Name }}, which
+//     GoReleaser sets to it in a build hook, ending a path behind dist, ., ..,
+//     ~, the glob *, a quote, a variable, a template or a $(command), which
 //     catches for b in */speedns run inside dist/,
-//     "${dir}/${target}/speedns" and bin=dist/speedns; "${bin}". The Go
-//     package ./cmd/speedns, the cask dist/speedns.rb and
+//     "${dir}/${target}/speedns", bin=dist/speedns; "${bin}" and a hook's
+//     cd "$(dirname "{{ .Path }}")" && ./{{ .Name }}. The Go package
+//     ./cmd/speedns, the cask dist/speedns.rb and
 //     ${RUNNER_TEMP}/speedns-repro-reference do not match.
 //
 // These refuse reading those paths as well as running them. That costs
@@ -697,17 +699,22 @@ const signingJobTools = `\bgo\s+(?:test|run|generate|tool)\b|` +
 // once a path is in a variable nothing tells an argument from a command.
 const signingJobBuildOutput = `\bspeedns_[a-z0-9]+_|` +
 	`\bdist/[^\s/"';|&)]+/|` +
-	`(?:[*}).~"']|\bdist|\$\w+)/speedns(?:\.exe)?(?:$|[\s"';|&)\x60])`
+	`(?:[*}).~"']|\bdist|\$\w+)/(?:speedns(?:\.exe)?(?:$|[\s"';|&)\x60])|\{\{[^}]*\.Name\b[^}]*\}\})`
 
 // shellPathPart is one part of a path as a script writes it, between slashes:
-// ~, a variable, an expression, a $(command) or a plain name such as . or ..,
-// quoted or not.
-const shellPathPart = `["']?(?:~|\$\{\{[^}]*\}\}|\$\{[^}]*\}|\$\w+|\$\([^)]*\)|[\w.-]+)["']?`
+// ~, a variable, an Actions expression, a GoReleaser template, a $(command) or
+// a plain name such as . or .., quoted or not.
+const shellPathPart = `["']?(?:~|\$\{\{[^}]*\}\}|\{\{[^}]*\}\}|\$\{[^}]*\}|\$\w+|\$\([^)]*\)|[\w.-]+)["']?`
+
+// goreleaserBuiltBinary is a GoReleaser template that reads .Path, quoted or
+// not. In a build hook, .Path is the binary the build has just made, such as
+// dist/speedns_linux_amd64_v1/speedns, so {{ .Path }} where a command starts
+// runs it.
+const goreleaserBuiltBinary = `["']?\{\{[^}]*\.Path\b[^}]*\}\}`
 
 // signingJobForbidden matches what a job able to mint OIDC tokens must not
 // run, in a run: script as shellCode leaves it, in a shell: or in any string
-// of .goreleaser.yaml. That is signingJobTools, signingJobBuildOutput, and a
-// file run straight from dist/, which the script does with
+// of .goreleaser.yaml. That is signingJobTools, signingJobBuildOutput, and
 //
 //   - a dist/ path where a command starts: at the start of a line; after one
 //     of ; & | { ! or a backtick; after a ( that opens no array, as x=( and
@@ -716,12 +723,27 @@ const shellPathPart = `["']?(?:~|\$\{\{[^}]*\}\}|\$\{[^}]*\}|\$\w+|\$\([^)]*\)|[
 //     their options written as single words that begin with -. VAR=value
 //     assignments may come first, the value bare, quoted or a substitution.
 //     The path may have parts in front of dist/, each a name, ., .., ~, a
-//     variable, an expression or a $(command), quoted or not, so
+//     variable, an expression, a template or a $(command), quoted or not, so
 //     ./dist/..., ../../dist/..., ~/work/dist/...,
 //     /srv/work/SpeeDNS/dist/..., "${GITHUB_WORKSPACE}/dist/...",
-//     "${{ github.workspace }}/dist/..." and "$(pwd)/dist/..." all count;
+//     "${{ github.workspace }}/dist/...", "$(pwd)/dist/..." and
+//     {{ .Env.GITHUB_WORKSPACE }}/dist/... all count;
+//   - goreleaserBuiltBinary where a command starts, as above. A GoReleaser
+//     build hook that runs it, as {{ .Path }} version and
+//     sh -c 'test "{{ .Os }}" != linux || {{ .Path }} version' do, runs the
+//     binary in the job that signs, while
+//     ./scripts/normalize-build-mtime.sh {{ .Path }} only hands it to a
+//     script. Each string of .goreleaser.yaml starts as a line does, so a
+//     hook's dir: of {{ dir .Path }} is refused as well;
 //   - find -exec, -execdir, -ok or -okdir with the found file itself, {} or
-//     ./{}, as the command.
+//     ./{}, as the command;
+//   - a find test that picks the binary by its name: -name, -iname, -path,
+//     -ipath, -wholename or -iwholename with speedns or speedns.exe, in any
+//     case, alone or ending a path. Whatever then runs what find lists,
+//     xargs, a variable or -exec sh -c, is out of the pattern's sight, so,
+//     as with the build output, a find that lists the binary only to hash
+//     it is refused as well. A find for other names, such as
+//     -name 'speedns_*.deb', passes.
 //
 // A top-level dist/ file passes as an argument of any command but the
 // wrappers above, whether on that command's line, on a continuation line or
@@ -735,22 +757,28 @@ const shellPathPart = `["']?(?:~|\$\{\{[^}]*\}\}|\$\{[^}]*\}|\$\w+|\$\([^)]*\)|[
 // (xargs -a dist/release-assets.txt).
 //
 // What a static pattern cannot see is left to review: a path whose every part
-// comes from a variable, such as "${dir}/${target}/${name}"; a file that find
-// lists and xargs runs (find dist -name speedns | xargs -I{} {} version); a
-// top-level dist/ file with any name but the binary's that is kept in a
-// variable or an env: value before it runs, or run as the argument of a
-// command other than the wrappers above (sh -c '"$1" version' _ dist/tool); a
-// wrapper option that takes a separate argument (env -u NAME ./dist/tool); a
-// binary extracted from an archive, or a top-level dist/ file copied out of
-// it, under another name; and whatever an action does with its with: inputs.
+// comes from a variable, such as "${dir}/${target}/${name}"; a find, or any
+// other listing, that picks the binary by anything but its name, as
+// -name 'speed*', -perm and -executable do, or by no test at all, before
+// something runs what it lists; a top-level dist/ file with any name but the
+// binary's that is kept in a variable or an env: value before it runs, or run
+// as the argument of a command other than the wrappers above
+// (sh -c '"$1" version' _ dist/tool); a wrapper option that takes a separate
+// argument (env -u NAME ./dist/tool); a binary extracted from an archive, or
+// a top-level dist/ file copied out of it, under another name; in
+// .goreleaser.yaml, a hook that keeps {{ .Path }}, or its directory, in its
+// env: (BIN={{ .Path }} or PATH={{ dir .Path }}:...) and runs it from there,
+// and a sign, SBOM or publisher command handed a binary as its artifact; and
+// whatever an action does with its with: inputs.
 var signingJobForbidden = regexp.MustCompile(`(?m)` + strings.Join([]string{
 	signingJobTools,
 	signingJobBuildOutput,
 	`(?:^|[;&|{!\x60]|(?:^|[^=])\(|(?:^|[\s;&|({!\x60])` +
 		`(?:if|elif|then|else|do|while|until|exec|command|time|nohup|sudo|env|xargs|bash|sh)\s+(?:-\S*\s+)*)\s*` +
 		`(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\$\([^)]*\)|\x60[^\x60]*\x60|[^\s"'(]+)*\s+)*` +
-		`(?:` + shellPathPart + `)?(?:/` + shellPathPart + `)*/?dist/`,
+		`(?:(?:` + shellPathPart + `)?(?:/` + shellPathPart + `)*/?dist/|` + goreleaserBuiltBinary + `)`,
 	`-(?:exec|ok)(?:dir)?\s+["']?(?:\./)?\{\}`,
+	`(?:^|\s)-i?(?:name|path|wholename)\s+["']?(?:[^\s"']*/)?(?i:speedns(?:\.exe)?)["']?(?:$|[\s;|&)])`,
 }, "|"))
 
 // signingJobForbiddenValue is signingJobForbidden for an env: value: the tools
@@ -970,15 +998,19 @@ func TestSigningJobFindingsReadMoreThanScripts(t *testing.T) {
 }
 
 // TestSigningJobPatternTellsRunsFromReads pins what signingJobForbidden
-// catches. The test above sees only the workflows as they stand, and each
-// review of the release split ran something the pattern let through: a binary
-// still inside dist/ five ways in the second review, and more forms in the
-// checks of that fix, among them quoted assignments, ../../, absolute paths,
-// expressions and find -exec ./{}. Each is a case here. The publish job's own
-// reads of dist/ must keep passing, on one line or continued over several,
-// since they are how it compares, uploads and attests the release. The reads
-// the pattern cannot tell from runs are pinned as refused, as its comment
-// says.
+// catches. TestJobsThatCanSignRunNoTestsOrBuiltBinaries sees only the
+// workflows and .goreleaser.yaml as they stand, and each review of the release
+// split ran something the pattern let through: a binary still inside dist/
+// five ways in the second review; more forms in the checks of that fix, among
+// them quoted assignments, ../../, absolute paths, expressions and
+// find -exec ./{}; and in the checks after those, a binary that find picks by
+// its name and a GoReleaser build hook that runs {{ .Path }}. Each is a case
+// here. signingJobFindings holds every string of .goreleaser.yaml to the
+// pattern as well, so such strings are cases too. The publish job's own reads
+// of dist/ must keep passing, on one line or continued over several, since
+// they are how it compares, uploads and attests the release, and so must the
+// config's own strings. The reads the pattern cannot tell from runs are
+// pinned as refused, as its comment says.
 func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1013,6 +1045,28 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 		{name: "find execdir", script: `find dist -name speedns -type f -execdir "{}" version \;`, forbidden: true},
 		{name: "find exec dot-slash", script: `find dist -name speedns -type f -exec ./{} version \;`, forbidden: true},
 		{name: "find okdir", script: `find dist -type f -okdir {} version \;`, forbidden: true},
+		// find picks the binary by its name, and something else runs it.
+		{name: "found binary kept in a variable", script: "bin=\"$(find dist -type f -name speedns | head -n1)\"\n\"${bin}\" version", forbidden: true},
+		{name: "found binary run by xargs", script: `find dist -name speedns | xargs -I{} {} version`, forbidden: true},
+		{name: "found binary by iname", script: `bin="$(find dist -iname speedns -print -quit)"; "$bin" version`, forbidden: true},
+		{name: "found binary run by sh -c", script: `find dist -type f -name speedns -exec sh -c '"$1" version' _ {} \;`, forbidden: true},
+		{name: "found binary run by env", script: `find dist -type f -name speedns -exec env {} version \;`, forbidden: true},
+		{name: "found binary in the project's spelling", script: `find dist -iname SpeeDNS -print`, forbidden: true},
+		{name: "found binary by a path in any case", script: `find dist -ipath "*/SpeeDNS" -print`, forbidden: true},
+		{name: "found windows binary", script: `find dist -name "speedns.exe" -print`, forbidden: true},
+
+		// Strings of .goreleaser.yaml, which a job that signs runs as
+		// GoReleaser's hooks. In a build hook, {{ .Path }} is the binary the
+		// build has just made and {{ .Name }} its file name.
+		{name: "hook running the built binary", script: "{{ .Path }} version", forbidden: true},
+		{name: "hook running the built binary, unspaced", script: "{{.Path}} version", forbidden: true},
+		{name: "hook running the quoted built binary", script: `"{{ .Path }}" version`, forbidden: true},
+		{name: "hook running the built binary behind a test", script: `sh -c 'test "{{ .Os }}" != linux || {{ .Path }} version'`, forbidden: true},
+		{name: "hook running the built binary through bash", script: `bash -c '{{ .Path }} --help'`, forbidden: true},
+		{name: "hook running the built binary through env", script: "env {{ .Path }} version", forbidden: true},
+		{name: "hook directory of the built binary", script: "{{ dir .Path }}", forbidden: true},
+		{name: "hook running the built binary by its name", script: `sh -c 'cd "$(dirname "{{ .Path }}")" && ./{{ .Name }} version'`, forbidden: true},
+		{name: "hook path under a template", script: "{{ .Env.GITHUB_WORKSPACE }}/dist/tool version", forbidden: true},
 
 		// A top-level dist/ file run from there. It is called tool, not
 		// speedns, so that only the rule for a dist/ path where a command
@@ -1057,6 +1111,7 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 		{name: "here-document listing", script: "cat >assets.txt <<'EOF'\ndist/checksums.txt\nEOF", forbidden: true},
 		{name: "brace list", script: "sha256sum {dist/checksums.txt,dist/CHANGELOG.md}", forbidden: true},
 		{name: "hash of a build directory binary", script: "sha256sum dist/speedns_linux_amd64_v1/speedns", forbidden: true},
+		{name: "hash of a binary found by its name", script: "find dist -name speedns -exec sha256sum {} +", forbidden: true},
 		{name: "wrapper option naming a dist/ file", script: `xargs -a dist/release-assets.txt gh release upload "${RELEASE_TAG}"`, forbidden: true},
 
 		{name: "reproducibility comparison", script: `bash scripts/compare-release-artifacts.sh "${RUNNER_TEMP}/speedns-repro-reference" dist`},
@@ -1076,6 +1131,8 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 		{name: "listing in a substitution", script: `files="$(ls dist/*.sbom.json)"`},
 		{name: "check in a subshell", script: "(cd dist && sha256sum --check checksums.txt)"},
 		{name: "find hashing", script: `find dist -maxdepth 1 -name '*.sbom.json' -exec sha256sum {} +`},
+		{name: "find hashing the packages", script: `find dist -maxdepth 1 -name 'speedns_*.deb' -exec sha256sum {} +`},
+		{name: "SBOM with a source name", script: "syft scan dist/SpeeDNS_0.7.0_linux_amd64.tar.gz --source-name speedns --output spdx-json=sbom.json"},
 		{name: "compare with the reference", script: `cmp dist/checksums.txt "${RUNNER_TEMP}/speedns-repro-reference/checksums.txt"`},
 		{name: "reference directory", script: `ls "${RUNNER_TEMP}/speedns-repro-reference"`},
 		{name: "changelog", script: "if [[ -f dist/CHANGELOG.md ]]; then\n  bash scripts/ensure-release.sh \"${RELEASE_TAG}\" dist/CHANGELOG.md\nfi"},
@@ -1089,6 +1146,11 @@ func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 		{name: "log through tee", script: "{\n  bash scripts/release-assets.sh verify dist dist/release-assets.txt\n} 2>&1 | tee dist/release-smoke.log"},
 		{name: "go version", script: "go version"},
 		{name: "module cache", script: "go env GOMODCACHE"},
+
+		{name: "hook given the built binary", script: "./scripts/normalize-build-mtime.sh {{ .Path }}"},
+		{name: "archive name template", script: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"},
+		{name: "SBOM document name", script: "{{ .ArtifactName }}.sbom.json"},
+		{name: "commit timestamp", script: "{{ .CommitTimestamp }}"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1471,6 +1533,47 @@ func TestReleaseRPMsRecordAFixedBuildHost(t *testing.T) {
 	}
 }
 
+// syftConfigOption is an argument that names a Syft configuration file:
+// --config, or its short form -c, alone or at the end of a cluster of the
+// short flags that take no value, -h, -q and -v. Syft's flag parser,
+// spf13/pflag, reads a cluster one letter at a time until a letter whose flag
+// takes a value, so -qc planted.yaml and -vcplanted.yaml both name
+// planted.yaml, while in -oc the c is the value of -o. It is written so that
+// bash reads it alike, as scripts/reproducible-syft.sh's config_option.
+var syftConfigOption = regexp.MustCompile(`^(--config|-[hqv]*c)`)
+
+// wrapperConfigOption is where scripts/reproducible-syft.sh sets the
+// expression it refuses configuration options with.
+var wrapperConfigOption = regexp.MustCompile(`(?m)^config_option='([^']*)'$`)
+
+// TestSyftConfigOptionMatchesEveryForm pins syftConfigOption, and that
+// scripts/reproducible-syft.sh refuses the same arguments. The checks of the
+// second review's fixes passed -qc planted.yaml to the SBOM command, which
+// both places let through: each refused only arguments that begin with -c.
+func TestSyftConfigOptionMatchesEveryForm(t *testing.T) {
+	content, err := os.ReadFile(filepath.Join("..", "scripts", "reproducible-syft.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := ""
+	if match := wrapperConfigOption.FindStringSubmatch(string(content)); match != nil {
+		wrapper = match[1]
+	}
+	if wrapper != syftConfigOption.String() {
+		t.Errorf("scripts/reproducible-syft.sh sets config_option to %q, not %q; the wrapper and this test must refuse the same arguments", wrapper, syftConfigOption)
+	}
+	for _, argument := range []string{"--config", "--config=planted.yaml", "-c", "-cplanted.yaml", "-c=planted.yaml", "-qc", "-vcplanted.yaml", "-hvqc"} {
+		if !syftConfigOption.MatchString(argument) {
+			t.Errorf("syftConfigOption lets %q name a second Syft configuration file", argument)
+		}
+	}
+	for _, argument := range []string{"$artifact", "--output", "spdx-json=$document", "-o", "-q", "-vv", "-oc", "--enrich=none"} {
+		if syftConfigOption.MatchString(argument) {
+			t.Errorf("syftConfigOption refuses %q, which names no Syft configuration file", argument)
+		}
+	}
+}
+
 // TestReleaseSBOMsStayOffline keeps every SBOM behind
 // scripts/reproducible-syft.sh, which normalizes the document, confines
 // Syft's license lookup to the local module cache and names Syft's only
@@ -1495,8 +1598,9 @@ func TestReleaseSBOMsStayOffline(t *testing.T) {
 				t.Errorf(".goreleaser.yaml sboms entry %s passes %q; Syft's enrichment looks licenses up on the network", sbom.ID, argument)
 			}
 			// Syft merges every file named with --config, or -c, into the
-			// wrapper's own, enrich: lists included.
-			if strings.HasPrefix(argument, "--config") || strings.HasPrefix(argument, "-c") {
+			// wrapper's own, enrich: lists included. syftConfigOption says
+			// which arguments name one.
+			if syftConfigOption.MatchString(argument) {
 				t.Errorf(".goreleaser.yaml sboms entry %s passes %q; reproducible-syft.sh names Syft's configuration file itself", sbom.ID, argument)
 			}
 		}

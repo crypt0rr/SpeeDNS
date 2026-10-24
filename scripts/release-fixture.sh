@@ -364,8 +364,10 @@ if [[ -n "$(find "${sbom_tmp}" -mindepth 1 -print -quit)" ]]; then
 fi
 # --enrich turns the network lookups back on, and another --config would be
 # merged into the wrapper's, enrich: lists included, so both are refused
-# before Syft runs, as separate, =-joined and attached values alike.
-for refused_option in '--enrich all' '--enrich=golang' '--config planted.yaml' '--config=planted.yaml' '-c planted.yaml' '-cplanted.yaml'; do
+# before Syft runs, as separate, =-joined and attached values alike, and -c
+# also at the end of a cluster of the flags that take no value, -h, -q and -v.
+for refused_option in '--enrich all' '--enrich=golang' '--config planted.yaml' '--config=planted.yaml' '-c planted.yaml' '-cplanted.yaml' \
+	'-qc planted.yaml' '-vcplanted.yaml' '-hvc planted.yaml'; do
 	read -r -a refused_arguments <<<"${refused_option}"
 	refused="${sbom_dir}/refused.sbom.json"
 	if PATH="${syft_bin}:${PATH}" SOURCE_DATE_EPOCH=1700000000 \

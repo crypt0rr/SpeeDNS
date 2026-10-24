@@ -7,6 +7,15 @@ set -euo pipefail
 # SBOM itself, and therefore checksums.txt, reproducible between identical
 # release builds.
 
+# Syft merges every file named with --config into the one below, enrich:
+# lists included. The short form -c takes its value attached too, and can end
+# a cluster of the short flags that take no value, -h, -q and -v: Syft's flag
+# parser reads a cluster one letter at a time until a letter whose flag takes
+# a value, so -qc planted.yaml names planted.yaml. schema/workflows_test.go
+# refuses the same arguments in .goreleaser.yaml, with this expression, which
+# it checks is the one set here.
+config_option='^(--config|-[hqv]*c)'
+
 document=""
 for argument in "$@"; do
 	case "${argument}" in
@@ -14,13 +23,11 @@ for argument in "$@"; do
 		echo "reproducible-syft.sh keeps Syft offline; remove ${argument} from the SBOM arguments" >&2
 		exit 2
 		;;
-	# Syft merges every file named this way into the one below, enrich:
-	# lists included. -c is the short form, and takes its value attached too.
-	--config | --config=* | -c*)
+	esac
+	if [[ "${argument}" =~ ${config_option} ]]; then
 		echo "reproducible-syft.sh names Syft's configuration file itself; remove ${argument} from the SBOM arguments" >&2
 		exit 2
-		;;
-	esac
+	fi
 	if [[ "${argument}" == *spdx-json=* ]]; then
 		document="${argument#*spdx-json=}"
 	fi
