@@ -677,27 +677,18 @@ const signingJobTools = `\bgo\s+(?:test|run|generate|tool)\b|` +
 	`scripts/(?:coverage|artifact-smoke|release-fixture)\.sh`
 
 // signingJobBuildOutput matches a path into what GoReleaser built, wherever it
-// is written: in a script, an env: value or a working directory alike.
-//
-//   - GoReleaser's per-target build directory, speedns_<os>_<arch>..., which
-//     catches cd dist && ./speedns_linux_amd64_v1/speedns. A release file
-//     name has the version, which always holds a dot, where a build
-//     directory has the OS, so the archives and packages do not match;
-//   - any path into a subdirectory of dist/, such as the glob dist/*/speedns;
-//   - the binary's own name, speedns or speedns.exe, or {{ .Name }}, which
-//     GoReleaser sets to it in a build hook, ending a path behind dist, ., ..,
-//     ~, the glob *, a quote, a variable, a template or a $(command), which
-//     catches for b in */speedns run inside dist/,
-//     "${dir}/${target}/speedns", bin=dist/speedns; "${bin}" and a hook's
-//     cd "$(dirname "{{ .Path }}")" && ./{{ .Name }}. The name ends where
-//     shellWordEnd says a word does. The Go package ./cmd/speedns, the cask
-//     dist/speedns.rb and ${RUNNER_TEMP}/speedns-repro-reference do not
-//     match.
+// is written: in a script, an env: value or a working directory alike. It
+// knows GoReleaser's per-target build directory (speedns_<os>_<arch>...), a
+// path into a subdirectory of dist/, and the binary's own name, speedns or
+// {{ .Name }}, ending a path. A release file name holds the version, with its
+// dot, where a build directory holds the OS, so the archives and packages at
+// the top of dist/ do not match, and neither do ./cmd/speedns or the cask
+// dist/speedns.rb.
 //
 // These refuse reading those paths as well as running them. That costs
 // nothing: a signing job compares, uploads and attests only what sits at the
-// top of dist/ (archives, packages, SBOMs, checksums.txt, the changelog), and
-// once a path is in a variable nothing tells an argument from a command.
+// top of dist/, and once a path is in a variable nothing tells an argument
+// from a command.
 const signingJobBuildOutput = `\bspeedns_[a-z0-9]+_|` +
 	`\bdist/[^\s/"';|&)]+/|` +
 	`(?:[*}).~"']|\bdist|\$\w+)/(?:speedns(?:\.exe)?` + shellWordEnd + `|\{\{[^}]*\.Name\b[^}]*\}\})`
@@ -711,33 +702,19 @@ const shellWordEnd = `(?:$|[\s"';|&)<>\x60])`
 // a plain name such as . or .., quoted or not.
 const shellPathPart = `["']?(?:~|\$\{\{[^}]*\}\}|\{\{[^}]*\}\}|\$\{[^}]*\}|\$\w+|\$\([^)]*\)|[\w.-]+)["']?`
 
-// goreleaserBuiltBinary is a GoReleaser template that reads .Path, quoted or
-// not, and inside a quoted sh -c or bash -c script as well, where it has a
-// second quote in front of it. Either quote may have a backslash in front, as
-// the inner one does inside a double-quoted script:
-// sh -c "\"{{ .Path }}\" version". In a build hook, .Path is the binary the
-// build has just made, such as dist/speedns_linux_amd64_v1/speedns, so
-// {{ .Path }} where a command starts runs it.
+// goreleaserBuiltBinary is a GoReleaser template that reads .Path, with up to
+// two opening quotes in front of it, each escaped or not, as it has inside a
+// quoted sh -c script. In a build hook .Path is the binary the build has just
+// made, so {{ .Path }} where a command starts runs it.
 const goreleaserBuiltBinary = `(?:\\?["']){0,2}\{\{[^}]*\.Path\b[^}]*\}\}`
 
 // signingJobUnpacks matches a command that unpacks or installs a release
-// archive or package from dist/, as distCommand reads one:
-//
-//   - tar with -x, alone or in a cluster such as -xzf or -zxvf, --extract or
-//     --get, or with a first argument such as xzf that holds an x;
-//   - unzip in any mode, a listing with -l included, and rpm2cpio;
-//   - dpkg or dpkg-deb with -i, -x, -X or -R, or with --install, --unpack,
-//     --extract, --vextract, --raw-extract or --fsys-tarfile;
-//   - rpm with -i, -U or -F, alone or in a cluster without q, such as -ivh
-//     or -Uvh, or with --install, --upgrade, --freshen or --reinstall. In
-//     -qip the i asks for the package's information, so that passes;
-//   - apt or apt-get with install or reinstall, and installer with -pkg.
-//
-// The publish job only hashes, compares, uploads and attests what is in
-// dist/, so none of these has a place there, while reads pass: tar -t,
-// whatever long options it has (--exclude holds an x), dpkg-deb -c, -I or -f,
-// and rpm -qip or -qpl. An unpack or install whose file is not in dist/, such
-// as a tool's archive under ${RUNNER_TEMP}, passes as well.
+// archive or package from dist/: tar extracting, unzip, rpm2cpio, dpkg or
+// dpkg-deb installing or extracting, rpm installing or upgrading, apt or
+// apt-get installing, and installer -pkg. The publish job only hashes,
+// compares, uploads and attests what is in dist/, so none of these has a
+// place there, while listings such as tar -t, dpkg-deb -c and rpm -qip pass.
+// unzip is refused in every mode, -l included.
 var signingJobUnpacks = strings.Join([]string{
 	distCommand(`tar`, `-[A-Za-z]*x[A-Za-z]*|--extract|--get`),
 	`(?:^|[^\w.-])tar\s+[A-Za-z]*x[A-Za-z]*\s[^;&|\n]*dist/`,
@@ -767,109 +744,28 @@ func distCommand(tool, mode string) string {
 
 // signingJobForbidden matches what a job able to mint OIDC tokens must not
 // run, in a run: script as shellCode leaves it, in a shell: or in any string
-// of .goreleaser.yaml. That is signingJobTools, signingJobBuildOutput, and
+// of .goreleaser.yaml: signingJobTools; signingJobBuildOutput; a dist/ path or
+// goreleaserBuiltBinary where a command starts, at the start of a line, after
+// a shell operator or keyword, or after a wrapper such as env, xargs, exec or
+// sh -c; find running the file it found (-exec {}); a find test that picks
+// the binary by its name; and signingJobUnpacks. A top-level dist/ file
+// passes as an argument or a redirection target, as the publish job's hashing
+// and uploads need. Where one stands where a command could start, the pattern
+// cannot tell a read from a run, and refuses it.
 //
-//   - a dist/ path where a command starts: at the start of a line; after one
-//     of ; & | { ! or a backtick; after a ( that opens no array, as x=( and
-//     x+=( do; after if, elif, then, else, do, while or until; or after
-//     exec, command, time, nohup, sudo, env, xargs, bash or sh and any of
-//     their options written as single words that begin with -. VAR=value
-//     assignments may come first, the value bare, quoted or a substitution.
-//     The path may have parts in front of dist/, each a name, ., .., ~, a
-//     variable, an expression, a template or a $(command), quoted or not,
-//     and one or two more quotes may open it, as the script's own quote
-//     does inside a quoted sh -c or bash -c script, each with a backslash in
-//     front or not, as an inner quote has inside a double-quoted script, so
-//     "dist/...", ./dist/..., ../../dist/..., ~/work/dist/...,
-//     /srv/work/SpeeDNS/dist/..., "${GITHUB_WORKSPACE}/dist/...",
-//     "${{ github.workspace }}/dist/...", "$(pwd)/dist/...",
-//     {{ .Env.GITHUB_WORKSPACE }}/dist/..., bash -c '"./dist/..." version'
-//     and bash -c "\"./dist/...\" version" all count;
-//   - goreleaserBuiltBinary where a command starts, as above. A GoReleaser
-//     build hook that runs it, as {{ .Path }} version,
-//     sh -c '"{{ .Path }}" version || true',
-//     sh -c "\"{{ .Path }}\" version" and
-//     sh -c 'test "{{ .Os }}" != linux || {{ .Path }} version' do, runs the
-//     binary in the job that signs, while
-//     ./scripts/normalize-build-mtime.sh {{ .Path }}, the template quoted or
-//     not and the command inside sh -c or not, only hands it to a script.
-//     Each string of .goreleaser.yaml starts as a line does, so a hook's
-//     dir: of {{ dir .Path }} is refused as well;
-//   - find -exec, -execdir, -ok or -okdir with the found file itself, {} or
-//     ./{}, as the command;
-//   - a find test that picks the binary by its name: -name, -iname, -path,
-//     -ipath, -wholename or -iwholename with speedns or speedns.exe, in any
-//     case, alone or ending a path, the name ending where shellWordEnd says,
-//     so a find inside backticks or with its list redirected
-//     (-name speedns>found.txt) counts. Whatever then runs what find lists,
-//     xargs, a variable or -exec sh -c, is out of the pattern's sight, so,
-//     as with the build output, a find that lists the binary only to hash
-//     it is refused as well. A find for other names, such as
-//     -name 'speedns_*.deb', passes;
-//   - signingJobUnpacks: a release archive or package from dist/ unpacked or
-//     installed by tar, unzip, rpm2cpio, dpkg, dpkg-deb, rpm, apt, apt-get
-//     or installer, which would put the built binary at a path no rule above
-//     names.
-//
-// A top-level dist/ file passes as an argument of any command but the
-// wrappers above and the commands of signingJobUnpacks, whether on that
-// command's line, on a continuation line or inside a $(command), as an item
-// of an array written on one line, and as a redirection target, as the
-// publish job's hashing and uploads need. Where a dist/ path stands where a
-// command could start, the pattern cannot tell a read from a run, so it
-// refuses those reads as well: an array or a here-document written one item
-// per line, a brace list such as {dist/a,dist/b}, and a dist/ file given to
-// an option of one of the wrappers, which reads as the command that follows
-// the options (xargs -a dist/release-assets.txt). signingJobUnpacks refuses
-// two reads too: unzip -l, as it refuses unzip in every mode, and an rpm
-// query that writes its -i apart from its -q (rpm -q -i -p dist/...).
+// TestSigningJobPatternTellsRunsFromReads is the specification: its cases say
+// which spellings each rule refuses and which reads it lets through. A
+// spelling that is not in the table may go either way.
 //
 // This is a tripwire for the direct ways a step would run a built binary, not
-// a sandbox: whoever can edit release.yml can edit this test as well, and
-// review of release.yml, .goreleaser.yaml and the scripts they call stays the
-// control. The pattern does not see:
-//
-//   - a built binary that reaches a path or a name the rules above do not
-//     know by any means but the commands of signingJobUnpacks: cp, mv, ln,
-//     go build -o or go install, another unpacker or package manager (ar,
-//     cpio, 7z, bsdtar, apk, pacman), one of those commands written another
-//     way (its name quoted, as "tar" and t'a'r are, or in a variable, an
-//     option abbreviated or clustered otherwise than above) or without the
-//     dist/ path on its own command (after cd dist, from a variable, through
-//     a pipe), a download, a cache restore or a second checkout;
-//   - a path assembled at run time, such as "${dir}/${target}/${name}" or a
-//     name relative to a directory the script has changed into
-//     (cd dist; for f in *), or kept in a variable, an env: value or, in
-//     .goreleaser.yaml, a hook's env: (BIN={{ .Path }} or
-//     PATH={{ dir .Path }}:...) before it runs;
-//   - a dist/ path or a name the rules above know, written so that its text
-//     differs from how they read it: a quote or a backslash inside the word
-//     anywhere but where the rules above allow one ("dist"/tool,
-//     ./"dist"/tool, "${GITHUB_WORKSPACE}"/"dist"/tool, di"st"/tool,
-//     d\ist/tool, ./"speedns", ./speedn's', -name 'spee'dns,
-//     tar -xf "dist"/..., or an escaped quote that closes a part of the path
-//     inside a double-quoted -c script), $'...' quoting ($'dist/tool'), a
-//     doubled slash (.//dist/tool) or a backslash-newline inside a word,
-//     which shellCode joins with a space where the shell joins with nothing;
-//   - a path handed to a program that runs its argument other than the
-//     wrappers above (timeout, nice, eval, source or ., a -c script that
-//     receives the path as "$1", xargs reading it from its input), to a
-//     wrapper through an option that takes a separate argument
-//     (env -u NAME, exec -a name), or to a wrapper whose own name is quoted,
-//     escaped or an absolute path ("env", /usr/bin/env);
-//   - a command that starts where the first rule above does not look, such
-//     as after a case pattern's ) or after coproc;
-//   - a listing other than find's name tests: a glob such as dist/*, ls, or a
-//     find that picks the binary by any other test (-name 'speed*', -perm,
-//     -executable) or by none, before something runs what it lists;
-//   - a renamed GoReleaser build id or binary, which changes the names the
-//     rules above know;
-//   - the code a step or a hook calls: a repository script other than the
-//     three signingJobTools refuses by name, such as
-//     scripts/release-assets.sh or scripts/reproducible-syft.sh, that runs a
-//     built binary itself, a GoReleaser sign, SBOM or publisher command
-//     handed a binary as its artifact, and whatever an action does with its
-//     with: inputs.
+// a sandbox and not a shell parser. It reads release.yml and .goreleaser.yaml
+// as text: it does not follow quoting, escapes, variables, comments or line
+// continuations as a shell does, and it never reads the scripts and actions
+// those steps call. A binary that is copied, renamed, unpacked by another
+// tool, assembled from variables or run through a program the pattern does
+// not know gets past it. Whoever can edit release.yml can edit this test as
+// well, so review of release.yml, .goreleaser.yaml and the scripts they call
+// stays the control.
 var signingJobForbidden = regexp.MustCompile(`(?m)` + strings.Join([]string{
 	signingJobTools,
 	signingJobBuildOutput,
@@ -905,9 +801,11 @@ var shellContinuation = regexp.MustCompile(`(?m)((?:^|[^\\])(?:\\\\)*)\\\n`)
 
 // shellCode drops a script's comment lines, which may well name a command
 // that the script does not run, and then joins each continued line to the
-// next, as the shell does, so an argument on a continuation line reads as the
-// argument it is, not as a command at the start of a line. The comments go
-// first because a backslash at the end of one continues nothing.
+// next, so an argument on a continuation line reads as the argument it is,
+// not as a command at the start of a line. The comments go first because a
+// backslash at the end of one continues nothing. It approximates the shell
+// and no more: it knows nothing of quoting, so a line that begins with #
+// inside a quoted string is dropped as well.
 func shellCode(script string) string {
 	return shellContinuation.ReplaceAllString(shellCommentLine.ReplaceAllString(script, ""), "${1} ")
 }
@@ -1098,23 +996,14 @@ func TestSigningJobFindingsReadMoreThanScripts(t *testing.T) {
 	}
 }
 
-// TestSigningJobPatternTellsRunsFromReads pins what signingJobForbidden
-// catches. TestJobsThatCanSignRunNoTestsOrBuiltBinaries sees only the
-// workflows and .goreleaser.yaml as they stand, and each review of the release
-// split ran something the pattern let through: a binary still inside dist/
-// five ways in the second review; more forms in the checks of that fix, among
-// them quoted assignments, ../../, absolute paths, expressions and
-// find -exec ./{}; in the checks after those, a binary that find picks by its
-// name and a GoReleaser build hook that runs {{ .Path }}; in the checks of
-// that fix, a path quoted inside a quoted sh -c or bash -c script, a find
-// inside backticks and a release archive or package unpacked or installed;
-// and in the checks of those, a path behind an escaped quote inside a
-// double-quoted script. Each is a case here. signingJobFindings holds every
-// string of .goreleaser.yaml to the pattern as well, so such strings are
-// cases too. The publish job's own reads of dist/ must keep passing, on one
-// line or continued over several, since they are how it compares, uploads and
-// attests the release, and so must the config's own strings. The reads the
-// pattern cannot tell from runs are pinned as refused, as its comment says.
+// TestSigningJobPatternTellsRunsFromReads is the specification of
+// signingJobForbidden. TestJobsThatCanSignRunNoTestsOrBuiltBinaries sees only
+// the workflows and .goreleaser.yaml as they stand, so every spelling a review
+// of the release split found the pattern letting through is a must-refuse
+// case here, and so are the reads it cannot tell from runs. The publish job's
+// own reads of dist/, on one line or continued over several, and strings like
+// the config's own must keep passing, since they are how it compares, uploads
+// and attests the release.
 func TestSigningJobPatternTellsRunsFromReads(t *testing.T) {
 	cases := []struct {
 		name      string
