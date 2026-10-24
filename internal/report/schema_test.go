@@ -136,6 +136,9 @@ func TestEncoderStillEmitsFieldsTheSchemaNoLongerRequires(t *testing.T) {
 //   - provenance-vX.json is that release's own encoder writing the report its
 //     schema test validated: completeReport() with run provenance, raw. They
 //     cover provenance before family and dnssec existed.
+//   - complete-vX.json is that release's own encoder writing schemaReport()
+//     raw with --profile-view, every optional section filled. v0.7.0 added
+//     remote_address, tls_version and http_protocol to the target.
 //
 // The golden alone did not change when v0.6.0 added fields to provenance, so
 // a release that adds a field vendors a report its own encoder writes with
@@ -150,7 +153,7 @@ func TestReleasedReportsMatchTheCurrentSchema(t *testing.T) {
 	for _, path := range paths {
 		names = append(names, filepath.Base(path))
 	}
-	want := "golden-v0.1.0.json golden-v0.2.0.json golden-v0.4.0.json provenance-v0.1.0.json provenance-v0.3.0.json provenance-v0.5.0.json"
+	want := "complete-v0.7.0.json golden-v0.1.0.json golden-v0.2.0.json golden-v0.4.0.json provenance-v0.1.0.json provenance-v0.3.0.json provenance-v0.5.0.json"
 	if got := strings.Join(names, " "); got != want {
 		t.Fatalf("released fixtures = %s, want %s", got, want)
 	}
