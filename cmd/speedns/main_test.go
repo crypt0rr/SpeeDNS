@@ -3940,3 +3940,41 @@ func TestProvenanceRecordsFamilyAndDNSSEC(t *testing.T) {
 		})
 	}
 }
+
+// TestRunBenchmarkHandsTheEngineItsNormalizedCorpus pins that a corpus the CLI
+// normalized while loading it -- a --domains file or the embedded list -- is
+// handed to the engine as normalized, so a large list is not normalized a
+// second time before the first query. The generated cache-miss corpus holds
+// at most 20 names and keeps the engine's own validation.
+func TestRunBenchmarkHandsTheEngineItsNormalizedCorpus(t *testing.T) {
+	oldEngine, oldNonce := runBenchmarkEngine, newCacheMissNonceFunc
+	t.Cleanup(func() { runBenchmarkEngine, newCacheMissNonceFunc = oldEngine, oldNonce })
+	var captured benchmark.Options
+	runBenchmarkEngine = func(_ context.Context, _ []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		captured = options
+		return fakeCLIReport(), nil
+	}
+	newCacheMissNonceFunc = func() (string, error) { return "0123456789abcdef", nil }
+	for _, tc := range []struct {
+		name       string
+		configure  func(*cliConfig)
+		normalized bool
+	}{
+		{"domains file", func(*cliConfig) {}, true},
+		{"embedded corpus", func(config *cliConfig) { config.domainFile = "" }, true},
+		{"cache-miss corpus", func(config *cliConfig) {
+			config.domainFile, config.cacheMiss, config.cacheMissSample = "", true, 2
+		}, false},
+	} {
+		config := cliConfigForTest(t)
+		config.output = filepath.Join(t.TempDir(), "report.json")
+		tc.configure(config)
+		if err := runBenchmark(context.Background(), config); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		names := captured.NormalizedDomains.Names()
+		if len(captured.Domains) == 0 || (len(names) != 0) != tc.normalized || (tc.normalized && fmt.Sprint(names) != fmt.Sprint(captured.Domains)) {
+			t.Fatalf("%s: engine received Domains %q and normalized %q", tc.name, captured.Domains, names)
+		}
+	}
+}

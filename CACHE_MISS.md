@@ -153,4 +153,7 @@ For the same reason `--profile-view` is a warm-cache tool: in cache-miss mode a
 resolver contributes a single transport, so the view has nothing to compare.
 Use it on an ordinary run to inspect transport cost for one resolver and
 address, with median, p95, cold latency, the score, and its deterministic 95%
-score confidence interval.
+score confidence interval. Even there the transports are measured in a fixed
+order over the same names, so a later one can read answers an earlier one
+cached; [`METHODOLOGY.md`](METHODOLOGY.md#cache-miss-mode-and-profile-view)
+describes that bias.

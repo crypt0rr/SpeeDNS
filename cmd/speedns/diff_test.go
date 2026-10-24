@@ -2,16 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"unicode"
 
+	"github.com/crypt0rr/SpeeDNS/internal/benchmark"
+	"github.com/crypt0rr/SpeeDNS/internal/catalog"
 	"github.com/crypt0rr/SpeeDNS/internal/compare"
+	"github.com/miekg/dns"
 )
 
 // writeDiffFixture writes a minimal comparable report and returns its path.
@@ -466,5 +471,111 @@ func TestDiffRequireFailureEscapesReportText(t *testing.T) {
 	want := `--require no-new-failed-targets: evil\x1b[2K\u{202e}@1.1.1.1/udp: opened -> DoH HTTP status 418 \x1b[2J\x1b[H\u{200b}teapot`
 	if !strings.Contains(errorMessage(err), want) {
 		t.Fatalf("stderr = %q, want it to contain %q", errorMessage(err), want)
+	}
+}
+
+// startLoopbackResolver answers every question with an empty NOERROR reply on
+// 127.0.0.1 over network, "udp" or "tcp", and returns the address it serves.
+func startLoopbackResolver(t *testing.T, network string) string {
+	t.Helper()
+	started := make(chan struct{})
+	server := &dns.Server{NotifyStartedFunc: func() { close(started) }, Handler: dns.HandlerFunc(func(writer dns.ResponseWriter, request *dns.Msg) {
+		reply := new(dns.Msg)
+		reply.SetReply(request)
+		_ = writer.WriteMsg(reply)
+	})}
+	var address string
+	if network == "udp" {
+		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.PacketConn, address = conn, conn.LocalAddr().String()
+	} else {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.Listener, address = listener, listener.Addr().String()
+	}
+	go func() { _ = server.ActivateAndServe() }()
+	<-started
+	t.Cleanup(func() { _ = server.Shutdown() })
+	return address
+}
+
+// TestInterruptedRunDiffsAsTheSameTargetSet runs the real engine twice against
+// loopback resolvers, once to completion and once interrupted as soon as the
+// UDP group finishes, so the TCP group never starts. An interrupted report used
+// to omit every target of a group that had not started, and diffing it against
+// the full baseline reported each of them as removed: --require
+// no-removed-targets and target-set-identical failed on an interrupt rather
+// than on a change in what was measured. The interrupted report now lists the
+// TCP target as incomplete, which the diff declines to compare and does not
+// call a removal.
+func TestInterruptedRunDiffsAsTheSameTargetSet(t *testing.T) {
+	udp, tcp := startLoopbackResolver(t, "udp"), startLoopbackResolver(t, "tcp")
+	oldEngine := runBenchmarkEngine
+	t.Cleanup(func() { runBenchmarkEngine = oldEngine })
+	interrupt := false
+	runBenchmarkEngine = func(ctx context.Context, targets []catalog.Target, options benchmark.Options) (benchmark.Report, error) {
+		// A loopback resolver is never ranked or paired by diff, which would
+		// decline both targets before the target sets were ever compared. The
+		// fixture stands in for two network resolvers, so it is measured as one.
+		for index := range targets {
+			targets[index].Resolver.Local = false
+		}
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		options.OnProgress = func(progress benchmark.Progress) {
+			if interrupt && progress.Protocol == catalog.UDP && progress.Phase == benchmark.ProgressComplete {
+				cancel()
+			}
+		}
+		return benchmark.Run(ctx, targets, options)
+	}
+	run := func(name string) string {
+		config := cliConfigForTest(t)
+		config.protocols = "udp,tcp"
+		config.resolverFlags = []string{"lab-udp=udp://" + udp, "lab-tcp=tcp://" + tcp}
+		config.sample = 2
+		config.output = filepath.Join(t.TempDir(), name)
+		err := runBenchmark(context.Background(), config)
+		if interrupt != errors.Is(err, context.Canceled) || (!interrupt && err != nil) {
+			t.Fatalf("%s run returned %v (interrupted: %v)", name, err, interrupt)
+		}
+		return config.output
+	}
+	baseline := run("baseline.json")
+	interrupt = true
+	current := run("interrupted.json")
+
+	var out bytes.Buffer
+	if err := runDiff(&out, baseline, current, "json", "", []string{"no-removed-targets", "target-set-identical"}); err != nil {
+		t.Fatalf("diff of an interrupted run against its full baseline failed: %v\n%s", err, out.String())
+	}
+	var document struct {
+		Findings    []compare.Finding     `json:"findings"`
+		NotCompared []compare.Suppression `json:"not_compared"`
+		Compared    int                   `json:"compared"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	for _, finding := range document.Findings {
+		if finding.Code == "PRESENCE" {
+			t.Fatalf("interrupt reported as a change in the target set: %#v", document.Findings)
+		}
+	}
+	if document.Compared != 1 || len(document.NotCompared) != 1 || document.NotCompared[0].Reason != "incomplete-target" ||
+		!strings.HasSuffix(document.NotCompared[0].Scope, "/tcp") {
+		t.Fatalf("diff compared %d and declined %#v, want the finished UDP target compared and the TCP target declined as incomplete", document.Compared, document.NotCompared)
+	}
+	loaded, err := compare.Load(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Results) != 2 {
+		t.Fatalf("interrupted report lists %d targets, want both selected targets: %#v", len(loaded.Results), loaded.Results)
 	}
 }

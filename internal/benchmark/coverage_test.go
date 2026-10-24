@@ -255,8 +255,12 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	cancel()
 	close(release)
-	if got := <-resultCh; len(got) != 1 || got[0].Target.ID() != targets[0].ID() {
-		t.Fatalf("cancelled scheduler results = %#v, want only dispatched target %#v", got, targets[0])
+	got := <-resultCh
+	if len(got) != len(targets) || got[0].Target.ID() != targets[0].ID() || got[1].Target.ID() != targets[1].ID() {
+		t.Fatalf("cancelled scheduler results = %#v, want every target in input order", got)
+	}
+	if !got[0].Incomplete || !got[1].Incomplete || got[1].OpenError != context.Canceled.Error() || len(got[1].Observations) != 0 {
+		t.Fatalf("cancelled scheduler results = %#v, want the dispatched target incomplete and the other unmeasured", got)
 	}
 	if len(cancelledProgress) != 3 {
 		t.Fatalf("cancelled scheduler progress = %#v, want preparation, measuring, and complete events", cancelledProgress)
@@ -277,8 +281,17 @@ func TestRunAndProtocolScheduling(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled Run error = %v, want context canceled", err)
 	}
-	if len(cancelledReport.Targets) != 1 || len(cancelledReport.Rankings) != 0 || !cancelledReport.Targets[0].Incomplete || cancelledReport.Targets[0].Target.ID() == "@/" || cancelledReport.Targets[0].Target.ID() != cancelledTargets[0].ID() {
-		t.Fatalf("cancelled Run targets = %#v, want only the first dispatched target", cancelledReport.Targets)
+	// The TCP group starts after the UDP group's cancellation, so it never
+	// starts at all; its target is listed, unmeasured, rather than dropped.
+	if len(cancelledReport.Targets) != len(cancelledTargets) || len(cancelledReport.Rankings) != 0 {
+		t.Fatalf("cancelled Run targets = %#v, want every selected target and no rankings", cancelledReport.Targets)
+	}
+	notDispatched, ok := cancelledReport.ResultFor(cancelledTargets[1].ID())
+	if !ok || !notDispatched.Incomplete || notDispatched.OpenError != context.Canceled.Error() || len(notDispatched.Observations) != 0 {
+		t.Fatalf("unstarted group target = %#v/%v, want it unmeasured and cancelled", notDispatched, ok)
+	}
+	if first, ok := cancelledReport.ResultFor(cancelledTargets[0].ID()); !ok || !first.Incomplete {
+		t.Fatalf("cancelled dispatched target = %#v/%v, want it incomplete", first, ok)
 	}
 
 	runTargetFunc = func(_ context.Context, target catalog.Target, _ []Query, _ Options) TargetResult {
@@ -654,12 +667,20 @@ func TestRunNoComparableReportsRetainUnusableResolverResponses(t *testing.T) {
 }
 
 func TestRunProtocolCancellationBeforeDispatch(t *testing.T) {
+	oldFactory := newFactory
+	t.Cleanup(func() { newFactory = oldFactory })
 	useFairScheduler(t)
+	newFactory = func(target catalog.Target, _ time.Duration, _ transport.QueryOptions) (transport.Factory, error) {
+		t.Errorf("target %s was prepared after cancellation", target.ID())
+		return &fakeFactory{}, nil
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	results := runProtocol(ctx, []catalog.Target{testTarget(catalog.UDP, "one")}, nil, Options{Concurrency: 5})
-	if len(results) != 0 {
-		t.Fatalf("pre-cancelled scheduler results = %#v", results)
+	target := testTarget(catalog.UDP, "one")
+	results := runProtocol(ctx, []catalog.Target{target}, nil, Options{Concurrency: 5})
+	if len(results) != 1 || results[0].Target.ID() != target.ID() || !results[0].Incomplete ||
+		results[0].OpenError != context.Canceled.Error() || len(results[0].Observations) != 0 || len(results[0].Cold) != 0 {
+		t.Fatalf("pre-cancelled scheduler results = %#v, want the target listed as unmeasured and cancelled", results)
 	}
 }
 

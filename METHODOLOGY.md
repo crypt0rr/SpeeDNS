@@ -14,7 +14,9 @@ sampling, and the same shuffled matrix is given to every resolver eligible for
 the same protocol.
 
 Protocols are benchmarked separately in the order `udp`, `tcp`, `doh`, `dot`,
-and `doq`. Targets are ordered by their complete target identity rather than
+and `doq`; [Cache-miss mode and profile view](#cache-miss-mode-and-profile-view)
+explains what that fixed order means when one resolver's transports are read
+side by side. Targets are ordered by their complete target identity rather than
 catalog input order. Each dispatched target is prepared once and keeps one
 reusable measured session. The measured phase advances in synchronized query
 rounds: every eligible target receives query `i` before any target receives
@@ -352,20 +354,33 @@ one-row-per-target schema.
 ## Interruption and diagnostics
 
 Cancellation never creates synthetic observations for queries that were not
-completed. A target that was handed to a worker may retain the observations it
-completed before cancellation, but it is marked `INCOMPLETE`, excluded from
-rankings, and reported with its cancellation diagnostic. Only a target that was
-never handed to a worker is absent from the report.
+completed, and an interrupted report still lists every selected target. A
+protocol group that finished before the interrupt keeps its complete results
+and its rankings. Every other target that had not already failed is marked
+`INCOMPLETE`, excluded from rankings, and reported with its cancellation
+diagnostic: a target that was handed to a worker keeps the observations it
+completed before cancellation, and a target the interrupt kept from ever
+reaching a worker is listed with none. A target whose session had already
+failed to open before the interrupt keeps that `FAILED` result and its error,
+because its outcome was already final; with no scored sample, it is unranked
+too.
 
-Protocol groups are measured one after another, so what an interrupted report
-lists depends on the group the interrupt reached. A group that had already
-finished keeps its complete results and its rankings. Within the group being
-measured, targets are prepared concurrently, so all of them normally reach a
-worker within the first moments of that group, and an interrupt has to arrive
-before the group's preparation begins for any of them to be missing. That
-group is therefore listed in full, with every target still being measured
-marked `INCOMPLETE`, not as a shortened list. A group the interrupt arrived
-before is never dispatched, and its targets are absent from the report.
+In practice, protocol groups are measured one after another, so the group the
+interrupt reached decides which results survive: every target of that group
+that was still being prepared or measured is `INCOMPLETE`, and so is every
+target of the groups after it. A target of that group whose session had
+already failed to open stays `FAILED`, so an interrupt during an encrypted
+group, where connect and TLS failures are common, can leave `FAILED` rows
+beside the `INCOMPLETE` ones. Within the group being measured, preparation
+runs at most `--concurrency` targets at once, and a worker takes its next
+target only after the cold probes of the previous one, which can take several
+timeouts for an unreachable endpoint. In a group larger than `--concurrency`,
+which is every group of a default run except `doq`, an interrupt during
+preparation therefore finds targets that have not reached a worker yet. They
+are listed with no observations, like every target of a group the interrupt
+arrived before, which is never started. Because the report's target set is the
+selected set, `speedns diff` pairs each of these targets with its baseline and
+declines it as `incomplete-target` rather than reporting it as removed.
 
 An interrupt can also land after the last protocol group has finished, while
 statistics and rankings are still being computed. That report is complete and
@@ -449,6 +464,13 @@ unfiltered resolvers may intentionally return different response classes; the
 policy is shown beside every target and those differences should be considered
 when interpreting a winner.
 
+The statistics themselves are reproducible bit for bit across architectures:
+given the same observations and seed, the medians, p95 values, scores and
+confidence-interval bounds are identical on amd64 and arm64, because every
+floating-point product is rounded before it is used. Earlier arm64 builds
+(Apple silicon, Linux arm64) could fuse a multiply and an add into one
+instruction, so their statistics may differ from current ones in the last bit.
+
 The embedded corpus is pinned and never downloaded at runtime. Its source,
 Tranco list ID, retrieval date, entry count, and SHA-256 checksum are stored in
 `data/domains.meta.json`.
@@ -513,6 +535,24 @@ score, and deterministic score confidence interval. Missing transport
 combinations are shown as unavailable in the table; profile view is a view of
 the same run, not a new cross-transport ranking and not a replacement for the
 per-protocol score.
+
+Reading one resolver's transports side by side carries a bias the
+per-protocol rankings do not. Protocol groups run in the fixed order `udp`,
+`tcp`, `doh`, `dot`, `doq`, and every group asks the same names, so when a
+later transport asks for a name, the resolver's cache -- one cache, shared by
+every transport it offers -- can already hold the answer an earlier group's
+query left there. A name the resolver had not cached before the run tends to
+pay its recursion in the first group that asks for it, and the transports
+measured after that read the warmed cache, so profile view can understate what
+an encrypted transport costs, most visibly with a corpus the resolvers do not
+already hold. Rankings and paired effects compare the targets of one protocol,
+measured in the same group after the same earlier groups, so the bias does not
+shift them as long as every compared resolver was also selected for the same
+earlier transports, which every bundled profile is. SpeeDNS deliberately keeps
+the order fixed rather than offering a reordered or interleaved mode: another
+fixed or seeded order would move the bias onto a different transport within
+each run rather than remove it, and only counterbalancing every query across
+transports would remove it.
 
 ## DNSSEC probing
 

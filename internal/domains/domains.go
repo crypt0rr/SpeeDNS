@@ -72,7 +72,28 @@ func Load(path string) ([]string, error) {
 type LoadResult struct {
 	Names   []string
 	Skipped []string
+	// normalized is Names again, as proof that this package produced them.
+	normalized Normalized
 }
+
+// Normalized returns the loaded names as a list that needs no further
+// normalization.
+func (r LoadResult) Normalized() Normalized { return r.normalized }
+
+// Normalized is a domain list this package has already validated and
+// canonicalized, in corpus order. Its only field is unexported, so a non-empty
+// value can only come from this package, and whoever holds one can pass the
+// names on without normalizing them again: for a list of a million names a
+// second, idempotent pass cost more than a second and about 150 MB of garbage
+// before the first query. The zero value holds no names.
+type Normalized struct {
+	names []string
+}
+
+// Names returns the normalized names. The slice is shared rather than copied,
+// so a large corpus is not duplicated just to be read; it must not be
+// modified.
+func (n Normalized) Names() []string { return n.names }
 
 // LoadTolerant loads a corpus, optionally skipping entries that are not usable
 // domain names instead of failing the list.
@@ -85,6 +106,14 @@ type LoadResult struct {
 // A list with no usable entry still fails: there is nothing to measure, and
 // reporting an empty corpus would be worse than an error.
 func LoadTolerant(path string, skipInvalid bool) (LoadResult, error) {
+	result, err := loadTolerant(path, skipInvalid)
+	// Every path below produces its names through Normalize, validateInputs
+	// or validateInputsSkipping, and an error leaves them empty.
+	result.normalized = Normalized{names: result.Names}
+	return result, err
+}
+
+func loadTolerant(path string, skipInvalid bool) (LoadResult, error) {
 	if strings.TrimSpace(path) == "" {
 		if _, err := verifyEmbeddedCorpus(); err != nil {
 			return LoadResult{}, fmt.Errorf("verify embedded domain corpus: %w", err)

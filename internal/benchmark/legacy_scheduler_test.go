@@ -11,16 +11,17 @@ import (
 // This file holds the target-level scheduler. It is a test fixture rather than
 // production code: runProtocol defaults to runProtocolFair, and nothing outside
 // a test selects the path below. It is kept because a large number of tests fake
-// a whole target rather than a transport, which this scheduler makes cheap, and
-// because it still covers dispatch compaction that the fair scheduler does not
-// perform.
+// a whole target rather than a transport, which this scheduler makes cheap. It
+// reports an interrupted group the way the fair scheduler does -- every target
+// it was given, the undispatched ones as unmeasured incomplete results -- so a
+// whole-target fake still describes the shipped result set.
 
 // runTargetFunc is the target-level seam. Replacing it has no effect unless
 // runProtocolLegacy is also selected, which useTargetSeam does for both.
 var runTargetFunc = runTarget
 
 // runProtocolLegacy dispatches whole targets to a worker pool through the
-// runTargetFunc seam and returns only the targets it managed to dispatch. It
+// runTargetFunc seam and returns a result for every target, in input order. It
 // is never selected by production code; tests that fake whole targets select
 // it explicitly.
 func runProtocolLegacy(ctx context.Context, targets []catalog.Target, queries []Query, opts Options) []TargetResult {
@@ -82,7 +83,11 @@ dispatch:
 	}
 	close(jobs)
 	wg.Wait()
-	compacted := dispatchedResults(results, dispatched)
+	for index, wasDispatched := range dispatched {
+		if !wasDispatched {
+			results[index] = unmeasuredResult(targets[index], ctx.Err())
+		}
+	}
 	emitProgress(opts, Progress{
 		Protocol:           targets[0].Protocol,
 		Phase:              ProgressComplete,
@@ -91,17 +96,7 @@ dispatch:
 		ExchangesCompleted: int(completedExchanges.Load()),
 		ExchangesTotal:     len(targets) * len(queries),
 	})
-	return compacted
-}
-
-func dispatchedResults(results []TargetResult, dispatched []bool) []TargetResult {
-	compacted := make([]TargetResult, 0, len(results))
-	for index, wasDispatched := range dispatched {
-		if wasDispatched {
-			compacted = append(compacted, results[index])
-		}
-	}
-	return compacted
+	return results
 }
 
 func runTarget(ctx context.Context, target catalog.Target, queries []Query, opts Options) TargetResult {

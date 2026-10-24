@@ -16,16 +16,19 @@ import (
 // The target identity is deliberately not escaped here. A structured warning
 // carries the target rather than a rendered label, so the identity is escaped
 // by whichever presenter renders it - covered by the report tests.
+//
+// The result is a failed rather than an incomplete one: an incomplete target's
+// OpenError is always the cancellation, which collectWarnings does not call an
+// open failure, so only a session that really failed reaches this message.
 func TestCollectWarningsEscapesEndpointSuppliedText(t *testing.T) {
 	target := testTarget(catalog.DoT, "192.0.2.10")
 	target.Resolver.Name = "Resolver\x1b[2K\rhidden"
 	result := TargetResult{
-		Target:     target,
-		OpenError:  "x509: certificate is valid for \x1b[2K\rspoofed.example, not resolver.example",
-		Incomplete: true,
+		Target:    target,
+		OpenError: "x509: certificate is valid for \x1b[2K\rspoofed.example, not resolver.example",
 	}
 	warnings := collectWarnings([]TargetResult{result})
-	if len(warnings) != 2 {
+	if len(warnings) != 1 {
 		t.Fatalf("warnings = %#v", warnings)
 	}
 	messages := make([]string, 0, len(warnings))
