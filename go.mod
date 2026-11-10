@@ -4,9 +4,9 @@ go 1.26.0
 
 require (
 	github.com/miekg/dns v1.1.73
-	github.com/quic-go/quic-go v0.64.1
+	github.com/quic-go/quic-go v0.65.0
 	github.com/spf13/cobra v1.10.2
-	github.com/spf13/pflag v1.0.10
+	github.com/spf13/pflag v1.1.0
 	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
 	golang.org/x/text v0.44.0
